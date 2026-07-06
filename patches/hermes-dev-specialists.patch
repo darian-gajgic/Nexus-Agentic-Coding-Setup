@@ -1,0 +1,270 @@
+commit e14fc203980f0f3137f85aa0625d967eed2d34f7
+Author: sinep <dariannixda@gmail.com>
+Date:   Tue Jul 7 01:34:23 2026 +0200
+
+    Dev specialists: mcp-serena + mcp-context7 toolsets + Big-Code rules
+    
+    All five coding specialists gain LSP symbol navigation (serena) and
+    current-docs grounding (context7) — both were installed but unreachable
+    for exactly these agents — plus the Big-Code discipline block: navigate
+    by symbol not file-reads, blast-radius-first planning, done = repo's own
+    gates green AND every touched symbol's usages re-searched, repo
+    conventions file wins, schema migrations always escalate.
+    
+    Grounding: Sourcegraph agentic-coding-2026 (deterministic retrieval,
+    symbol-usage verification) + live audit 2026-07-07.
+    
+    Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+diff --git a/.lesson_usage.jsonl b/.lesson_usage.jsonl
+new file mode 100644
+index 0000000..a04803f
+--- /dev/null
++++ b/.lesson_usage.jsonl
+@@ -0,0 +1,3 @@
++{"ids": ["962fa09c-7b1d-47b9-bcc5-10bb3a2bc1d0"], "ts": "2026-07-06T20:26:21"}
++{"ids": ["310438b9-6d8f-452a-a09e-657e232eadb8"], "ts": "2026-07-06T21:49:26"}
++{"ids": ["310438b9-6d8f-452a-a09e-657e232eadb8"], "ts": "2026-07-07T00:13:01"}
+diff --git a/.pending_lessons.json b/.pending_lessons.json
+new file mode 100644
+index 0000000..f11d20e
+--- /dev/null
++++ b/.pending_lessons.json
+@@ -0,0 +1,44 @@
++[
++  {
++    "id": "b7088364367a",
++    "specialist": "tech-lead-orchestrator",
++    "lesson": "When a task requires producing multiple full documents in a single response, draft the skeleton of ALL deliverables first (every required section across both documents) before deepening any one \u2014 never write the first document to completion before starting the next, because output-budget limits will truncate later deliverables (here, SPEC got cut off at R2 and PLAN.md was never started).",
++    "insight": "The agent over-invested in elaborating SPEC.md section by section and ran out of output before reaching PLAN.md, leaving the deliverable incomplete; sequencing all documents' skeletons first guarantees the multi-part deliverable is at minimum structurally whole.",
++    "source_goal": "Produce a SPEC.md and PLAN.md for a self-contained Next.js (App Router) full-stack storefront that sells graphics cards (GPUs) and motherboards. Deliverable = a SPEC then a PLAN. Write NO code \u2014 this is read-only exploration and spec/plan authoring only. Output both documents in full as your final result.\n\nSTACK: Next.js 14+ App Router, TypeScript, SQLite (better-sqlite3), Tailwind CSS + shadcn/ui",
++    "source_outcome": "I've absorbed the playbook, rubric, and exemplars. Now I'll produce both documents. All requirements will be numbered, falsifiable, with runnable verification commands mapping R# \u2192 command \u2192 expected output.\n\n---\n\n# SPEC.md\n\n## 1. Context & goal\n\nA self-contained Next.js (App Router) full-stack storefront that sells graphics cards (GPUs) and motherboards. The goal: a visitor can browse a seeded product catalogue, search by name or brand, filter by category / brand / price range / key specs, open a product detail page, add items to a cart that persists across page reloads in localStorage (mirro",
++    "similar_existing": null,
++    "similarity": 0.0,
++    "confidence": 0.7,
++    "type": "rule",
++    "created_at": "2026-07-06T22:00:36",
++    "status": "pending"
++  },
++  {
++    "id": "21e5e45952c8",
++    "specialist": "acceptance-verifier",
++    "lesson": "When verifying WCAG/contrast acceptance criteria, do not rely on the overall Lighthouse Accessibility score \u2014 read the individual `color-contrast` audit pass/fail, because a passing \u226595 category score can still contain a hard-failing color-contrast audit (score 0.00) driven by a few elements (CTA buttons, accent-colored links) missing 4.5:1 by margins as small as 0.04.",
++    "insight": "Brand accent colors (e.g., #6366f1) on dark backgrounds or as button backgrounds against white text are the recurring failure points because they're chosen for aesthetics and land just under 4.5:1, so the verifier must check the audit detail, not the headline score.",
++    "source_goal": "Perform the final acceptance gate for the finished IT-specialist webshop. Act as a fresh-context evaluator with NO prior assumptions. Independently verify the site against the acceptance criteria and return a PASS or FAIL verdict with concrete evidence.\n\nSITE LOCATION: /home/sinep/nexus-agent-os/workspaces/task-a130394d/freelancer-site/ (Astro static site)\n\nACCEPTANCE CRITERIA SOURCE: /home/sinep/",
++    "source_outcome": "I now have all evidence. Let me compile the final verdict.\n\n---\n\n# ACCEPTANCE GATE VERDICT: **FAIL**\n\nOne blocking finding. Everything else passes. The fix is a 2-line CSS change.\n\n---\n\n## BLOCKING FINDING: WCAG color-contrast failures (R8 / PLAN Task 13)\n\n**Criterion violated:**\n- SPEC R8: \"Color contrast ratios: body text \u22654.5:1 against background\"\n- PLAN Task 13 acceptance criterion: \"No Lighthouse issue flagged as 'fail' in the Accessibility category\"\n\n**Evidence \u2014 Lighthouse `color-contrast` audit: score 0.00 (FAIL):**\n\n| Element | File:Line | FG | BG | Ratio | Required | Gap |\n|---|---|-",
++    "similar_existing": null,
++    "similarity": 0.0,
++    "confidence": 0.9,
++    "type": "rule",
++    "created_at": "2026-07-06T22:30:18",
++    "status": "pending"
++  },
++  {
++    "id": "7c8cc99379ea",
++    "specialist": "code-reviewer",
++    "lesson": "When reviewing filter/search features, trace UI input values through to their API/database comparison fields to verify unit consistency (e.g., dollars vs cents), since label-domain mismatches silently return wrong results without any error.",
++    "insight": "The HIGH-1 price-filter bug was caught by following the typed dollar value through the query param to the `price_cents` comparison, a cross-layer trace that surface-level reading would miss.",
++    "source_goal": "Produce a severity-ranked code review of the GPUs+motherboards webshop implementation against its SPEC. Output: (1) findings list CRITICAL/HIGH/MEDIUM/LOW with file:line, why, concrete fix; (2) per-requirement R1..R29 met/partial/missing checklist; (3) explicit verdict REQUEST CHANGES / APPROVE WITH COMMENTS / APPROVE. Do NOT rewrite the code.",
++    "source_outcome": "Now I have all the source files. Let me compile the review.\n\n---\n\n# Code Review: GPUs + Motherboards Webshop (task-412d272a) vs SPEC (task-a9f6fe19)\n\n## FRAME\n\n**GOAL:** Severity-ranked review of the implementation against the SPEC contract.\n**DONE WHEN:** Findings list, R1\u2013R29 checklist, and verdict delivered.\n**OUT OF SCOPE:** Rewriting code. Auth/IDOR (no auth in SPEC scope).\n\n---\n\n## (1) Findings \u2014 CRITICAL / HIGH / MEDIUM / LOW\n\n### HIGH-1 \u00b7 Price-filter unit mismatch \u2014 breaks R14 UI contract\n\n**File:** `components/CatalogueClient.tsx:124,139,26-27,67-68`\n\n**Why:** The min/max price input",
++    "similar_existing": null,
++    "similarity": 0.0,
++    "confidence": 0.72,
++    "type": "rule",
++    "created_at": "2026-07-07T00:00:32",
++    "status": "pending"
++  }
++]
+\ No newline at end of file
+diff --git a/.pending_lessons.lock b/.pending_lessons.lock
+new file mode 100644
+index 0000000..e69de29
+diff --git a/.reflect_state.json b/.reflect_state.json
+new file mode 100644
+index 0000000..3529521
+--- /dev/null
++++ b/.reflect_state.json
+@@ -0,0 +1 @@
++{"processed": 5, "last_run": "2026-07-07T00:30:28", "last_drafted": 0}
+\ No newline at end of file
+diff --git a/.reflection_log.jsonl b/.reflection_log.jsonl
+new file mode 100644
+index 0000000..8a10784
+--- /dev/null
++++ b/.reflection_log.jsonl
+@@ -0,0 +1,5 @@
++{"specialist": "tech-lead-orchestrator", "goal": "Produce a SPEC.md and PLAN.md for a self-contained Next.js (App Router) full-stack storefront that sells graphics cards (GPUs) and motherboards. Deliverable = a SPEC then a PLAN. Write NO code \u2014 this is read-only exploration and spec/plan authoring only. Output both documents in full as your final result.\n\nSTACK: Next.js 14+ App Router, TypeScript, SQLite (better-sqlite3), Tailwind CSS + shadcn/ui for the UI layer. Zero-config single-file DB. No external services.\n\nSCOPE = storefront only: browse catalogue, search, filter (by category, brand, price range, key specs), product detail page, cart,", "outcome": "I've absorbed the playbook, rubric, and exemplars. Now I'll produce both documents. All requirements will be numbered, falsifiable, with runnable verification commands mapping R# \u2192 command \u2192 expected output.\n\n---\n\n# SPEC.md\n\n## 1. Context & goal\n\nA self-contained Next.js (App Router) full-stack storefront that sells graphics cards (GPUs) and motherboards. The goal: a visitor can browse a seeded product catalogue, search by name or brand, filter by category / brand / price range / key specs, open a product detail page, add items to a cart that persists across page reloads in localStorage (mirrored by an API), and complete a mock checkout that produces an order id and a confirmation screen \u2014 all backed by a single-file SQLite database, with no external services, no user accounts, no real payment, and no shipping. Currency is USD throughout, stored as integer minor units (cents). The deliverable is the storefront codebase that passes `npm run build` with zero errors and the full Vitest suite green.\n\nActors: anonymous visitor (the only actor). Money-path impact: none (mock checkout, no real payment). Stack: Next.js 14+ App Router, TypeScript, better-sqlite3 (single-file DB at `data/store.db`), Tailwind CSS, shadcn/ui, Vitest.\n\n## 2. Requirements\n\n**Data & seeding**\n\n- **R1.** Running `npm run seed` creates/overwrites `data/store.db` and inserts at least 8 products with `category = 'gpu'` and at least 8 products with `category = 'motherboard'`, spanning at least 3 distinct brands total. Verification: `sqlite3 data/store.db \"select category, count(*) from products group by category;\"` prints two rows with counts \u2265 8; `select count(distinct brand) from products;` prints \u2265 3.\n- **R2.** Every product row has a non-null `id` (integer primary key), `slug` (unique), `name`, `category` (`'gpu'` or `'motherboard'`), `brand`, `price_cents` (integer > 0), `image_url`, `specs` (valid JSON object), `stock` (integer \u2265 0), and `description` (non-empty text). Verification: `select * fro", "ts": "2026-07-06T21:43:49"}
++{"specialist": "code-implementer", "goal": "Implement the GPUs + Motherboards webshop exactly to the attached SPEC. Build ALL of: a Next.js (App Router) full-stack TypeScript app with SQLite (better-sqlite3), Tailwind CSS \u2014 storefront home, catalogue with server-side filtering/search via API, product detail route /products/[slug], cart (client state in localStorage under key \"gx-cart\" + an API mirror), mock checkout with order confirmation, product seed script with >= 8 GPUs and >= 8 motherboards across at least 3 brands each, and a polished responsive UI (product cards, sticky cart count badge, empty states, loading states).\n\nWrite tes", "outcome": "API call failed after 3 retries: HTTP 429: The service may be temporarily overloaded, please try again later", "ts": "2026-07-06T22:01:08"}
++{"specialist": "acceptance-verifier", "goal": "Perform the final acceptance gate for the finished IT-specialist webshop. Act as a fresh-context evaluator with NO prior assumptions. Independently verify the site against the acceptance criteria and return a PASS or FAIL verdict with concrete evidence.\n\nSITE LOCATION: /home/sinep/nexus-agent-os/workspaces/task-a130394d/freelancer-site/ (Astro static site)\n\nACCEPTANCE CRITERIA SOURCE: /home/sinep/nexus-agent-os/workspaces/task-86d0a608/deliverable.md (combined PLAN.md + SPEC.md \u2014 contains requirements R1-R12 and verification commands V1-V9).\n\nRUN COMMANDS (already confirmed working, but verify", "outcome": "I now have all evidence. Let me compile the final verdict.\n\n---\n\n# ACCEPTANCE GATE VERDICT: **FAIL**\n\nOne blocking finding. Everything else passes. The fix is a 2-line CSS change.\n\n---\n\n## BLOCKING FINDING: WCAG color-contrast failures (R8 / PLAN Task 13)\n\n**Criterion violated:**\n- SPEC R8: \"Color contrast ratios: body text \u22654.5:1 against background\"\n- PLAN Task 13 acceptance criterion: \"No Lighthouse issue flagged as 'fail' in the Accessibility category\"\n\n**Evidence \u2014 Lighthouse `color-contrast` audit: score 0.00 (FAIL):**\n\n| Element | File:Line | FG | BG | Ratio | Required | Gap |\n|---|---|---|---|---|---|---|\n| `.card-link` (\"Learn more \u2192\") | `src/components/ServiceCard.astro:80` | `#6366f1` | `#13131a` | **4.13:1** | 4.5:1 | -0.37 |\n| `.btn-primary.btn-lg` (CTA buttons) | `src/styles/global.css:211-213` | `#ffffff` | `#6366f1` | **4.46:1** | 4.5:1 | -0.04 |\n\n**Command and output:**\n```\n$ npx lighthouse http://localhost:4322/ --only-categories=accessibility\nAccessibility: 0.95 (95/100)  \u2190 score passes \u226590, BUT:\n\n[color-contrast] score=0.00\n  Item 1-3: <span class=\"card-link\"> \u2014 contrast 4.13, foreground #6366f1, background #13131a, font 10.5pt (14px) normal\n  Item 4:   <a class=\"btn btn-primary btn-lg\"> \u2014 contrast 4.46, foreground #ffffff, background #6366f1, font 13.5pt (18px) normal\n```\n\n**Why it blocks:** R8 requires body text \u22654.5:1. The `.card-link` spans (3 instances on the homepage, 3 on `/services`) are 14px normal-weight text at 4.13:1 \u2014 a genuine WCAG AA failure. The `.btn-primary` CTA buttons (the most prominent interactive elements on the site) are at 4.46:1, missing by 0.04. The PLAN's Task 13 explicitly requires \"No Lighthouse issue flagged as 'fail' in the Accessibility category\" \u2014 `color-contrast` IS flagged as fail.\n\n**Exact fix:**\n1. `src/components/ServiceCard.astro:80` \u2014 change `color: var(--color-accent)` to `color: var(--color-accent-hover)` (#818cf8). New ratio: **5.78:1** \u2713\n2. `src/styles/global.css:215` \u2014 darken `.btn-primary` background ", "ts": "2026-07-06T22:03:18"}
++{"specialist": "code-reviewer", "goal": "Produce a severity-ranked code review of the GPUs+motherboards webshop implementation against its SPEC. Output: (1) findings list CRITICAL/HIGH/MEDIUM/LOW with file:line, why, concrete fix; (2) per-requirement R1..R29 met/partial/missing checklist; (3) explicit verdict REQUEST CHANGES / APPROVE WITH COMMENTS / APPROVE. Do NOT rewrite the code.", "outcome": "Now I have all the source files. Let me compile the review.\n\n---\n\n# Code Review: GPUs + Motherboards Webshop (task-412d272a) vs SPEC (task-a9f6fe19)\n\n## FRAME\n\n**GOAL:** Severity-ranked review of the implementation against the SPEC contract.\n**DONE WHEN:** Findings list, R1\u2013R29 checklist, and verdict delivered.\n**OUT OF SCOPE:** Rewriting code. Auth/IDOR (no auth in SPEC scope).\n\n---\n\n## (1) Findings \u2014 CRITICAL / HIGH / MEDIUM / LOW\n\n### HIGH-1 \u00b7 Price-filter unit mismatch \u2014 breaks R14 UI contract\n\n**File:** `components/CatalogueClient.tsx:124,139,26-27,67-68`\n\n**Why:** The min/max price inputs are labeled \"Min Price ($)\" and \"Max Price ($)\" with placeholders \"0\" and \"9999\" (implying **dollars**). But `applyFiltersWith` (line 67-68) sends the raw typed value as `min_price`/`max_price` query params, and the API (`lib/db.ts:76-83`) compares them against `price_cents` (**cents**). The cheapest seeded product is 14,999\u00a2 ($149.99).\n\nConcrete failures:\n- User types \"200\" in Min Price \u2192 API filters `price_cents >= 200` \u2192 **all 18 products** (200\u00a2 = $2.00).\n- User types \"9999\" (the placeholder) in Max Price \u2192 API filters `price_cents <= 9999` \u2192 **zero products**.\n- Any realistic dollar-range query returns the wrong results.\n\nThis does **not** break R6 (which calls the API directly with cent values), but it violates R14's contract: \"Selecting/typing values updates the visible product cards to match.\"\n\n**Fix:** Either multiply the input by 100 before sending to the API (`parseIntSafe(min) * 100`), or relabel the inputs to \"Min Price (cents)\" / \"Max Price (cents)\" and adjust placeholders to match the cent domain. The former is the better UX.\n\n---\n\n### HIGH-2 \u00b7 Cart page at wrong route with wrong testid \u2014 breaks R21 + \u00a73\n\n**Files:** `Header.tsx:48`, `app/checkout/cart/page.tsx:76` (entire file), missing `app/cart/page.tsx`\n\n**Why:** SPEC R21 explicitly requires the cart page at route **`/cart`** with **`data-testid=\"cart-page\"`**. SPEC \u00a73 file layout shows `app/cart/page.tsx`. ", "ts": "2026-07-06T23:42:56"}
++{"specialist": "code-implementer", "goal": "Redesign the visual layer of an existing Next.js webshop so it looks like a modern 2025 webshop instead of one from 2005. The functional code is ALREADY CORRECT AND GREEN (16 unit tests pass, npm run build exits 0). Your job is ONLY the visual/design redesign \u2014 do NOT rewrite or change the behavior of any API route, DB query, cart logic, or test. Preserve every data-testid attribute, the cart localStorage JSON shape, and all API response contracts EXACTLY. After your redesign, all 16 unit tests must still pass and npm run build must still exit 0.\n\nPROJECT ROOT: /home/sinep/nexus-agent-os/works", "outcome": "## Summary\n\n### Outcome: Visual redesign COMPLETE \u2014 all 16 tests pass, build exits 0\n\nI redesigned the entire visual layer of the webshop from a dated 2005 gray/white aesthetic to a modern 2025 dark-premium design with glassmorphism, aurora gradients, per-product SVG art, and smooth animations. **All 16 unit tests pass, `npm run build` exits 0, and all functional code (API routes, DB queries, cart logic, tests) was left untouched.**\n\n### What was accomplished\n\n**Design system foundation:**\n- `tailwind.config.ts` \u2014 Full brand palette (ink/accent/brand colors), 8 keyframe animations (fade-in-up, aurora, float, glow-pulse, badge-bump, check-pop, shimmer), glassmorphism box-shadows, Inter + JetBrains Mono fonts\n- `app/globals.css` \u2014 CSS variables for dark theme, aurora background blobs (animated), glass/glass-card/glass-header utility classes, gradient-text classes, skeleton shimmer, btn-primary/btn-secondary buttons, input-dark styling, category badge colors (GPU=cyan, MB=teal), stock dots (green/amber/red), prefers-reduced-motion support\n\n**Component redesigns (all data-testids preserved):**\n- `app/layout.tsx` \u2014 next/font Inter+JetBrains Mono, fixed aurora background layer, glass footer\n- `components/Header.tsx` \u2014 Glassmorphism sticky header (backdrop-blur), animated cart badge bump on count change, gradient logo icon\n- `app/page.tsx` \u2014 Full hero section with gradient headline, CTAs, stats row, floating orbs, catalogue anchor\n- `components/CatalogueClient.tsx` \u2014 Glass panel filter bar, skeleton loading cards (6 cards), staggered card entrance animation\n- `components/ProductCard.tsx` \u2014 Glass cards with hover lift+glow, category pills, brand badges, stock dots, mono price typography\n- `components/AddToCartButton.tsx` \u2014 Stepper quantity control, animated checkmark on add, gradient button\n- `app/products/[slug]/page.tsx` \u2014 Gallery-style layout, spec table with dividers, stock indicators\n- `app/checkout/cart/page.tsx` \u2014 Modern line items with thumbnails, glass summary (add", "ts": "2026-07-07T00:23:07"}
+diff --git a/acceptance-verifier.md b/acceptance-verifier.md
+index c01d71b..a7dde66 100644
+--- a/acceptance-verifier.md
++++ b/acceptance-verifier.md
+@@ -1,7 +1,7 @@
+ ---
+ name: acceptance-verifier
+ description: "Use when dev work is claimed done and needs a final gate — a fresh-context evaluator that grades the result against the goal's acceptance criteria and PLAN.md, runs the tests and build, and returns PASS with evidence or precise blocking FAIL findings."
+-tools: [file, terminal]
++tools: [file, terminal, mcp-serena, mcp-context7]
+ mem0_agent_id: acceptance-verifier
+ ---
+ 
+@@ -57,3 +57,20 @@ scoring stays as defined there). The full reference lives at
+ 5. Never return a first draft: revise once against the original request line by line,
+    then apply your Knowledge protocol self-score. Lead the final answer with the
+    outcome; state plainly what was NOT done or is uncertain.
++
++## Big-repo navigation & verification (mandatory on any existing codebase)
++- Navigate by SYMBOL, not by reading files end-to-end: use the mcp-serena tools
++  (find symbol, find references, symbol overview) to locate definitions and every
++  caller; read only the definitions you actually need. Grep/cat whole files only
++  when symbol search cannot express the question.
++- BLAST RADIUS FIRST: before changing any symbol, list its references and name the
++  affected layers in your plan. A change is scoped by its callers, not by its file.
++- Ground every library/API usage in current docs via mcp-context7 — never
++  training-data memory — whenever a dependency question arises.
++- DONE means: the repo's OWN gates pass (test/build/lint commands from AGENTS.md /
++  CLAUDE.md in the repo — run them, paste real output) AND you re-searched the
++  codebase for every symbol you touched; any usage you never opened means the task
++  is NOT done.
++- Follow the repo's conventions file (AGENTS.md/CLAUDE.md) over personal style.
++- Schema or stateful-data migrations: STOP and escalate to the human — propose,
++  never execute.
+diff --git a/code-implementer.md b/code-implementer.md
+index 1c55698..7a9aa78 100644
+--- a/code-implementer.md
++++ b/code-implementer.md
+@@ -1,7 +1,7 @@
+ ---
+ name: code-implementer
+ description: "Use to implement ONE scoped coding task end-to-end — it writes the code AND its tests, runs them to green, and reports with evidence. Give it a precise goal with acceptance criteria (from PLAN.md/SPEC.md); it stays inside its assigned files and never expands scope."
+-tools: [file, terminal]
++tools: [file, terminal, mcp-serena, mcp-context7]
+ mem0_agent_id: code-implementer
+ ---
+ 
+@@ -44,3 +44,20 @@ scoring stays as defined there). The full reference lives at
+ 5. Never return a first draft: revise once against the original request line by line,
+    then apply your Knowledge protocol self-score. Lead the final answer with the
+    outcome; state plainly what was NOT done or is uncertain.
++
++## Big-repo navigation & verification (mandatory on any existing codebase)
++- Navigate by SYMBOL, not by reading files end-to-end: use the mcp-serena tools
++  (find symbol, find references, symbol overview) to locate definitions and every
++  caller; read only the definitions you actually need. Grep/cat whole files only
++  when symbol search cannot express the question.
++- BLAST RADIUS FIRST: before changing any symbol, list its references and name the
++  affected layers in your plan. A change is scoped by its callers, not by its file.
++- Ground every library/API usage in current docs via mcp-context7 — never
++  training-data memory — whenever a dependency question arises.
++- DONE means: the repo's OWN gates pass (test/build/lint commands from AGENTS.md /
++  CLAUDE.md in the repo — run them, paste real output) AND you re-searched the
++  codebase for every symbol you touched; any usage you never opened means the task
++  is NOT done.
++- Follow the repo's conventions file (AGENTS.md/CLAUDE.md) over personal style.
++- Schema or stateful-data migrations: STOP and escalate to the human — propose,
++  never execute.
+diff --git a/code-reviewer.md b/code-reviewer.md
+index ecf7524..b989023 100644
+--- a/code-reviewer.md
++++ b/code-reviewer.md
+@@ -1,7 +1,7 @@
+ ---
+ name: code-reviewer
+ description: "Use when reviewing a diff, pull request, or file for correctness, security, performance, and maintainability before merge, and you want severity-ranked, actionable findings with a clear pass/fail gate."
+-tools: [file, terminal]
++tools: [file, terminal, mcp-serena, mcp-context7]
+ mem0_agent_id: code-reviewer
+ ---
+ 
+@@ -82,3 +82,20 @@ scoring stays as defined there). The full reference lives at
+ 5. Never return a first draft: revise once against the original request line by line,
+    then apply your Knowledge protocol self-score. Lead the final answer with the
+    outcome; state plainly what was NOT done or is uncertain.
++
++## Big-repo navigation & verification (mandatory on any existing codebase)
++- Navigate by SYMBOL, not by reading files end-to-end: use the mcp-serena tools
++  (find symbol, find references, symbol overview) to locate definitions and every
++  caller; read only the definitions you actually need. Grep/cat whole files only
++  when symbol search cannot express the question.
++- BLAST RADIUS FIRST: before changing any symbol, list its references and name the
++  affected layers in your plan. A change is scoped by its callers, not by its file.
++- Ground every library/API usage in current docs via mcp-context7 — never
++  training-data memory — whenever a dependency question arises.
++- DONE means: the repo's OWN gates pass (test/build/lint commands from AGENTS.md /
++  CLAUDE.md in the repo — run them, paste real output) AND you re-searched the
++  codebase for every symbol you touched; any usage you never opened means the task
++  is NOT done.
++- Follow the repo's conventions file (AGENTS.md/CLAUDE.md) over personal style.
++- Schema or stateful-data migrations: STOP and escalate to the human — propose,
++  never execute.
+diff --git a/debugger.md b/debugger.md
+index b01632a..fb08774 100644
+--- a/debugger.md
++++ b/debugger.md
+@@ -1,7 +1,7 @@
+ ---
+ name: debugger
+ description: "Use when diagnosing a specific error, stack trace, test failure, crash, or reproducible unexpected behavior and you need root-cause analysis plus a verified minimal fix."
+-tools: [file, terminal]
++tools: [file, terminal, mcp-serena, mcp-context7]
+ mem0_agent_id: debugger
+ ---
+ 
+@@ -70,3 +70,20 @@ scoring stays as defined there). The full reference lives at
+ 5. Never return a first draft: revise once against the original request line by line,
+    then apply your Knowledge protocol self-score. Lead the final answer with the
+    outcome; state plainly what was NOT done or is uncertain.
++
++## Big-repo navigation & verification (mandatory on any existing codebase)
++- Navigate by SYMBOL, not by reading files end-to-end: use the mcp-serena tools
++  (find symbol, find references, symbol overview) to locate definitions and every
++  caller; read only the definitions you actually need. Grep/cat whole files only
++  when symbol search cannot express the question.
++- BLAST RADIUS FIRST: before changing any symbol, list its references and name the
++  affected layers in your plan. A change is scoped by its callers, not by its file.
++- Ground every library/API usage in current docs via mcp-context7 — never
++  training-data memory — whenever a dependency question arises.
++- DONE means: the repo's OWN gates pass (test/build/lint commands from AGENTS.md /
++  CLAUDE.md in the repo — run them, paste real output) AND you re-searched the
++  codebase for every symbol you touched; any usage you never opened means the task
++  is NOT done.
++- Follow the repo's conventions file (AGENTS.md/CLAUDE.md) over personal style.
++- Schema or stateful-data migrations: STOP and escalate to the human — propose,
++  never execute.
+diff --git a/tech-lead-orchestrator.md b/tech-lead-orchestrator.md
+index ec793a1..cf71013 100644
+--- a/tech-lead-orchestrator.md
++++ b/tech-lead-orchestrator.md
+@@ -1,7 +1,7 @@
+ ---
+ name: tech-lead-orchestrator
+ description: "Use when starting any non-trivial dev task — before code is written, to explore the codebase read-only and produce a PLAN.md/SPEC.md with an ordered task list, testable acceptance criteria, edge cases, and the specialist assigned to each step."
+-tools: [file, terminal]
++tools: [file, terminal, mcp-serena, mcp-context7]
+ mem0_agent_id: tech-lead-orchestrator
+ ---
+ 
+@@ -63,3 +63,20 @@ scoring stays as defined there). The full reference lives at
+ 5. Never return a first draft: revise once against the original request line by line,
+    then apply your Knowledge protocol self-score. Lead the final answer with the
+    outcome; state plainly what was NOT done or is uncertain.
++
++## Big-repo navigation & verification (mandatory on any existing codebase)
++- Navigate by SYMBOL, not by reading files end-to-end: use the mcp-serena tools
++  (find symbol, find references, symbol overview) to locate definitions and every
++  caller; read only the definitions you actually need. Grep/cat whole files only
++  when symbol search cannot express the question.
++- BLAST RADIUS FIRST: before changing any symbol, list its references and name the
++  affected layers in your plan. A change is scoped by its callers, not by its file.
++- Ground every library/API usage in current docs via mcp-context7 — never
++  training-data memory — whenever a dependency question arises.
++- DONE means: the repo's OWN gates pass (test/build/lint commands from AGENTS.md /
++  CLAUDE.md in the repo — run them, paste real output) AND you re-searched the
++  codebase for every symbol you touched; any usage you never opened means the task
++  is NOT done.
++- Follow the repo's conventions file (AGENTS.md/CLAUDE.md) over personal style.
++- Schema or stateful-data migrations: STOP and escalate to the human — propose,
++  never execute.
