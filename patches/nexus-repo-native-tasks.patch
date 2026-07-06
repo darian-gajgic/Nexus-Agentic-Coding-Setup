@@ -1,0 +1,433 @@
+diff --git a/database.py b/database.py
+index 404486a..d2db200 100644
+--- a/database.py
++++ b/database.py
+@@ -229,6 +229,7 @@ def init_db():
+         ("workflow_id", "TEXT"),
+         ("depends_on", "TEXT"),
+         ("loop_config", "TEXT"),
++        ("repo_path", "TEXT"),
+     ]
+     for col, typedef in task_migrations:
+         if col not in existing_task_cols:
+diff --git a/hermes_dispatch.py b/hermes_dispatch.py
+index ca0c1e7..e862da1 100644
+--- a/hermes_dispatch.py
++++ b/hermes_dispatch.py
+@@ -314,6 +314,36 @@ def deps_satisfied(task: dict) -> bool:
+ 
+ DOC_TOOLS_PY = "/home/sinep/nexus-agent-os/.venv/bin/python"
+ 
++import worktree as wt
++
++
++def _repo_slug(task: dict) -> str:
++    """Pipeline tasks share one branch (stages build on each other); loose
++    tasks get their own."""
++    return (task.get("workflow_id") or task.get("id") or "task").replace("wf-", "").replace("task-", "")
++
++
++def _repo_context(task: dict) -> dict | None:
++    """Resolve the task's isolated worktree (idempotent) + repo conventions
++    file. Returns {worktree, branch, base, conventions} or None."""
++    repo = (task.get("repo_path") or "").strip()
++    if not repo:
++        return None
++    info = wt.ensure_task_worktree(repo, _repo_slug(task))
++    if not info:
++        return None
++    conventions = ""
++    for name in ("AGENTS.md", "CLAUDE.md", ".hermes.md"):
++        p = Path(info["worktree_path"]) / name
++        if p.is_file():
++            try:
++                conventions = f"[{name}]\n" + p.read_text()[:6000]
++            except Exception:
++                pass
++            break
++    return {"worktree": info["worktree_path"], "branch": info["worktree_branch"],
++            "base": info.get("base_branch") or "main", "conventions": conventions}
++
+ 
+ def _attachment_lines(task: dict, workspace: Path) -> list[str]:
+     """Operator-attached input files: the task's own + its project's."""
+@@ -330,19 +360,41 @@ def _attachment_lines(task: dict, workspace: Path) -> list[str]:
+     return out
+ 
+ 
+-def build_framing(task: dict, workspace: Path) -> str:
++def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> str:
+     parts = [
+         f"You are executing Nexus kanban task {task['id']} (\"{task['title']}\") autonomously "
+         "for the Nexus Agent OS control plane. Work the task to completion in this turn.",
+-        f"Write your final deliverable to the file {workspace}/deliverable.md using your file "
+-        "tools (the directory exists). You may create additional supporting files next to it. "
+-        "If the task calls for binary output formats (pdf, docx, xlsx, pptx, png), produce "
+-        f"them as files next to deliverable.md using {DOC_TOOLS_PY} — python-docx, openpyxl, "
+-        "python-pptx, reportlab, pypdf, pillow and markdown are preinstalled there — and have "
+-        "deliverable.md reference them. For browser-based checks use your browser tools or "
+-        f"Python playwright from that same interpreter; the npm 'playwright' package is NOT "
+-        "installed globally.",
+     ]
++    if repo_ctx:
++        parts.append(
++            f"REPO-NATIVE TASK: you operate on the EXISTING repository checked out at "
++            f"{repo_ctx['worktree']} — an isolated git worktree on branch "
++            f"{repo_ctx['branch']} (baseline: {repo_ctx['base']}; the operator's main "
++            "checkout is untouched). Rules:\n"
++            f"- Work INSIDE {repo_ctx['worktree']} — change the real code there, do NOT "
++            "scaffold a fresh project in the task workspace.\n"
++            "- Follow the repository's own conventions and commands (see the conventions "
++            "file below if present). Its test/build/lint gates are YOUR gates — run them "
++            "and paste real output.\n"
++            "- Navigate by symbol (mcp-serena) and check every touched symbol's other "
++            "usages before calling the work done.\n"
++            "- COMMIT your work on the branch in clear, scoped commits (git add/commit in "
++            "the worktree). Never push, never merge, never switch branches.\n"
++            f"- Write {workspace}/deliverable.md as a CHANGE REPORT: what changed and why, "
++            "files touched, commands run with real output, follow-ups. The DIFF on the "
++            "branch is the real deliverable — the operator reviews and merges it manually."
++            + (f"\n\nREPOSITORY CONVENTIONS {repo_ctx['conventions'][:6200]}"
++               if repo_ctx.get("conventions") else ""))
++    else:
++        parts.append(
++            f"Write your final deliverable to the file {workspace}/deliverable.md using your file "
++            "tools (the directory exists). You may create additional supporting files next to it. "
++            "If the task calls for binary output formats (pdf, docx, xlsx, pptx, png), produce "
++            f"them as files next to deliverable.md using {DOC_TOOLS_PY} — python-docx, openpyxl, "
++            "python-pptx, reportlab, pypdf, pillow and markdown are preinstalled there — and have "
++            "deliverable.md reference them. For browser-based checks use your browser tools or "
++            f"Python playwright from that same interpreter; the npm 'playwright' package is NOT "
++            "installed globally.")
+     parts.append(
+         "When the task needs a STRUCTURED FACT — exchange rates, weather, country/market "
+         "data, public holidays, economic indicators, paper/package/repo metadata, "
+@@ -672,7 +724,16 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
+                         f"{'Resuming' if resume else 'Dispatched'} task {task_id} "
+                         f"('{task['title']}') via Hermes session {session_id}")
+ 
+-        framing = build_framing(task, workspace)
++        repo_ctx = _repo_context(task)
++        if task.get("repo_path") and not repo_ctx:
++            _set_task(task_id, dispatch_state="failed",
++                      dispatch_error=f"repo worktree setup failed for {task.get('repo_path')}")
++            _set_dispatch(dispatch_id, state="failed", ended_at=time.time(),
++                          error="worktree setup failed")
++            db.log_activity("error", agent_id,
++                            f"Task {task_id}: could not create worktree in {task.get('repo_path')}")
++            return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
++        framing = build_framing(task, workspace, repo_ctx)
+         if resume:
+             input_text = (f"You were interrupted mid-task. Continue task {task_id} now and "
+                           "finish it. The original instructions still apply: write the final "
+@@ -686,6 +747,23 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
+ 
+         _set_task(task_id, dispatch_state="finalizing")
+         content = result.get("content") or ""
++        if repo_ctx:
++            # The branch diff IS the deliverable: snapshot anything the agent
++            # left uncommitted (never lose work), then capture the full diff
++            # vs the baseline into the workspace for review/UI/judging.
++            try:
++                if wt.snapshot_commit(repo_ctx["worktree"],
++                                      f"nexus {task_id}: uncommitted-work snapshot"):
++                    db.log_activity("warn", agent_id,
++                                    f"Task {task_id}: agent left uncommitted changes — snapshot-committed")
++                diff = wt.capture_diff(repo_ctx["worktree"], repo_ctx["base"])
++                (workspace / "changes.diff").write_text(diff or "(no changes on the branch)\n")
++                db.log_activity("info", agent_id,
++                                f"Task {task_id}: captured branch diff "
++                                f"({len(diff.splitlines())} lines) from {repo_ctx['branch']}")
++            except Exception as e:
++                db.log_activity("error", agent_id,
++                                f"Task {task_id}: diff capture failed: {str(e)[:100]}")
+         # Hermes surfaces upstream provider failures (e.g. Z.ai 429 after retries)
+         # as assistant TEXT with no error event — a partial flag and/or the
+         # "API call failed" wrapper string are the reliable signals.
+diff --git a/server.py b/server.py
+index 2bd943c..1e4395a 100644
+--- a/server.py
++++ b/server.py
+@@ -127,6 +127,7 @@ class TaskCreate(BaseModel):
+     workflow_id: Optional[str] = None
+     depends_on: Optional[list[str]] = None
+     loop_config: Optional[dict] = None
++    repo_path: Optional[str] = None
+ 
+ 
+ class TaskUpdate(BaseModel):
+@@ -143,6 +144,7 @@ class TaskUpdate(BaseModel):
+     workflow_id: Optional[str] = None
+     depends_on: Optional[list[str]] = None
+     loop_config: Optional[dict] = None
++    repo_path: Optional[str] = None
+ 
+ 
+ class ProgramCreate(BaseModel):
+@@ -231,13 +233,14 @@ async def create_task(body: TaskCreate):
+     now = time.time()
+     db.execute("""INSERT INTO tasks
+         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
+-         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config)
+-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path)
++        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         (tid, body.title, body.description, body.status, body.priority,
+          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
+          body.domain, body.specialist, 1 if body.high_stakes else 0, body.budget_tokens, body.model,
+          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
+-         json.dumps(body.loop_config) if body.loop_config else None))
++         json.dumps(body.loop_config) if body.loop_config else None,
++         (body.repo_path or None)))
+     db.log_activity("info", "system", f"Task created: '{body.title}'")
+     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
+     await mgr.broadcast({"type": "task_created", "data": task})
+@@ -280,6 +283,14 @@ async def update_task(task_id: str, body: TaskUpdate):
+         updates["depends_on"] = json.dumps(deps) if deps else None
+     if body.loop_config is not None:
+         updates["loop_config"] = json.dumps(body.loop_config) if body.loop_config else None
++    if body.repo_path is not None:
++        rp = (body.repo_path or "").strip()
++        if rp:
++            import worktree as _wt
++            if not _wt.is_repo(rp):
++                return JSONResponse(status_code=400, content={
++                    "error": f"repo_path is not a git repository: {rp}"})
++        updates["repo_path"] = rp or None
+     updates["updated_at"] = time.time()
+ 
+     set_clause = ", ".join(f"{k} = ?" for k in updates)
+diff --git a/static/app.js b/static/app.js
+index b0b7e37..ef1eefe 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -958,6 +958,11 @@ function openTaskDetail(id) {
+       <div class="chip c-accent" style="white-space:normal">${esc(t.rubric_score)}</div></div>` : ''}
+     ${t.learn_section ? `<div class="form-group"><label class="form-label">Learn (for you two)</label>
+       <div style="background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.25);border-radius:8px;padding:10px 12px;font-size:12.5px;white-space:pre-wrap">${esc(t.learn_section)}</div></div>` : ''}
++    ${t.repo_path ? `<div class="form-group"><label class="form-label">🧬 Repo-native task</label>
++      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px">
++        <span class="chip c-cyan" style="font-family:var(--font-mono)">${esc(t.repo_path)}</span>
++        <span class="muted">branch nexus/${esc((t.workflow_id || t.id).replace('wf-', '').replace('task-', ''))} · diff is the deliverable</span>
++      </div></div>` : ''}
+     <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
+       <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
+     <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
+@@ -2567,6 +2572,11 @@ function showTaskModal(status) {
+       <label class="form-label">Tags (comma-separated)</label>
+       <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
+     </div>
++    <div class="form-group">
++      <label class="form-label">🧬 Existing code repository (repo-native task)</label>
++      <select class="form-select" id="m-task-repo"><option value="">— None: fresh workspace (default) —</option></select>
++      <div class="form-hint">Pick a repo and the task works INSIDE it: isolated git worktree + branch, follows the repo's AGENTS.md/CLAUDE.md conventions, runs its own test gates, and delivers a reviewable DIFF. Your main checkout is never touched.</div>
++    </div>
+     <div class="form-group">
+       <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
+       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
+@@ -2596,6 +2606,14 @@ function showTaskModal(status) {
+       if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
+         specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+     } catch { /* optional */ }
++    try {
++      const repos = (await api('GET', '/api/projects')).projects || [];
++      const rsel = $('#m-task-repo');
++      if (rsel && repos.length) {
++        rsel.innerHTML = `<option value="">— None: fresh workspace (default) —</option>` +
++          repos.map(r => `<option value="${esc(r.path)}">${esc(r.name)}</option>`).join('');
++      }
++    } catch { /* optional */ }
+     try {
+       if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
+       const tsel = $('#m-task-template');
+@@ -2667,6 +2685,7 @@ async function submitTask() {
+   closeModal();
+   await api('POST', '/api/tasks', {
+     loop_config: loopCfg,
++    repo_path: $('#m-task-repo') ? ($('#m-task-repo').value || null) : null,
+     title,
+     description: $('#m-task-desc').value,
+     status: $('#m-task-status').value,
+@@ -5089,8 +5108,8 @@ function viewDeliverables() {
+         <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
+           ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
+         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+-          ${d.files.map(f => f.name.endsWith('.md')
+-            ? `<a href="#" onclick="previewDeliverable('${esc(d.task_id)}','${esc(f.name)}');return false" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📄 ${esc(f.name)}</a>`
++          ${d.files.map(f => (f.name.endsWith('.md') || f.name.endsWith('.diff'))
++            ? `<a href="#" onclick="previewDeliverable('${esc(d.task_id)}','${esc(f.name)}');return false" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">${f.name.endsWith('.diff') ? '🧬' : '📄'} ${esc(f.name)}</a>`
+             : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
+         </div>
+         <div class="row-actions">
+diff --git a/static/index.html b/static/index.html
+index bb6661f..db3d0e3 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -93,6 +93,6 @@
+ 
+ <button id="fbBtn" onclick="feedbackModal()" title="Something wrong or annoying here? File it — your last steps get attached automatically" style="position:fixed;right:18px;bottom:18px;z-index:900;width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(20,20,32,.85);color:var(--text-dim);font-size:17px;cursor:pointer;backdrop-filter:blur(6px)">🐞</button>
+ <script src="/static/nexus3d.js?v=1" type="module"></script>
+-<script src="/static/app.js?v=28"></script>
++<script src="/static/app.js?v=29"></script>
+ </body>
+ </html>
+diff --git a/templates.json b/templates.json
+index e4a0612..baec6b0 100644
+--- a/templates.json
++++ b/templates.json
+@@ -1,52 +1,79 @@
+ [
+   {
+     "id": "landing-hero",
+-    "name": "🖥 Landing page hero",
++    "name": "\ud83d\udda5 Landing page hero",
+     "title": "Landing page hero section for [product]",
+     "description": "Write the hero section (headline, subheadline, CTA button text, one supporting proof line) for the landing page of [describe the product]. Audience: [who]. Give 3 headline variants and mark which one you'd ship and why. Follow the marketing playbook and STYLE-VOICE.",
+     "domain": "marketing",
+     "specialist": "copywriter-specialist",
+     "high_stakes": true,
+-    "tags": ["landing", "copy"]
++    "tags": [
++      "landing",
++      "copy"
++    ]
+   },
+   {
+     "id": "marketplace-listing",
+-    "name": "🛒 Marketplace listing",
++    "name": "\ud83d\uded2 Marketplace listing",
+     "title": "Marketplace listing for [product]",
+-    "description": "Create a complete marketplace listing for [product, condition, key specs]: title optimized for search, bullet highlights, description, and pricing rationale vs comparable listings. Platform: [eBay/Amazon/Kleinanzeigen…].",
++    "description": "Create a complete marketplace listing for [product, condition, key specs]: title optimized for search, bullet highlights, description, and pricing rationale vs comparable listings. Platform: [eBay/Amazon/Kleinanzeigen\u2026].",
+     "domain": "ecommerce",
+     "specialist": "marketplace-listing-optimizer",
+     "high_stakes": true,
+-    "tags": ["listing", "ecommerce"]
++    "tags": [
++      "listing",
++      "ecommerce"
++    ]
+   },
+   {
+     "id": "social-post",
+-    "name": "📣 Social post",
++    "name": "\ud83d\udce3 Social post",
+     "title": "Social post: [topic] for [platform]",
+     "description": "Write a platform-native post about [topic] for [platform]. Goal: [engagement/signups/awareness]. Include hook, body, CTA, and 2 alternative hooks. Match STYLE-VOICE.",
+     "domain": "content-creation",
+     "specialist": "social-content-creator",
+     "high_stakes": false,
+-    "tags": ["social", "content"]
++    "tags": [
++      "social",
++      "content"
++    ]
+   },
+   {
+     "id": "research-question",
+-    "name": "🔎 Research question",
++    "name": "\ud83d\udd0e Research question",
+     "title": "Research: [question]",
+     "description": "Research [question] thoroughly: current state, key players/options, numbers where available, and a clear recommendation with reasoning. Cite sources. End with the 3 most decision-relevant findings.",
+     "domain": "research-learning",
+     "specialist": "market-researcher",
+     "high_stakes": false,
+-    "tags": ["research"]
++    "tags": [
++      "research"
++    ]
+   },
+   {
+     "id": "dj-set-plan",
+-    "name": "🎧 DJ set plan",
++    "name": "\ud83c\udfa7 DJ set plan",
+     "title": "DJ set plan: [event/venue/slot]",
+     "description": "Plan a [length]-minute DJ set for [event/venue, crowd, time slot]. Include energy arc, 3-4 phases with genre/BPM ranges, anchor tracks per phase, transition notes, and 2 backup directions if the floor doesn't respond.",
+     "domain": "music-dj",
+     "specialist": "dj-set-curator",
+     "high_stakes": false,
+-    "tags": ["music", "set"]
++    "tags": [
++      "music",
++      "set"
++    ]
++  },
++  {
++    "id": "onboard-repo",
++    "name": "\ud83e\uddec Onboard a code repository",
++    "title": "Onboard repo: [repo name] \u2014 generate AGENTS.md",
++    "description": "READ-ONLY onboarding of the repository this task is attached to (set the task's repo field!). Explore the codebase by symbol (mcp-serena) and produce/refresh AGENTS.md at the repo root with, in this order: 1) one-paragraph purpose; 2) architecture map (top-level dirs -> responsibility, key entry points); 3) exact commands: test, build, lint, run (verify each actually works and paste real output in the deliverable); 4) conventions (naming, error handling, patterns to follow/avoid \u2014 derived from the code, not invented); 5) danger zones (fragile modules, migrations, generated files not to touch). KEEP IT UNDER 150 LINES \u2014 ruthless concision; agents ignore bloated conventions files. Do not change any other file. Commit AGENTS.md on the branch.",
++    "domain": "software-engineering",
++    "specialist": "tech-lead-orchestrator",
++    "high_stakes": false,
++    "tags": [
++      "onboarding",
++      "repo"
++    ]
+   }
+-]
++]
+\ No newline at end of file
+diff --git a/worktree.py b/worktree.py
+index d1fcbbe..882363c 100644
+--- a/worktree.py
++++ b/worktree.py
+@@ -62,3 +62,58 @@ def remove_worktree(repo_path: str, wt_path: str) -> bool:
+     if code != 0 and os.path.isdir(wt_path):
+         shutil.rmtree(wt_path, ignore_errors=True)
+     return True
++
++
++# ── Repo-native tasks (v3.5): worktree-per-pipeline + diff deliverables ──
++
++def base_branch(repo_path: str) -> str:
++    """The branch the operator's main checkout is on — the diff baseline."""
++    code, out = _run_git(repo_path, "symbolic-ref", "--short", "HEAD")
++    return out.strip() if code == 0 and out.strip() else "main"
++
++
++def ensure_task_worktree(repo_path: str, slug: str) -> dict | None:
++    """Idempotent worktree + branch `nexus/<slug>` for a task/pipeline.
++    Tasks of one project share a slug (= one branch), so the pipeline's
++    stages (implement -> review -> fix -> verify) see each other's work,
++    while different pipelines on the same repo stay isolated. The operator's
++    main checkout is never touched."""
++    repo = Path(repo_path).resolve()
++    if not is_repo(str(repo)):
++        return None
++    branch = f"nexus/{slug}"
++    wt_path = repo / ".worktrees" / f"nexus-{slug}"
++    if wt_path.is_dir() and is_repo(str(wt_path)):
++        return {"worktree_path": str(wt_path), "worktree_branch": branch,
++                "base_branch": base_branch(str(repo))}
++    base = base_branch(str(repo))
++    (repo / ".worktrees").mkdir(exist_ok=True)
++    code, out = _run_git(str(repo), "worktree", "add", "-b", branch,
++                         str(wt_path), base)
++    if code != 0:  # branch exists from an earlier run — reattach
++        code, out = _run_git(str(repo), "worktree", "add", str(wt_path), branch)
++        if code != 0:
++            return None
++    return {"worktree_path": str(wt_path), "worktree_branch": branch,
++            "base_branch": base}
++
++
++def snapshot_commit(wt_path: str, message: str) -> bool:
++    """Safety net: commit anything the agent left uncommitted, so the diff
++    capture never loses work. No-op on a clean tree."""
++    if not worktree_has_changes(wt_path):
++        return False
++    _run_git(wt_path, "add", "-A")
++    code, _ = _run_git(wt_path, "-c", "user.name=nexus", "-c",
++                       "user.email=nexus@local", "commit", "-m", message)
++    return code == 0
++
++
++def capture_diff(wt_path: str, base: str) -> str:
++    """The pipeline's real deliverable: everything the branch changed vs the
++    baseline (three-dot = since the merge-base, immune to base moving on)."""
++    code, out = _run_git(wt_path, "diff", f"{base}...HEAD")
++    if code != 0:
++        return ""
++    code2, stat = _run_git(wt_path, "diff", "--stat", f"{base}...HEAD")
++    return (stat + "\n\n" + out) if code2 == 0 and stat else out
