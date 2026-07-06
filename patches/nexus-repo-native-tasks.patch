@@ -369,10 +369,10 @@ index e4a0612..baec6b0 100644
 +]
 \ No newline at end of file
 diff --git a/worktree.py b/worktree.py
-index d1fcbbe..882363c 100644
+index d1fcbbe..3159478 100644
 --- a/worktree.py
 +++ b/worktree.py
-@@ -62,3 +62,58 @@ def remove_worktree(repo_path: str, wt_path: str) -> bool:
+@@ -62,3 +62,63 @@ def remove_worktree(repo_path: str, wt_path: str) -> bool:
      if code != 0 and os.path.isdir(wt_path):
          shutil.rmtree(wt_path, ignore_errors=True)
      return True
@@ -402,6 +402,11 @@ index d1fcbbe..882363c 100644
 +                "base_branch": base_branch(str(repo))}
 +    base = base_branch(str(repo))
 +    (repo / ".worktrees").mkdir(exist_ok=True)
++    # Self-ignoring dir: keeps the client's main checkout clean without
++    # touching their .gitignore.
++    gi = repo / ".worktrees" / ".gitignore"
++    if not gi.exists():
++        gi.write_text("*\n")
 +    code, out = _run_git(str(repo), "worktree", "add", "-b", branch,
 +                         str(wt_path), base)
 +    if code != 0:  # branch exists from an earlier run — reattach
