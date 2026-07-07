@@ -57,13 +57,38 @@ instruction — this repo is the canonical record):
 - **Non-breaking:** a task without `repo_path` behaves byte-identically to
   before; verified by the full 109-check gate.
 
+## Install on a new machine (complete package)
+```bash
+git clone git@github.com:dariannixda-eng/Nexus-Agentic-Coding-Setup.git
+cd Nexus-Agentic-Coding-Setup
+bash install.sh            # installs to ~/nexus-agent-os
+systemctl --user start nexus   # dashboard: https://127.0.0.1:8777
+```
+Prerequisites the installer expects (it warns, doesn't install them):
+**Hermes Agent** with its gateway on `localhost:8642` and a GLM key
+(use the hermes-team-setup repo for that), plus `python3`, `git`, `openssl`.
+Recommended: serena + context7 MCP servers configured in Hermes — the dev
+specialists use them for symbol navigation and current docs.
+
 ## Repo layout
-- `patches/` — the changes as reviewable git patches.
+- `app/` — the COMPLETE Nexus Agent OS source tree (2.2 MB, runtime data
+  excluded) with the repo-native feature applied. This is what installs.
+- `install.sh` — one-command install: copies the tree, builds the venv
+  (`app/requirements.txt`; voice stack optional in `requirements-voice.txt`),
+  generates a self-signed cert, installs the five dev specialists into
+  `~/.hermes/agents` (with backups), and registers the systemd user unit.
+- `system/nexus.service` — the unit template (paths rewritten at install).
+- `patches/` — the feature as reviewable git patches.
   `nexus-repo-native-tasks.patch` applies on nexus-agent-os @ **01d7138**.
-- `files/` — FULL copies of every changed file (nexus + the five Hermes
-  specialist definitions) as an apply fallback if the patch base has moved,
-  and as the readable source of truth.
+- `files/` — copies of just the feature-changed files (review-friendly view;
+  `app/` supersedes them for installation).
+- `scripts/refresh-app.sh` — re-snapshot this package from the live source
+  machine before pushing updates.
 - `docs/` — the research plan this implements.
+
+NOT in the package (by design): `nexus.db` and task workspaces (runtime data),
+TLS certs (generated per machine), JARVIS voice models (optional GPU stack —
+see `docs/JARVIS-VOICE.md` in `app/docs/`), and Hermes itself (own setup repo).
 
 ## Apply / verify / rollback
 - Nexus: `git -C ~/nexus-agent-os apply patches/nexus-repo-native-tasks.patch`

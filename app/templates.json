@@ -1,0 +1,79 @@
+[
+  {
+    "id": "landing-hero",
+    "name": "\ud83d\udda5 Landing page hero",
+    "title": "Landing page hero section for [product]",
+    "description": "Write the hero section (headline, subheadline, CTA button text, one supporting proof line) for the landing page of [describe the product]. Audience: [who]. Give 3 headline variants and mark which one you'd ship and why. Follow the marketing playbook and STYLE-VOICE.",
+    "domain": "marketing",
+    "specialist": "copywriter-specialist",
+    "high_stakes": true,
+    "tags": [
+      "landing",
+      "copy"
+    ]
+  },
+  {
+    "id": "marketplace-listing",
+    "name": "\ud83d\uded2 Marketplace listing",
+    "title": "Marketplace listing for [product]",
+    "description": "Create a complete marketplace listing for [product, condition, key specs]: title optimized for search, bullet highlights, description, and pricing rationale vs comparable listings. Platform: [eBay/Amazon/Kleinanzeigen\u2026].",
+    "domain": "ecommerce",
+    "specialist": "marketplace-listing-optimizer",
+    "high_stakes": true,
+    "tags": [
+      "listing",
+      "ecommerce"
+    ]
+  },
+  {
+    "id": "social-post",
+    "name": "\ud83d\udce3 Social post",
+    "title": "Social post: [topic] for [platform]",
+    "description": "Write a platform-native post about [topic] for [platform]. Goal: [engagement/signups/awareness]. Include hook, body, CTA, and 2 alternative hooks. Match STYLE-VOICE.",
+    "domain": "content-creation",
+    "specialist": "social-content-creator",
+    "high_stakes": false,
+    "tags": [
+      "social",
+      "content"
+    ]
+  },
+  {
+    "id": "research-question",
+    "name": "\ud83d\udd0e Research question",
+    "title": "Research: [question]",
+    "description": "Research [question] thoroughly: current state, key players/options, numbers where available, and a clear recommendation with reasoning. Cite sources. End with the 3 most decision-relevant findings.",
+    "domain": "research-learning",
+    "specialist": "market-researcher",
+    "high_stakes": false,
+    "tags": [
+      "research"
+    ]
+  },
+  {
+    "id": "dj-set-plan",
+    "name": "\ud83c\udfa7 DJ set plan",
+    "title": "DJ set plan: [event/venue/slot]",
+    "description": "Plan a [length]-minute DJ set for [event/venue, crowd, time slot]. Include energy arc, 3-4 phases with genre/BPM ranges, anchor tracks per phase, transition notes, and 2 backup directions if the floor doesn't respond.",
+    "domain": "music-dj",
+    "specialist": "dj-set-curator",
+    "high_stakes": false,
+    "tags": [
+      "music",
+      "set"
+    ]
+  },
+  {
+    "id": "onboard-repo",
+    "name": "\ud83e\uddec Onboard a code repository",
+    "title": "Onboard repo: [repo name] \u2014 generate AGENTS.md",
+    "description": "READ-ONLY onboarding of the repository this task is attached to (set the task's repo field!). Explore the codebase by symbol (mcp-serena) and produce/refresh AGENTS.md at the repo root with, in this order: 1) one-paragraph purpose; 2) architecture map (top-level dirs -> responsibility, key entry points); 3) exact commands: test, build, lint, run (verify each actually works and paste real output in the deliverable); 4) conventions (naming, error handling, patterns to follow/avoid \u2014 derived from the code, not invented); 5) danger zones (fragile modules, migrations, generated files not to touch). KEEP IT UNDER 150 LINES \u2014 ruthless concision; agents ignore bloated conventions files. Do not change any other file. Commit AGENTS.md on the branch.",
+    "domain": "software-engineering",
+    "specialist": "tech-lead-orchestrator",
+    "high_stakes": false,
+    "tags": [
+      "onboarding",
+      "repo"
+    ]
+  }
+]
