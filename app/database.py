@@ -239,6 +239,8 @@ def init_db():
     existing_wf_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)").fetchall()}
     if "loop_config" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN loop_config TEXT")
+    if "high_stakes" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN high_stakes INTEGER DEFAULT 0")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (

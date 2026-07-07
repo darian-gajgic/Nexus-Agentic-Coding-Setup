@@ -1354,6 +1354,9 @@ Object.assign(TOURS, {
   'wizard-modal': [
     { sel: '.modal-content h2, .modal-content', title: 'The proposed plan', body: 'The AI turned your description into stages. Each row is one task; arrows show what feeds what. Locked rows are quality gates (review, verification) — they exist so mistakes get caught before they reach you.' },
     { sel: '.modal-content input[type="checkbox"]', title: 'Trim it', body: 'Untick optional stages you don\'t want — dependents automatically reconnect around removed ones. Assumptions the AI made are listed; if one is wrong, cancel and rephrase your description.' },
+    { sel: '#wf-repo', title: '🧬 Your code repository', body: 'For coding projects: pick a repo here and every coding stage works INSIDE it on an isolated branch — following the repo\'s house rules and tests — instead of building from scratch. You review the diff and merge it yourself.' },
+    { sel: '#wf-highstakes', title: '⚖ High stakes', body: 'Check this and every task of the project becomes eligible for the frontier judge — a stronger AI grading each deliverable against your quality rubric. Combined with a quality loop, judging happens automatically per version.' },
+    { sel: '#wf-loop', title: '🔁 The improvement loop', body: 'On = failed checks and judge verdicts automatically send work back with the findings attached, then re-check. Quality mode allows more rounds and arms the auto-judge; speed mode keeps rounds minimal.' },
     { sel: '.modal-actions .btn-primary', title: 'Approve', body: 'Creates all tasks with their dependencies. Stages start on their own as their inputs become ready — watch progress on the board or the project page.' },
   ],
   'agent-drawer': [
@@ -5561,6 +5564,14 @@ async function newWorkflowUI() {
   render();
 }
 
+async function setWorkflowHighStakes(id, on) {
+  try {
+    await api('PATCH', `/api/workflows/${id}`, { high_stakes: on });
+    state.tasks = await api('GET', '/api/tasks'); // member tasks changed too
+    toast(on ? 'High stakes ON — applied to all tasks of this project' : 'High stakes off for this project', 'ok');
+  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
+}
+
 async function openWorkflowDetail(id) {
   let w;
   try { w = await api('GET', `/api/workflows/${id}`); }
@@ -5593,6 +5604,14 @@ async function openWorkflowDetail(id) {
         ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
         <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
       </div></div>
+    <div class="form-group">
+      <label style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" ${w.high_stakes ? 'checked' : ''}
+          onchange="setWorkflowHighStakes('${esc(w.id)}', this.checked)">
+        ⚖ High-stakes project
+      </label>
+      <div class="form-hint">Applies to ALL tasks of this project: every deliverable becomes eligible for the frontier judge. It runs automatically only when the loop is on quality + closed; otherwise it stays the manual judge button.</div>
+    </div>
     <div class="modal-actions" style="justify-content:space-between">
       <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
       <div style="display:flex;gap:10px">
@@ -5879,6 +5898,17 @@ function proposeWorkflowModal(wf, meta) {
     ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
     ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
     <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
+    ${isCoding ? `
+    <div class="form-group" style="margin-top:8px">
+      <label class="form-label">🧬 Existing code repository</label>
+      <select class="form-select" id="wf-repo"><option value="">— None: fresh workspace (default) —</option></select>
+      <div class="form-hint">Pick a repo and every coding stage works INSIDE it: isolated branch, the repo's own conventions and tests, and a reviewable diff as the deliverable. Your checkout is never touched.</div>
+    </div>` : ''}
+    <div class="form-group" style="margin-top:8px">
+      <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-highstakes" ${tasks.some(t => t.high_stakes) ? 'checked' : ''}>
+        ⚖ High-stakes project</label>
+      <div class="form-hint">Marks every task as high-stakes: each deliverable becomes eligible for the frontier judge (a stronger AI grading against your quality rubric). The judge only runs automatically when the loop below is on quality + closed — otherwise it stays a button.</div>
+    </div>
     <div class="form-group" style="margin-top:8px">
       <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
@@ -5894,6 +5924,15 @@ function proposeWorkflowModal(wf, meta) {
       <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
     </div>`);
   const b = $('#wfCreateBtn');
+  // repo picker options (coding projects only)
+  const repoSel = $('#wf-repo');
+  if (repoSel) {
+    api('GET', '/api/projects').then(d => {
+      const ps = d.projects || d || [];
+      if (repoSel.isConnected) repoSel.innerHTML +=
+        ps.map(p => `<option value="${esc(p.path)}">${esc(p.name)}</option>`).join('');
+    }).catch(() => { });
+  }
   const keeps = () => tasks.map((_, i) => {
     const cb = $(`#wfKeep${i}`);
     return !cb || cb.checked;
@@ -5919,6 +5958,10 @@ function proposeWorkflowModal(wf, meta) {
       }
       return out;
     };
+    const projHigh = !!($('#wf-highstakes') && $('#wf-highstakes').checked);
+    const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
+    const DEV_SPECIALISTS = new Set(['code-implementer', 'tech-lead-orchestrator',
+      'code-reviewer', 'acceptance-verifier', 'debugger']);
     let wfLoop = null;
     if ($('#wf-loop') && $('#wf-loop').checked) {
       try {
@@ -5928,14 +5971,15 @@ function proposeWorkflowModal(wf, meta) {
           meta: {
             title: wf.name, domain: wf.domain,
             specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
-            high_stakes: tasks.some((t, i) => keep[i] && t.high_stakes),
+            high_stakes: projHigh || tasks.some((t, i) => keep[i] && t.high_stakes),
           },
         });
       } catch (e) { toast('Loop design failed (project created without loop): ' + e.message, 'err'); }
     }
     try {
       const w = await api('POST', '/api/workflows',
-        { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop });
+        { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop,
+          high_stakes: projHigh });
       const ids = [];
       for (let i = 0; i < tasks.length; i++) {
         const t = tasks[i];
@@ -5943,9 +5987,12 @@ function proposeWorkflowModal(wf, meta) {
         const created = await api('POST', '/api/tasks', {
           title: t.title, description: t.description, status: 'backlog',
           priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
-          high_stakes: !!t.high_stakes, model: t.model || null,
+          high_stakes: projHigh || !!t.high_stakes, model: t.model || null,
           budget_tokens: t.budget_tokens || null, tags: t.tags || [],
           workflow_id: w.id,
+          // repo-native: coding stages work inside the chosen repo (they
+          // share one branch, so review/fix/verify see each other's work)
+          repo_path: repo && DEV_SPECIALISTS.has(t.specialist) ? repo : null,
           depends_on: [...eff(i, new Set())].sort((a, b2) => a - b2).map(x => ids[x]).filter(Boolean),
         });
         ids.push(created.id);

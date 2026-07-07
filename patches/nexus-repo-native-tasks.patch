@@ -1,5 +1,5 @@
 diff --git a/database.py b/database.py
-index 404486a..d2db200 100644
+index 404486a..95ba647 100644
 --- a/database.py
 +++ b/database.py
 @@ -229,6 +229,7 @@ def init_db():
@@ -10,6 +10,15 @@ index 404486a..d2db200 100644
      ]
      for col, typedef in task_migrations:
          if col not in existing_task_cols:
+@@ -238,6 +239,8 @@ def init_db():
+     existing_wf_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)").fetchall()}
+     if "loop_config" not in existing_wf_cols:
+         conn.execute("ALTER TABLE workflows ADD COLUMN loop_config TEXT")
++    if "high_stakes" not in existing_wf_cols:
++        conn.execute("ALTER TABLE workflows ADD COLUMN high_stakes INTEGER DEFAULT 0")
+ 
+     # Known issues: operator feedback with interaction context (v3.4)
+     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (
 diff --git a/hermes_dispatch.py b/hermes_dispatch.py
 index ca0c1e7..965e110 100644
 --- a/hermes_dispatch.py
@@ -235,8 +244,21 @@ index 9893a7f..834b0fc 100644
          os.unlink(audio_path)
 +        if mp4_path is not None:
 +            mp4_path.unlink(missing_ok=True)  # was leaked on every sentence
+diff --git a/scripts/verify.sh b/scripts/verify.sh
+index 1efde5b..42fdf7b 100755
+--- a/scripts/verify.sh
++++ b/scripts/verify.sh
+@@ -46,7 +46,7 @@ chk "no duplicate function defs in app.js" '
+   [ "$COUNT" -eq "$UNIQUE" ]
+ '
+ chk "no console.log/debugger left in app.js" '
+-  ! grep -nE "console\.(log|debug)|debugger" static/app.js | grep -v "//.*console"
++  ! grep -nE "console\.(log|debug)|debugger" static/app.js | grep -v "//.*console" | grep -vE "debugger.\]"
+ '
+ 
+ echo -e "${YELLOW}═══ 5. JARVIS FUNCTION INTEGRITY ═══${NC}"
 diff --git a/server.py b/server.py
-index 2bd943c..bac3fe1 100644
+index 2bd943c..6e8a8d7 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,7 @@ class TaskCreate(BaseModel):
@@ -335,7 +357,40 @@ index 2bd943c..bac3fe1 100644
  # ===== JARVIS Neural Lip-Sync (Wav2Lip) =====
  
  _lipsync_ready = False
-@@ -3445,6 +3454,182 @@ async def agent_config_update(agent_id: str, body: dict):
+@@ -3097,10 +3106,11 @@ async def create_workflow(body: dict):
+     wid = f"wf-{uuid.uuid4().hex[:8]}"
+     now = time.time()
+     lc = body.get("loop_config")
+-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config) "
+-               "VALUES (?,?,?,?,?,?,?,?)",
++    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes) "
++               "VALUES (?,?,?,?,?,?,?,?,?)",
+                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
+-                json.dumps(lc) if isinstance(lc, dict) else None))
++                json.dumps(lc) if isinstance(lc, dict) else None,
++                1 if body.get("high_stakes") else 0))
+     db.log_activity("info", "system", f"Workflow created: '{name}'")
+     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
+     await mgr.broadcast({"type": "workflow_created", "data": w})
+@@ -3144,6 +3154,17 @@ async def update_workflow(wf_id: str, body: dict):
+         lc = body["loop_config"]
+         db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
+                    (json.dumps(lc) if isinstance(lc, dict) else None, time.time(), wf_id))
++    if "high_stakes" in body:
++        hs = 1 if body["high_stakes"] else 0
++        db.execute("UPDATE workflows SET high_stakes=?, updated_at=? WHERE id=?",
++                   (hs, time.time(), wf_id))
++        # project-level stakes apply to every member task: high stakes makes
++        # each deliverable judge-eligible — whether the judge actually RUNS
++        # stays gated by the loop (quality + closed), so this is safe to
++        # apply across the board
++        db.execute("UPDATE tasks SET high_stakes=? WHERE workflow_id=?", (hs, wf_id))
++        db.log_activity("info", "system",
++                        f"Workflow {wf_id}: high_stakes={'on' if hs else 'off'} applied to all member tasks")
+     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+ 
+ 
+@@ -3445,6 +3466,182 @@ async def agent_config_update(agent_id: str, body: dict):
  import tools_hub
  
  
@@ -519,7 +574,7 @@ index 2bd943c..bac3fe1 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..b10efd3 100644
+index b0b7e37..49dafbe 100644
 --- a/static/app.js
 +++ b/static/app.js
 @@ -308,7 +308,6 @@ async function tick() {
@@ -665,7 +720,7 @@ index b0b7e37..b10efd3 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -1051,6 +1109,342 @@ async function deleteAttachment(kind, id, name, elId) {
+@@ -1051,6 +1109,345 @@ async function deleteAttachment(kind, id, name, elId) {
    } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
  }
  
@@ -914,6 +969,9 @@ index b0b7e37..b10efd3 100644
 +  'wizard-modal': [
 +    { sel: '.modal-content h2, .modal-content', title: 'The proposed plan', body: 'The AI turned your description into stages. Each row is one task; arrows show what feeds what. Locked rows are quality gates (review, verification) — they exist so mistakes get caught before they reach you.' },
 +    { sel: '.modal-content input[type="checkbox"]', title: 'Trim it', body: 'Untick optional stages you don\'t want — dependents automatically reconnect around removed ones. Assumptions the AI made are listed; if one is wrong, cancel and rephrase your description.' },
++    { sel: '#wf-repo', title: '🧬 Your code repository', body: 'For coding projects: pick a repo here and every coding stage works INSIDE it on an isolated branch — following the repo\'s house rules and tests — instead of building from scratch. You review the diff and merge it yourself.' },
++    { sel: '#wf-highstakes', title: '⚖ High stakes', body: 'Check this and every task of the project becomes eligible for the frontier judge — a stronger AI grading each deliverable against your quality rubric. Combined with a quality loop, judging happens automatically per version.' },
++    { sel: '#wf-loop', title: '🔁 The improvement loop', body: 'On = failed checks and judge verdicts automatically send work back with the findings attached, then re-check. Quality mode allows more rounds and arms the auto-judge; speed mode keeps rounds minimal.' },
 +    { sel: '.modal-actions .btn-primary', title: 'Approve', body: 'Creates all tasks with their dependencies. Stages start on their own as their inputs become ready — watch progress on the board or the project page.' },
 +  ],
 +  'agent-drawer': [
@@ -1008,7 +1066,7 @@ index b0b7e37..b10efd3 100644
  // ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
  const KNOWN_MODELS = ['glm-5.2', 'glm-5.1', 'glm-4.5-air'];
  const settingsState = { fetched: false, dispatch: {}, model: {} };
-@@ -2567,6 +2961,11 @@ function showTaskModal(status) {
+@@ -2567,6 +2964,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -1020,7 +1078,7 @@ index b0b7e37..b10efd3 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +2995,14 @@ function showTaskModal(status) {
+@@ -2596,6 +2998,14 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
@@ -1035,7 +1093,7 @@ index b0b7e37..b10efd3 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +3074,7 @@ async function submitTask() {
+@@ -2667,6 +3077,7 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
@@ -1043,7 +1101,7 @@ index b0b7e37..b10efd3 100644
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -3198,13 +3606,15 @@ function viewMemory() {
+@@ -3198,13 +3609,15 @@ function viewMemory() {
    const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
    const sharedCount = (specialistsState.shared || []).length;
    const tabs = [
@@ -1060,7 +1118,7 @@ index b0b7e37..b10efd3 100644
    else if (memoryState.tab === 'agent') body = memAgentHTML();
    else if (memoryState.tab === 'lessons') body = memLessonsHTML();
    else if (memoryState.tab === 'shared') body = memSharedHTML();
-@@ -3226,7 +3636,48 @@ async function loadAgentMemoryTab() {
+@@ -3226,7 +3639,48 @@ async function loadAgentMemoryTab() {
    if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
  }
  
@@ -1109,7 +1167,7 @@ index b0b7e37..b10efd3 100644
    $$('[data-memtab]').forEach(el => {
      el.onclick = () => {
        memoryState.tab = el.dataset.memtab;
-@@ -3778,28 +4229,31 @@ function renderJarvisView() {
+@@ -3778,28 +4232,31 @@ function renderJarvisView() {
          </div>
        </div>
  
@@ -1160,7 +1218,7 @@ index b0b7e37..b10efd3 100644
          </div>
          <div class="jarvis-feed" id="jFeed"></div>
          <div class="jarvis-chat-row">
-@@ -3839,8 +4293,36 @@ function renderJarvisView() {
+@@ -3839,8 +4296,36 @@ function renderJarvisView() {
    // Wire up controls
    jarvisBindControls();
  
@@ -1199,7 +1257,7 @@ index b0b7e37..b10efd3 100644
  }
  
  async function jarvisBootSequence() {
-@@ -3996,10 +4478,12 @@ function jarvisBindControls() {
+@@ -3996,10 +4481,12 @@ function jarvisBindControls() {
  
    stopBtn.addEventListener('click', () => jarvisStopStreaming());
  
@@ -1215,7 +1273,7 @@ index b0b7e37..b10efd3 100644
    });
  
    // Conversation mode toggle
-@@ -4012,7 +4496,8 @@ function jarvisBindControls() {
+@@ -4012,7 +4499,8 @@ function jarvisBindControls() {
  }
  
  // ===== STATUS =====
@@ -1225,7 +1283,7 @@ index b0b7e37..b10efd3 100644
    try {
      const s = await api('GET', '/api/jarvis/status');
      jarvisState.connected = s.connected;
-@@ -4037,8 +4522,10 @@ async function jarvisLoadStatus() {
+@@ -4037,8 +4525,10 @@ async function jarvisLoadStatus() {
      $('#jVoiceStatus').textContent = 'OFF';
    }
  
@@ -1238,7 +1296,7 @@ index b0b7e37..b10efd3 100644
  }
  
  async function jarvisLoadData() {
-@@ -4083,12 +4570,13 @@ function jarvisUpdateActivity() {
+@@ -4083,12 +4573,13 @@ function jarvisUpdateActivity() {
      el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
      return;
    }
@@ -1253,7 +1311,7 @@ index b0b7e37..b10efd3 100644
    const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
    const labelEl = $('#jState');
    if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
-@@ -4132,7 +4620,8 @@ function jarvisRenderFeed() {
+@@ -4132,7 +4623,8 @@ function jarvisRenderFeed() {
    feed.innerHTML = jarvisState.messages.map(m => {
      const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
      const cls2 = m.live ? ' live' : '';
@@ -1263,7 +1321,7 @@ index b0b7e37..b10efd3 100644
    }).join('');
    feed.scrollTop = feed.scrollHeight;
    const mc = $('#jMsgCount');
-@@ -4193,6 +4682,16 @@ async function jarvisStreamChat(text) {
+@@ -4193,6 +4685,16 @@ async function jarvisStreamChat(text) {
  
      liveMsg.live = false;
  
@@ -1280,7 +1338,7 @@ index b0b7e37..b10efd3 100644
      // Speak the response
      if (fullText && jarvisState.voiceAvailable) {
        jarvisSpeak(fullText);
-@@ -4201,7 +4700,9 @@ async function jarvisStreamChat(text) {
+@@ -4201,7 +4703,9 @@ async function jarvisStreamChat(text) {
      if (e.name === 'AbortError') {
        liveMsg.text += ' [stopped]';
      } else {
@@ -1291,7 +1349,7 @@ index b0b7e37..b10efd3 100644
      }
      liveMsg.live = false;
    } finally {
-@@ -4247,7 +4748,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4247,7 +4751,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
      case 'tool_call':
        const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
        if (toolName && toolName !== '_thinking') {
@@ -1300,7 +1358,7 @@ index b0b7e37..b10efd3 100644
        }
        break;
      case 'run.completed':
-@@ -4256,10 +4757,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4256,10 +4760,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
        liveMsg.live = false;
        break;
      case 'run.failed':
@@ -1320,7 +1378,7 @@ index b0b7e37..b10efd3 100644
    }
  }
  
-@@ -4307,7 +4815,12 @@ async function jarvisProcessTTSQueue() {
+@@ -4307,7 +4818,12 @@ async function jarvisProcessTTSQueue() {
      return;
    }
    jarvisState.ttsAnimating = true;
@@ -1333,7 +1391,7 @@ index b0b7e37..b10efd3 100644
  
    // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
    // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
-@@ -4317,6 +4830,7 @@ async function jarvisProcessTTSQueue() {
+@@ -4317,6 +4833,7 @@ async function jarvisProcessTTSQueue() {
  
    while (pending) {
      const clip = await pending;
@@ -1341,7 +1399,7 @@ index b0b7e37..b10efd3 100644
      // Kick off NEXT render now (runs in parallel with current playback)
      let nextPending = null;
      if (jarvisState.ttsQueue.length > 0) {
-@@ -4326,9 +4840,17 @@ async function jarvisProcessTTSQueue() {
+@@ -4326,9 +4843,17 @@ async function jarvisProcessTTSQueue() {
      }
      if (clip) await jarvisPlayClip(clip);
      pending = nextPending;
@@ -1359,7 +1417,7 @@ index b0b7e37..b10efd3 100644
    jarvisSetMode('idle');
    jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
    jarvisMaybeAutoListen();
-@@ -4365,7 +4887,10 @@ async function jarvisFetchClip(text) {
+@@ -4365,7 +4890,10 @@ async function jarvisFetchClip(text) {
  // both from the SAME blob — synced by construction. If WAV (/tts fallback):
  // audio only.
  function jarvisPlayClip(blob) {
@@ -1371,7 +1429,7 @@ index b0b7e37..b10efd3 100644
    return new Promise((resolve) => {
      let resolved = false;
      const url = URL.createObjectURL(blob);
-@@ -4377,11 +4902,15 @@ function jarvisPlayClip(blob) {
+@@ -4377,11 +4905,15 @@ function jarvisPlayClip(blob) {
      const cleanup = () => {
        if (resolved) return;
        resolved = true;
@@ -1387,7 +1445,7 @@ index b0b7e37..b10efd3 100644
  
      const startIfReady = () => {
        if (started || !audioReady || !videoReady) return;
-@@ -4420,10 +4949,38 @@ function jarvisAudioEl() {
+@@ -4420,10 +4952,38 @@ function jarvisAudioEl() {
    if (!jarvisState.ttsAudioEl) {
      const el = new Audio();
      jarvisState.ttsAudioEl = el;
@@ -1426,7 +1484,7 @@ index b0b7e37..b10efd3 100644
  function jarvisMaybeAutoListen() {
    if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
      jarvisStartRecording();
-@@ -4432,12 +4989,19 @@ function jarvisMaybeAutoListen() {
+@@ -4432,12 +4992,19 @@ function jarvisMaybeAutoListen() {
  
  function jarvisStopTTS() {
    jarvisState.ttsQueue = [];
@@ -1447,7 +1505,7 @@ index b0b7e37..b10efd3 100644
    jarvisSetIdleAvatar();
  }
  
-@@ -4463,12 +5027,16 @@ async function jarvisStartRecording() {
+@@ -4463,12 +5030,16 @@ async function jarvisStartRecording() {
        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
      }
      const ctx = jarvisState.audioContext;
@@ -1464,7 +1522,7 @@ index b0b7e37..b10efd3 100644
      jarvisMicLevelLoop();
  
      jarvisState.mediaRecorder.ondataavailable = (e) => {
-@@ -4526,6 +5094,7 @@ function jarvisMicLevelLoop() {
+@@ -4526,6 +5097,7 @@ function jarvisMicLevelLoop() {
    if (!jarvisState.micAnalyser || !jarvisState.recording) {
      const el = $('#jMicLevel');
      if (el) el.style.width = '0%';
@@ -1472,7 +1530,7 @@ index b0b7e37..b10efd3 100644
      return;
    }
    jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
-@@ -4534,6 +5103,18 @@ function jarvisMicLevelLoop() {
+@@ -4534,6 +5106,18 @@ function jarvisMicLevelLoop() {
    const avg = sum / jarvisState._micDataArray.length / 255;
    const el = $('#jMicLevel');
    if (el) el.style.width = (avg * 100 * 2) + '%';
@@ -1491,7 +1549,7 @@ index b0b7e37..b10efd3 100644
    requestAnimationFrame(jarvisMicLevelLoop);
  }
  
-@@ -4547,7 +5128,13 @@ setInterval(() => {
+@@ -4547,7 +5131,13 @@ setInterval(() => {
  }, 2000);
  
  
@@ -1506,7 +1564,37 @@ index b0b7e37..b10efd3 100644
  function closeModal() {
    const m = $('#modal');
    if (m) m.style.display = 'none';
-@@ -5089,8 +5676,8 @@ function viewDeliverables() {
+@@ -4974,6 +5564,14 @@ async function newWorkflowUI() {
+   render();
+ }
+ 
++async function setWorkflowHighStakes(id, on) {
++  try {
++    await api('PATCH', `/api/workflows/${id}`, { high_stakes: on });
++    state.tasks = await api('GET', '/api/tasks'); // member tasks changed too
++    toast(on ? 'High stakes ON — applied to all tasks of this project' : 'High stakes off for this project', 'ok');
++  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
++}
++
+ async function openWorkflowDetail(id) {
+   let w;
+   try { w = await api('GET', `/api/workflows/${id}`); }
+@@ -5006,6 +5604,14 @@ async function openWorkflowDetail(id) {
+         ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
+         <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
+       </div></div>
++    <div class="form-group">
++      <label style="display:flex;align-items:center;gap:8px">
++        <input type="checkbox" ${w.high_stakes ? 'checked' : ''}
++          onchange="setWorkflowHighStakes('${esc(w.id)}', this.checked)">
++        ⚖ High-stakes project
++      </label>
++      <div class="form-hint">Applies to ALL tasks of this project: every deliverable becomes eligible for the frontier judge. It runs automatically only when the loop is on quality + closed; otherwise it stays the manual judge button.</div>
++    </div>
+     <div class="modal-actions" style="justify-content:space-between">
+       <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
+       <div style="display:flex;gap:10px">
+@@ -5089,8 +5695,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -1517,8 +1605,85 @@ index b0b7e37..b10efd3 100644
              : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
          </div>
          <div class="row-actions">
+@@ -5292,6 +5898,17 @@ function proposeWorkflowModal(wf, meta) {
+     ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
+     ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
+     <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
++    ${isCoding ? `
++    <div class="form-group" style="margin-top:8px">
++      <label class="form-label">🧬 Existing code repository</label>
++      <select class="form-select" id="wf-repo"><option value="">— None: fresh workspace (default) —</option></select>
++      <div class="form-hint">Pick a repo and every coding stage works INSIDE it: isolated branch, the repo's own conventions and tests, and a reviewable diff as the deliverable. Your checkout is never touched.</div>
++    </div>` : ''}
++    <div class="form-group" style="margin-top:8px">
++      <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-highstakes" ${tasks.some(t => t.high_stakes) ? 'checked' : ''}>
++        ⚖ High-stakes project</label>
++      <div class="form-hint">Marks every task as high-stakes: each deliverable becomes eligible for the frontier judge (a stronger AI grading against your quality rubric). The judge only runs automatically when the loop below is on quality + closed — otherwise it stays a button.</div>
++    </div>
+     <div class="form-group" style="margin-top:8px">
+       <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
+       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
+@@ -5307,6 +5924,15 @@ function proposeWorkflowModal(wf, meta) {
+       <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
+     </div>`);
+   const b = $('#wfCreateBtn');
++  // repo picker options (coding projects only)
++  const repoSel = $('#wf-repo');
++  if (repoSel) {
++    api('GET', '/api/projects').then(d => {
++      const ps = d.projects || d || [];
++      if (repoSel.isConnected) repoSel.innerHTML +=
++        ps.map(p => `<option value="${esc(p.path)}">${esc(p.name)}</option>`).join('');
++    }).catch(() => { });
++  }
+   const keeps = () => tasks.map((_, i) => {
+     const cb = $(`#wfKeep${i}`);
+     return !cb || cb.checked;
+@@ -5332,6 +5958,10 @@ function proposeWorkflowModal(wf, meta) {
+       }
+       return out;
+     };
++    const projHigh = !!($('#wf-highstakes') && $('#wf-highstakes').checked);
++    const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
++    const DEV_SPECIALISTS = new Set(['code-implementer', 'tech-lead-orchestrator',
++      'code-reviewer', 'acceptance-verifier', 'debugger']);
+     let wfLoop = null;
+     if ($('#wf-loop') && $('#wf-loop').checked) {
+       try {
+@@ -5341,14 +5971,15 @@ function proposeWorkflowModal(wf, meta) {
+           meta: {
+             title: wf.name, domain: wf.domain,
+             specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
+-            high_stakes: tasks.some((t, i) => keep[i] && t.high_stakes),
++            high_stakes: projHigh || tasks.some((t, i) => keep[i] && t.high_stakes),
+           },
+         });
+       } catch (e) { toast('Loop design failed (project created without loop): ' + e.message, 'err'); }
+     }
+     try {
+       const w = await api('POST', '/api/workflows',
+-        { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop });
++        { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop,
++          high_stakes: projHigh });
+       const ids = [];
+       for (let i = 0; i < tasks.length; i++) {
+         const t = tasks[i];
+@@ -5356,9 +5987,12 @@ function proposeWorkflowModal(wf, meta) {
+         const created = await api('POST', '/api/tasks', {
+           title: t.title, description: t.description, status: 'backlog',
+           priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
+-          high_stakes: !!t.high_stakes, model: t.model || null,
++          high_stakes: projHigh || !!t.high_stakes, model: t.model || null,
+           budget_tokens: t.budget_tokens || null, tags: t.tags || [],
+           workflow_id: w.id,
++          // repo-native: coding stages work inside the chosen repo (they
++          // share one branch, so review/fix/verify see each other's work)
++          repo_path: repo && DEV_SPECIALISTS.has(t.specialist) ? repo : null,
+           depends_on: [...eff(i, new Set())].sort((a, b2) => a - b2).map(x => ids[x]).filter(Boolean),
+         });
+         ids.push(created.id);
 diff --git a/static/index.html b/static/index.html
-index bb6661f..83ef1c5 100644
+index bb6661f..3b0de99 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -1553,7 +1718,7 @@ index bb6661f..83ef1c5 100644
 -<script src="/static/app.js?v=28"></script>
 +<script src="/static/memory3d.js?v=5" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=34"></script>
++<script src="/static/app.js?v=35"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css

@@ -46,7 +46,7 @@ chk "no duplicate function defs in app.js" '
   [ "$COUNT" -eq "$UNIQUE" ]
 '
 chk "no console.log/debugger left in app.js" '
-  ! grep -nE "console\.(log|debug)|debugger" static/app.js | grep -v "//.*console"
+  ! grep -nE "console\.(log|debug)|debugger" static/app.js | grep -v "//.*console" | grep -vE "debugger.\]"
 '
 
 echo -e "${YELLOW}═══ 5. JARVIS FUNCTION INTEGRITY ═══${NC}"
