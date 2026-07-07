@@ -377,6 +377,9 @@ function switchView(view) {
   if (currentView === 'dashboard' && view !== 'dashboard' && window.Nexus3D) {
     window.Nexus3D.dispose();
   }
+  if (currentView === 'memory' && view !== 'memory' && window.Memory3D) {
+    window.Memory3D.dispose();
+  }
   currentView = view;
   agentsBuilt = false;
   dashBuilt = false;
@@ -3217,13 +3220,15 @@ function viewMemory() {
   const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
   const sharedCount = (specialistsState.shared || []).length;
   const tabs = [
+    ['map3d', '🧠 3D Map', null],
     ['semantic', `Semantic (mem0)`, semCount],
     ['agent', 'Agent memory', null],
     ['lessons', 'Specialist lessons', lessonCount || null],
     ['shared', 'Shared context', sharedCount || null],
   ];
   let body = '';
-  if (memoryState.tab === 'semantic') body = memSemanticHTML();
+  if (memoryState.tab === 'map3d') body = mem3dHTML();
+  else if (memoryState.tab === 'semantic') body = memSemanticHTML();
   else if (memoryState.tab === 'agent') body = memAgentHTML();
   else if (memoryState.tab === 'lessons') body = memLessonsHTML();
   else if (memoryState.tab === 'shared') body = memSharedHTML();
@@ -3245,7 +3250,34 @@ async function loadAgentMemoryTab() {
   if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
 }
 
+function mem3dHTML() {
+  return `
+    <div class="view-intro" style="margin-bottom:10px">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space (projected to its 3 principal semantic axes — nothing is arranged by hand). Lines are the strongest semantic associations; brighter means stronger. Related memories physically cluster together. <strong>Drag</strong> to orbit · <strong>scroll</strong> to zoom · <strong>hover</strong> a node for its full record.</div>
+    <div id="mem3dStage" style="position:relative;height:calc(100vh - 285px);min-height:520px;border-radius:14px;border:1px solid rgba(124,92,255,.18);background:#07070d;overflow:hidden">
+      <div class="loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Projecting ${'768'}-dim memory space…</div>
+    </div>`;
+}
+
+async function mountMem3d() {
+  const stage = document.getElementById('mem3dStage');
+  if (!stage) return;
+  try {
+    const data = await api('GET', '/api/memory3d');
+    if (!document.getElementById('mem3dStage')) return; // user navigated away
+    if (!data.nodes || !data.nodes.length) {
+      stage.innerHTML = '<div class="empty" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><span class="e-ico">🧠</span>No semantic memories yet — they appear as agents work and learn.</div>';
+      return;
+    }
+    stage.innerHTML = '';
+    if (window.Memory3D) window.Memory3D.mount(stage, data);
+  } catch (e) {
+    stage.innerHTML = `<div class="empty" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><span class="e-ico">⚠️</span>${esc(e.message)}</div>`;
+  }
+}
+
 function bindMemory() {
+  if (memoryState.tab === 'map3d') mountMem3d();
+  else if (window.Memory3D) window.Memory3D.dispose();
   $$('[data-memtab]').forEach(el => {
     el.onclick = () => {
       memoryState.tab = el.dataset.memtab;

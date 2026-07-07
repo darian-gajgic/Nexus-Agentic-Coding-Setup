@@ -167,7 +167,7 @@ index ca0c1e7..965e110 100644
          # as assistant TEXT with no error event — a partial flag and/or the
          # "API call failed" wrapper string are the reliable signals.
 diff --git a/server.py b/server.py
-index 2bd943c..1e4395a 100644
+index 2bd943c..881f87e 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,7 @@ class TaskCreate(BaseModel):
@@ -219,11 +219,119 @@ index 2bd943c..1e4395a 100644
      updates["updated_at"] = time.time()
  
      set_clause = ", ".join(f"{k} = ?" for k in updates)
+@@ -3445,6 +3456,97 @@ async def agent_config_update(agent_id: str, body: dict):
+ import tools_hub
+ 
+ 
++# ── Memory 3D map: real mem0 vectors (qdrant) → PCA 3D + similarity links ──
++_MEM3D_CACHE: dict = {"ts": 0.0, "data": None}
++
++
++@app.get("/api/memory3d")
++async def memory3d(force: bool = False):
++    """Nodes = mem0 memories at their REAL vector positions (768-dim qdrant
++    embeddings PCA-projected to 3D); links = strongest cosine similarities.
++    Nothing is invented — distance on screen is semantic distance in mem0."""
++    if not force and _MEM3D_CACHE["data"] and time.time() - _MEM3D_CACHE["ts"] < 120:
++        return _MEM3D_CACHE["data"]
++    try:
++        import numpy as np
++        import requests as _rq
++        pts, offset = [], None
++        while len(pts) < 800:
++            body = {"limit": 256, "with_payload": True, "with_vector": True}
++            if offset:
++                body["offset"] = offset
++            r = _rq.post("http://localhost:6333/collections/mem0/points/scroll",
++                         json=body, timeout=10).json()["result"]
++            pts.extend(r["points"])
++            offset = r.get("next_page_offset")
++            if not offset:
++                break
++        # qdrant named vectors: the dense 768-dim embedding lives under "",
++        # next to a sparse "bm25" — keep only points that carry the dense one
++        def _dense(p):
++            v = p.get("vector")
++            if isinstance(v, dict):
++                v = v.get("") or v.get("dense")
++            return v if isinstance(v, list) else None
++        pts = [p for p in pts if _dense(p)]
++        if len(pts) < 3:
++            return {"nodes": [], "links": [], "note": "not enough memories yet"}
++
++        vecs = np.array([_dense(p) for p in pts], dtype=np.float32)
++        vecs /= (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9)
++        centered = vecs - vecs.mean(axis=0)
++        # PCA via SVD — the 3 principal semantic axes of the whole memory
++        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
++        coords = centered @ vt[:3].T
++        # normalize into a comfortable room size (~[-60, 60])
++        coords = coords / (np.abs(coords).max() + 1e-9) * 60.0
++
++        # top-k similarity links (real cosine, deduped pairs)
++        sims = vecs @ vecs.T
++        np.fill_diagonal(sims, -1.0)
++        k = 3
++        links, seen = [], set()
++        for i in range(len(pts)):
++            for j in np.argsort(-sims[i])[:k]:
++                j = int(j)
++                s = float(sims[i][j])
++                if s < 0.45:
++                    continue
++                key = (min(i, j), max(i, j))
++                if key in seen:
++                    continue
++                seen.add(key)
++                links.append({"a": key[0], "b": key[1], "s": round(s, 3)})
++        degree: dict = {}
++        for ln in links:
++            degree[ln["a"]] = degree.get(ln["a"], 0) + 1
++            degree[ln["b"]] = degree.get(ln["b"], 0) + 1
++
++        nodes = []
++        for i, p in enumerate(pts):
++            pl = p.get("payload") or {}
++            nodes.append({
++                "id": str(p["id"]),
++                "x": round(float(coords[i][0]), 2),
++                "y": round(float(coords[i][1]), 2),
++                "z": round(float(coords[i][2]), 2),
++                "text": str(pl.get("data") or "")[:400],
++                "agent": pl.get("agent_id") or "",
++                "user": pl.get("user_id") or "",
++                "channel": pl.get("channel") or "",
++                "by": pl.get("attributed_to") or "",
++                "created_at": pl.get("created_at") or "",
++                "degree": degree.get(i, 0),
++            })
++        data = {"nodes": nodes, "links": links,
++                "count": len(nodes), "dims": 768, "generated_at": time.time()}
++        _MEM3D_CACHE.update(ts=time.time(), data=data)
++        return data
++    except Exception as e:
++        return JSONResponse(status_code=503, content={
++            "error": f"memory map unavailable: {str(e)[:120]} (is qdrant running?)"})
++
++
+ @app.get("/api/tools")
+ async def api_tools():
+     """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..ef1eefe 100644
+index b0b7e37..5e9a675 100644
 --- a/static/app.js
 +++ b/static/app.js
-@@ -958,6 +958,11 @@ function openTaskDetail(id) {
+@@ -377,6 +377,9 @@ function switchView(view) {
+   if (currentView === 'dashboard' && view !== 'dashboard' && window.Nexus3D) {
+     window.Nexus3D.dispose();
+   }
++  if (currentView === 'memory' && view !== 'memory' && window.Memory3D) {
++    window.Memory3D.dispose();
++  }
+   currentView = view;
+   agentsBuilt = false;
+   dashBuilt = false;
+@@ -958,6 +961,11 @@ function openTaskDetail(id) {
        <div class="chip c-accent" style="white-space:normal">${esc(t.rubric_score)}</div></div>` : ''}
      ${t.learn_section ? `<div class="form-group"><label class="form-label">Learn (for you two)</label>
        <div style="background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.25);border-radius:8px;padding:10px 12px;font-size:12.5px;white-space:pre-wrap">${esc(t.learn_section)}</div></div>` : ''}
@@ -235,7 +343,7 @@ index b0b7e37..ef1eefe 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -2567,6 +2572,11 @@ function showTaskModal(status) {
+@@ -2567,6 +2575,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -247,7 +355,7 @@ index b0b7e37..ef1eefe 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +2606,14 @@ function showTaskModal(status) {
+@@ -2596,6 +2609,14 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
@@ -262,7 +370,7 @@ index b0b7e37..ef1eefe 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +2685,7 @@ async function submitTask() {
+@@ -2667,6 +2688,7 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
@@ -270,7 +378,59 @@ index b0b7e37..ef1eefe 100644
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -5089,8 +5108,8 @@ function viewDeliverables() {
+@@ -3198,13 +3220,15 @@ function viewMemory() {
+   const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
+   const sharedCount = (specialistsState.shared || []).length;
+   const tabs = [
++    ['map3d', '🧠 3D Map', null],
+     ['semantic', `Semantic (mem0)`, semCount],
+     ['agent', 'Agent memory', null],
+     ['lessons', 'Specialist lessons', lessonCount || null],
+     ['shared', 'Shared context', sharedCount || null],
+   ];
+   let body = '';
+-  if (memoryState.tab === 'semantic') body = memSemanticHTML();
++  if (memoryState.tab === 'map3d') body = mem3dHTML();
++  else if (memoryState.tab === 'semantic') body = memSemanticHTML();
+   else if (memoryState.tab === 'agent') body = memAgentHTML();
+   else if (memoryState.tab === 'lessons') body = memLessonsHTML();
+   else if (memoryState.tab === 'shared') body = memSharedHTML();
+@@ -3226,7 +3250,34 @@ async function loadAgentMemoryTab() {
+   if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
+ }
+ 
++function mem3dHTML() {
++  return `
++    <div class="view-intro" style="margin-bottom:10px">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space (projected to its 3 principal semantic axes — nothing is arranged by hand). Lines are the strongest semantic associations; brighter means stronger. Related memories physically cluster together. <strong>Drag</strong> to orbit · <strong>scroll</strong> to zoom · <strong>hover</strong> a node for its full record.</div>
++    <div id="mem3dStage" style="position:relative;height:calc(100vh - 285px);min-height:520px;border-radius:14px;border:1px solid rgba(124,92,255,.18);background:#07070d;overflow:hidden">
++      <div class="loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Projecting ${'768'}-dim memory space…</div>
++    </div>`;
++}
++
++async function mountMem3d() {
++  const stage = document.getElementById('mem3dStage');
++  if (!stage) return;
++  try {
++    const data = await api('GET', '/api/memory3d');
++    if (!document.getElementById('mem3dStage')) return; // user navigated away
++    if (!data.nodes || !data.nodes.length) {
++      stage.innerHTML = '<div class="empty" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><span class="e-ico">🧠</span>No semantic memories yet — they appear as agents work and learn.</div>';
++      return;
++    }
++    stage.innerHTML = '';
++    if (window.Memory3D) window.Memory3D.mount(stage, data);
++  } catch (e) {
++    stage.innerHTML = `<div class="empty" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><span class="e-ico">⚠️</span>${esc(e.message)}</div>`;
++  }
++}
++
+ function bindMemory() {
++  if (memoryState.tab === 'map3d') mountMem3d();
++  else if (window.Memory3D) window.Memory3D.dispose();
+   $$('[data-memtab]').forEach(el => {
+     el.onclick = () => {
+       memoryState.tab = el.dataset.memtab;
+@@ -5089,8 +5140,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -282,15 +442,16 @@ index b0b7e37..ef1eefe 100644
          </div>
          <div class="row-actions">
 diff --git a/static/index.html b/static/index.html
-index bb6661f..db3d0e3 100644
+index bb6661f..8c2f0b2 100644
 --- a/static/index.html
 +++ b/static/index.html
-@@ -93,6 +93,6 @@
+@@ -93,6 +93,7 @@
  
  <button id="fbBtn" onclick="feedbackModal()" title="Something wrong or annoying here? File it — your last steps get attached automatically" style="position:fixed;right:18px;bottom:18px;z-index:900;width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(20,20,32,.85);color:var(--text-dim);font-size:17px;cursor:pointer;backdrop-filter:blur(6px)">🐞</button>
  <script src="/static/nexus3d.js?v=1" type="module"></script>
 -<script src="/static/app.js?v=28"></script>
-+<script src="/static/app.js?v=29"></script>
++<script src="/static/memory3d.js?v=1" type="module"></script>
++<script src="/static/app.js?v=30"></script>
  </body>
  </html>
 diff --git a/templates.json b/templates.json

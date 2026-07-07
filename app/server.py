@@ -3456,6 +3456,97 @@ async def agent_config_update(agent_id: str, body: dict):
 import tools_hub
 
 
+# ── Memory 3D map: real mem0 vectors (qdrant) → PCA 3D + similarity links ──
+_MEM3D_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+@app.get("/api/memory3d")
+async def memory3d(force: bool = False):
+    """Nodes = mem0 memories at their REAL vector positions (768-dim qdrant
+    embeddings PCA-projected to 3D); links = strongest cosine similarities.
+    Nothing is invented — distance on screen is semantic distance in mem0."""
+    if not force and _MEM3D_CACHE["data"] and time.time() - _MEM3D_CACHE["ts"] < 120:
+        return _MEM3D_CACHE["data"]
+    try:
+        import numpy as np
+        import requests as _rq
+        pts, offset = [], None
+        while len(pts) < 800:
+            body = {"limit": 256, "with_payload": True, "with_vector": True}
+            if offset:
+                body["offset"] = offset
+            r = _rq.post("http://localhost:6333/collections/mem0/points/scroll",
+                         json=body, timeout=10).json()["result"]
+            pts.extend(r["points"])
+            offset = r.get("next_page_offset")
+            if not offset:
+                break
+        # qdrant named vectors: the dense 768-dim embedding lives under "",
+        # next to a sparse "bm25" — keep only points that carry the dense one
+        def _dense(p):
+            v = p.get("vector")
+            if isinstance(v, dict):
+                v = v.get("") or v.get("dense")
+            return v if isinstance(v, list) else None
+        pts = [p for p in pts if _dense(p)]
+        if len(pts) < 3:
+            return {"nodes": [], "links": [], "note": "not enough memories yet"}
+
+        vecs = np.array([_dense(p) for p in pts], dtype=np.float32)
+        vecs /= (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9)
+        centered = vecs - vecs.mean(axis=0)
+        # PCA via SVD — the 3 principal semantic axes of the whole memory
+        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+        coords = centered @ vt[:3].T
+        # normalize into a comfortable room size (~[-60, 60])
+        coords = coords / (np.abs(coords).max() + 1e-9) * 60.0
+
+        # top-k similarity links (real cosine, deduped pairs)
+        sims = vecs @ vecs.T
+        np.fill_diagonal(sims, -1.0)
+        k = 3
+        links, seen = [], set()
+        for i in range(len(pts)):
+            for j in np.argsort(-sims[i])[:k]:
+                j = int(j)
+                s = float(sims[i][j])
+                if s < 0.45:
+                    continue
+                key = (min(i, j), max(i, j))
+                if key in seen:
+                    continue
+                seen.add(key)
+                links.append({"a": key[0], "b": key[1], "s": round(s, 3)})
+        degree: dict = {}
+        for ln in links:
+            degree[ln["a"]] = degree.get(ln["a"], 0) + 1
+            degree[ln["b"]] = degree.get(ln["b"], 0) + 1
+
+        nodes = []
+        for i, p in enumerate(pts):
+            pl = p.get("payload") or {}
+            nodes.append({
+                "id": str(p["id"]),
+                "x": round(float(coords[i][0]), 2),
+                "y": round(float(coords[i][1]), 2),
+                "z": round(float(coords[i][2]), 2),
+                "text": str(pl.get("data") or "")[:400],
+                "agent": pl.get("agent_id") or "",
+                "user": pl.get("user_id") or "",
+                "channel": pl.get("channel") or "",
+                "by": pl.get("attributed_to") or "",
+                "created_at": pl.get("created_at") or "",
+                "degree": degree.get(i, 0),
+            })
+        data = {"nodes": nodes, "links": links,
+                "count": len(nodes), "dims": 768, "generated_at": time.time()}
+        _MEM3D_CACHE.update(ts=time.time(), data=data)
+        return data
+    except Exception as e:
+        return JSONResponse(status_code=503, content={
+            "error": f"memory map unavailable: {str(e)[:120]} (is qdrant running?)"})
+
+
 @app.get("/api/tools")
 async def api_tools():
     """Live health-checked registry of all integrated tools."""
