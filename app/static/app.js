@@ -380,6 +380,9 @@ function switchView(view) {
   if (currentView === 'memory' && view !== 'memory' && window.Memory3D) {
     window.Memory3D.dispose();
   }
+  if (currentView === 'jarvis' && view !== 'jarvis') {
+    jarvisTeardown();
+  }
   currentView = view;
   agentsBuilt = false;
   dashBuilt = false;
@@ -3252,9 +3255,13 @@ async function loadAgentMemoryTab() {
 
 function mem3dHTML() {
   return `
-    <div class="view-intro" style="margin-bottom:10px">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space (projected to its 3 principal semantic axes — nothing is arranged by hand). Lines are the strongest semantic associations; brighter means stronger. Related memories physically cluster together. <strong>Drag</strong> to orbit · <strong>scroll</strong> to zoom · <strong>hover</strong> a node for its full record.</div>
-    <div id="mem3dStage" style="position:relative;height:calc(100vh - 285px);min-height:520px;border-radius:14px;border:1px solid rgba(124,92,255,.18);background:#07070d;overflow:hidden">
-      <div class="loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Projecting ${'768'}-dim memory space…</div>
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap">
+      <div class="view-intro" style="flex:1;min-width:320px;margin:0">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space. The floating labels are <strong>semantic regions</strong> — named by their own most distinctive words, computed, not written by anyone. <strong>Drag</strong> orbit · <strong>scroll</strong> zoom · <strong>hover</strong> for the record.</div>
+      <input class="form-input" id="mem3dSearch" placeholder="🔍 light up memories about…" style="width:250px">
+      <span id="mem3dStats" style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);white-space:nowrap"></span>
+    </div>
+    <div id="mem3dStage" style="position:relative;height:calc(100vh - 258px);min-height:600px;border-radius:14px;border:1px solid rgba(124,92,255,.18);background:#07070d;overflow:hidden">
+      <div class="loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Projecting 768-dim memory space…</div>
     </div>`;
 }
 
@@ -3270,6 +3277,16 @@ async function mountMem3d() {
     }
     stage.innerHTML = '';
     if (window.Memory3D) window.Memory3D.mount(stage, data);
+    const stats = document.getElementById('mem3dStats');
+    if (stats) stats.textContent =
+      `${data.count} memories · ${data.links.length} associations · ${(data.clusters || []).length} regions · 768-D live`;
+    const inp = document.getElementById('mem3dSearch');
+    if (inp) inp.oninput = () => {
+      const n = window.Memory3D.search(inp.value);
+      if (stats) stats.textContent = inp.value.trim()
+        ? `${n} of ${data.count} memories match · ${data.links.length} associations`
+        : `${data.count} memories · ${data.links.length} associations · ${(data.clusters || []).length} regions · 768-D live`;
+    };
   } catch (e) {
     stage.innerHTML = `<div class="empty" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><span class="e-ico">⚠️</span>${esc(e.message)}</div>`;
   }
@@ -3829,28 +3846,31 @@ function renderJarvisView() {
         </div>
       </div>
 
-      <!-- CENTER COLUMN -->
+      <!-- CENTER COLUMN — holographic stage -->
       <div class="jarvis-center">
-        <div class="avatar-reactor-row">
-          <!-- Face IS the button: reactor animation wraps around the avatar.
-               Clicking the face toggles recording (start/stop talking). -->
-          <div class="reactor-wrap" id="jReactorWrap" title="Click to talk">
-            <canvas id="jReactor"></canvas>
-            <div class="avatar-wrap" id="jAvatarWrap"></div>
-            <div class="reactor-state">
-              <div class="st" id="jState">IDLE</div>
-              <div class="hint" id="jHint">CLICK TO TALK</div>
+        <div id="jStage" class="jarvis-stage">
+          <!-- Jarvis3D mounts its canvas here (absolute, behind everything) -->
+          <div class="avatar-reactor-row stage-center">
+            <!-- Face IS the button: reactor animation wraps around the avatar.
+                 Clicking the face toggles recording (start/stop talking). -->
+            <div class="reactor-wrap" id="jReactorWrap" title="Click to talk">
+              <canvas id="jReactor"></canvas>
+              <div class="avatar-wrap" id="jAvatarWrap"><div class="holo-scan"></div></div>
+              <div class="reactor-state">
+                <div class="st" id="jState">IDLE</div>
+                <div class="hint" id="jHint">CLICK TO TALK</div>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="voice-controls">
-          <div class="mic-level"><i id="jMicLevel"></i></div>
-          <span class="voice-state-label" id="jVoiceLabel">IDLE</span>
-          <label class="conv-toggle" title="Auto-listen after JARVIS replies (hands-free conversation)">
-            <input type="checkbox" id="jConvToggle">
-            <span class="conv-slider"></span>
-            <span class="conv-label">CONV</span>
-          </label>
+          <div class="voice-controls stage-controls">
+            <div class="mic-level"><i id="jMicLevel"></i></div>
+            <span class="voice-state-label" id="jVoiceLabel">IDLE</span>
+            <label class="conv-toggle" title="Hands-free conversation: auto-listen after JARVIS replies, auto-stop on silence">
+              <input type="checkbox" id="jConvToggle">
+              <span class="conv-slider"></span>
+              <span class="conv-label">CONV</span>
+            </label>
+          </div>
         </div>
         <div class="jarvis-feed" id="jFeed"></div>
         <div class="jarvis-chat-row">
@@ -3890,8 +3910,36 @@ function renderJarvisView() {
   // Wire up controls
   jarvisBindControls();
 
-  // Load status
-  jarvisLoadStatus();
+  // Load status (generation token kills any previous self-poll chain —
+  // each visit used to stack another 15s polling loop forever)
+  jarvisState.statusGen = (jarvisState.statusGen || 0) + 1;
+  jarvisLoadStatus(jarvisState.statusGen);
+
+  // Holographic stage + restore feed from state (was rendered empty on
+  // re-entry while old messages silently lived on in jarvisState)
+  if (window.Jarvis3D) window.Jarvis3D.mount($('#jStage'));
+  if (jarvisState.messages.length) jarvisRenderFeed();
+  if (!jarvisState.streaming && !jarvisState.ttsAnimating) jarvisSetMode('idle');
+  else jarvisSetMode(jarvisState.mode);
+}
+
+function jarvisTeardown() {
+  // Called when leaving the view: without this the mic stayed HOT, the
+  // level RAF ran forever, TTS kept talking to nobody and each visit
+  // stacked another status-poll chain.
+  try {
+    if (jarvisState.mediaRecorder && jarvisState.recording) {
+      jarvisState.mediaRecorder.onstop = null; // don't transcribe on teardown
+      jarvisState.mediaRecorder.stop();
+      jarvisState.mediaRecorder.stream.getTracks().forEach(t => t.stop());
+    }
+  } catch { }
+  jarvisState.recording = false;
+  jarvisState.micAnalyser = null;         // ends jarvisMicLevelLoop's RAF
+  try { jarvisStopTTS(); } catch { }
+  try { jarvisStopStreaming(); } catch { }
+  jarvisState.statusGen = (jarvisState.statusGen || 0) + 1; // kill poll chain
+  if (window.Jarvis3D) window.Jarvis3D.dispose();
 }
 
 async function jarvisBootSequence() {
@@ -4047,10 +4095,12 @@ function jarvisBindControls() {
 
   stopBtn.addEventListener('click', () => jarvisStopStreaming());
 
-  // Face IS the button — click the avatar to toggle recording
+  // Face IS the button — click the avatar to toggle recording.
+  // Barge-in: clicking while JARVIS is speaking interrupts it and listens.
   $('#jReactorWrap').addEventListener('click', () => {
-    if (jarvisState.recording) jarvisStopRecording();
-    else jarvisStartRecording();
+    if (jarvisState.recording) { jarvisStopRecording(); return; }
+    if (jarvisState.ttsAnimating) jarvisStopTTS();
+    jarvisStartRecording();
   });
 
   // Conversation mode toggle
@@ -4063,7 +4113,8 @@ function jarvisBindControls() {
 }
 
 // ===== STATUS =====
-async function jarvisLoadStatus() {
+async function jarvisLoadStatus(gen) {
+  if (gen !== jarvisState.statusGen) return; // superseded poll chain — die
   try {
     const s = await api('GET', '/api/jarvis/status');
     jarvisState.connected = s.connected;
@@ -4088,8 +4139,10 @@ async function jarvisLoadStatus() {
     $('#jVoiceStatus').textContent = 'OFF';
   }
 
-  // Update every 15s
-  setTimeout(() => { if (currentView === 'jarvis') jarvisLoadStatus(); }, 15000);
+  // Update every 15s — only the newest generation's chain survives
+  setTimeout(() => {
+    if (currentView === 'jarvis' && gen === jarvisState.statusGen) jarvisLoadStatus(gen);
+  }, 15000);
 }
 
 async function jarvisLoadData() {
@@ -4134,12 +4187,13 @@ function jarvisUpdateActivity() {
     el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
     return;
   }
-  el.innerHTML = items.map(a => `<div><b>${a.source}</b> ${a.message}</div>`).join('');
+  el.innerHTML = items.map(a => `<div><b>${esc(a.source)}</b> ${esc(a.message)}</div>`).join('');
 }
 
 // ===== MODE =====
 function jarvisSetMode(mode) {
   jarvisState.mode = mode;
+  if (window.Jarvis3D) window.Jarvis3D.setMode(mode); // holographic stage follows
   const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
   const labelEl = $('#jState');
   if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
@@ -4183,7 +4237,8 @@ function jarvisRenderFeed() {
   feed.innerHTML = jarvisState.messages.map(m => {
     const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
     const cls2 = m.live ? ' live' : '';
-    return `<div class="j-msg ${cls}${cls2}">${m.text}</div>`;
+    // esc() — transcripts and streamed LLM text were interpolated raw (XSS)
+    return `<div class="j-msg ${cls}${cls2}">${esc(m.text)}</div>`;
   }).join('');
   feed.scrollTop = feed.scrollHeight;
   const mc = $('#jMsgCount');
@@ -4298,7 +4353,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
     case 'tool_call':
       const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
       if (toolName && toolName !== '_thinking') {
-        jarvisAddMessage('tool', `<b>TOOL</b> ${toolName}`);
+        jarvisAddMessage('tool', `⚙ TOOL · ${toolName}`);
       }
       break;
     case 'run.completed':
@@ -4358,7 +4413,12 @@ async function jarvisProcessTTSQueue() {
     return;
   }
   jarvisState.ttsAnimating = true;
+  jarvisState.ttsStopped = false;
   jarvisSetMode('talking');
+  if (jarvisState.audioContext && jarvisState.audioContext.state === 'suspended') {
+    jarvisState.audioContext.resume().catch(() => { });
+  }
+  jarvisTtsLevelLoop(); // stage pulses with the real voice amplitude
 
   // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
   // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
@@ -4368,6 +4428,7 @@ async function jarvisProcessTTSQueue() {
 
   while (pending) {
     const clip = await pending;
+    if (jarvisState.ttsStopped) { pending = null; break; } // barge-in/stop
     // Kick off NEXT render now (runs in parallel with current playback)
     let nextPending = null;
     if (jarvisState.ttsQueue.length > 0) {
@@ -4377,9 +4438,17 @@ async function jarvisProcessTTSQueue() {
     }
     if (clip) await jarvisPlayClip(clip);
     pending = nextPending;
+    // a sentence queued in the shift/flag race window gets picked up here
+    // instead of stranding in the queue with no drainer
+    if (!pending && jarvisState.ttsQueue.length > 0 && !jarvisState.ttsStopped) {
+      const nt = jarvisState.ttsQueue.shift();
+      $('#jTtsCount').textContent = jarvisState.ttsQueue.length;
+      pending = jarvisFetchClip(nt);
+    }
   }
 
   jarvisState.ttsAnimating = false;
+  jarvisState.ttsStopped = false;
   jarvisSetMode('idle');
   jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
   jarvisMaybeAutoListen();
@@ -4416,7 +4485,10 @@ async function jarvisFetchClip(text) {
 // both from the SAME blob — synced by construction. If WAV (/tts fallback):
 // audio only.
 function jarvisPlayClip(blob) {
-  const isVideo = blob.type === 'video/mp4' || blob.size > 20000;
+  // decide by CONTENT TYPE only: the old `size > 20000` heuristic classified
+  // every /tts WAV over ~0.45s as video, whose decode then failed → the
+  // audio-only fallback never actually played
+  const isVideo = (blob.type || '').startsWith('video');
   return new Promise((resolve) => {
     let resolved = false;
     const url = URL.createObjectURL(blob);
@@ -4428,11 +4500,15 @@ function jarvisPlayClip(blob) {
     const cleanup = () => {
       if (resolved) return;
       resolved = true;
+      if (jarvisState.currentClipCleanup === cleanup) jarvisState.currentClipCleanup = null;
       audio.oncanplay = null; audio.onended = null; audio.onerror = null;
       if (video) { video.oncanplay = null; video.onended = null; video.onerror = null; }
       URL.revokeObjectURL(url);
       resolve();
     };
+    // stop/barge-in resolves the in-flight clip immediately instead of
+    // waiting for the 30s watchdog (which wedged the pipeline)
+    jarvisState.currentClipCleanup = cleanup;
 
     const startIfReady = () => {
       if (started || !audioReady || !videoReady) return;
@@ -4471,8 +4547,36 @@ function jarvisAudioEl() {
   if (!jarvisState.ttsAudioEl) {
     const el = new Audio();
     jarvisState.ttsAudioEl = el;
+    // Route through an analyser so the holographic stage pulses with the
+    // REAL speech amplitude. createMediaElementSource is once-per-element,
+    // which is exactly why the element must stay persistent. Fail-soft.
+    try {
+      if (!jarvisState.audioContext) {
+        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const ctx = jarvisState.audioContext;
+      const src = ctx.createMediaElementSource(el);
+      const an = ctx.createAnalyser();
+      an.fftSize = 128;
+      src.connect(an);
+      an.connect(ctx.destination); // rerouted — must reconnect or it goes silent
+      jarvisState.ttsAnalyser = an;
+      jarvisState._ttsData = new Uint8Array(an.frequencyBinCount);
+    } catch { }
   }
   return jarvisState.ttsAudioEl;
+}
+
+function jarvisTtsLevelLoop() {
+  if (!jarvisState.ttsAnimating || !jarvisState.ttsAnalyser) {
+    if (window.Jarvis3D && !jarvisState.recording) window.Jarvis3D.setLevel(0);
+    return;
+  }
+  jarvisState.ttsAnalyser.getByteFrequencyData(jarvisState._ttsData);
+  let sum = 0;
+  for (let i = 0; i < jarvisState._ttsData.length; i++) sum += jarvisState._ttsData[i];
+  if (window.Jarvis3D) window.Jarvis3D.setLevel((sum / jarvisState._ttsData.length / 255) * 2.4);
+  requestAnimationFrame(jarvisTtsLevelLoop);
 }
 
 function jarvisMaybeAutoListen() {
@@ -4483,12 +4587,19 @@ function jarvisMaybeAutoListen() {
 
 function jarvisStopTTS() {
   jarvisState.ttsQueue = [];
+  jarvisState.ttsStopped = true;   // drain loop exits at the next await
   const ttsCount = $('#jTtsCount');
   if (ttsCount) ttsCount.textContent = 0;
   if (jarvisState.ttsAudioEl) {
+    // pause but KEEP the element — it carries the user-gesture autoplay
+    // unlock; nulling it made the next reply's play() rejectable by Chrome
     jarvisState.ttsAudioEl.pause();
-    jarvisState.ttsAudioEl = null;
+    try { jarvisState.ttsAudioEl.currentTime = 0; } catch { }
   }
+  if (jarvisState.avatarVideo) jarvisState.avatarVideo.pause();
+  // resolve the in-flight clip NOW — pausing never fires onended, so the
+  // pipeline stayed wedged (ttsAnimating=true) for up to 30s after STOP
+  if (jarvisState.currentClipCleanup) jarvisState.currentClipCleanup();
   jarvisSetIdleAvatar();
 }
 
@@ -4514,12 +4625,16 @@ async function jarvisStartRecording() {
       jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
     }
     const ctx = jarvisState.audioContext;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => { });
+    if (jarvisState._micSource) { try { jarvisState._micSource.disconnect(); } catch { } }
     const micSource = ctx.createMediaStreamSource(stream);
+    jarvisState._micSource = micSource; // kept so we can disconnect (nodes accumulated per recording)
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
     micSource.connect(analyser);
     jarvisState.micAnalyser = analyser;
     jarvisState._micDataArray = new Uint8Array(analyser.frequencyBinCount);
+    jarvisState._vad = { spokeAt: 0, startedAt: performance.now() };
     jarvisMicLevelLoop();
 
     jarvisState.mediaRecorder.ondataavailable = (e) => {
@@ -4577,6 +4692,7 @@ function jarvisMicLevelLoop() {
   if (!jarvisState.micAnalyser || !jarvisState.recording) {
     const el = $('#jMicLevel');
     if (el) el.style.width = '0%';
+    if (window.Jarvis3D && jarvisState.mode !== 'talking') window.Jarvis3D.setLevel(0);
     return;
   }
   jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
@@ -4585,6 +4701,18 @@ function jarvisMicLevelLoop() {
   const avg = sum / jarvisState._micDataArray.length / 255;
   const el = $('#jMicLevel');
   if (el) el.style.width = (avg * 100 * 2) + '%';
+  if (window.Jarvis3D) window.Jarvis3D.setLevel(avg * 2.2); // stage reacts to the real mic
+
+  // Hands-free: in conversation mode, stop on ~1.8s of silence after speech
+  // (before this, "auto-listen" still required a click to stop — not hands-free)
+  const v = jarvisState._vad;
+  if (jarvisState.conversationMode && v) {
+    const now = performance.now();
+    if (avg > 0.06) v.spokeAt = now;
+    const spoke = v.spokeAt > 0;
+    if (spoke && now - v.spokeAt > 1800) { jarvisStopRecording(); return; }
+    if (!spoke && now - v.startedAt > 8000) { jarvisStopRecording(); return; } // nothing said
+  }
   requestAnimationFrame(jarvisMicLevelLoop);
 }
 

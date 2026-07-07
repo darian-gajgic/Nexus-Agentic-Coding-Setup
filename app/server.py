@@ -1271,7 +1271,16 @@ async def jarvis_stt(file: UploadFile = File(...)):
     if not _voice_ready:
         return JSONResponse(status_code=503, content={"error": "voice pipeline not available"})
     audio_bytes = await file.read()
-    text = await _voice.transcribe(audio_bytes)
+    if not audio_bytes:
+        return JSONResponse(status_code=400, content={"error": "empty audio upload"})
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": "audio too large (25MB max)"})
+    try:
+        text = await _voice.transcribe(audio_bytes)
+    except Exception as e:
+        # unguarded, a GPU error here surfaced as a NON-JSON 500 (seen live:
+        # cudaErrorInvalidDevice 2026-07-05) and broke the frontend's .json()
+        return JSONResponse(status_code=500, content={"error": f"transcription failed: {str(e)[:200]}"})
     return {"text": text}
 
 
@@ -1283,22 +1292,11 @@ async def jarvis_tts(body: dict):
     text = body.get("text", "").strip()
     if not text:
         return JSONResponse(status_code=400, content={"error": "empty text"})
-    wav_bytes = await _voice.synthesize(text)
+    try:
+        wav_bytes = await _voice.synthesize(text)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"synthesis failed: {str(e)[:200]}"})
     return RawResponse(content=wav_bytes, media_type="audio/wav")
-
-
-@app.post("/api/jarvis/voice/talk")
-async def jarvis_voice_talk(body: dict):
-    """Full voice turn: transcribe audio → Hermes chat → synthesize reply.
-    Returns the text response. The frontend plays TTS separately via /tts.
-    """
-    if not _voice_ready:
-        return JSONResponse(status_code=503, content={"error": "voice pipeline not available"})
-
-    # This endpoint receives pre-transcribed text (the browser does STT
-    # via /stt, then sends the text here for Hermes chat streaming).
-    # The actual orchestration is done in the frontend for lower latency.
-    return JSONResponse(status_code=400, content={"error": "use /stt + /chat/stream + /tts instead"})
 
 
 # ===== JARVIS Neural Lip-Sync (Wav2Lip) =====
@@ -3538,7 +3536,58 @@ async def memory3d(force: bool = False):
                 "created_at": pl.get("created_at") or "",
                 "degree": degree.get(i, 0),
             })
-        data = {"nodes": nodes, "links": links,
+
+        # ── semantic regions: k-means in the FULL 768-dim space, named by
+        # their most distinctive real words (tf-idf-ish) — the map's
+        # "continent labels", computed, never invented ──
+        clusters = []
+        try:
+            n = len(vecs)
+            k_c = max(3, min(8, n // 40))
+            rng = np.random.RandomState(42)
+            cent = vecs[rng.choice(n, k_c, replace=False)]
+            assign = np.zeros(n, dtype=int)
+            for _ in range(12):
+                assign = np.argmax(vecs @ cent.T, axis=1)
+                for c in range(k_c):
+                    m = vecs[assign == c]
+                    if len(m):
+                        v = m.mean(axis=0)
+                        cent[c] = v / (np.linalg.norm(v) + 1e-9)
+            import re as _re
+            _STOP = set(("the a an and or of to in for on with is are was were be been "
+                         "this that it its as at by from user agent memory not has have "
+                         "had do does did will would can could should about into when "
+                         "which their there they them he she his her you your i we our "
+                         "than then also only more most some any all no yes if but so "
+                         "after before during between over under out up down new one two "
+                         "using use used via each per s t").split())
+            docs = []
+            for p in pts:
+                pl = p.get("payload") or {}
+                txt = str(pl.get("text_lemmatized") or pl.get("data") or "").lower()
+                docs.append(set(w for w in _re.findall(r"[a-z][a-z0-9_-]{2,}", txt)
+                                if w not in _STOP))
+            import collections as _col
+            global_df = _col.Counter(w for d in docs for w in d)
+            for c in range(k_c):
+                idxs = [i for i in range(n) if assign[i] == c]
+                if len(idxs) < 4:
+                    continue
+                local = _col.Counter(w for i in idxs for w in docs[i])
+                scored = sorted(local.items(),
+                                key=lambda kv: kv[1] * (kv[1] / (global_df[kv[0]] + 1)),
+                                reverse=True)[:3]
+                cx = coords[idxs].mean(axis=0)
+                clusters.append({
+                    "label": " · ".join(w for w, _ in scored) or f"region {c+1}",
+                    "x": round(float(cx[0]), 2), "y": round(float(cx[1]), 2),
+                    "z": round(float(cx[2]), 2), "size": len(idxs),
+                })
+        except Exception:
+            clusters = []
+
+        data = {"nodes": nodes, "links": links, "clusters": clusters,
                 "count": len(nodes), "dims": 768, "generated_at": time.time()}
         _MEM3D_CACHE.update(ts=time.time(), data=data)
         return data
