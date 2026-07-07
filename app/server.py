@@ -131,6 +131,22 @@ class TaskCreate(BaseModel):
     client: Optional[str] = None
 
 
+def _derive_client(client, repo_path):
+    """Explicit client wins; else repos under ~/Client-Projects/<client>/…
+    imply their client — folder layout, memory scope and galaxy color agree
+    without typing the client twice."""
+    c = (client or "").strip().lower()
+    if c:
+        return c
+    rp = os.path.realpath(os.path.expanduser(repo_path or ""))
+    base = os.path.realpath(os.path.expanduser("~/Client-Projects"))
+    if rp.startswith(base + os.sep):
+        parts = rp[len(base) + 1:].split(os.sep)
+        if parts and parts[0]:
+            return parts[0].lower()
+    return None
+
+
 class TaskUpdate(BaseModel):
     status: Optional[str] = None
     priority: Optional[int] = None
@@ -242,7 +258,7 @@ async def create_task(body: TaskCreate):
          body.domain, body.specialist, 1 if body.high_stakes else 0, body.budget_tokens, body.model,
          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
          json.dumps(body.loop_config) if body.loop_config else None,
-         (body.repo_path or None), ((body.client or '').strip().lower() or None)))
+         (body.repo_path or None), (_derive_client(body.client, body.repo_path))))
     db.log_activity("info", "system", f"Task created: '{body.title}'")
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     await mgr.broadcast({"type": "task_created", "data": task})
@@ -3677,6 +3693,95 @@ def _run_git_action(cwd: str, *cmd: str, timeout: int = 120):
     import subprocess
     r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
     return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-800:]
+
+
+_SLUG_RE = r"^[a-z0-9][a-z0-9._-]{0,60}$"
+
+
+def _create_repo(client: str, name: str, publish: bool):
+    """Shared: seed ~/Client-Projects/<client>/<name> as a git repo
+    (README, .gitignore, first commit), optionally publish private to GitHub.
+    Repo-first is the greenfield rule: every client project is a proper,
+    backed-up repository from minute one."""
+    import re
+    client = (client or "").strip().lower()
+    name = (name or "").strip().lower()
+    if not re.match(_SLUG_RE, client) or not re.match(_SLUG_RE, name):
+        return None, "client and project must be lowercase slugs (a-z, 0-9, -, _)"
+    root = os.path.expanduser(f"~/Client-Projects/{client}/{name}")
+    if os.path.exists(root):
+        return None, f"already exists: {root}"
+    os.makedirs(root)
+    with open(os.path.join(root, "README.md"), "w") as f:
+        f.write(f"# {name}\n\nClient project for **{client}**. Managed via Nexus Agent OS.\n")
+    with open(os.path.join(root, ".gitignore"), "w") as f:
+        f.write("node_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n"
+                ".env\n.worktrees/\n.next/\ncoverage/\n")
+    for cmd in (["git", "init", "-b", "main"], ["git", "add", "-A"],
+                ["git", "-c", "user.name=nexus", "-c", "user.email=nexus@local",
+                 "commit", "-m", f"init: {client}/{name} (created via Nexus)"]):
+        code, out = _run_git_action(root, *cmd)
+        if code != 0:
+            return None, f"git setup failed: {out}"
+    pub_note = ""
+    if publish:
+        code, out = _run_git_action(root, "gh", "repo", "create", f"{client}-{name}",
+                                    "--private", "--source", ".", "--push", timeout=180)
+        pub_note = " · published privately to GitHub" if code == 0 else f" · GitHub publish FAILED: {out[-160:]}"
+    db.log_activity("info", "system", f"Client project created: {client}/{name}{pub_note}")
+    return root, pub_note
+
+
+@app.post("/api/projects/create-client")
+async def project_create_client(body: dict):
+    root, note = _create_repo(body.get("client"), body.get("name"),
+                              bool(body.get("publish")))
+    if root is None:
+        return JSONResponse(status_code=400, content={"error": note})
+    return {"ok": True, "path": root, "client": (body.get("client") or "").strip().lower(),
+            "note": note.strip(" ·")}
+
+
+@app.post("/api/tasks/{task_id}/promote")
+async def task_promote(task_id: str, body: dict):
+    """Rescue path: lift an app that was born in a task WORKSPACE into a real
+    client repository. Copies the code (junk excluded), seeds the repo, and
+    commits 'imported from task'. All future rounds then run repo-native."""
+    import shutil
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task or not task.get("workspace_path"):
+        return JSONResponse(status_code=404, content={"error": "task or workspace not found"})
+    ws = Path(task["workspace_path"])
+    sub = (body.get("subdir") or "").strip().strip("/")
+    src = (ws / sub) if sub else ws
+    src = src.resolve()
+    if not str(src).startswith(str(ws.resolve())) or not src.is_dir():
+        return JSONResponse(status_code=400, content={"error": "invalid subdir"})
+    root, note = _create_repo(body.get("client"), body.get("name"), bool(body.get("publish")))
+    if root is None:
+        return JSONResponse(status_code=400, content={"error": note})
+    SKIP = {"node_modules", ".venv", ".venv-preview", "__pycache__", ".next", "dist",
+            "build", "coverage", "attachments", ".git"}
+    SKIP_FILES = {"_dispatch.json", "_preview.log", "changes.diff"}
+    copied = 0
+    for item in src.iterdir():
+        if item.name in SKIP or item.name in SKIP_FILES:
+            continue
+        if not sub and item.name.startswith("deliverable"):
+            continue  # promoting the whole workspace: reports stay behind
+        dst = Path(root) / item.name
+        if item.is_dir():
+            shutil.copytree(item, dst, ignore=shutil.ignore_patterns(*SKIP))
+        else:
+            shutil.copy2(item, dst)
+        copied += 1
+    _run_git_action(root, "git", "add", "-A")
+    code, out = _run_git_action(root, "git", "-c", "user.name=nexus", "-c",
+                                "user.email=nexus@local", "commit", "-m",
+                                f"import: promoted from Nexus task {task_id} ('{task['title'][:60]}')")
+    db.log_activity("info", "system",
+                    f"Task {task_id} promoted to repository {root} ({copied} top-level items)")
+    return {"ok": True, "path": root, "items": copied, "note": note.strip(" ·")}
 
 
 @app.post("/api/projects/publish")

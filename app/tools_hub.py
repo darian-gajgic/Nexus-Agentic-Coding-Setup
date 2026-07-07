@@ -377,34 +377,57 @@ def _is_project(path: Path) -> bool:
     return False
 
 
+CLIENT_PROJECTS_ROOT = HOME / "Client-Projects"
+
+
+def _project_entry(d, client=None):
+    try:
+        st = d.stat()
+    except Exception:
+        return None
+    gi = _git_info(d)
+    return {
+        "name": d.name,
+        "path": str(d),
+        "client": client,
+        "size_bytes": _dir_size(d),
+        "languages": _detect_languages(d),
+        "git_branch": gi["branch"],
+        "git_dirty": gi["dirty"],
+        "git_remote": gi["remote"],
+        "is_repo": gi["branch"] is not None,
+        "has_venv": (d / ".venv").is_dir(),
+        "last_modified": st.st_mtime,
+        "description": _read_first_readme_line(d),
+    }
+
+
 def get_projects() -> list:
-    """Scan /home/<user>/ for project directories."""
+    """Scan /home/<user>/ for project directories.
+    Client work lives one level deeper: ~/Client-Projects/<client>/<project> —
+    those entries carry their client name (memory scope + galaxy color align)."""
     projects = []
     scan_root = HOME
     for d in sorted(scan_root.iterdir()):
         if not d.is_dir() or d.name.startswith(".") or d.name in EXCLUDE_DIRS:
             continue
+        if d == CLIENT_PROJECTS_ROOT:
+            continue  # handled below, nested per client
         if not _is_project(d):
             continue
-        try:
-            st = d.stat()
-        except Exception:
-            continue
-        gi = _git_info(d)
-        readme = _read_first_readme_line(d)
-        projects.append({
-            "name": d.name,
-            "path": str(d),
-            "size_bytes": _dir_size(d),
-            "languages": _detect_languages(d),
-            "git_branch": gi["branch"],
-            "git_dirty": gi["dirty"],
-            "git_remote": gi["remote"],
-            "is_repo": gi["branch"] is not None,
-            "has_venv": (d / ".venv").is_dir(),
-            "last_modified": st.st_mtime,
-            "description": readme,
-        })
+        e = _project_entry(d)
+        if e:
+            projects.append(e)
+    if CLIENT_PROJECTS_ROOT.is_dir():
+        for cdir in sorted(CLIENT_PROJECTS_ROOT.iterdir()):
+            if not cdir.is_dir() or cdir.name.startswith("."):
+                continue
+            for d in sorted(cdir.iterdir()):
+                if not d.is_dir() or d.name.startswith("."):
+                    continue
+                e = _project_entry(d, client=cdir.name)
+                if e:
+                    projects.append(e)
     projects.sort(key=lambda p: p["last_modified"], reverse=True)
     return projects
 
