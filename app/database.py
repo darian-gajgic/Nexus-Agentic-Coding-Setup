@@ -270,6 +270,9 @@ def init_db():
         conn.execute("ALTER TABLE workflows ADD COLUMN project_path TEXT")
     if "user_id" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN user_id TEXT")
+    # Block 3: mid-run replanning checkpoint state (JSON; NULL = nothing pending)
+    if "replan" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN replan TEXT")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (
@@ -329,6 +332,49 @@ def init_db():
         "(SELECT t.user_id FROM tasks t WHERE t.id = json_extract(approvals.payload, '$.task_id')),"
         " 'u_owner') WHERE user_id IS NULL")
 
+    # ===== Eval corpus tables (Block 3, additive — docs/SPEC-BLOCK3.md R3) =====
+    # A run executes fixed per-domain briefs through the real dispatch framing
+    # and scores each deliverable with the frontier judge against the rubric.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS eval_runs (
+        id TEXT PRIMARY KEY,
+        domain TEXT NOT NULL,
+        notes TEXT DEFAULT '',
+        status TEXT DEFAULT 'running',
+        cases_total INTEGER DEFAULT 0,
+        cases_done INTEGER DEFAULT 0,
+        score_total INTEGER DEFAULT 0,
+        score_max INTEGER DEFAULT 0,
+        ship_count INTEGER DEFAULT 0,
+        fingerprint TEXT DEFAULT '{}',
+        error TEXT,
+        started_at REAL,
+        ended_at REAL,
+        user_id TEXT NOT NULL
+    )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS eval_results (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        case_title TEXT DEFAULT '',
+        specialist TEXT,
+        model TEXT,
+        status TEXT DEFAULT 'pending',
+        verdict TEXT,
+        score INTEGER,
+        score_max INTEGER,
+        gates_passed INTEGER,
+        gates_failed INTEGER,
+        judge_output TEXT,
+        deliverable_path TEXT,
+        tokens_used INTEGER DEFAULT 0,
+        gen_seconds REAL,
+        error TEXT,
+        started_at REAL,
+        ended_at REAL
+    )""")
+
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
     dispatch_defaults = [
@@ -357,6 +403,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, status)",
         "CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_eval_runs_user ON eval_runs(user_id, started_at)",
+        "CREATE INDEX IF NOT EXISTS idx_eval_results_run ON eval_results(run_id)",
     ):
         conn.execute(ddl)
     conn.commit()

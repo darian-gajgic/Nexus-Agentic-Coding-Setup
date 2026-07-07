@@ -239,7 +239,8 @@ def _sweep_workflow_loops(actions_left: int) -> int:
         if not trig:
             continue
         tasks = db.query_all(
-            "SELECT * FROM tasks WHERE workflow_id=? ORDER BY created_at", (wf["id"],))
+            "SELECT * FROM tasks WHERE workflow_id=? AND status != 'archived' "
+            "ORDER BY created_at", (wf["id"],))
         ver = next((t for t in tasks if t.get("specialist") == "acceptance-verifier"), None)
         if not ver or ver.get("dispatch_state") != "completed" \
                 or ver.get("status") not in ("review", "done"):
@@ -339,9 +340,76 @@ def _sweep_task_loops(actions_left: int) -> int:
     return actions_left
 
 
+def _parse_replan(wf) -> dict | None:
+    try:
+        rp = json.loads(wf.get("replan") or "null")
+        return rp if isinstance(rp, dict) else None
+    except Exception:
+        return None
+
+
+def _sweep_replan_detection():
+    """R2.1 (SPEC-BLOCK3): DETECTION ONLY — free, no LLM, no action. Flags a
+    workflow replan.status='needed' when a stage failed terminally or the final
+    inspection failed with no automatic fix round remaining. Drafting and
+    applying stay behind the operator (gated deliberately: this is the
+    loop-engine touchpoint, and the engine must never rewrite a pipeline)."""
+    for wf in db.query_all("SELECT * FROM workflows WHERE status='active'"):
+        rp = _parse_replan(wf)
+        if rp and rp.get("status") in ("needed", "drafting", "proposed"):
+            continue  # a checkpoint is already open
+        tasks = db.query_all(
+            "SELECT * FROM tasks WHERE workflow_id=? AND status != 'archived' "
+            "ORDER BY created_at", (wf["id"],))
+        if not tasks:
+            continue
+        # A dismissed/applied checkpoint covers exactly ONE failure — a
+        # DIFFERENT stage failing later must re-arm the checkpoint.
+        handled = rp.get("failed_task_id") \
+            if rp and rp.get("status") in ("dismissed", "applied") else None
+        candidates = []  # (reason, task_id, title)
+        for t in tasks:
+            if t.get("dispatch_state") == "failed":
+                candidates.append((
+                    f"stage '{t['title'][:60]}' failed terminally: "
+                    f"{(t.get('dispatch_error') or 'no error recorded')[:200]}",
+                    t["id"], t["title"]))
+        if not candidates:
+            ver = next((t for t in reversed(tasks)
+                        if t.get("specialist") == "acceptance-verifier"), None)
+            if ver and ver.get("dispatch_state") == "completed" \
+                    and ver.get("status") in ("review", "done") \
+                    and _verdict_from_summary(ver.get("result_summary")) == "FAIL":
+                cfg = _cfg(wf)
+                trig = _trigger(cfg, "verify_fail") \
+                    if cfg and cfg.get("enabled") and cfg.get("mode") == "closed" else None
+                if not trig:  # no automatic fix round remains → human checkpoint
+                    candidates.append((
+                        "final inspection FAILED and no automatic fix round "
+                        "remains — replan or fix by hand", ver["id"], ver["title"]))
+        fresh = next((c for c in candidates if c[1] != handled), None)
+        if not fresh:
+            continue
+        reason, fid, ftitle = fresh
+        payload = {"status": "needed", "reason": reason, "failed_task_id": fid,
+                   "failed_task_title": (ftitle or "")[:200], "detected_at": time.time()}
+        db.execute("UPDATE workflows SET replan=? WHERE id=?",
+                   (json.dumps(payload), wf["id"]))
+        db.log_activity("warn", "loop",
+                        f"REPLAN checkpoint on '{wf['name']}': {reason[:150]} "
+                        "(open the project to draft a recovery plan)",
+                        user_id=wf.get("user_id"))
+        try:
+            import hermes_dispatch as _hd
+            _hd.notify_desktop("Nexus: pipeline stalled ⚠", f"{wf['name']}: {reason[:120]}")
+        except Exception:
+            pass
+
+
 def loop_sweep():
     if db.get_setting("dispatch.enabled", "0") != "1":
         return
+    _sweep_replan_detection()
     left = _sweep_workflow_loops(MAX_ACTIONS_PER_SWEEP)
     _sweep_task_loops(left)
 

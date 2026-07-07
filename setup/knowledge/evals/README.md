@@ -1,5 +1,13 @@
 # Evals — stop tuning blind
 
+> **This protocol is AUTOMATED now (2026-07-08).** The living corpus moved to
+> `domains/<domain>/evals/*.md` (format: `domains/EVALS-README.md`), and Nexus runs +
+> scores it end-to-end: **Specialists → 📏 Evals** — pick the domain, press ▶ Run evals;
+> the frontier judge scores every case against the domain RUBRIC and the run history
+> keeps score trends per config fingerprint. The three cases that used to live in
+> `cases/` are ported into the per-domain corpus. This folder stays as the manual
+> protocol description + baseline archive.
+
 Purpose: every time you change the setup (SOUL.md, a playbook, a specialist, a model setting),
 run 2–3 of these fixed tasks and compare against the saved baseline. If outputs didn't get
 better, the change didn't help — revert it. 30 minutes of eval beats a week of vibes.

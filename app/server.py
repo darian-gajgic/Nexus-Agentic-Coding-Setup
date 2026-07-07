@@ -96,6 +96,24 @@ def startup():
         "WHERE judge_verdict='running'").rowcount
     if stuck:
         db.log_activity("warn", "judge", f"Cleared {stuck} judge run(s) orphaned by restart")
+    # Same for replan drafts (R2.2) — a restart mid-draft would 409 forever.
+    for w in db.query_all("SELECT id, replan FROM workflows WHERE replan IS NOT NULL"):
+        try:
+            rp = json.loads(w["replan"] or "null")
+        except Exception:
+            rp = None
+        if isinstance(rp, dict) and rp.get("status") == "drafting":
+            rp["status"] = "needed"
+            rp["error"] = "draft interrupted by server restart — draft it again"
+            db.execute("UPDATE workflows SET replan=? WHERE id=?", (json.dumps(rp), w["id"]))
+            db.log_activity("warn", "system",
+                            f"Workflow {w['id']}: replan draft orphaned by restart — reset to 'needed'")
+    # Eval runs are sequential daemon threads — clear runs orphaned by restart.
+    orphaned = db.execute(
+        "UPDATE eval_runs SET status='failed', error='interrupted by server restart', "
+        "ended_at=? WHERE status IN ('running','cancelling')", (time.time(),)).rowcount
+    if orphaned:
+        db.log_activity("warn", "evals", f"Cleared {orphaned} eval run(s) orphaned by restart")
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
@@ -874,6 +892,22 @@ def _specialist_mem0_id(name):
         return str(fm.get("mem0_agent_id") or name).strip()
     except Exception:
         return name
+
+
+@app.get("/api/specialists/names")
+def get_specialist_names():
+    """Lightweight roster for pickers (name + one-liner) — no qdrant scroll."""
+    import glob
+    out = []
+    for fp in sorted(glob.glob(os.path.expanduser("~/.hermes/agents/*.md"))):
+        try:
+            fm, _b = _parse_agent_md(open(fp).read())
+            if fm.get("name"):
+                out.append({"name": str(fm["name"]).strip(),
+                            "description": (fm.get("description") or "").strip()[:180]})
+        except Exception:
+            pass
+    return {"specialists": out}
 
 
 @app.get("/api/specialists")
@@ -2459,49 +2493,10 @@ def _parse_judge_output(text: str):
 
 def _judge_thread(task_id: str, file_path: str, domain: str):
     """Run the frontier judge (minutes) and persist the verdict. The command
-    template lives in settings key judge.cmd so gates can stub it (R4.3).
-
-    Runs with cwd=~/knowledge AND copies the deliverable there first: headless
-    `claude -p` (inside cjudge) can only read files under its working directory
-    without permission prompts, and the judge must read BOTH the rubric tree
-    and the deliverable."""
-    import shutil
-    tmpdir = Path(KNOWLEDGE_DIR) / ".nexus-judge-tmp"
-    judged_path = file_path
-    try:
-        tmpdir.mkdir(exist_ok=True)
-        tmp_file = tmpdir / f"{task_id}.md"
-        shutil.copy2(file_path, tmp_file)
-        judged_path = str(tmp_file)
-    except Exception:
-        pass  # fall back to the original path
-    import shlex
-    import shutil as _shutil
-    # shell=False + per-token formatting: the template values are validated, and
-    # this removes the shell layer entirely (defense in depth for judge.cmd).
-    tokens = [t.format(file=judged_path, domain=domain)
-              for t in shlex.split(db.get_setting("judge.cmd", "cjudge {file} {domain}"))]
-    # Under the systemd unit PATH may lack ~/.local/bin (where cjudge lives).
-    if tokens and not _shutil.which(tokens[0]):
-        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-        if os.path.isfile(candidate):
-            tokens[0] = candidate
-    try:
-        r = _sp.run(tokens, capture_output=True, text=True, timeout=900,
-                    cwd=KNOWLEDGE_DIR)
-        out = (r.stdout or "")
-        if r.returncode != 0:
-            out += f"\n[judge exited {r.returncode}] {(r.stderr or '')[-1000:]}"
-    except _sp.TimeoutExpired:
-        out = "[judge timed out after 900s]"
-    except Exception as e:
-        out = f"[judge failed to run: {e}]"
-    finally:
-        try:
-            if judged_path != file_path:
-                os.unlink(judged_path)
-        except Exception:
-            pass
+    execution is shared with the eval runner (evals.run_judge_cmd — template in
+    settings key judge.cmd so gates can stub it, R4.3)."""
+    import evals as _ev
+    out = _ev.run_judge_cmd(file_path, domain)
     verdict, learning = _parse_judge_output(out)
     db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=? WHERE id=?",
                (verdict or "error", out[-30000:], time.time(), task_id))
@@ -3135,17 +3130,21 @@ def _clamp_wizard_questions(data: dict) -> list:
     return out
 
 
-def _repair_workflow(raw_tasks: list, wf_name: str) -> tuple[list, list]:
+def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5) -> tuple[list, list]:
     """Deterministic post-LLM validation + auto-repair of a proposed project DAG.
     Never trusts the model's wiring: enforces the earlier-index invariant (acyclic
     by construction), inserts the mandatory quality gates for coding projects
     (code-reviewer + high-stakes acceptance-verifier — appended, so the invariant
     holds), fixes gate edges, chains orphans, and falls back to a sequential
-    chain rather than ever returning a broken graph."""
+    chain rather than ever returning a broken graph.
+
+    max_raw: 5 for LLM output; 7 when revalidating an operator-edited plan that
+    already contains the appended gates (slicing those off would discard the
+    operator's edits to the gate tasks and re-append pristine copies)."""
     repairs: list = []
     names = _specialist_names()
     tasks = []
-    for i, rt in enumerate((raw_tasks or [])[:5]):
+    for i, rt in enumerate((raw_tasks or [])[:max_raw]):
         t = _clamp_wizard_task(rt if isinstance(rt, dict) else {}, repairs, names)
         deps = (rt.get("depends_on") if isinstance(rt, dict) else None) or []
         t["depends_on_idx"] = sorted({d for d in deps if isinstance(d, int) and 0 <= d < i})
@@ -3493,13 +3492,38 @@ async def task_wizard(body: dict):
     return out
 
 
+@app.post("/api/tasks/wizard/revalidate")
+async def task_wizard_revalidate(body: dict):
+    """R1.3: deterministic re-validation of an OPERATOR-EDITED plan — no LLM.
+    The same `_repair_workflow()` that guards wizard output guards human edits:
+    specialist whitelist, dev-stage model floor, dependency invariant, mandatory
+    quality gates. Nothing is created; the UI shows the repaired plan (with the
+    repair notes) and creates only what the operator confirms."""
+    raw = body.get("tasks") if isinstance(body.get("tasks"), list) else []
+    if not raw:
+        return JSONResponse(status_code=400, content={"error": "tasks required"})
+    name = str(body.get("name") or "").strip()[:120] or "Edited project"
+    for rt in raw:
+        # The editor speaks depends_on_idx (like the proposal it renders);
+        # _repair_workflow reads depends_on. Accept both.
+        if isinstance(rt, dict) and "depends_on" not in rt:
+            rt["depends_on"] = rt.get("depends_on_idx") or []
+    tasks, repairs = _repair_workflow(raw, name, max_raw=7)
+    if repairs:
+        db.log_activity("info", "system",
+                        f"Plan editor auto-repair on '{name[:40]}': " + " · ".join(repairs)[:300])
+    return {"tasks": tasks, "repairs": repairs}
+
+
 # ── Workflows: multi-task projects/campaigns with dependencies (v2.1) ──
 # Professional pattern (Linear/Jira projects + a light dependency DAG): a
 # workflow groups tasks; a task with depends_on only runs once those shipped,
 # and their deliverable files are injected as INPUT into its dispatch framing.
 
 def _workflow_rollup(w: dict) -> dict:
-    tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? ORDER BY created_at", (w["id"],))
+    # archived = superseded by a replan (R2.3): kept for audit, out of the math
+    tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? AND status != 'archived' "
+                         "ORDER BY created_at", (w["id"],))
     by = {}
     for t in tasks:
         by[t["status"]] = by.get(t["status"], 0) + 1
@@ -3622,6 +3646,258 @@ async def delete_workflow(wf_id: str):
     return {"ok": True}
 
 
+# ── Mid-run replanning (Block 3 R2, docs/SPEC-BLOCK3.md) ──
+# Three separate gates by design: the loop engine only DETECTS (free, no LLM),
+# the operator triggers DRAFTING, and APPLYING is operator-approved after
+# review/edit in the plan editor. The engine never rewrites a pipeline itself.
+
+def _parse_replan(w: dict) -> dict | None:
+    try:
+        rp = json.loads(w.get("replan") or "null")
+        return rp if isinstance(rp, dict) else None
+    except Exception:
+        return None
+
+
+def _save_replan(wf_id: str, rp: dict):
+    db.execute("UPDATE workflows SET replan=?, updated_at=? WHERE id=?",
+               (json.dumps(rp), time.time(), wf_id))
+
+
+def _replan_context(w: dict, tasks: list, reason: str) -> str:
+    """Everything the planning session needs to replan the REMAINING work:
+    goal, DAG with per-task status, and the failure evidence."""
+    lines = [f"REPLAN REQUEST for the running project '{w['name']}'.",
+             f"Project goal: {w.get('goal') or '(none recorded)'}",
+             f"Domain: {w.get('domain') or 'general'}",
+             f"Why replanning is needed: {reason}",
+             "", "CURRENT PIPELINE STATE:"]
+    by_id = {t["id"]: i for i, t in enumerate(tasks)}
+    for i, t in enumerate(tasks):
+        if t.get("status") == "done":
+            mark = "DONE"
+        elif t.get("dispatch_state") == "failed":
+            mark = "FAILED"
+        else:
+            mark = (t.get("status") or "pending").upper()
+        try:
+            deps = [str(by_id[d] + 1) for d in json.loads(t.get("depends_on") or "[]") if d in by_id]
+        except Exception:
+            deps = []
+        lines.append(f"{i + 1}. [{mark}] '{t['title']}' (specialist: {t.get('specialist') or '—'}"
+                     + (f", waits for {','.join(deps)}" if deps else "") + ")")
+        if t.get("dispatch_state") == "failed" and t.get("dispatch_error"):
+            lines.append(f"   failure: {str(t['dispatch_error'])[:400]}")
+        if t.get("specialist") == "acceptance-verifier" and mark in ("DONE", "REVIEW") \
+                and (t.get("result_summary") or "").strip():
+            lines.append("   inspection findings: " + t["result_summary"][:1200].replace("\n", " "))
+    lines += [
+        "",
+        "YOUR JOB: plan ONLY the remaining work — the tasks that recover from the "
+        "failure and finish the goal. Rules:",
+        "- Do NOT recreate DONE tasks. Their deliverables are automatically injected "
+        "as INPUT into the first task(s) of your new plan.",
+        "- Address the failure explicitly: the first new task's description must say "
+        "what went wrong and how this attempt differs.",
+        "- Non-done tasks of the old plan are ARCHIVED when your plan is applied — "
+        "re-include their work in your new tasks where it is still needed.",
+        "- Same house rules as always: <=5 tasks, coding work keeps the "
+        "review/verification gates (they are re-enforced server-side anyway).",
+        'Reply with ONLY the JSON plan: {"type":"workflow","workflow":{"name":str,'
+        '"goal":str,"domain":str,"tasks":[...]},"assumptions":[...]}.',
+    ]
+    return "\n".join(lines)
+
+
+def _wizard_plan_sync(title: str, user_msg: str, uid: str | None) -> dict:
+    """Synchronous planning-only wizard call (for background threads): fresh
+    role-locked session, one silent retry on a malformed reply, session deleted."""
+    framing = _task_wizard_framing(allow_questions=False)
+    last_err: Exception = RuntimeError("wizard returned nothing")
+    for _attempt in (0, 1):
+        sid = hd.create_session(title, system_prompt=_WIZARD_ROLE_LOCK)
+        hd.publish_session_scope(sid, user=uid)
+        try:
+            res = hd.stream_turn(sid, user_msg, system_message=framing, max_seconds=300)
+        finally:
+            hd.delete_session(sid)
+        raw = (res.get("content") or "").strip()
+        if res.get("error") or not raw:
+            last_err = RuntimeError(res.get("error") or "the model returned nothing")
+            continue
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            last_err = RuntimeError("reply was not a JSON plan")
+            continue
+        try:
+            return json.loads(raw[start:end + 1])
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+    raise last_err
+
+
+def _replan_draft_thread(wf_id: str, uid: str | None):
+    w = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
+    if not w:
+        return
+    rp = _parse_replan(w) or {}
+    tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? AND status != 'archived' "
+                         "ORDER BY created_at", (wf_id,))
+    try:
+        user_msg = _replan_context(w, tasks, rp.get("reason") or "operator requested a replan")
+        data = _wizard_plan_sync(f"nexus:replan-{wf_id}", user_msg, uid)
+        wf = data.get("workflow") if data.get("type") == "workflow" else None
+        raw_tasks = (wf or {}).get("tasks") or ([data.get("task")] if data.get("task") else [])
+        new_tasks, repairs = _repair_workflow(raw_tasks, w["name"])
+        if not new_tasks:
+            raise RuntimeError("the wizard proposed no tasks")
+        rp.update({
+            "status": "proposed",
+            "proposal": {
+                "name": w["name"],
+                "goal": str((wf or {}).get("goal") or w.get("goal") or "").strip()[:500],
+                "tasks": new_tasks,
+                "repairs": repairs,
+                "assumptions": [str(x).strip()[:200] for x in (data.get("assumptions") or [])[:8]
+                                if str(x).strip()],
+            },
+            "drafted_at": time.time(),
+            "error": None,
+        })
+        _save_replan(wf_id, rp)
+        db.log_activity("info", "system",
+                        f"Replan drafted for '{w['name']}' ({len(new_tasks)} remaining-work "
+                        "task(s)) — awaiting operator review", user_id=w.get("user_id"))
+        hd.notify_desktop("Nexus: replan ready 📋", f"{w['name']}: proposal awaits your review")
+    except Exception as e:
+        rp.update({"status": "needed", "error": str(e)[:300]})
+        _save_replan(wf_id, rp)
+        db.log_activity("error", "system",
+                        f"Replan draft failed for '{w['name']}': {str(e)[:160]}",
+                        user_id=w.get("user_id"))
+
+
+@app.post("/api/workflows/{wf_id}/replan/draft")
+async def replan_draft(wf_id: str):
+    """R2.2: operator-triggered — the planning wizard drafts a recovery plan for
+    the remaining work (async, minutes; poll the workflow's replan.status)."""
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    rp = _parse_replan(w) or {"reason": "operator requested a replan",
+                              "failed_task_id": None, "detected_at": time.time()}
+    if rp.get("status") == "drafting":
+        return JSONResponse(status_code=409, content={"error": "a draft is already running"})
+    rp["status"] = "drafting"
+    rp["error"] = None
+    _save_replan(wf_id, rp)
+    uid = auth.current_user_id()  # captured OUTSIDE the thread (contextvar)
+    threading.Thread(target=_replan_draft_thread, args=(wf_id, uid), daemon=True).start()
+    db.log_activity("info", "system", f"Replan draft started for '{w['name']}'", user_id=uid)
+    return {"ok": True, "status": "drafting"}
+
+
+@app.post("/api/workflows/{wf_id}/replan/apply")
+async def replan_apply(wf_id: str, body: dict):
+    """R2.3: operator-approved apply of the (possibly edited) recovery plan.
+    Superseded non-done tasks are archived (kept for audit), new tasks are
+    created in Backlog wired to each other and to every DONE predecessor."""
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    raw = body.get("tasks") if isinstance(body.get("tasks"), list) else []
+    if not raw:
+        return JSONResponse(status_code=400, content={"error": "tasks required"})
+    running = db.query_one(
+        "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND dispatch_state IN "
+        "('dispatching','streaming','finalizing')", (wf_id,))
+    if (running or {}).get("c"):
+        return JSONResponse(status_code=409, content={
+            "error": "a stage is still executing — wait for it to finish (or fail) first"})
+    for rt in raw:
+        if isinstance(rt, dict) and "depends_on" not in rt:
+            rt["depends_on"] = rt.get("depends_on_idx") or []
+    new_tasks, repairs = _repair_workflow(raw, w["name"], max_raw=7)
+    if not new_tasks:
+        return JSONResponse(status_code=400, content={"error": "no valid tasks in the plan"})
+    now = time.time()
+    uid = auth.current_user_id()
+    done_ids = [t["id"] for t in db.query_all(
+        "SELECT id FROM tasks WHERE workflow_id=? AND status='done' ORDER BY created_at",
+        (wf_id,))]
+    # Archive the superseded remainder: released from claims, out of rollups/
+    # board/loop-engine, kept in the DB + project detail for audit.
+    superseded = db.query_all(
+        "SELECT id FROM tasks WHERE workflow_id=? AND status NOT IN ('done','archived')",
+        (wf_id,))
+    for t in superseded:
+        db.execute("UPDATE tasks SET status='archived', claimed_by=NULL, claimed_at=NULL, "
+                   "updated_at=? WHERE id=?", (now, t["id"]))
+        # a pending approval on superseded work must never be decidable
+        db.execute(
+            "UPDATE approvals SET status='expired', decided_at=?, decided_by='superseded by replan' "
+            "WHERE status='pending' AND payload LIKE ?", (now, f'%"task_id": "{t["id"]}"%'))
+    # Create the recovery tasks; roots inherit every DONE task as dependency so
+    # their deliverables inject as INPUT (same mechanism as normal pipelines).
+    ids: list = []
+    for t in new_tasks:
+        deps = [ids[d] for d in (t.get("depends_on_idx") or []) if d < len(ids)]
+        if not deps and done_ids:
+            deps = list(done_ids)
+        created = await create_task(TaskCreate(
+            title=t["title"], description=t["description"], status="backlog",
+            priority=t.get("priority") if t.get("priority") in (0, 1, 2, 3) else 2,
+            domain=t.get("domain"), specialist=t.get("specialist"),
+            high_stakes=bool(t.get("high_stakes")) or bool(w.get("high_stakes")),
+            budget_tokens=t.get("budget_tokens"), model=t.get("model"),
+            tags=t.get("tags") or [], workflow_id=wf_id,
+            repo_path=(w.get("project_path") if t.get("specialist") in _DEV_SPECIALISTS else None),
+            client=w.get("client"), depends_on=deps))
+        if isinstance(created, JSONResponse):
+            return created  # foreign-ref/validation error — surface it verbatim
+        ids.append(created["id"])
+    # A new plan earns fresh automatic-fix rounds.
+    cfg = None
+    try:
+        cfg = json.loads(w.get("loop_config") or "null")
+    except Exception:
+        pass
+    if isinstance(cfg, dict):
+        for trig in cfg.get("triggers") or []:
+            trig["used"] = 0
+            trig.pop("used_tasks", None)
+        db.execute("UPDATE workflows SET loop_config=? WHERE id=?", (json.dumps(cfg), wf_id))
+    rp = _parse_replan(db.query_one("SELECT replan FROM workflows WHERE id=?", (wf_id,))) or {}
+    rp.update({"status": "applied", "applied_at": now, "created_task_ids": ids,
+               "archived_task_ids": [t["id"] for t in superseded], "error": None})
+    _save_replan(wf_id, rp)
+    db.log_activity("warn", "system",
+                    f"REPLAN applied on '{w['name']}': {len(superseded)} task(s) archived, "
+                    f"{len(ids)} recovery task(s) created (loop rounds reset)", user_id=uid)
+    roll = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+    await mgr.broadcast({"type": "workflow_updated", "data": roll}, user_id=uid)
+    return {"ok": True, "workflow": roll, "created_task_ids": ids, "repairs": repairs}
+
+
+@app.post("/api/workflows/{wf_id}/replan/dismiss")
+async def replan_dismiss(wf_id: str):
+    """Close the checkpoint without acting — it will not re-flag for the SAME
+    failed task (a new failure re-arms detection)."""
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    rp = _parse_replan(w)
+    if not rp:
+        return JSONResponse(status_code=404, content={"error": "nothing to dismiss"})
+    rp["status"] = "dismissed"
+    rp["dismissed_at"] = time.time()
+    _save_replan(wf_id, rp)
+    db.log_activity("info", "system", f"Replan dismissed on '{w['name']}'",
+                    user_id=auth.current_user_id())
+    return {"ok": True}
+
+
 # ── Deliverables: every agent output in one place (v2.1) ──
 
 @app.get("/api/deliverables")
@@ -3659,6 +3935,96 @@ async def list_deliverables(limit: int = 100):
             "app": app_detected,
         })
     return {"deliverables": out}
+
+
+# ── Eval corpus (Block 3 R3, docs/SPEC-BLOCK3.md) ──
+
+@app.get("/api/evals")
+async def evals_corpus():
+    """The per-domain eval corpus (cases without their briefs)."""
+    import evals as ev
+    return {"domains": ev.list_corpus()}
+
+
+@app.post("/api/evals/run")
+async def evals_run(body: dict):
+    """Start an eval run: fixed briefs → real dispatch framing → frontier judge
+    vs the domain rubric. One run at a time; refuses during quota backoff."""
+    import evals as ev
+    domain = (body.get("domain") or "").strip()
+    cases = body.get("cases") if isinstance(body.get("cases"), list) else None
+    run_id, err = ev.start_run(domain, cases, auth.current_user_id(),
+                               body.get("notes") or "")
+    if err:
+        code = 409 if "running" in err or "backoff" in err else 400
+        return JSONResponse(status_code=code, content={"error": err})
+    return {"ok": True, "run_id": run_id}
+
+
+@app.get("/api/evals/runs")
+async def evals_runs(domain: str | None = None):
+    q = "SELECT * FROM eval_runs WHERE user_id=?"
+    params: list = [auth.current_user_id()]
+    if domain:
+        q += " AND domain=?"
+        params.append(domain)
+    q += " ORDER BY started_at DESC LIMIT 100"
+    runs = db.query_all(q, tuple(params))
+    for r in runs:
+        try:
+            r["fingerprint"] = json.loads(r.get("fingerprint") or "{}")
+        except Exception:
+            r["fingerprint"] = {}
+    return {"runs": runs}
+
+
+@app.get("/api/evals/runs/{run_id}")
+async def evals_run_detail(run_id: str):
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    try:
+        run["fingerprint"] = json.loads(run.get("fingerprint") or "{}")
+    except Exception:
+        run["fingerprint"] = {}
+    results = db.query_all("SELECT * FROM eval_results WHERE run_id=? ORDER BY id",
+                           (run_id,))
+    for r in results:
+        if r.get("judge_output"):
+            r["judge_output"] = r["judge_output"][-8000:]
+    return {"run": run, "results": results}
+
+
+@app.get("/api/evals/runs/{run_id}/file")
+async def evals_run_file(run_id: str, case: str):
+    """The generated deliverable of one eval case (ownership-gated)."""
+    run = db.query_one("SELECT id FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    row = db.query_one("SELECT deliverable_path FROM eval_results WHERE run_id=? AND case_id=?",
+                       (run_id, case))
+    p = (row or {}).get("deliverable_path")
+    if not p or not os.path.isfile(p):
+        return JSONResponse(status_code=404, content={"error": "no deliverable"})
+    import evals as ev
+    resolved = Path(p).resolve()
+    if not str(resolved).startswith(str(ev.WORKSPACES.resolve()) + os.sep):
+        return JSONResponse(status_code=403, content={"error": "path escapes eval workspace"})
+    return FileResponse(str(resolved), media_type="text/plain")
+
+
+@app.post("/api/evals/runs/{run_id}/cancel")
+async def evals_run_cancel(run_id: str):
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    if run.get("status") != "running":
+        return JSONResponse(status_code=409, content={"error": f"run is {run.get('status')}"})
+    db.execute("UPDATE eval_runs SET status='cancelling' WHERE id=?", (run_id,))
+    return {"ok": True, "status": "cancelling"}
 
 
 # ── Hermes skills: list / read / save / AI wizard (v2.1) ──

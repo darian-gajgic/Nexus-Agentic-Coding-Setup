@@ -205,8 +205,8 @@ con.execute("UPDATE tasks SET status='review', dispatch_state='completed', "
             "workspace_path=?, result_summary='stub' WHERE id=?", (str(ws_e), tE))
 con.execute("DELETE FROM approvals WHERE id LIKE 'appr-e2estub%'")  # leftovers from prior runs
 con.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
-            "risk_level, requested_at) VALUES ('appr-e2estub', 'e2e', 'deliverable', "
-            "'E2E judge probe review', ?, 'pending', 'high', 1)",
+            "risk_level, requested_at, user_id) VALUES ('appr-e2estub', 'e2e', 'deliverable', "
+            "'E2E judge probe review', ?, 'pending', 'high', 1, 'u_owner')",
             (json.dumps({"task_id": tE}),))
 con.commit(); con.close()
 
@@ -245,8 +245,8 @@ ok("deliverable versioned", (ws_e / "deliverable.v1.md").is_file(),
 con = sqlite3.connect(str(ROOT / "nexus.db"))
 con.execute("UPDATE tasks SET status='review', dispatch_state='completed' WHERE id=?", (tE,))
 con.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
-            "risk_level, requested_at) VALUES ('appr-e2estub2', 'e2e', 'deliverable', "
-            "'E2E judge probe re-review', ?, 'pending', 'high', 2)",
+            "risk_level, requested_at, user_id) VALUES ('appr-e2estub2', 'e2e', 'deliverable', "
+            "'E2E judge probe re-review', ?, 'pending', 'high', 2, 'u_owner')",
             (json.dumps({"task_id": tE}),))
 con.commit(); con.close()
 patch("/api/approvals/appr-e2estub2", json={"status": "approved", "decided_by": "e2e"})
@@ -257,8 +257,8 @@ con = sqlite3.connect(str(ROOT / "nexus.db"))
 con.execute("UPDATE tasks SET status='review', dispatch_state='completed', retry_feedback=NULL "
             "WHERE id=?", (tE,))
 con.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
-            "risk_level, requested_at) VALUES ('appr-e2estub3', 'e2e', 'deliverable', "
-            "'E2E auto-feedback probe', ?, 'pending', 'high', 3)",
+            "risk_level, requested_at, user_id) VALUES ('appr-e2estub3', 'e2e', 'deliverable', "
+            "'E2E auto-feedback probe', ?, 'pending', 'high', 3, 'u_owner')",
             (json.dumps({"task_id": tE}),))
 con.commit(); con.close()
 post(f"/api/tasks/{tE}/retry", json={})
