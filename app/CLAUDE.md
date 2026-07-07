@@ -85,6 +85,15 @@ Key points (current architecture):
 - **Runtime gate — Block 3 UI (Playwright):** `.venv/bin/python scripts/verify_block3_ui.py` —
   drives the plan editor inside the proposal modal (edit/add/revalidate without creating),
   the replan review modal, and the Specialists→Evals tab. 15 checks.
+- **Runtime gate — Block 2 (review v2/memory edit/PR):** `.venv/bin/python scripts/verify_block2_e2e.py` —
+  review JSON line numbers + Pygments highlight, comment CRUD + cross-user 404, retry
+  consumes comments, memory edit/merge/delete on seeded qdrant probes (re-embed proof,
+  tag preservation, ownership), PR flow against a scratch repo + local bare origin with
+  stubbed gh (settings pr.cmd, restored), code map in framing. 48 checks, self-cleaning.
+  Needs qdrant + ollama up (both local, always on).
+- **Runtime gate — Block 2 UI (Playwright):** `.venv/bin/python scripts/verify_block2_ui.py` —
+  review modal (gutters, highlight spans, unified⇄split toggle, line-comment composer,
+  retry-with-feedback button), memory modal confirm-gating, Create-PR button. 21 checks.
 - **Per-edit gate:** `.claude/check.sh` (auto-run by Claude Code PostToolUse on Write|Edit).
 - Playwright is installed in `.venv`. Screenshots save to `~/.hermes/cache/screenshots/`.
 

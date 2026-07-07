@@ -575,7 +575,7 @@ async function mountDashGalaxy(tries) {
     const data = await api('GET', '/api/memory3d');
     if (!document.getElementById('dashGalaxy') || currentView !== 'dashboard') return;
     if (data.nodes && data.nodes.length) {
-      window.Memory3D.mount(el, data);
+      window.Memory3D.mount(el, data, { onSelect: openMemoryNodeModal });
       const hc = document.getElementById('heroMemCount');
       if (hc) hc.textContent = `${data.count} memories`;
     } else {
@@ -1152,6 +1152,9 @@ function openTaskDetail(id) {
           ? `<button class="btn-ghost" title="Execute NOW via a real Hermes session" onclick="dispatchTaskUI('${esc(t.id)}')">▶ Dispatch</button>` : ''}
         ${['failed'].includes(t.dispatch_state) || (t.judge_verdict && t.judge_verdict !== 'SHIP' && t.judge_verdict !== 'running')
           ? `<button class="btn-ghost" title="Fresh attempt with feedback attached" onclick="retryTaskUI('${esc(t.id)}')">↻ Retry</button>` : ''}
+        ${t.repo_path && t.result_summary ? (t.pr_url
+          ? `<a class="btn-ghost" href="${esc(t.pr_url)}" target="_blank" style="text-decoration:none" title="Open the GitHub pull request">↗ View PR</a>`
+          : `<button class="btn-ghost" title="Push the task branch to origin and open a GitHub pull request (gh)" onclick="createPrUI('${esc(t.id)}')">⬆ Create PR</button>`) : ''}
         ${t.result_summary ? `<button class="btn-ghost" title="New task that reads THIS deliverable as its input" onclick="followUpTaskUI('${esc(t.id)}')">➡ Follow-up task</button>
         <button class="btn-ghost" onclick="logFeedbackUI('${esc(t.id)}','win')">🏆 Log WIN</button>
         <button class="btn-ghost" onclick="logFeedbackUI('${esc(t.id)}','lesson')">📓 Log LESSON</button>` : ''}
@@ -2016,48 +2019,156 @@ async function kiDelete(id) {
   catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
-// ═══════════════════ RESULT REVIEW (PR-style comparison, all output types) ═══════════════════
+// ═══════ RESULT REVIEW v2 (side-by-side, syntax highlight, line comments — SPEC-BLOCK2 R1) ═══════
 let _review = null;
 
 async function reviewTaskUI(taskId, title) {
   showModal(`<h2>🔍 Review changes — ${esc(title || taskId)}</h2>
     <div class="loading" style="padding:40px;text-align:center">Comparing versions…</div>`);
   try {
-    const r = await api('GET', `/api/tasks/${taskId}/review`);
-    _review = { r, taskId, sel: 0 };
-    renderReviewModal(title || taskId);
+    const [r, cr] = await Promise.all([
+      api('GET', `/api/tasks/${taskId}/review`),
+      api('GET', `/api/tasks/${taskId}/review/comments`).catch(() => ({ comments: [] })),
+    ]);
+    _review = { r, taskId, title: title || taskId, sel: 0, composing: null,
+                comments: cr.comments || [],
+                mode: localStorage.getItem('nexusReviewMode') || 'unified' };
+    renderReviewModal();
   } catch (e) {
     showModal(`<h2>🔍 Review</h2><div class="empty">${esc(e.message)}</div>
       <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
   }
 }
 
-function renderReviewModal(title) {
-  const { r } = _review;
+// `l.h` is server-generated Pygments HTML whose text content Pygments itself
+// escaped — the ONE sanctioned raw-HTML injection; everything else stays esc().
+const dlHTML = l => l.h !== undefined ? l.h : esc(l.s);
+// A comment anchors to the line's REAL file position: deletions to the old
+// side, additions and context to the new side.
+const rcAnchor = l => l.t === '-' ? { side: 'old', line: l.o } : { side: 'new', line: l.n };
+const rcOpenCount = () => (_review.comments || []).filter(c => c.status === 'open').length;
+const rcFileCount = path => (_review.comments || []).filter(c => c.status === 'open' && c.file_path === path).length;
+
+function renderReviewModal() {
+  const { r, mode, title } = _review;
   const files = r.files || [];
   const statChip = f => `<span class="review-stat"><span class="rf-add">+${f.additions}</span> <span class="rf-del">−${f.deletions}</span></span>`;
   const icon = f => f.status === 'added' ? '🟢' : f.status === 'deleted' ? '🔴' : '🟡';
+  const nOpen = rcOpenCount();
   showModal(`
     <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔍 ${esc(title)}
       <span class="chip">${esc(r.mode === 'git' ? 'git diff' : 'version comparison')}</span>
+      <span class="review-toggle" id="rvToggle">
+        <button class="${mode === 'unified' ? 'active' : ''}" onclick="setReviewMode('unified')">Unified</button>
+        <button class="${mode === 'split' ? 'active' : ''}" onclick="setReviewMode('split')">Side-by-side</button>
+      </span>
       <span class="review-stat" style="margin-left:auto"><span class="rf-add">+${r.additions || 0}</span> <span class="rf-del">−${r.deletions || 0}</span> · ${files.length} file(s)</span></h2>
-    <div class="view-intro" style="margin-bottom:10px">${esc(r.source || '')}${r.note ? ' — ' + esc(r.note) : ''}. 🟢 added · 🟡 changed · 🔴 removed — click a file to inspect it.</div>
+    <div class="view-intro" style="margin-bottom:10px">${esc(r.source || '')}${r.note ? ' — ' + esc(r.note) : ''}. 🟢 added · 🟡 changed · 🔴 removed — click a file to inspect it, hover a line and hit ＋ to comment.</div>
     ${files.length ? `
     <div class="review-layout">
       <div class="review-files">
         ${files.map((f, i) => `
-          <div class="review-file ${i === _review.sel ? 'active' : ''}" onclick="_review.sel=${i};renderReviewFilePane()" id="rf-${i}">
-            <span>${icon(f)}</span><span class="rf-path" title="${esc(f.path)}">${esc(f.path)}</span>${statChip(f)}
+          <div class="review-file ${i === _review.sel ? 'active' : ''}" onclick="_review.sel=${i};_review.composing=null;renderReviewFilePane()" id="rf-${i}">
+            <span>${icon(f)}</span><span class="rf-path" title="${esc(f.path)}">${esc(f.path)}</span>${rcFileCount(f.path) ? `<span class="chip c-accent" style="padding:1px 7px">💬${rcFileCount(f.path)}</span>` : ''}${statChip(f)}
           </div>`).join('')}
       </div>
       <div class="review-pane" id="reviewPane"></div>
     </div>` : '<div class="empty"><span class="e-ico">✓</span>No changes to review — output is identical to the previous version.</div>'}
-    <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+    <div class="modal-actions" style="justify-content:space-between;align-items:center">
+      <span class="muted" style="font-size:12px" id="rvFooterInfo">${nOpen
+        ? `💬 <b>${nOpen}</b> open comment(s) — they attach to the next retry as line-by-line feedback`
+        : 'Line comments you add here become the feedback of the next retry.'}</span>
+      <div style="display:flex;gap:10px">
+        ${nOpen ? `<button class="btn-ghost" style="border-color:var(--accent-2)" onclick="reviewRetryUI()">↻ Retry with this feedback</button>` : ''}
+        <button class="btn-primary" onclick="closeModal()">Close</button>
+      </div>
+    </div>`);
   if (files.length) renderReviewFilePane();
 }
 
+function setReviewMode(m) {
+  _review.mode = m;
+  localStorage.setItem('nexusReviewMode', m);
+  renderReviewModal();
+}
+
+function rcThreadHTML(f, l) {
+  const a = rcAnchor(l);
+  const list = (_review.comments || []).filter(c =>
+    c.file_path === f.path && c.side === a.side && c.line_no === a.line);
+  if (!list.length) return '';
+  return `<div class="rc-thread">` + list.map(c => `
+    <div class="rc-comment ${esc(c.status)}">
+      <div>${esc(c.body)}</div>
+      <div class="rc-meta">${c.status === 'open'
+      ? `<span>open — attaches to the next retry</span>
+         <button class="btn-icon" title="Edit" onclick="rcEdit('${esc(c.id)}')">✏️</button>
+         <button class="btn-icon" title="Delete" onclick="rcDelete('${esc(c.id)}')">✕</button>`
+      : `<span>✓ sent with a retry${c.consumed_at ? ' ' + fmtAgo(c.consumed_at) : ''}</span>`}</div>
+    </div>`).join('') + `</div>`;
+}
+
+function rcComposerHTML() {
+  return `<div class="rc-composer">
+    <textarea id="rcInput" rows="2" placeholder="What should change on this line?"></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn-ghost" onclick="rcCancel()">Cancel</button>
+      <button class="btn-primary" onclick="rcSave()">💬 Comment</button>
+    </div>
+  </div>`;
+}
+
+function uniLineHTML(f, hi, l, li) {
+  const composerHere = _review.composing && _review.composing.hi === hi && _review.composing.li === li;
+  return `<div class="diff-line ${l.t === '+' ? 'add' : l.t === '-' ? 'del' : ''}">
+      <span class="dl-num">${l.o ?? ''}</span><span class="dl-num">${l.n ?? ''}</span>
+      <button class="dl-cbtn" title="Comment on this line" onclick="rcCompose(${hi},${li})">＋</button>
+      <span class="diff-sign">${l.t === ' ' ? '' : esc(l.t)}</span><pre>${dlHTML(l)}</pre>
+    </div>` + rcThreadHTML(f, l) + (composerHere ? rcComposerHTML() : '');
+}
+
+function splitCellHTML(f, ent, side) {
+  if (!ent) return `<div class="split-cell empty"><span class="dl-num"></span><pre></pre></div>`;
+  const { l, hi, li } = ent;
+  const cls = l.t === '+' ? 'add' : l.t === '-' ? 'del' : '';
+  const num = side === 'old' ? (l.o ?? '') : (l.n ?? '');
+  // the ＋ affordance lives where the anchor is: old cell for deletions,
+  // new cell for additions AND context
+  const canComment = (side === 'old' && l.t === '-') || (side === 'new' && l.t !== '-');
+  return `<div class="split-cell ${cls}">
+      <span class="dl-num">${num}</span>
+      ${canComment ? `<button class="dl-cbtn" title="Comment on this line" onclick="rcCompose(${hi},${li})">＋</button>` : ''}
+      <pre>${dlHTML(l)}</pre>
+    </div>`;
+}
+
+function splitHunkHTML(f, h, hi) {
+  const lines = (h.lines || []).map((l, li) => ({ l, hi, li }));
+  const rows = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].l.t === ' ') { rows.push([lines[i], lines[i]]); i++; continue; }
+    const dels = [], adds = [];
+    while (i < lines.length && lines[i].l.t === '-') dels.push(lines[i++]);
+    while (i < lines.length && lines[i].l.t === '+') adds.push(lines[i++]);
+    if (!dels.length && !adds.length) { i++; continue; }
+    for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
+      rows.push([dels[k] || null, adds[k] || null]);
+    }
+  }
+  return `<div class="diff-hunk"><div class="diff-hunk-head">${esc(h.header)}</div>` +
+    rows.map(([L, R]) => {
+      let out = `<div class="split-row">${splitCellHTML(f, L, 'old')}${splitCellHTML(f, R, 'new')}</div>`;
+      if (L) out += rcThreadHTML(f, L.l);
+      if (R && R !== L) out += rcThreadHTML(f, R.l);
+      const c = _review.composing;
+      if (c && c.hi === hi && ((L && L.li === c.li) || (R && R.li === c.li))) out += rcComposerHTML();
+      return out;
+    }).join('') + `</div>`;
+}
+
 function renderReviewFilePane() {
-  const { r, sel } = _review;
+  const { r, sel, mode } = _review;
   const f = (r.files || [])[sel];
   const pane = document.getElementById('reviewPane');
   if (!f || !pane) return;
@@ -2074,18 +2185,86 @@ function renderReviewFilePane() {
     html += `<div class="empty" style="padding:20px">Binary file — ${f.status}${f.old_size != null ? `, ${(f.old_size / 1024).toFixed(0)} KB` : ''}${f.new_size != null ? ` → ${(f.new_size / 1024).toFixed(0)} KB` : ''}</div>`;
   } else if (!(f.hunks || []).length) {
     html += `<div class="empty" style="padding:20px">${f.status === 'added' ? 'New file (preview it under the task\'s Files section).' : 'No line-level comparison available.'}</div>`;
+  } else if (mode === 'split') {
+    html += (f.hunks || []).map((h, hi) => splitHunkHTML(f, h, hi)).join('');
   } else {
-    html += (f.hunks || []).map(h => `
+    html += (f.hunks || []).map((h, hi) => `
       <div class="diff-hunk">
         <div class="diff-hunk-head">${esc(h.header)}</div>
-        ${(h.lines || []).map(l => `
-          <div class="diff-line ${l.t === '+' ? 'add' : l.t === '-' ? 'del' : ''}">
-            <span class="diff-sign">${l.t === ' ' ? '' : esc(l.t)}</span><pre>${esc(l.s)}</pre>
-          </div>`).join('')}
+        ${(h.lines || []).map((l, li) => uniLineHTML(f, hi, l, li)).join('')}
       </div>`).join('');
   }
+  const keepScroll = pane.scrollTop;
   pane.innerHTML = html;
-  pane.scrollTop = 0;
+  pane.scrollTop = _review.composing ? keepScroll : 0;
+  const inp = document.getElementById('rcInput');
+  if (inp) inp.focus();
+}
+
+function rcCompose(hi, li) {
+  _review.composing = { hi, li };
+  renderReviewFilePane();
+}
+
+function rcCancel() {
+  _review.composing = null;
+  renderReviewFilePane();
+}
+
+async function rcSave() {
+  const { r, sel, taskId, composing } = _review;
+  if (!composing) return;
+  const f = r.files[sel];
+  const l = f.hunks[composing.hi].lines[composing.li];
+  const a = rcAnchor(l);
+  const body = (document.getElementById('rcInput')?.value || '').trim();
+  if (!body) { toast('Write the comment first', 'err'); return; }
+  try {
+    await api('POST', `/api/tasks/${taskId}/review/comments`,
+      { file_path: f.path, side: a.side, line_no: a.line, line_text: l.s, body });
+    _review.composing = null;
+    await rcReload();
+  } catch (e) { toast('Comment failed: ' + e.message, 'err'); }
+}
+
+async function rcReload() {
+  try {
+    const cr = await api('GET', `/api/tasks/${_review.taskId}/review/comments`);
+    _review.comments = cr.comments || [];
+  } catch { /* keep the stale list */ }
+  renderReviewModal();
+}
+
+async function rcEdit(id) {
+  const c = (_review.comments || []).find(x => x.id === id);
+  if (!c) return;
+  const nb = prompt('Edit comment:', c.body);
+  if (nb == null || !nb.trim()) return;
+  try {
+    await api('PATCH', `/api/tasks/${_review.taskId}/review/comments/${id}`, { body: nb.trim() });
+    await rcReload();
+  } catch (e) { toast('Edit failed: ' + e.message, 'err'); }
+}
+
+async function rcDelete(id) {
+  if (!confirm('Delete this comment?')) return;
+  try {
+    await api('DELETE', `/api/tasks/${_review.taskId}/review/comments/${id}`);
+    await rcReload();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+async function reviewRetryUI() {
+  const n = rcOpenCount();
+  if (!confirm(`Re-run this task with your ${n} line comment(s) attached as feedback? The current deliverable is versioned, not destroyed.`)) return;
+  try {
+    await api('POST', `/api/tasks/${_review.taskId}/retry`, { feedback: null });
+    toast('Task queued for retry — your line comments are attached', 'ok');
+    closeModal();
+    state.tasks = await api('GET', '/api/tasks');
+    await loadAgenticData(); // the superseded approval row disappears
+    render();
+  } catch (e) { toast('Retry failed: ' + e.message, 'err'); }
 }
 
 async function reviewWorkflowUI(wfId, name) {
@@ -2517,7 +2696,7 @@ function followUpTaskUI(id) {
 }
 
 async function retryTaskUI(id) {
-  const note = prompt('Feedback for the retry — what must be different? (optional: leave EMPTY to automatically attach the frontier judge’s findings)');
+  const note = prompt('Feedback for the retry — what must be different? (optional: leave EMPTY to automatically attach the frontier judge’s findings; open review line-comments ride along either way)');
   if (note === null) return; // cancelled — nothing happens
   try {
     await api('POST', `/api/tasks/${id}/retry`, { feedback: note.trim() || null });
@@ -2527,6 +2706,18 @@ async function retryTaskUI(id) {
     await loadAgenticData(); // the superseded approval row disappears
     render();
   } catch (e) { toast('Retry failed: ' + e.message, 'err'); }
+}
+
+async function createPrUI(id) {
+  if (!confirm('Push this task\'s branch to origin and open a GitHub pull request? (SPEC-BLOCK2 R3 — the branch leaves your machine.)')) return;
+  toast('Creating PR — pushing the branch…');
+  try {
+    const r = await api('POST', `/api/tasks/${id}/pr`);
+    toast(r.existing ? 'A PR already existed for this branch — reusing it' : 'PR created', 'ok');
+    if (r.url) window.open(r.url, '_blank');
+    state.tasks = await api('GET', '/api/tasks');
+    openTaskDetail(id);
+  } catch (e) { toast('PR failed: ' + e.message, 'err'); }
 }
 
 async function logFeedbackUI(id, kind) {
@@ -4173,7 +4364,10 @@ function memSemanticHTML() {
       <div class="mc-badges">
         ${memBadge('agent', m.agent_id, '#b3a1ff')}${memBadge('user', m.user_id, '#60a5fa')}${memBadge('channel', m.channel, '#4ade80')}${memBadge('from', m.attributed_to, '#fb923c')}
       </div>
-      <div class="mc-meta">${esc((m.updated_at || m.created_at || '').replace('T', ' ').slice(0, 19))} · vector ${m.vector_dims || '?'}-dim · id ${esc((m.id || '').slice(0, 8))}</div>
+      <div class="mc-meta" style="display:flex;align-items:center;gap:8px">
+        <span style="flex:1">${esc((m.updated_at || m.created_at || '').replace('T', ' ').slice(0, 19))} · vector ${m.vector_dims || '?'}-dim · id ${esc((m.id || '').slice(0, 8))}</span>
+        <button class="btn-icon" title="Edit / merge / delete" onclick="memCardEdit('${esc(String(m.id))}')">✏️</button>
+      </div>
     </div>`).join('') || `<div class="empty"><span class="e-ico">◍</span>No semantic memories${q ? ` matching "${esc(memoryState.search)}"` : ' yet — they accumulate as you work with Hermes'}.</div>`;
   return `
     <div class="stats-strip">
@@ -4298,7 +4492,7 @@ async function loadAgentMemoryTab() {
 function mem3dHTML() {
   return `
     <div style="display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap">
-      <div class="view-intro" style="flex:1;min-width:320px;margin:0">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space. The floating labels are <strong>semantic regions</strong> — named by their own most distinctive words, computed, not written by anyone. <strong>Drag</strong> orbit · <strong>scroll</strong> zoom · <strong>hover</strong> for the record.</div>
+      <div class="view-intro" style="flex:1;min-width:320px;margin:0">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space. The floating labels are <strong>semantic regions</strong> — named by their own most distinctive words, computed, not written by anyone. <strong>Drag</strong> orbit · <strong>scroll</strong> zoom · <strong>hover</strong> for the record · <strong>click</strong> a star to edit, merge or delete it.</div>
       <input class="form-input" id="mem3dSearch" placeholder="🔍 light up memories about…" style="width:250px">
       <span id="mem3dStats" style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);white-space:nowrap"></span>
     </div>
@@ -4318,7 +4512,7 @@ async function mountMem3d() {
       return;
     }
     stage.innerHTML = '';
-    if (window.Memory3D) window.Memory3D.mount(stage, data);
+    if (window.Memory3D) window.Memory3D.mount(stage, data, { onSelect: openMemoryNodeModal });
     const stats = document.getElementById('mem3dStats');
     if (stats) stats.textContent =
       `${data.count} memories · ${data.links.length} associations · ${(data.clusters || []).length} regions · 768-D live`;
@@ -4367,6 +4561,156 @@ function bindMemory() {
   document.querySelectorAll('.shared-del').forEach(el => {
     el.onclick = () => deleteSharedContext(el.getAttribute('data-id'));
   });
+}
+
+// ═══════ Galaxy memory editing (SPEC-BLOCK2 R2): edit / merge / delete, confirm-gated ═══════
+let _memMerge = null;
+
+function memCardEdit(id) {
+  const m = ((memoryState.data || {}).memories || []).find(x => String(x.id) === String(id));
+  if (m) openMemoryNodeModal(m);
+}
+
+function openMemoryNodeModal(node) {
+  // accepts BOTH shapes: a galaxy node ({id,text,agent,user,...}) and a
+  // semantic-list row ({id,memory,agent_id,metadata:{user},...})
+  const m = {
+    id: String(node.id),
+    text: node.text ?? node.memory ?? '',
+    agent: node.agent ?? node.agent_id,
+    user: node.user ?? ((node.metadata || {}).user),
+    channel: node.channel,
+    created_at: node.created_at,
+  };
+  showModal(`
+    <h2>🧠 Memory</h2>
+    <div class="view-intro">Saving re-embeds the text — the star moves to where its new meaning lives. ${m.user ? '' : '<b>This is a SHARED memory</b> — every user reads it; only admins can change it.'}</div>
+    <div class="form-group"><label class="form-label">Text</label>
+      <textarea class="form-input" id="memEditText" rows="6" style="font-size:13px;line-height:1.5">${esc(m.text)}</textarea></div>
+    <div class="mc-badges" style="margin-bottom:8px">
+      ${memBadge('agent', m.agent, '#b3a1ff')}${memBadge('user tag', m.user || 'shared', '#60a5fa')}${memBadge('channel', m.channel, '#4ade80')}
+    </div>
+    <div class="mc-meta">id ${esc(m.id)} · stored ${esc(String(m.created_at || '?').replace('T', ' ').slice(0, 19))}</div>
+    <div class="modal-actions" style="justify-content:space-between">
+      <button class="btn-sm danger" onclick="memDeleteUI('${esc(m.id)}')">🗑 Delete</button>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn-ghost" onclick="memMergeUI('${esc(m.id)}')">⧉ Merge with…</button>
+        <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+        <button class="btn-primary" onclick="memSaveUI('${esc(m.id)}')">💾 Save changes</button>
+      </div>
+    </div>`);
+}
+
+async function memSaveUI(id) {
+  const text = (document.getElementById('memEditText')?.value || '').trim();
+  if (!text) { toast('The text cannot be empty — use Delete to remove a memory', 'err'); return; }
+  if (!confirm('Rewrite this memory? It is re-embedded and recalled in its new form from now on.')) return;
+  try {
+    await api('PATCH', `/api/memory/${encodeURIComponent(id)}`, { text });
+    toast('Memory updated', 'ok');
+    closeModal();
+    memAfterChange();
+  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
+}
+
+async function memDeleteUI(id) {
+  if (!confirm('Delete this memory permanently? Agents stop recalling it immediately.')) return;
+  try {
+    await api('DELETE', `/api/memory/${encodeURIComponent(id)}`);
+    toast('Memory deleted', 'ok');
+    closeModal();
+    memAfterChange();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+async function memMergeUI(id) {
+  let d;
+  try { d = await api('GET', '/api/memory'); }
+  catch (e) { toast('Could not load memories: ' + e.message, 'err'); return; }
+  const all = d.memories || [];
+  const src = all.find(m => String(m.id) === String(id));
+  if (!src) { toast('Source memory not found', 'err'); return; }
+  _memMerge = { id: String(id), src, all: all.filter(m => String(m.id) !== String(id)), sel: new Set(), q: '' };
+  renderMemMerge();
+}
+
+function memMergeListHTML() {
+  const { all, sel, q } = _memMerge;
+  return all
+    .filter(m => !q || (m.memory || '').toLowerCase().includes(q))
+    .slice(0, 80)
+    .map(m => `
+      <label class="mem-merge-row">
+        <input type="checkbox" ${sel.has(String(m.id)) ? 'checked' : ''} onchange="memMergeToggle('${esc(String(m.id))}')">
+        <span>${esc((m.memory || '').slice(0, 180))}</span>
+      </label>`).join('') || '<div class="empty">Nothing matches.</div>';
+}
+
+function renderMemMerge() {
+  const { src, sel } = _memMerge;
+  showModal(`
+    <h2>⧉ Merge memories</h2>
+    <div class="view-intro">Fold duplicates or fragments into ONE memory. You edit the merged text before anything is written — the sources are deleted only AFTER the merged memory is stored.</div>
+    <div class="mem-card" style="margin-bottom:8px"><b style="font-size:11px;color:var(--text-dim)">MERGING INTO THIS:</b><div>${esc((src.memory || '').slice(0, 240))}</div></div>
+    <div class="search-bar"><input type="search" id="memMergeSearch" placeholder="Filter memories…" value="${esc(_memMerge.q)}"></div>
+    <div class="mem-merge-list" id="memMergeList">${memMergeListHTML()}</div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="memMergeGo" onclick="memMergePreview()" ${sel.size ? '' : 'disabled'}>Preview merged text (${sel.size + 1})</button>
+    </div>`);
+  const s = document.getElementById('memMergeSearch');
+  if (s) s.oninput = () => {
+    _memMerge.q = s.value.toLowerCase();
+    const list = document.getElementById('memMergeList');
+    if (list) list.innerHTML = memMergeListHTML();
+  };
+}
+
+function memMergeToggle(id) {
+  const s = _memMerge.sel;
+  s.has(id) ? s.delete(id) : s.add(id);
+  const b = document.getElementById('memMergeGo');
+  if (b) { b.disabled = !s.size; b.textContent = `Preview merged text (${s.size + 1})`; }
+}
+
+function memMergePreview() {
+  const { src, all, sel } = _memMerge;
+  if (!sel.size) return;
+  if (sel.size + 1 > 8) { toast('Merge at most 8 memories at once', 'err'); return; }
+  const chosen = all.filter(m => sel.has(String(m.id)));
+  const text = [src, ...chosen].map(m => (m.memory || '').trim()).filter(Boolean).join('\n');
+  showModal(`
+    <h2>⧉ Merge ${chosen.length + 1} memories into one</h2>
+    <div class="view-intro">This text becomes ONE new memory (re-embedded); the ${chosen.length + 1} sources are then deleted. Edit it into a single clean statement — the system never invents content for you.</div>
+    <textarea class="form-input" id="memMergeText" rows="9" style="font-size:13px;line-height:1.5">${esc(text)}</textarea>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="renderMemMerge()">← Back to selection</button>
+      <button class="btn-primary" onclick="memMergeConfirm()">✓ Merge & delete ${chosen.length + 1} sources</button>
+    </div>`);
+}
+
+async function memMergeConfirm() {
+  const ids = [_memMerge.id, ..._memMerge.sel];
+  const text = (document.getElementById('memMergeText')?.value || '').trim();
+  if (!text) { toast('The merged text cannot be empty', 'err'); return; }
+  if (!confirm(`Merge ${ids.length} memories into one and DELETE the sources? This cannot be undone.`)) return;
+  try {
+    const r = await api('POST', '/api/memory/merge', { ids, text });
+    toast((r.failed || []).length
+      ? `Merged, but ${r.failed.length} source(s) could not be deleted — check the memory list`
+      : `Merged ${ids.length} memories into one`, (r.failed || []).length ? 'err' : 'ok');
+    closeModal();
+    memAfterChange();
+  } catch (e) { toast('Merge failed: ' + e.message, 'err'); }
+}
+
+function memAfterChange() {
+  memoryState.fetched = false;
+  if (currentView === 'memory') {
+    loadMemory(); // re-renders the active subtab; map3d remounts via bindMemory
+  } else if (currentView === 'dashboard') {
+    mountDashGalaxy(0); // the server cleared its galaxy cache — refetch
+  }
 }
 
 // ═══════════════════════════════ OBSERVABILITY ═══════════════════════════════

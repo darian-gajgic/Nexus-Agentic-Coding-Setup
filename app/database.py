@@ -253,10 +253,29 @@ def init_db():
         ("repo_path", "TEXT"),
         ("client", "TEXT"),
         ("user_id", "TEXT"),
+        ("pr_url", "TEXT"),
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
+
+    # Review v2 (docs/SPEC-BLOCK2.md R1.4): per-line comments on a task's
+    # change review. status: open (feeds the NEXT retry) | consumed (attached
+    # to a retry — kept for audit). Fail-closed per user like approvals.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS review_comments (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        side TEXT NOT NULL DEFAULT 'new',
+        line_no INTEGER,
+        line_text TEXT DEFAULT '',
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        consumed_at REAL,
+        created_at REAL
+    )""")
 
     # Migrate workflows columns (looping v3.2)
     existing_wf_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)").fetchall()}
