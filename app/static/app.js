@@ -3192,10 +3192,11 @@ function showTaskModal(status) {
     try {
       const repos = (await api('GET', '/api/projects')).projects || [];
       const rsel = $('#m-task-repo');
-      if (rsel && focusCtx.project) setTimeout(() => { rsel.value = focusCtx.project.path; }, 60);
       if (rsel && repos.length) {
         rsel.innerHTML = `<option value="">— None: fresh workspace (default) —</option>` +
-          repos.map(r => `<option value="${esc(r.path)}">${esc(r.name)}</option>`).join('');
+          repos.map(r => `<option value="${esc(r.path)}">${r.client ? '🏢 ' + esc(r.client) + ' / ' : (r.personal ? '🏠 ' : '')}${esc(r.name)}</option>`).join('');
+        // preselect AFTER the options exist — a timer here raced the fetch
+        if (focusCtx.project) rsel.value = focusCtx.project.path;
       }
     } catch { /* optional */ }
     try {
