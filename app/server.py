@@ -128,6 +128,7 @@ class TaskCreate(BaseModel):
     depends_on: Optional[list[str]] = None
     loop_config: Optional[dict] = None
     repo_path: Optional[str] = None
+    client: Optional[str] = None
 
 
 class TaskUpdate(BaseModel):
@@ -145,6 +146,7 @@ class TaskUpdate(BaseModel):
     depends_on: Optional[list[str]] = None
     loop_config: Optional[dict] = None
     repo_path: Optional[str] = None
+    client: Optional[str] = None
 
 
 class ProgramCreate(BaseModel):
@@ -233,14 +235,14 @@ async def create_task(body: TaskCreate):
     now = time.time()
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
-         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tid, body.title, body.description, body.status, body.priority,
          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
          body.domain, body.specialist, 1 if body.high_stakes else 0, body.budget_tokens, body.model,
          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
          json.dumps(body.loop_config) if body.loop_config else None,
-         (body.repo_path or None)))
+         (body.repo_path or None), ((body.client or '').strip().lower() or None)))
     db.log_activity("info", "system", f"Task created: '{body.title}'")
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     await mgr.broadcast({"type": "task_created", "data": task})
@@ -283,6 +285,8 @@ async def update_task(task_id: str, body: TaskUpdate):
         updates["depends_on"] = json.dumps(deps) if deps else None
     if body.loop_config is not None:
         updates["loop_config"] = json.dumps(body.loop_config) if body.loop_config else None
+    if body.client is not None:
+        updates["client"] = (body.client or "").strip().lower() or None
     if body.repo_path is not None:
         rp = (body.repo_path or "").strip()
         if rp:
@@ -3106,11 +3110,12 @@ async def create_workflow(body: dict):
     wid = f"wf-{uuid.uuid4().hex[:8]}"
     now = time.time()
     lc = body.get("loop_config")
-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes) "
-               "VALUES (?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?)",
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
                 json.dumps(lc) if isinstance(lc, dict) else None,
-                1 if body.get("high_stakes") else 0))
+                1 if body.get("high_stakes") else 0,
+                ((body.get("client") or "").strip().lower() or None)))
     db.log_activity("info", "system", f"Workflow created: '{name}'")
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     await mgr.broadcast({"type": "workflow_created", "data": w})
@@ -3154,6 +3159,14 @@ async def update_workflow(wf_id: str, body: dict):
         lc = body["loop_config"]
         db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
                    (json.dumps(lc) if isinstance(lc, dict) else None, time.time(), wf_id))
+    if "client" in body:
+        cl = (body.get("client") or "").strip().lower() or None
+        db.execute("UPDATE workflows SET client=?, updated_at=? WHERE id=?",
+                   (cl, time.time(), wf_id))
+        # client scope applies to every member task — their sessions carry it
+        db.execute("UPDATE tasks SET client=? WHERE workflow_id=?", (cl, wf_id))
+        db.log_activity("info", "system",
+                        f"Workflow {wf_id}: client scope set to {cl or '(none)'} on all member tasks")
     if "high_stakes" in body:
         hs = 1 if body["high_stakes"] else 0
         db.execute("UPDATE workflows SET high_stakes=?, updated_at=? WHERE id=?",
@@ -3546,6 +3559,7 @@ async def memory3d(force: bool = False):
                 "user": pl.get("user_id") or "",
                 "channel": pl.get("channel") or "",
                 "by": pl.get("attributed_to") or "",
+                "client": pl.get("client") or "",
                 "created_at": pl.get("created_at") or "",
                 "degree": degree.get(i, 0),
             })
@@ -3611,8 +3625,13 @@ async def memory3d(force: bool = False):
             label_by_cluster = {c["id"]: c["label"].split(" · ")[0] for c in clusters}
             raw_groups: dict = {}
             for i, node in enumerate(nodes):
-                aid = (node.get("agent") or "unknown").lower()
-                raw_groups.setdefault(aid, []).append(i)
+                # client scope outranks agent identity: each client's memory
+                # is its own visible region of the mind
+                if node.get("client"):
+                    key = f"client: {node['client']}"
+                else:
+                    key = (node.get("agent") or "unknown").lower()
+                raw_groups.setdefault(key, []).append(i)
             final: dict = {}
             half = len(nodes) / 2
             for aid, idxs in raw_groups.items():

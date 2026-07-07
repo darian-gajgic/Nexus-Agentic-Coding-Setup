@@ -61,6 +61,73 @@ declare done, the user runs it and it's broken, and you waste N iterations "fixi
 the sanitized test never could have caught the bug. See `references/browser-media-playback.md`
 for the concrete autoplay-policy case.
 
+### Gate ordering: build and dev server share the build cache (Next.js, and similar)
+
+Most JS-framework dev servers (`next dev`, `vite`, `nuxt`) and their production build commands
+(`next build`, `vite build`) write to the **same** build-output directory (`.next`, `.vite`, etc.).
+Running the build command while a dev server is live is a silent corruption: the build wipes and
+regenerates the on-disk chunks while the dev server still holds the old chunks in memory. The dev
+server then serves stale references to chunks that no longer exist on disk, and EVERY route starts
+returning HTTP 500 with a webpack error like `Cannot find module './276.js'` in the runtime. The
+code is fine; the verification harness has poisoned itself.
+
+Symptom signature (how to tell this from a real code bug):
+- Routes were 200 a moment ago, then went 500 **immediately after** a `next build` step, with no
+  code change in between.
+- The 500's response JSON contains `Cannot find module './NNN.js'` pointing at the build-output
+  webpack runtime — a missing-chunk error, not an application error.
+- The **build itself exited 0** and the unit tests passed. Only the routes served by the dev
+  server are broken.
+- Restarting the dev server (or clearing `.next` and restarting) restores 200s.
+
+The fix is gate **ordering**, not more debugging. When a verification run needs both a dev server
+(for e2e) and a production build:
+
+1. Clear the build cache once (`node` script that recursively `unlinkSync`/`rmdirSync` the `.next`
+   dir — `rm -rf` and `node -e` are often blocked by shell security scanners; a small script file
+   works).
+2. Run unit tests (they don't touch the build cache).
+3. Start the dev server, run the e2e tests against it.
+4. **Kill the dev server and wait for the port to free** before the next step.
+5. Run the production build — it now owns the build-output dir exclusively.
+
+Equivalently: never run `next build` while `next dev` is running on the same project. If you need
+both in one verification script, sequence them dev-then-build (or build-then-dev) with a clean
+kill in between. (Hit 2026-07-07, webshop fix-up: a verification script ran `next build` as Gate 3
+while the Gate-2 dev server was still live on :3001; the build succeeded but every route then
+returned 500, and the e2e re-run "failed" — two iterations spent debugging a harness self-poisoning
+before the sequencing was corrected. The fixes under test were correct all along; the build's route
+table — which showed `/cart` present and `/checkout/cart` gone — was the trustworthy signal that got
+ignored in favor of the corrupted dev server's 500s.)
+
+### Playwright fill+blur fires before React commits state (stale-handler reads)
+
+When a React input's filter/onBlur handler closes over component state (the common pattern:
+`<input onChange={e => setMaxPrice(e.target.value)} onBlur={applyFilters} />` where `applyFilters`
+reads `maxPrice` from state), Playwright's `fill('400')` followed immediately by `blur()` fires the
+`onChange` and `onBlur` in the same microtask. React has not yet re-rendered with the new state, so
+the `onBlur` handler reads the **stale, pre-typing** state value — the filter appears not to apply
+(zero API requests captured, the full unfiltered list stays visible). This is NOT a bug in the
+production code; it is a test-harness timing artifact.
+
+Symptom signature:
+- The test types into a field and triggers the handler, but **zero network requests** fire (inspect
+  with `page.on('request', ...)`).
+- A human typing the same value and clicking away (a slower, real-gesture cadence) sees the filter
+  work correctly.
+- Adding a `waitForTimeout(200-300)` between `fill()` and `blur()` makes the test pass — confirming
+  the race.
+
+Fix: after `fill()`, wait a tick for React to commit the state update BEFORE firing `blur()` (or
+whatever triggers the stale-closure handler). Prefer a small `waitForTimeout` over
+`waitForFunction` on the state, because React state isn't directly observable from the page — the
+reliable signal is the request the handler fires, which you assert on next. Encapsulate this in a
+helper (`setPriceFilter(testid, value)` = `fill` → `waitForTimeout(250)` → `blur` → wait for
+loading-state to detach) so every field interaction in the suite gets it for free. (Hit
+2026-07-07, webshop HIGH-1 regression: the price-filter e2e test `fill('400')`+`blur()` captured
+zero requests and showed all 18 products; a 250ms wait before blur fixed it, and the test then
+correctly discriminated the fixed code from the buggy code.)
+
 ## What to assert
 
 - A user action produces the expected DOM change (not just a fetch fired).

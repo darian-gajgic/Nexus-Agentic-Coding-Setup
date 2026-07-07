@@ -230,6 +230,7 @@ def init_db():
         ("depends_on", "TEXT"),
         ("loop_config", "TEXT"),
         ("repo_path", "TEXT"),
+        ("client", "TEXT"),
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -241,6 +242,8 @@ def init_db():
         conn.execute("ALTER TABLE workflows ADD COLUMN loop_config TEXT")
     if "high_stakes" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN high_stakes INTEGER DEFAULT 0")
+    if "client" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN client TEXT")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (

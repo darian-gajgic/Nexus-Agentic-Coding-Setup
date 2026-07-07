@@ -1204,6 +1204,8 @@ function viewManual() {
     <h2>🧠 Memory</h2>
     <div class="m-sub">The galaxy is real data, not art</div>
     <p>Everything your AI remembers is a point in a 768-dimensional "meaning space". The galaxy (Dashboard, and Memory → 3D Map) projects those true positions into 3D: <b>distance = similarity of meaning</b>. Regions get their colors and names from the memories themselves. Search any topic and the matching stars flare while everything else fades. Hover a star to read the memory and its strongest associations.</p>
+    <h4>Client memory isolation</h4>
+    <p>Projects and tasks can carry a <b>client</b> tag. Everything agents learn while working for that client is stored in the client's own private scope: sessions for other clients — and your personal chats — can never retrieve it. Each client appears as its own color group in the galaxy. Generalized craft lessons (with client names stripped, human-reviewed) still improve your specialists globally, so quality compounds across clients without data crossing between them. Ending a contract? One command deletes everything in that client's scope.</p>
   </div>
 
   <div class="manual-sec" id="m-money">
@@ -1355,6 +1357,7 @@ Object.assign(TOURS, {
     { sel: '.modal-content h2, .modal-content', title: 'The proposed plan', body: 'The AI turned your description into stages. Each row is one task; arrows show what feeds what. Locked rows are quality gates (review, verification) — they exist so mistakes get caught before they reach you.' },
     { sel: '.modal-content input[type="checkbox"]', title: 'Trim it', body: 'Untick optional stages you don\'t want — dependents automatically reconnect around removed ones. Assumptions the AI made are listed; if one is wrong, cancel and rephrase your description.' },
     { sel: '#wf-repo', title: '🧬 Your code repository', body: 'For coding projects: pick a repo here and every coding stage works INSIDE it on an isolated branch — following the repo\'s house rules and tests — instead of building from scratch. You review the diff and merge it yourself.' },
+    { sel: '#wf-client', title: '🏢 Client scope', body: 'Working for a client? Type their name and everything agents learn in this project goes into that client\'s private memory — invisible to other clients and to your personal chats. Generalized craft lessons still improve your specialists globally.' },
     { sel: '#wf-highstakes', title: '⚖ High stakes', body: 'Check this and every task of the project becomes eligible for the frontier judge — a stronger AI grading each deliverable against your quality rubric. Combined with a quality loop, judging happens automatically per version.' },
     { sel: '#wf-loop', title: '🔁 The improvement loop', body: 'On = failed checks and judge verdicts automatically send work back with the findings attached, then re-check. Quality mode allows more rounds and arms the auto-judge; speed mode keeps rounds minimal.' },
     { sel: '.modal-actions .btn-primary', title: 'Approve', body: 'Creates all tasks with their dependencies. Stages start on their own as their inputs become ready — watch progress on the board or the project page.' },
@@ -5572,6 +5575,15 @@ async function setWorkflowHighStakes(id, on) {
   } catch (e) { toast('Update failed: ' + e.message, 'err'); }
 }
 
+async function setWorkflowClient(id) {
+  const v = ($('#wfd-client') ? $('#wfd-client').value : '').trim().toLowerCase();
+  try {
+    await api('PATCH', `/api/workflows/${id}`, { client: v || null });
+    state.tasks = await api('GET', '/api/tasks');
+    toast(v ? `Client scope '${v}' applied to all tasks of this project` : 'Client scope removed', 'ok');
+  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
+}
+
 async function openWorkflowDetail(id) {
   let w;
   try { w = await api('GET', `/api/workflows/${id}`); }
@@ -5611,6 +5623,14 @@ async function openWorkflowDetail(id) {
         ⚖ High-stakes project
       </label>
       <div class="form-hint">Applies to ALL tasks of this project: every deliverable becomes eligible for the frontier judge. It runs automatically only when the loop is on quality + closed; otherwise it stays the manual judge button.</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">🏢 Client scope (memory isolation)</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input class="form-input" id="wfd-client" value="${esc(w.client || '')}" placeholder="none — internal project" style="max-width:260px">
+        <button class="btn-sm" onclick="setWorkflowClient('${esc(w.id)}')">Set</button>
+      </div>
+      <div class="form-hint">Applies to all tasks: their sessions read/write this client's private memory scope. Other clients and personal chats never see it.</div>
     </div>
     <div class="modal-actions" style="justify-content:space-between">
       <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
@@ -5905,6 +5925,11 @@ function proposeWorkflowModal(wf, meta) {
       <div class="form-hint">Pick a repo and every coding stage works INSIDE it: isolated branch, the repo's own conventions and tests, and a reviewable diff as the deliverable. Your checkout is never touched.</div>
     </div>` : ''}
     <div class="form-group" style="margin-top:8px">
+      <label class="form-label">🏢 Client (optional — isolates this project's memory)</label>
+      <input class="form-input" id="wf-client" placeholder="e.g. acme — leave empty for internal work" style="max-width:340px">
+      <div class="form-hint">With a client set, everything agents learn here is stored in that client's private memory scope: other clients' sessions (and your personal chats) can never see it. Generalized craft lessons still reach your specialists via the reviewed-lessons pipeline.</div>
+    </div>
+    <div class="form-group" style="margin-top:8px">
       <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-highstakes" ${tasks.some(t => t.high_stakes) ? 'checked' : ''}>
         ⚖ High-stakes project</label>
       <div class="form-hint">Marks every task as high-stakes: each deliverable becomes eligible for the frontier judge (a stronger AI grading against your quality rubric). The judge only runs automatically when the loop below is on quality + closed — otherwise it stays a button.</div>
@@ -5959,6 +5984,7 @@ function proposeWorkflowModal(wf, meta) {
       return out;
     };
     const projHigh = !!($('#wf-highstakes') && $('#wf-highstakes').checked);
+    const projClient = $('#wf-client') ? ($('#wf-client').value.trim().toLowerCase() || null) : null;
     const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
     const DEV_SPECIALISTS = new Set(['code-implementer', 'tech-lead-orchestrator',
       'code-reviewer', 'acceptance-verifier', 'debugger']);
@@ -5979,7 +6005,7 @@ function proposeWorkflowModal(wf, meta) {
     try {
       const w = await api('POST', '/api/workflows',
         { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop,
-          high_stakes: projHigh });
+          high_stakes: projHigh, client: projClient });
       const ids = [];
       for (let i = 0; i < tasks.length; i++) {
         const t = tasks[i];
@@ -5993,6 +6019,7 @@ function proposeWorkflowModal(wf, meta) {
           // repo-native: coding stages work inside the chosen repo (they
           // share one branch, so review/fix/verify see each other's work)
           repo_path: repo && DEV_SPECIALISTS.has(t.specialist) ? repo : null,
+          client: projClient,
           depends_on: [...eff(i, new Set())].sort((a, b2) => a - b2).map(x => ids[x]).filter(Boolean),
         });
         ids.push(created.id);

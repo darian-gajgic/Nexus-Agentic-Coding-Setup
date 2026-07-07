@@ -1,4 +1,4 @@
 source: ~/.hermes + ~/hermes-guardian + systemd user units (local)
 agents: 18 active + 28 archived
 skills: 15 (custom or modified-vs-upstream only)
-exported-at: 2026-07-07T03:08:01+02:00
+exported-at: 2026-07-07T15:30:44+02:00
