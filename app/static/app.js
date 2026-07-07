@@ -363,7 +363,7 @@ const VIEW_META = {
   monitor: ['System Monitor', 'Live host telemetry'],
   tools: ['Tools Hub', 'Connected tools & integration health'],
   programs: ['Programs', 'Registered workloads'],
-  projects: ['Projects', 'Code projects on this machine'],
+  projects: ['Repositories', 'Your code repositories — infra and client projects, with backup & delivery workflow'],
   guardian: ['Guardian', 'Change protection & automatic drift repair'],
   usage: ['Usage & Cost', 'Token consumption & estimated spend'],
   observability: ['LLM Observability', 'Traces, tokens & cost via Langfuse'],
@@ -1185,6 +1185,7 @@ function viewManual() {
   <div class="manual-sec" id="m-coding">
     <h2>🧬 Coding on your own repositories</h2>
     <div class="m-sub">Repo-native tasks: the diff is the deliverable</div>
+    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Repositories tab or the wizard's repo dropdown) — never in a loose workspace. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
     <div class="m-steps">
       <div class="m-step"><div>Once per repository: run the <b>"🧬 Onboard a code repository"</b> template. It studies your repo (read-only) and writes an AGENTS.md — the house rules every agent will follow there.</div></div>
       <div class="m-step"><div>On any coding task or project, pick your repo under <b>"Existing code repository"</b>.</div></div>
@@ -1945,6 +1946,7 @@ async function loadTaskExtras(t) {
           ${run && run.ready ? `<span class="chip c-green">running</span><a class="btn-sm" href="${esc(run.url)}" target="_blank" style="text-decoration:none">↗ Open</a>
             <button class="btn-sm danger" onclick="stopAppUI('${esc(t.id)}')">⏹ Stop</button>`
       : `<button class="btn-sm" style="border-color:var(--accent-2)" onclick="testAppUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">▶ Test app</button>`}
+          <button class="btn-sm" title="Lift this app out of the task workspace into a real client repository (git + backup + delivery workflow)" onclick="promoteTaskUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">📦 Promote to repository</button>
         </div></div>`;
     }
     if ((fr.files || []).length) {
@@ -3367,8 +3369,11 @@ function viewProjects() {
   const fmtSize = b => b > 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b > 1e6 ? (b / 1e6).toFixed(0) + ' MB' : (b / 1e3).toFixed(0) + ' KB';
   const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
   let html = `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+      <button class="btn-primary" onclick="newClientProjectUI()">➕ New client project</button>
+    </div>
     <div class="stats-strip">
-      <div class="stat-card"><div class="stat-num" style="color:#b3a1ff">${projs.length}</div><div class="stat-label">Projects</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:#b3a1ff">${projs.length}</div><div class="stat-label">Repositories</div></div>
       <div class="stat-card green"><div class="stat-num green">${projs.filter(p => p.is_repo).length}</div><div class="stat-label">Git Repos</div></div>
       <div class="stat-card orange"><div class="stat-num" style="color:var(--yellow)">${projs.filter(p => p.git_dirty).length}</div><div class="stat-label">Uncommitted</div></div>
       <div class="stat-card"><div class="stat-num">${fmtSize(projs.reduce((a, p) => a + p.size_bytes, 0))}</div><div class="stat-label">Total Size</div></div>
@@ -3383,7 +3388,7 @@ function viewProjects() {
       p.is_repo ? '<span style="color:var(--green)">● clean</span>' :
         '<span class="muted">○ no git</span>';
     html += `<tr class="proj-row" data-path="${esc(p.path)}">
-      <td><div class="proj-name">${esc(p.name)}</div><div class="proj-desc muted">${esc(p.description || '')}</div></td>
+      <td><div class="proj-name">${esc(p.name)} ${p.client ? `<span class="chip c-cyan" title="client project — memory isolated">🏢 ${esc(p.client)}</span>` : ''}</div><div class="proj-desc muted">${esc(p.description || '')}</div></td>
       <td>${langs}</td>
       <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
       <td>${status}</td>
@@ -3422,6 +3427,102 @@ function bindProjects() {
         </div>`);
     };
   });
+}
+
+async function wfRepoChanged(repoSel) {
+  if (repoSel.value === '__new__') {
+    repoSel.value = '';
+    const client = prompt('Client name:', ($('#wf-client') || {}).value || '');
+    if (!client) return;
+    const name = prompt('Project name:', '');
+    if (!name) return;
+    try {
+      const r = await api('POST', '/api/projects/create-client',
+        { client: client.trim().toLowerCase(), name: name.trim().toLowerCase(), publish: true });
+      const opt = document.createElement('option');
+      opt.value = r.path;
+      opt.textContent = `🏢 ${r.client} / ${name.trim().toLowerCase()}`;
+      opt.dataset.client = r.client;
+      repoSel.insertBefore(opt, repoSel.lastElementChild);
+      repoSel.value = r.path;
+      if ($('#wf-client')) $('#wf-client').value = r.client;
+      toast('Repository created' + (r.note ? ' — ' + r.note : ''), 'ok', 5000);
+    } catch (e) { toast('Create failed: ' + e.message, 'err', 6000); }
+    return;
+  }
+  // picking a client repo auto-fills the client scope — one source of truth
+  const sel = repoSel.selectedOptions[0];
+  if (sel && sel.dataset.client && $('#wf-client') && !$('#wf-client').value.trim()) {
+    $('#wf-client').value = sel.dataset.client;
+  }
+}
+
+function newClientProjectUI() {
+  showModal(`
+    <h2>➕ New client project</h2>
+    <div class="view-intro" style="margin-bottom:10px">Creates <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code> as a proper git repository (README, .gitignore, first commit) — the repo-first rule: client code is versioned and backable from minute one. Every work round then targets this repo via the wizard.</div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Client</label>
+        <input class="form-input" id="ncp-client" placeholder="acme"></div>
+      <div class="form-group"><label class="form-label">Project</label>
+        <input class="form-input" id="ncp-name" placeholder="webshop"></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+      <input type="checkbox" id="ncp-publish" checked> ☁ Also publish privately to GitHub now (recommended — offsite backup from day one)</label>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="ncp-create">Create repository</button>
+    </div>`);
+  $('#ncp-create').onclick = async () => {
+    const client = $('#ncp-client').value.trim().toLowerCase();
+    const name = $('#ncp-name').value.trim().toLowerCase();
+    if (!client || !name) { toast('Client and project name required', 'err'); return; }
+    $('#ncp-create').disabled = true; $('#ncp-create').textContent = 'Creating…';
+    try {
+      const r = await api('POST', '/api/projects/create-client',
+        { client, name, publish: $('#ncp-publish').checked });
+      toast(`Repository created: ${r.path}` + (r.note ? ' — ' + r.note : ''), 'ok', 6000);
+      closeModal(); projectsState.fetched = false; render();
+    } catch (e) {
+      toast('Create failed: ' + e.message, 'err', 6000);
+      $('#ncp-create').disabled = false; $('#ncp-create').textContent = 'Create repository';
+    }
+  };
+}
+
+async function promoteTaskUI(taskId, title) {
+  showModal(`
+    <h2>📦 Promote to repository</h2>
+    <div class="view-intro" style="margin-bottom:10px">Lifts the app built in this task's workspace into a real client repository under <code>~/Client-Projects</code> (git history, backup, delivery workflow). All future work rounds then target the repository — this workspace stays as the historical record.</div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Client</label>
+        <input class="form-input" id="pr-client" placeholder="acme (or 'internal')"></div>
+      <div class="form-group"><label class="form-label">Project name</label>
+        <input class="form-input" id="pr-name" placeholder="webshop"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Code folder inside the workspace (empty = everything except reports)</label>
+      <input class="form-input" id="pr-subdir" placeholder="e.g. webshop"></div>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+      <input type="checkbox" id="pr-publish" checked> ☁ Publish privately to GitHub</label>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="pr-go">Promote</button>
+    </div>`);
+  $('#pr-go').onclick = async () => {
+    const client = $('#pr-client').value.trim().toLowerCase();
+    const name = $('#pr-name').value.trim().toLowerCase();
+    if (!client || !name) { toast('Client and project name required', 'err'); return; }
+    $('#pr-go').disabled = true; $('#pr-go').textContent = 'Promoting…';
+    try {
+      const r = await api('POST', `/api/tasks/${taskId}/promote`,
+        { client, name, subdir: $('#pr-subdir').value.trim(), publish: $('#pr-publish').checked });
+      toast(`📦 Promoted to ${r.path} (${r.items} items)` + (r.note ? ' — ' + r.note : ''), 'ok', 7000);
+      closeModal(); projectsState.fetched = false;
+    } catch (e) {
+      toast('Promote failed: ' + e.message, 'err', 6000);
+      $('#pr-go').disabled = false; $('#pr-go').textContent = 'Promote';
+    }
+  };
 }
 
 async function publishRepoUI(path, name) {
@@ -6005,9 +6106,13 @@ function proposeWorkflowModal(wf, meta) {
   const repoSel = $('#wf-repo');
   if (repoSel) {
     api('GET', '/api/projects').then(d => {
-      const ps = d.projects || d || [];
-      if (repoSel.isConnected) repoSel.innerHTML +=
-        ps.map(p => `<option value="${esc(p.path)}">${esc(p.name)}</option>`).join('');
+      const ps = (d.projects || d || []).filter(p => p.is_repo);
+      ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0)); // client repos first
+      if (!repoSel.isConnected) return;
+      repoSel.innerHTML += ps.map(p =>
+        `<option value="${esc(p.path)}" data-client="${esc(p.client || '')}">${p.client ? '🏢 ' + esc(p.client) + ' / ' : ''}${esc(p.name)}</option>`).join('') +
+        '<option value="__new__">➕ New client repository…</option>';
+      repoSel.onchange = () => wfRepoChanged(repoSel);
     }).catch(() => { });
   }
   const keeps = () => tasks.map((_, i) => {
