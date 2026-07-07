@@ -3106,10 +3106,11 @@ async def create_workflow(body: dict):
     wid = f"wf-{uuid.uuid4().hex[:8]}"
     now = time.time()
     lc = body.get("loop_config")
-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config) "
-               "VALUES (?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes) "
+               "VALUES (?,?,?,?,?,?,?,?,?)",
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
-                json.dumps(lc) if isinstance(lc, dict) else None))
+                json.dumps(lc) if isinstance(lc, dict) else None,
+                1 if body.get("high_stakes") else 0))
     db.log_activity("info", "system", f"Workflow created: '{name}'")
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     await mgr.broadcast({"type": "workflow_created", "data": w})
@@ -3153,6 +3154,17 @@ async def update_workflow(wf_id: str, body: dict):
         lc = body["loop_config"]
         db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
                    (json.dumps(lc) if isinstance(lc, dict) else None, time.time(), wf_id))
+    if "high_stakes" in body:
+        hs = 1 if body["high_stakes"] else 0
+        db.execute("UPDATE workflows SET high_stakes=?, updated_at=? WHERE id=?",
+                   (hs, time.time(), wf_id))
+        # project-level stakes apply to every member task: high stakes makes
+        # each deliverable judge-eligible — whether the judge actually RUNS
+        # stays gated by the loop (quality + closed), so this is safe to
+        # apply across the board
+        db.execute("UPDATE tasks SET high_stakes=? WHERE workflow_id=?", (hs, wf_id))
+        db.log_activity("info", "system",
+                        f"Workflow {wf_id}: high_stakes={'on' if hs else 'off'} applied to all member tasks")
     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
 
 
