@@ -360,8 +360,8 @@ let quotaTickCounter = 0;
 // ===== VIEW ROUTER =====
 const VIEW_META = {
   dashboard: ['Dashboard', 'Mission control — live overview of your agent OS'],
-  kanban: ['Kanban Board', 'Plan, assign and track work across the fleet'],
-  workflows: ['Pipelines', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
+  kanban: ['Tasks', 'The task board: plan, assign and track every unit of work'],
+  workflows: ['Workflows', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
   deliverables: ['Deliverables', 'Every agent output in one place — read, download, chain'],
   agents: ['Agent Fleet', 'Click any agent for memory, messages & cost'],
   agentic: ['Agentic Capabilities', 'Approvals · verification · scheduling · self-healing · cost control'],
@@ -371,7 +371,7 @@ const VIEW_META = {
   monitor: ['System Monitor', 'Live host telemetry'],
   tools: ['Tools Hub', 'Connected tools & integration health'],
   programs: ['Programs', 'Registered workloads'],
-  projects: ['Repositories', 'Your code repositories — infra and client projects, with backup & delivery workflow'],
+  projects: ['Projects', 'Your durable projects — client and personal, with backup & delivery workflow'],
   guardian: ['Guardian', 'Change protection & automatic drift repair'],
   usage: ['Usage & Cost', 'Token consumption & estimated spend'],
   observability: ['LLM Observability', 'Traces, tokens & cost via Langfuse'],
@@ -1160,7 +1160,7 @@ function viewManual() {
   </div>
 
   <div class="manual-sec" id="m-projects">
-    <h2>🧩 Pipelines</h2>
+    <h2>🧩 Workflows</h2>
     <div class="m-sub">Rounds of work where one step feeds the next — they visit your durable projects</div>
     <p>A project chains tasks with <b>dependencies</b>. Each stage starts automatically once its predecessors finish, and receives their outputs as input. This is how big jobs stay organized:</p>
     <div class="m-visual">  SPEC &amp; PLAN ──▶ IMPLEMENT ──▶ CODE REVIEW ──▶ FIX FINDINGS ──▶ FINAL VERIFICATION
@@ -1193,7 +1193,7 @@ function viewManual() {
   <div class="manual-sec" id="m-coding">
     <h2>🧬 Coding on your own repositories</h2>
     <div class="m-sub">Repo-native tasks: the diff is the deliverable</div>
-    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Repositories tab or the wizard's repo dropdown) — never in a loose workspace. Personal long-lived work (uni projects, own experiments) gets the same treatment via 🏠 personal projects (~/Projects, no client, personal memory). Small iterative jobs (diagnose → try → feedback, like fixing a car) don't need a project at all: one task + Reject-with-feedback rounds. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
+    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Projects tab or the wizard's repo dropdown) — never in a loose workspace. Personal long-lived work (uni projects, own experiments) gets the same treatment via 🏠 personal projects (~/Projects, no client, personal memory). Small iterative jobs (diagnose → try → feedback, like fixing a car) don't need a project at all: one task + Reject-with-feedback rounds. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
     <div class="m-steps">
       <div class="m-step"><div>Once per repository: run the <b>"🧬 Onboard a code repository"</b> template. It studies your repo (read-only) and writes an AGENTS.md — the house rules every agent will follow there.</div></div>
       <div class="m-step"><div>On any coding task or project, pick your repo under <b>"Existing code repository"</b>.</div></div>
@@ -1300,7 +1300,7 @@ const TOURS = {
     { sel: '.kanban-card', title: 'A task card', body: 'Click any card to open its full record: description, budget, the agent working on it, attachments, its improvement loop, and every file it produced. The ⚑ flag shows which agent claimed it.' },
   ],
   workflows: [
-    { sel: '#content', title: 'Pipelines = rounds of work', body: 'A pipeline chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when its inputs are ready. Pipelines VISIT your durable projects (Repositories tab): build v1, fix a bug, iterate a campaign — the project accumulates the results, pipelines come and go.' },
+    { sel: '#content', title: 'Workflows = rounds of work', body: 'A workflow chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when its inputs are ready. Pipelines VISIT your durable projects (Projects tab): build v1, fix a bug, iterate a campaign — the project accumulates the results, pipelines come and go.' },
     { sel: '.btn-primary', title: 'Describe a goal', body: 'Click "✨ Describe a goal" and say what you want in plain words — e.g. "an online shop for GPUs". The AI asks smart questions, then proposes a full pipeline (plan → build → review → fix → verify) which you can trim before approving. Coding projects always get quality gates.' },
     { sel: '.agentic-row, .wf-card', title: 'A project', body: 'Click one to see its stages, their status, the improvement loop (🔁), and attached files. Green stages are done; the diagram shows what feeds what.' },
   ],
@@ -3378,7 +3378,7 @@ function viewProjects() {
   const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
   let html = `
     <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
-      <button class="btn-primary" onclick="newClientProjectUI()">➕ New client project</button>
+      <button class="btn-primary" onclick="newClientProjectUI()">➕ New project</button>
     </div>
     <div class="stats-strip">
       <div class="stat-card"><div class="stat-num" style="color:#b3a1ff">${projs.length}</div><div class="stat-label">Repositories</div></div>
@@ -3476,7 +3476,7 @@ function slugify(s) {
 
 function newClientProjectUI() {
   showModal(`
-    <h2>➕ New client project</h2>
+    <h2>➕ New project</h2>
     <div class="view-intro" style="margin-bottom:10px">Creates <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code> as a proper git repository (README, .gitignore, first commit) — the repo-first rule: client code is versioned and backable from minute one. Every work round then targets this repo via the wizard.</div>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <input type="checkbox" id="ncp-personal" onchange="const c=$('#ncp-client'); if(c){c.disabled=this.checked; c.value=this.checked?'':c.value;}">
@@ -5746,7 +5746,7 @@ function viewWorkflows() {
   return `
     <div class="view-intro" style="margin-bottom:12px">A <strong>project</strong> connects several tasks into one campaign. Tasks with dependencies wait until their inputs are DONE, then run automatically — each agent reads its predecessors' deliverable files. Example: research → ad copy → channel plan → publish plan.</div>
     <div style="display:flex;gap:10px;margin-bottom:14px">
-      <button class="btn-primary" onclick="newWorkflowUI()">+ New project</button>
+      <button class="btn-primary" onclick="newWorkflowUI()">➕ Create workflow</button>
       <button class="btn-ghost" title="Describe the whole goal in plain words — the AI plans the task chain" onclick="describeTaskUI()">✨ Describe a goal (AI plans it)</button>
       <button class="btn-ghost" title="Creates a ready-made 4-task marketing campaign chain — edit the [brackets], then watch it run in order" onclick="createExampleCampaign()">Example: marketing campaign</button>
     </div>
