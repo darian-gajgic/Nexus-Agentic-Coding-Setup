@@ -3189,7 +3189,7 @@ async def create_workflow(body: dict):
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
                 json.dumps(lc) if isinstance(lc, dict) else None,
                 1 if body.get("high_stakes") else 0,
-                ((body.get("client") or "").strip().lower() or None),
+                _derive_client(body.get("client"), body.get("project_path")),
                 ((body.get("project_path") or "").strip() or None)))
     db.log_activity("info", "system", f"Workflow created: '{name}'")
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
