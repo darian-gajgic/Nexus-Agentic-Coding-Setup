@@ -299,7 +299,7 @@ index 1efde5b..42fdf7b 100755
  
  echo -e "${YELLOW}═══ 5. JARVIS FUNCTION INTEGRITY ═══${NC}"
 diff --git a/server.py b/server.py
-index 2bd943c..0358ceb 100644
+index 2bd943c..297b60a 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,8 @@ class TaskCreate(BaseModel):
@@ -444,7 +444,7 @@ index 2bd943c..0358ceb 100644
      return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
  
  
-@@ -3445,6 +3479,188 @@ async def agent_config_update(agent_id: str, body: dict):
+@@ -3445,6 +3479,269 @@ async def agent_config_update(agent_id: str, body: dict):
  import tools_hub
  
  
@@ -630,11 +630,92 @@ index 2bd943c..0358ceb 100644
 +            "error": f"memory map unavailable: {str(e)[:120]} (is qdrant running?)"})
 +
 +
++# ── Code-project git actions: offsite backup + delivery workflow ──
++
++def _valid_repo_path(path: str):
++    """Path must be a git repo inside $HOME — never operate elsewhere."""
++    import worktree as _wt
++    p = os.path.realpath(os.path.expanduser(path or ""))
++    home = os.path.realpath(os.path.expanduser("~"))
++    if not p.startswith(home + os.sep):
++        return None
++    return p if _wt.is_repo(p) else None
++
++
++def _run_git_action(cwd: str, *cmd: str, timeout: int = 120):
++    import subprocess
++    r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
++    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-800:]
++
++
++@app.post("/api/projects/publish")
++async def project_publish(body: dict):
++    """Create a PRIVATE GitHub repo for a local-only repository and push it —
++    the offsite backup + future handover vehicle. Explicit button, never auto."""
++    import re
++    p = _valid_repo_path(body.get("path"))
++    if not p:
++        return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
++    name = (body.get("name") or os.path.basename(p)).strip()
++    if not re.match(r"^[A-Za-z0-9._-]{1,90}$", name):
++        return JSONResponse(status_code=400, content={"error": "invalid repository name"})
++    code, out = _run_git_action(p, "git", "remote", "get-url", "origin")
++    if code == 0:
++        return JSONResponse(status_code=409, content={"error": f"repo already has a remote: {out}"})
++    code, out = _run_git_action(p, "gh", "repo", "create", name,
++                                "--private", "--source", ".", "--push", timeout=180)
++    if code != 0:
++        return JSONResponse(status_code=502, content={"error": f"publish failed: {out}"})
++    db.log_activity("info", "system", f"Published {os.path.basename(p)} to GitHub (private) as {name}")
++    return {"ok": True, "output": out}
++
++
++@app.post("/api/projects/push")
++async def project_push(body: dict):
++    """Push the current branch + tags to origin — the post-merge backup step."""
++    p = _valid_repo_path(body.get("path"))
++    if not p:
++        return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
++    code, _ = _run_git_action(p, "git", "remote", "get-url", "origin")
++    if code != 0:
++        return JSONResponse(status_code=400, content={"error": "no remote — publish to GitHub first"})
++    code, branch = _run_git_action(p, "git", "symbolic-ref", "--short", "HEAD")
++    code2, out = _run_git_action(p, "git", "push", "-u", "origin",
++                                 branch if code == 0 else "HEAD", "--follow-tags", timeout=180)
++    if code2 != 0:
++        return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
++    db.log_activity("info", "system", f"Pushed {os.path.basename(p)} ({branch}) to origin")
++    return {"ok": True, "output": out or "up to date"}
++
++
++@app.post("/api/projects/tag")
++async def project_tag(body: dict):
++    """Annotated release tag + push — marks the exact delivered state
++    (invoice ↔ code state, reproducible forever)."""
++    import re
++    p = _valid_repo_path(body.get("path"))
++    if not p:
++        return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
++    tag = (body.get("tag") or "").strip()
++    if not re.match(r"^v?[0-9][A-Za-z0-9._-]{0,40}$", tag):
++        return JSONResponse(status_code=400, content={"error": "tag should look like v1.0 / v2.1.3"})
++    msg = (body.get("message") or f"Release {tag}").strip()[:200]
++    code, out = _run_git_action(p, "git", "tag", "-a", tag, "-m", msg)
++    if code != 0:
++        return JSONResponse(status_code=409, content={"error": f"tag failed: {out}"})
++    code, rout = _run_git_action(p, "git", "push", "origin", tag, timeout=120)
++    pushed = code == 0
++    db.log_activity("info", "system",
++                    f"Tagged {os.path.basename(p)} {tag}" + ("" if pushed else " (local only — no remote)"))
++    return {"ok": True, "pushed": pushed,
++            "output": rout if pushed else "tag created locally; publish/push to back it up"}
++
++
  @app.get("/api/tools")
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..9de88fe 100644
+index b0b7e37..7c436cb 100644
 --- a/static/app.js
 +++ b/static/app.js
 @@ -308,7 +308,6 @@ async function tick() {
@@ -780,7 +861,7 @@ index b0b7e37..9de88fe 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -1051,6 +1109,348 @@ async function deleteAttachment(kind, id, name, elId) {
+@@ -1051,6 +1109,360 @@ async function deleteAttachment(kind, id, name, elId) {
    } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
  }
  
@@ -865,6 +946,13 @@ index b0b7e37..9de88fe 100644
 +      <div class="m-step"><div>On any coding task or project, pick your repo under <b>"Existing code repository"</b>.</div></div>
 +      <div class="m-step"><div>Agents then work <b>inside</b> an isolated copy (a git worktree on branch <code>nexus/…</code>) — your checkout is never touched. They follow the repo's conventions and run its own tests.</div></div>
 +      <div class="m-step"><div>Review the <b>changes.diff</b> in Deliverables. Merge the branch yourself when satisfied — nothing merges automatically, ever.</div></div>
++    </div>
++    <h4>Backup & delivery workflow (Projects tab → click a repo)</h4>
++    <div class="m-steps">
++      <div class="m-step"><div><b>Publish to GitHub</b> — once per repo: creates a PRIVATE GitHub repository and pushes everything. From then on this repo is backed up offsite and has a handover vehicle.</div></div>
++      <div class="m-step"><div><b>Push</b> — after every merge: one click sends your latest state (and tags) to GitHub. The push IS the backup.</div></div>
++      <div class="m-step"><div><b>Tag release</b> — when you deliver: marks the exact shipped code state (e.g. v1.0) forever. "What did we ship for invoice #12?" always has a precise answer.</div></div>
++      <div class="m-step"><div><b>Handover</b> — at contract end: transfer the GitHub repository to the client's organization (repo Settings → Transfer ownership). Ownership should mirror the contract.</div></div>
 +    </div>
 +  </div>
 +
@@ -1005,6 +1093,11 @@ index b0b7e37..9de88fe 100644
 +  skills: [
 +    { sel: '#content', title: 'The skill library', body: 'Skills are how-to manuals agents load when a task matches. Click any skill to edit it, or let the ✨ wizard draft a new one following best practices — you always review before it goes live.' },
 +  ],
++  projects: [
++    { sel: '.stats-strip', title: 'Your code projects', body: 'Every git repository and project folder on this machine. "Uncommitted" counts repos with unsaved changes - worth a look before ending the day.' },
++    { sel: '.data-table', title: 'The Remote column', body: '"☁ backed up" = this repo also lives on GitHub (offsite backup). "⚠ local only" = it exists ONLY on this disk - click the row and publish it. For client work, local-only is a risk you do not want.' },
++    { sel: '.proj-row', title: 'The delivery workflow', body: 'Click any repo: Publish (once - creates a private GitHub repo), Push (after every merged change - that push IS your backup), Tag release (when you deliver - marks the exact shipped state forever). Handover later = transfer the GitHub repo to the client organization.' },
++  ],
 +  manual: [
 +    { sel: '#content', title: 'The manual', body: 'Everything explained for humans — from "what is this" to the full technical architecture. Use the chapter chips to jump around. The ? button on every other tab gives you a guided walkthrough of exactly that tab.' },
 +  ],
@@ -1129,7 +1222,7 @@ index b0b7e37..9de88fe 100644
  // ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
  const KNOWN_MODELS = ['glm-5.2', 'glm-5.1', 'glm-4.5-air'];
  const settingsState = { fetched: false, dispatch: {}, model: {} };
-@@ -2567,6 +2967,11 @@ function showTaskModal(status) {
+@@ -2567,6 +2979,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -1141,7 +1234,7 @@ index b0b7e37..9de88fe 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +3001,14 @@ function showTaskModal(status) {
+@@ -2596,6 +3013,14 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
@@ -1156,7 +1249,7 @@ index b0b7e37..9de88fe 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +3080,7 @@ async function submitTask() {
+@@ -2667,6 +3092,7 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
@@ -1164,7 +1257,75 @@ index b0b7e37..9de88fe 100644
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -3198,13 +3612,15 @@ function viewMemory() {
+@@ -2948,7 +3374,7 @@ function viewProjects() {
+       <div class="stat-card"><div class="stat-num">${fmtSize(projs.reduce((a, p) => a + p.size_bytes, 0))}</div><div class="stat-label">Total Size</div></div>
+     </div>
+     <div class="panel"><table class="data-table">
+-      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Size</th><th>Modified</th></tr></thead>
++      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Remote</th><th>Size</th><th>Modified</th></tr></thead>
+       <tbody>`;
+   for (const p of projs) {
+     const langs = Object.entries(p.languages).slice(0, 3).map(([l]) =>
+@@ -2961,6 +3387,7 @@ function viewProjects() {
+       <td>${langs}</td>
+       <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
+       <td>${status}</td>
++      <td>${p.is_repo ? (p.git_remote ? '<span title="' + esc(p.git_remote) + '" style="color:var(--accent-2)">☁ backed up</span>' : '<span style="color:var(--yellow)">⚠ local only</span>') : '<span class="muted">—</span>'}</td>
+       <td>${fmtSize(p.size_bytes)}</td>
+       <td class="muted">${fmtDays(p.last_modified)}</td>
+     </tr>`;
+@@ -2982,11 +3409,50 @@ function bindProjects() {
+           <div class="kv-row"><span class="kv-key">Size</span><span class="kv-val">${(p.size_bytes / 1e6).toFixed(1)} MB</span></div>
+           <div class="kv-row"><span class="kv-key">venv</span><span class="kv-val">${p.has_venv ? 'yes' : 'no'}</span></div>
+           <h4 style="margin-top:12px">Languages</h4>${langs}
++          ${p.is_repo ? `
++          <h4 style="margin-top:14px">Git workflow</h4>
++          <div class="form-hint" style="margin-bottom:8px">${p.git_remote
++            ? 'Backed up to a remote. Push after merges; tag what you deliver.'
++            : '⚠ This repository exists ONLY on this machine — a disk failure loses it. Publish creates a PRIVATE GitHub repo and pushes everything (your offsite backup and the future handover vehicle).'}</div>
++          <div style="display:flex;gap:8px;flex-wrap:wrap">
++            ${!p.git_remote ? `<button class="btn-primary" onclick="publishRepoUI('${esc(p.path)}','${esc(p.name)}')">☁ Publish to GitHub (private)</button>` : `
++            <button class="btn-primary" onclick="pushRepoUI('${esc(p.path)}')">⬆ Push to remote</button>
++            <button class="btn-ghost" onclick="tagRepoUI('${esc(p.path)}','${esc(p.name)}')">🏷 Tag release</button>`}
++          </div>` : ''}
+         </div>`);
+     };
+   });
+ }
+ 
++async function publishRepoUI(path, name) {
++  const repoName = prompt('GitHub repository name (private):', name);
++  if (!repoName) return;
++  toast('Publishing to GitHub…', 'info');
++  try {
++    await api('POST', '/api/projects/publish', { path, name: repoName });
++    toast('☁ Published privately to GitHub — this repo is now backed up offsite', 'ok', 5000);
++    closeModal(); projectsState.fetched = false; render();
++  } catch (e) { toast('Publish failed: ' + e.message, 'err', 6000); }
++}
++
++async function pushRepoUI(path) {
++  toast('Pushing…', 'info');
++  try {
++    const r = await api('POST', '/api/projects/push', { path });
++    toast('⬆ ' + (r.output || 'pushed'), 'ok', 4000);
++  } catch (e) { toast('Push failed: ' + e.message, 'err', 6000); }
++}
++
++async function tagRepoUI(path, name) {
++  const tag = prompt(`Release tag for ${name} (marks the exact delivered state):`, 'v1.0');
++  if (!tag) return;
++  const msg = prompt('Short release note (what was delivered):', `Release ${tag}`) || `Release ${tag}`;
++  try {
++    const r = await api('POST', '/api/projects/tag', { path, tag, message: msg });
++    toast('🏷 ' + tag + ' — ' + (r.pushed ? 'tagged and pushed' : r.output), 'ok', 5000);
++  } catch (e) { toast('Tag failed: ' + e.message, 'err', 6000); }
++}
++
+ // ═══════════════════════════════ GUARDIAN ═══════════════════════════════
+ const guardianState = { data: null, loading: false, fetched: false };
+ async function loadGuardian() {
+@@ -3198,13 +3664,15 @@ function viewMemory() {
    const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
    const sharedCount = (specialistsState.shared || []).length;
    const tabs = [
@@ -1181,7 +1342,7 @@ index b0b7e37..9de88fe 100644
    else if (memoryState.tab === 'agent') body = memAgentHTML();
    else if (memoryState.tab === 'lessons') body = memLessonsHTML();
    else if (memoryState.tab === 'shared') body = memSharedHTML();
-@@ -3226,7 +3642,48 @@ async function loadAgentMemoryTab() {
+@@ -3226,7 +3694,48 @@ async function loadAgentMemoryTab() {
    if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
  }
  
@@ -1230,7 +1391,7 @@ index b0b7e37..9de88fe 100644
    $$('[data-memtab]').forEach(el => {
      el.onclick = () => {
        memoryState.tab = el.dataset.memtab;
-@@ -3778,28 +4235,31 @@ function renderJarvisView() {
+@@ -3778,28 +4287,31 @@ function renderJarvisView() {
          </div>
        </div>
  
@@ -1281,7 +1442,7 @@ index b0b7e37..9de88fe 100644
          </div>
          <div class="jarvis-feed" id="jFeed"></div>
          <div class="jarvis-chat-row">
-@@ -3839,8 +4299,36 @@ function renderJarvisView() {
+@@ -3839,8 +4351,36 @@ function renderJarvisView() {
    // Wire up controls
    jarvisBindControls();
  
@@ -1320,7 +1481,7 @@ index b0b7e37..9de88fe 100644
  }
  
  async function jarvisBootSequence() {
-@@ -3996,10 +4484,12 @@ function jarvisBindControls() {
+@@ -3996,10 +4536,12 @@ function jarvisBindControls() {
  
    stopBtn.addEventListener('click', () => jarvisStopStreaming());
  
@@ -1336,7 +1497,7 @@ index b0b7e37..9de88fe 100644
    });
  
    // Conversation mode toggle
-@@ -4012,7 +4502,8 @@ function jarvisBindControls() {
+@@ -4012,7 +4554,8 @@ function jarvisBindControls() {
  }
  
  // ===== STATUS =====
@@ -1346,7 +1507,7 @@ index b0b7e37..9de88fe 100644
    try {
      const s = await api('GET', '/api/jarvis/status');
      jarvisState.connected = s.connected;
-@@ -4037,8 +4528,10 @@ async function jarvisLoadStatus() {
+@@ -4037,8 +4580,10 @@ async function jarvisLoadStatus() {
      $('#jVoiceStatus').textContent = 'OFF';
    }
  
@@ -1359,7 +1520,7 @@ index b0b7e37..9de88fe 100644
  }
  
  async function jarvisLoadData() {
-@@ -4083,12 +4576,13 @@ function jarvisUpdateActivity() {
+@@ -4083,12 +4628,13 @@ function jarvisUpdateActivity() {
      el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
      return;
    }
@@ -1374,7 +1535,7 @@ index b0b7e37..9de88fe 100644
    const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
    const labelEl = $('#jState');
    if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
-@@ -4132,7 +4626,8 @@ function jarvisRenderFeed() {
+@@ -4132,7 +4678,8 @@ function jarvisRenderFeed() {
    feed.innerHTML = jarvisState.messages.map(m => {
      const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
      const cls2 = m.live ? ' live' : '';
@@ -1384,7 +1545,7 @@ index b0b7e37..9de88fe 100644
    }).join('');
    feed.scrollTop = feed.scrollHeight;
    const mc = $('#jMsgCount');
-@@ -4193,6 +4688,16 @@ async function jarvisStreamChat(text) {
+@@ -4193,6 +4740,16 @@ async function jarvisStreamChat(text) {
  
      liveMsg.live = false;
  
@@ -1401,7 +1562,7 @@ index b0b7e37..9de88fe 100644
      // Speak the response
      if (fullText && jarvisState.voiceAvailable) {
        jarvisSpeak(fullText);
-@@ -4201,7 +4706,9 @@ async function jarvisStreamChat(text) {
+@@ -4201,7 +4758,9 @@ async function jarvisStreamChat(text) {
      if (e.name === 'AbortError') {
        liveMsg.text += ' [stopped]';
      } else {
@@ -1412,7 +1573,7 @@ index b0b7e37..9de88fe 100644
      }
      liveMsg.live = false;
    } finally {
-@@ -4247,7 +4754,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4247,7 +4806,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
      case 'tool_call':
        const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
        if (toolName && toolName !== '_thinking') {
@@ -1421,7 +1582,7 @@ index b0b7e37..9de88fe 100644
        }
        break;
      case 'run.completed':
-@@ -4256,10 +4763,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4256,10 +4815,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
        liveMsg.live = false;
        break;
      case 'run.failed':
@@ -1441,7 +1602,7 @@ index b0b7e37..9de88fe 100644
    }
  }
  
-@@ -4307,7 +4821,12 @@ async function jarvisProcessTTSQueue() {
+@@ -4307,7 +4873,12 @@ async function jarvisProcessTTSQueue() {
      return;
    }
    jarvisState.ttsAnimating = true;
@@ -1454,7 +1615,7 @@ index b0b7e37..9de88fe 100644
  
    // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
    // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
-@@ -4317,6 +4836,7 @@ async function jarvisProcessTTSQueue() {
+@@ -4317,6 +4888,7 @@ async function jarvisProcessTTSQueue() {
  
    while (pending) {
      const clip = await pending;
@@ -1462,7 +1623,7 @@ index b0b7e37..9de88fe 100644
      // Kick off NEXT render now (runs in parallel with current playback)
      let nextPending = null;
      if (jarvisState.ttsQueue.length > 0) {
-@@ -4326,9 +4846,17 @@ async function jarvisProcessTTSQueue() {
+@@ -4326,9 +4898,17 @@ async function jarvisProcessTTSQueue() {
      }
      if (clip) await jarvisPlayClip(clip);
      pending = nextPending;
@@ -1480,7 +1641,7 @@ index b0b7e37..9de88fe 100644
    jarvisSetMode('idle');
    jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
    jarvisMaybeAutoListen();
-@@ -4365,7 +4893,10 @@ async function jarvisFetchClip(text) {
+@@ -4365,7 +4945,10 @@ async function jarvisFetchClip(text) {
  // both from the SAME blob — synced by construction. If WAV (/tts fallback):
  // audio only.
  function jarvisPlayClip(blob) {
@@ -1492,7 +1653,7 @@ index b0b7e37..9de88fe 100644
    return new Promise((resolve) => {
      let resolved = false;
      const url = URL.createObjectURL(blob);
-@@ -4377,11 +4908,15 @@ function jarvisPlayClip(blob) {
+@@ -4377,11 +4960,15 @@ function jarvisPlayClip(blob) {
      const cleanup = () => {
        if (resolved) return;
        resolved = true;
@@ -1508,7 +1669,7 @@ index b0b7e37..9de88fe 100644
  
      const startIfReady = () => {
        if (started || !audioReady || !videoReady) return;
-@@ -4420,10 +4955,38 @@ function jarvisAudioEl() {
+@@ -4420,10 +5007,38 @@ function jarvisAudioEl() {
    if (!jarvisState.ttsAudioEl) {
      const el = new Audio();
      jarvisState.ttsAudioEl = el;
@@ -1547,7 +1708,7 @@ index b0b7e37..9de88fe 100644
  function jarvisMaybeAutoListen() {
    if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
      jarvisStartRecording();
-@@ -4432,12 +4995,19 @@ function jarvisMaybeAutoListen() {
+@@ -4432,12 +5047,19 @@ function jarvisMaybeAutoListen() {
  
  function jarvisStopTTS() {
    jarvisState.ttsQueue = [];
@@ -1568,7 +1729,7 @@ index b0b7e37..9de88fe 100644
    jarvisSetIdleAvatar();
  }
  
-@@ -4463,12 +5033,16 @@ async function jarvisStartRecording() {
+@@ -4463,12 +5085,16 @@ async function jarvisStartRecording() {
        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
      }
      const ctx = jarvisState.audioContext;
@@ -1585,7 +1746,7 @@ index b0b7e37..9de88fe 100644
      jarvisMicLevelLoop();
  
      jarvisState.mediaRecorder.ondataavailable = (e) => {
-@@ -4526,6 +5100,7 @@ function jarvisMicLevelLoop() {
+@@ -4526,6 +5152,7 @@ function jarvisMicLevelLoop() {
    if (!jarvisState.micAnalyser || !jarvisState.recording) {
      const el = $('#jMicLevel');
      if (el) el.style.width = '0%';
@@ -1593,7 +1754,7 @@ index b0b7e37..9de88fe 100644
      return;
    }
    jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
-@@ -4534,6 +5109,18 @@ function jarvisMicLevelLoop() {
+@@ -4534,6 +5161,18 @@ function jarvisMicLevelLoop() {
    const avg = sum / jarvisState._micDataArray.length / 255;
    const el = $('#jMicLevel');
    if (el) el.style.width = (avg * 100 * 2) + '%';
@@ -1612,7 +1773,7 @@ index b0b7e37..9de88fe 100644
    requestAnimationFrame(jarvisMicLevelLoop);
  }
  
-@@ -4547,7 +5134,13 @@ setInterval(() => {
+@@ -4547,7 +5186,13 @@ setInterval(() => {
  }, 2000);
  
  
@@ -1627,7 +1788,7 @@ index b0b7e37..9de88fe 100644
  function closeModal() {
    const m = $('#modal');
    if (m) m.style.display = 'none';
-@@ -4974,6 +5567,23 @@ async function newWorkflowUI() {
+@@ -4974,6 +5619,23 @@ async function newWorkflowUI() {
    render();
  }
  
@@ -1651,7 +1812,7 @@ index b0b7e37..9de88fe 100644
  async function openWorkflowDetail(id) {
    let w;
    try { w = await api('GET', `/api/workflows/${id}`); }
-@@ -5006,6 +5616,22 @@ async function openWorkflowDetail(id) {
+@@ -5006,6 +5668,22 @@ async function openWorkflowDetail(id) {
          ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
          <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
        </div></div>
@@ -1674,7 +1835,7 @@ index b0b7e37..9de88fe 100644
      <div class="modal-actions" style="justify-content:space-between">
        <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
        <div style="display:flex;gap:10px">
-@@ -5089,8 +5715,8 @@ function viewDeliverables() {
+@@ -5089,8 +5767,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -1685,7 +1846,7 @@ index b0b7e37..9de88fe 100644
              : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
          </div>
          <div class="row-actions">
-@@ -5292,6 +5918,22 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5292,6 +5970,22 @@ function proposeWorkflowModal(wf, meta) {
      ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
      ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
      <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
@@ -1708,7 +1869,7 @@ index b0b7e37..9de88fe 100644
      <div class="form-group" style="margin-top:8px">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -5307,6 +5949,15 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5307,6 +6001,15 @@ function proposeWorkflowModal(wf, meta) {
        <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
      </div>`);
    const b = $('#wfCreateBtn');
@@ -1724,7 +1885,7 @@ index b0b7e37..9de88fe 100644
    const keeps = () => tasks.map((_, i) => {
      const cb = $(`#wfKeep${i}`);
      return !cb || cb.checked;
-@@ -5332,6 +5983,11 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5332,6 +6035,11 @@ function proposeWorkflowModal(wf, meta) {
        }
        return out;
      };
@@ -1736,7 +1897,7 @@ index b0b7e37..9de88fe 100644
      let wfLoop = null;
      if ($('#wf-loop') && $('#wf-loop').checked) {
        try {
-@@ -5341,14 +5997,15 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5341,14 +6049,15 @@ function proposeWorkflowModal(wf, meta) {
            meta: {
              title: wf.name, domain: wf.domain,
              specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
@@ -1754,7 +1915,7 @@ index b0b7e37..9de88fe 100644
        const ids = [];
        for (let i = 0; i < tasks.length; i++) {
          const t = tasks[i];
-@@ -5356,9 +6013,13 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5356,9 +6065,13 @@ function proposeWorkflowModal(wf, meta) {
          const created = await api('POST', '/api/tasks', {
            title: t.title, description: t.description, status: 'backlog',
            priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
@@ -1770,7 +1931,7 @@ index b0b7e37..9de88fe 100644
          });
          ids.push(created.id);
 diff --git a/static/index.html b/static/index.html
-index bb6661f..8b62611 100644
+index bb6661f..27887fc 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -1805,7 +1966,7 @@ index bb6661f..8b62611 100644
 -<script src="/static/app.js?v=28"></script>
 +<script src="/static/memory3d.js?v=5" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=36"></script>
++<script src="/static/app.js?v=37"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css
