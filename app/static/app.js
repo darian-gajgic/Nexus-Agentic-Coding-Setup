@@ -1333,10 +1333,56 @@ const TOURS = {
   ],
 };
 
+// ── Popup tours: when a modal/drawer is open, the ? explains THAT window ──
+Object.assign(TOURS, {
+  'task-detail-modal': [
+    { sel: '#td-status, .modal-content', title: 'Status & priority', body: 'Status is the kanban column this task sits in — moving it here is the same as dragging the card. Priority orders it against other waiting tasks (1 is most urgent).' },
+    { sel: '#td-model', title: 'Which AI model works on it', body: 'glm-5.2 is the smart default for real work. glm-4.5-air is faster and cheaper — fine for simple mechanical jobs. Each model has its own traffic lane, so light tasks never queue behind heavy ones.' },
+    { sel: '#td-budget', title: 'The spending fence', body: 'The maximum tokens (AI fuel) this task may consume. Empty = the default from Settings. If it runs out, the task pauses as "blocked: budget" — retrying grants exactly one more slice, so nothing ever runs away.' },
+    { sel: '#td-depends', title: 'Dependencies', body: 'Tasks selected here must finish first; their results are handed to this task as input automatically. This is how pipelines pass work along.' },
+    { sel: '[id^="attachRow"], .attach-list, #td-attachments', title: 'Attachments', body: 'Give the agent your material: PDFs, Office files, images. It is REQUIRED to read them before working. Results can come back in these formats too — just ask in the description.' },
+    { sel: '[onclick*="loopViewerModal"], [onclick*="viewLoop"]', title: 'The improvement loop 🔁', body: 'Shows how this task self-corrects: which check triggers a rework, how many rounds are allowed, and whether it runs automatically (closed) or waits for you (open). You can regenerate or disable it here.' },
+    { sel: '[onclick*="retryTask"], [onclick*="dispatchTask"]', title: 'Dispatch / Retry', body: 'Dispatch sends the task to an agent now. Retry re-runs a finished/failed task — add a sentence of feedback first and the agent must address it. Retry also grants a fresh budget slice.' },
+    { sel: '.modal-content', title: 'Files & transcript', body: 'Every file the task produced is listed at the bottom with previews and downloads. The transcript link shows the agent\'s full working session — every command, every step, complete transparency.' },
+  ],
+  'task-create-modal': [
+    { sel: '#m-task-title, .modal-content input', title: 'Title & description', body: 'Say what you want, for whom, and what "done" looks like — one sentence each is plenty. Tip: the ✨ wizard on the board does this planning for you and asks the right questions.' },
+    { sel: '#m-task-specialist', title: 'Specialist', body: 'Pick an expert (coder, researcher, reviewer…) or leave it on "Agent decides". Specialists carry their own instructions and remember lessons from your past feedback.' },
+    { sel: '#m-task-repo', title: '🧬 Existing code repository', body: 'For coding on YOUR projects: pick a repo and the agent works inside an isolated copy (a git branch), follows the repo\'s house rules, runs its tests, and delivers a reviewable diff. Your checkout is never touched.' },
+    { sel: '#m-task-loop', title: 'Looping', body: 'Enable and the task self-corrects: failed checks send it back with the findings attached, automatically (closed mode) or with your approval (open mode). Choose quality (more rounds, judge involved) or speed.' },
+  ],
+  'wizard-modal': [
+    { sel: '.modal-content h2, .modal-content', title: 'The proposed plan', body: 'The AI turned your description into stages. Each row is one task; arrows show what feeds what. Locked rows are quality gates (review, verification) — they exist so mistakes get caught before they reach you.' },
+    { sel: '.modal-content input[type="checkbox"]', title: 'Trim it', body: 'Untick optional stages you don\'t want — dependents automatically reconnect around removed ones. Assumptions the AI made are listed; if one is wrong, cancel and rephrase your description.' },
+    { sel: '.modal-actions .btn-primary', title: 'Approve', body: 'Creates all tasks with their dependencies. Stages start on their own as their inputs become ready — watch progress on the board or the project page.' },
+  ],
+  'agent-drawer': [
+    { sel: '#drawerBody .kv-row, #drawerBody', title: 'The agent\'s vitals', body: 'PID is its live process; heartbeat shows it\'s healthy (the watchdog restarts it within seconds if not); tasks done/failed is its track record.' },
+    { sel: '#cfg-autoclaim', title: 'Auto-claim', body: 'On = this agent grabs unassigned Todo tasks by itself. Off = it only works on tasks you assign to it explicitly.' },
+    { sel: '#cfg-maxtokens', title: 'Spending cap', body: 'A hard token ceiling for this lane. When reached, the watchdog pauses it as cost_capped — a per-worker fence on top of task budgets.' },
+    { sel: '.dtab', title: 'Memory · Messages · Cost', body: 'The tabs show what this agent remembers, its message history with other agents, and exactly what it has consumed.' },
+  ],
+});
+
+function tourContext() {
+  // a visible popup wins over the underlying view
+  const modal = document.getElementById('modal');
+  if (modal && modal.style.display !== 'none' && modal.style.display !== '') {
+    const mc = modal.innerHTML || '';
+    if (document.getElementById('td-budget')) return 'task-detail-modal';
+    if (document.getElementById('m-task-title') || document.getElementById('m-task-loop')) return 'task-create-modal';
+    if (mc.includes('stage') || mc.includes('Assumptions') || mc.includes('pipeline')) return 'wizard-modal';
+  }
+  const drawer = document.getElementById('drawer');
+  if (drawer && drawer.classList.contains('open')) return 'agent-drawer';
+  return currentView;
+}
+
 let _tour = null;
 function startTour(view) {
   endTour();
-  const steps = (TOURS[view] || []).filter(s => document.querySelector(s.sel));
+  const ctx = view === currentView ? tourContext() : view;
+  const steps = (TOURS[ctx] || []).filter(s => document.querySelector(s.sel));
   if (!steps.length) { switchView('manual'); return; }
   _tour = { steps, i: 0 };
   const dim = document.createElement('div');
@@ -4623,6 +4669,16 @@ async function jarvisStreamChat(text) {
 
     liveMsg.live = false;
 
+    // Empty reply = the provider dropped the run (peak-time 429 load-shedding
+    // after retries). The empty bubble rendered as a lone dot with no text —
+    // replace it with an honest, actionable message instead.
+    if (!liveMsg.text.trim()) {
+      const i = jarvisState.messages.indexOf(liveMsg);
+      if (i >= 0) jarvisState.messages.splice(i, 1);
+      jarvisAddMessage('error',
+        '⚠ No reply arrived — the AI provider is overloaded right now (peak-time load shedding). Wait a few seconds and send it again.');
+    }
+
     // Speak the response
     if (fullText && jarvisState.voiceAvailable) {
       jarvisSpeak(fullText);
@@ -4631,7 +4687,9 @@ async function jarvisStreamChat(text) {
     if (e.name === 'AbortError') {
       liveMsg.text += ' [stopped]';
     } else {
-      jarvisAddMessage('error', `Stream error: ${e.message}`);
+      const i = jarvisState.messages.indexOf(liveMsg);
+      if (i >= 0 && !liveMsg.text.trim()) jarvisState.messages.splice(i, 1);
+      jarvisAddMessage('error', `Stream error: ${e.message} — try again.`);
     }
     liveMsg.live = false;
   } finally {
@@ -4686,10 +4744,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
       liveMsg.live = false;
       break;
     case 'run.failed':
-    case 'error':
-      jarvisAddMessage('error', parsed.error || parsed.detail || 'Unknown error');
+    case 'error': {
+      // error payloads can be nested objects — never render [object Object]
+      const raw = parsed.error ?? parsed.detail ?? parsed.message ?? 'Unknown error';
+      const msg = typeof raw === 'string' ? raw : (raw.message || JSON.stringify(raw).slice(0, 200));
+      jarvisAddMessage('error',
+        /429|1305|overload/i.test(msg)
+          ? '⚠ The AI provider is overloaded right now (peak-time load shedding). Wait a few seconds and try again.'
+          : msg);
       liveMsg.live = false;
       break;
+    }
   }
 }
 
@@ -5050,7 +5115,13 @@ setInterval(() => {
 }, 2000);
 
 
-function showModal(html) { const c = $('#modalContent'); if (c) c.innerHTML = html; $('#modal').style.display = 'flex'; }
+function showModal(html) {
+  const c = $('#modalContent');
+  // every popup carries its own ? — the topbar one is under the overlay
+  if (c) c.innerHTML = html +
+    '<button class="help-btn modal-help" onclick="startTour(currentView)" title="Explain this window step by step">?</button>';
+  $('#modal').style.display = 'flex';
+}
 function closeModal() {
   const m = $('#modal');
   if (m) m.style.display = 'none';
