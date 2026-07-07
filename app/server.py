@@ -1812,8 +1812,10 @@ class ApprovalCreate(BaseModel):
 
 @app.get("/api/approvals")
 async def list_approvals(status: Optional[str] = None, limit: int = 50):
-    q = "SELECT * FROM approvals WHERE 1=1"
-    params = []
+    # Per-user, fail-closed (gap fix): approvals carry the owner's work
+    # (deliverable reviews) — they exist on the owner's board only.
+    q = "SELECT * FROM approvals WHERE user_id = ?"
+    params = [auth.current_user_id()]
     if status:
         q += " AND status = ?"; params.append(status)
     q += " ORDER BY requested_at DESC LIMIT ?"
@@ -1823,17 +1825,24 @@ async def list_approvals(status: Optional[str] = None, limit: int = 50):
 
 @app.post("/api/approvals")
 async def create_approval(body: ApprovalCreate):
+    uid = auth.current_user_id()
+    task_id = (body.payload or {}).get("task_id")
+    if task_id and not _owned_task(task_id):
+        # a task-linked approval may only reference the caller's own task —
+        # same no-existence-disclosure contract as the other task refs
+        return JSONResponse(status_code=404, content={"error": f"task not found: {task_id}"})
     aid = f"appr-{uuid.uuid4().hex[:10]}"
     now = time.time()
     db.execute(
-        "INSERT INTO approvals (id, agent_id, action_type, description, payload, status, risk_level, requested_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO approvals (id, agent_id, action_type, description, payload, status, risk_level, requested_at, user_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (aid, body.agent_id, body.action_type, body.description, json.dumps(body.payload),
-         "pending", body.risk_level, now),
+         "pending", body.risk_level, now, uid),
     )
     ap = db.query_one("SELECT * FROM approvals WHERE id = ?", (aid,))
-    db.log_activity("info", body.agent_id or "system", f"Approval requested: {body.description}")
-    await mgr.broadcast({"type": "approval_created", "data": ap})
+    db.log_activity("info", body.agent_id or "system", f"Approval requested: {body.description}",
+                    user_id=uid)
+    await mgr.broadcast({"type": "approval_created", "data": ap}, user_id=uid)
     return ap
 
 
@@ -1843,6 +1852,12 @@ async def decide_approval(approval_id: str, body: dict):
     decided_by = body.get("decided_by", "operator")
     if decision not in ("approved", "rejected"):
         return JSONResponse(status_code=400, content={"error": "status must be approved|rejected"})
+    owned = db.query_one("SELECT id FROM approvals WHERE id=? AND user_id=?",
+                         (approval_id, auth.current_user_id()))
+    if not owned:
+        # foreign ≡ nonexistent — deciding someone else's approval would
+        # ship/retry THEIR task
+        return JSONResponse(status_code=404, content={"error": "not found"})
     cur = db.execute(
         "UPDATE approvals SET status=?, decided_at=?, decided_by=? WHERE id=? AND status='pending'",
         (decision, time.time(), decided_by, approval_id),
@@ -1872,8 +1887,8 @@ async def decide_approval(approval_id: str, body: dict):
                 # _retry_task falls back to the judge's findings automatically
                 _retry_task(task_id, (body.get("feedback") or "").strip() or None)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
-            await mgr.broadcast({"type": "task_updated", "data": t2})
-    await mgr.broadcast({"type": "approval_updated", "data": ap})
+            await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
+    await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
     return ap
 
 
