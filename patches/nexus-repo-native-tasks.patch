@@ -964,7 +964,7 @@ index 2bd943c..e605294 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..c9fe6cf 100644
+index b0b7e37..92fb118 100644
 --- a/static/app.js
 +++ b/static/app.js
 @@ -104,11 +104,19 @@ async function api(method, path, body) {
@@ -989,7 +989,15 @@ index b0b7e37..c9fe6cf 100644
    }
    return res.json();
  }
-@@ -308,7 +316,6 @@ async function tick() {
+@@ -127,6 +135,7 @@ async function init() {
+   await loadAll();
+   switchView('dashboard');
+   startClock();
++  renderFocusBar();
+   setInterval(tick, 3000);
+   // Session strip + known-issues badge are visible immediately, not after
+   // the first slow quota tick.
+@@ -308,7 +317,6 @@ async function tick() {
      if (pendingRender && !uiLocked()) { pendingRender = false; render(); updateSidebarMini(); return; }
      if (currentView === 'dashboard') {
        updateDashboardInPlace();
@@ -997,7 +1005,7 @@ index b0b7e37..c9fe6cf 100644
      } else if (currentView === 'agents') {
        renderAgentsView(); // in-place patcher once built
      } else if (currentView === 'kanban') {
-@@ -353,8 +360,8 @@ let quotaTickCounter = 0;
+@@ -353,8 +361,8 @@ let quotaTickCounter = 0;
  // ===== VIEW ROUTER =====
  const VIEW_META = {
    dashboard: ['Dashboard', 'Mission control — live overview of your agent OS'],
@@ -1008,7 +1016,7 @@ index b0b7e37..c9fe6cf 100644
    deliverables: ['Deliverables', 'Every agent output in one place — read, download, chain'],
    agents: ['Agent Fleet', 'Click any agent for memory, messages & cost'],
    agentic: ['Agentic Capabilities', 'Approvals · verification · scheduling · self-healing · cost control'],
-@@ -364,18 +371,25 @@ const VIEW_META = {
+@@ -364,18 +372,25 @@ const VIEW_META = {
    monitor: ['System Monitor', 'Live host telemetry'],
    tools: ['Tools Hub', 'Connected tools & integration health'],
    programs: ['Programs', 'Registered workloads'],
@@ -1037,7 +1045,7 @@ index b0b7e37..c9fe6cf 100644
    }
    currentView = view;
    agentsBuilt = false;
-@@ -404,6 +418,7 @@ function render() {
+@@ -404,6 +419,7 @@ function render() {
    else if (currentView === 'usage') { c.innerHTML = wrapView(viewUsage()); bindUsage(); }
    else if (currentView === 'settings') { c.innerHTML = wrapView(viewSettings()); bindSettings(); }
    else if (currentView === 'issues') { c.innerHTML = wrapView(viewKnownIssues()); }
@@ -1045,7 +1053,7 @@ index b0b7e37..c9fe6cf 100644
    else if (currentView === 'observability') { c.innerHTML = wrapView(viewObservability()); bindObservability(); }
    else if (currentView === 'memory') { c.innerHTML = wrapView(viewMemory()); bindMemory(); }
    else if (currentView === 'specialists') { c.innerHTML = wrapView(viewSpecialists()); bindSpecialists(); }
-@@ -427,7 +442,8 @@ function renderDashboard() {
+@@ -427,7 +443,8 @@ function renderDashboard() {
    if (!dashBuilt) {
      c.innerHTML = wrapView(viewDashboard());
      dashBuilt = true;
@@ -1055,7 +1063,7 @@ index b0b7e37..c9fe6cf 100644
      animateStatValues();
      loadOnboardingCta();
    } else {
-@@ -435,6 +451,56 @@ function renderDashboard() {
+@@ -435,6 +452,56 @@ function renderDashboard() {
    }
  }
  
@@ -1112,7 +1120,7 @@ index b0b7e37..c9fe6cf 100644
  // X4: "run the onboarding" call-to-action until the Business Brain is personalized
  async function loadOnboardingCta() {
    const box = $('#onboardingCta');
-@@ -552,19 +618,14 @@ function viewDashboard() {
+@@ -552,19 +619,14 @@ function viewDashboard() {
    const liveCount = (state.agents || []).filter(a => a.status === 'running' || a.status === 'busy').length;
  
    return `
@@ -1138,7 +1146,15 @@ index b0b7e37..c9fe6cf 100644
        <div class="now-strip">
          <div class="now-title"><span class="status-dot online"></span> Executing right now</div>
          <div id="nowStrip">${nowRunningHTML()}</div>
-@@ -958,6 +1019,11 @@ function openTaskDetail(id) {
+@@ -714,6 +776,7 @@ function kanbanTagUniverse() {
+ }
+ 
+ function taskMatchesFilters(t) {
++  if (!taskInFocus(t)) return false; // global focus context scopes first
+   const f = kanbanFilters;
+   if (f.q) {
+     const q = f.q.toLowerCase();
+@@ -958,6 +1021,11 @@ function openTaskDetail(id) {
        <div class="chip c-accent" style="white-space:normal">${esc(t.rubric_score)}</div></div>` : ''}
      ${t.learn_section ? `<div class="form-group"><label class="form-label">Learn (for you two)</label>
        <div style="background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.25);border-radius:8px;padding:10px 12px;font-size:12.5px;white-space:pre-wrap">${esc(t.learn_section)}</div></div>` : ''}
@@ -1150,10 +1166,76 @@ index b0b7e37..c9fe6cf 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -1051,6 +1117,361 @@ async function deleteAttachment(kind, id, name, elId) {
+@@ -1051,6 +1119,427 @@ async function deleteAttachment(kind, id, name, elId) {
    } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
  }
  
++// ═══════════════════ GLOBAL FOCUS CONTEXT (Projects › Workflows › Tasks) ═══════════════════
++// Select a project and every downstream view scopes to it; select a workflow
++// and Tasks narrows further. Creation inherits the deepest selection.
++// Persisted across reloads; always visible in the bar under the topbar.
++let focusCtx = { project: null, workflow: null };
++try { focusCtx = JSON.parse(localStorage.getItem('nexusFocus') || '{}') || {}; } catch { }
++focusCtx.project = focusCtx.project || null;
++focusCtx.workflow = focusCtx.workflow || null;
++
++function saveFocus() {
++  try { localStorage.setItem('nexusFocus', JSON.stringify(focusCtx)); } catch { }
++  renderFocusBar();
++}
++
++function setFocusProject(path, name, client) {
++  if (focusCtx.project && focusCtx.project.path !== path) focusCtx.workflow = null;
++  focusCtx.project = path ? { path, name, client: client || null } : null;
++  if (!path) focusCtx.workflow = null;
++  saveFocus();
++  toast(path ? `🎯 Working in project: ${name} — Workflows & Tasks are now scoped to it` : 'Project focus cleared — showing everything', 'ok');
++  render();
++}
++
++function setFocusWorkflow(id, name) {
++  focusCtx.workflow = id ? { id, name } : null;
++  saveFocus();
++  toast(id ? `🎯 Focused workflow: ${name} — Tasks shows only its tasks` : 'Workflow focus cleared', 'ok');
++  render();
++}
++
++function renderFocusBar() {
++  const bar = document.getElementById('focusBar');
++  if (!bar) return;
++  const p = focusCtx.project, w = focusCtx.workflow;
++  if (!p && !w) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
++  bar.style.display = 'flex';
++  bar.innerHTML = `<span style="font-family:var(--font-mono);font-size:10.5px;letter-spacing:.1em">🎯 WORKING IN</span>` +
++    (p ? `<span class="focus-chip">📂 <b>${esc(p.name)}</b>${p.client ? ` <span class="muted">(${esc(p.client)})</span>` : ''}<span class="fx" title="clear project focus" onclick="setFocusProject(null)">✕</span></span>` : '') +
++    (p && w ? '<span class="focus-sep">›</span>' : '') +
++    (w ? `<span class="focus-chip">⚙ <b>${esc(w.name)}</b><span class="fx" title="clear workflow focus" onclick="setFocusWorkflow(null)">✕</span></span>` : '') +
++    `<span class="muted" style="margin-left:auto;font-size:11px">new workflows & tasks are assigned here automatically</span>`;
++}
++
++// workflow ids whose tasks live in the focused project (derived — a workflow
++// has no project field; its tasks' repo_path is the truth)
++function focusProjectWorkflowIds() {
++  const p = focusCtx.project;
++  if (!p) return null;
++  const ids = new Set();
++  (state.tasks || []).forEach(t => {
++    if (t.workflow_id && t.repo_path && (t.repo_path === p.path || t.repo_path.startsWith(p.path + '/'))) {
++      ids.add(t.workflow_id);
++    }
++  });
++  return ids;
++}
++
++function taskInFocus(t) {
++  if (focusCtx.workflow) return t.workflow_id === focusCtx.workflow.id;
++  const p = focusCtx.project;
++  if (!p) return true;
++  if (t.repo_path && (t.repo_path === p.path || t.repo_path.startsWith(p.path + '/'))) return true;
++  const ids = focusProjectWorkflowIds();
++  return !!(t.workflow_id && ids && ids.has(t.workflow_id));
++}
++
 +// ═══════════════════ USER MANUAL (view: manual) ═══════════════════
 +function viewManual() {
 +  return `<div class="manual-wrap">
@@ -1333,7 +1415,7 @@ index b0b7e37..c9fe6cf 100644
 +  kanban: [
 +    { sel: '.kanban-board, #content', title: 'Your task board', body: 'Work flows left to right: Backlog (ideas) → Todo (ready) → In Progress (an agent is working) → Review (check the result) → Done. Drag cards between columns, or let agents pull work themselves.' },
 +    { sel: '[onclick*="describeTaskUI"], .btn-primary', title: 'The magic entrance ✨', body: 'Don\'t build tasks by hand — click "✨ Describe a task", type what you want in normal sentences, and the AI plans it: it may ask a few clarifying questions (each with a recommended answer), then proposes the task or a whole pipeline for you to approve.' },
-+    { sel: '#kWorkflow', title: 'Filters', body: 'Narrow the board to one project or one assignee. Useful once many tasks accumulate.' },
++    { sel: '#kWorkflow', title: 'Filters', body: 'Narrow the board by workflow or assignee. Tip: the 🎯 focus buttons (Projects and Workflows tabs) scope this whole board globally — the bar at the top shows what you are working in.' },
 +    { sel: '.kanban-card', title: 'A task card', body: 'Click any card to open its full record: description, budget, the agent working on it, attachments, its improvement loop, and every file it produced. The ⚑ flag shows which agent claimed it.' },
 +  ],
 +  workflows: [
@@ -1512,7 +1594,7 @@ index b0b7e37..c9fe6cf 100644
  // ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
  const KNOWN_MODELS = ['glm-5.2', 'glm-5.1', 'glm-4.5-air'];
  const settingsState = { fetched: false, dispatch: {}, model: {} };
-@@ -1533,6 +1954,7 @@ async function loadTaskExtras(t) {
+@@ -1533,6 +2022,7 @@ async function loadTaskExtras(t) {
            ${run && run.ready ? `<span class="chip c-green">running</span><a class="btn-sm" href="${esc(run.url)}" target="_blank" style="text-decoration:none">↗ Open</a>
              <button class="btn-sm danger" onclick="stopAppUI('${esc(t.id)}')">⏹ Stop</button>`
        : `<button class="btn-sm" style="border-color:var(--accent-2)" onclick="testAppUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">▶ Test app</button>`}
@@ -1520,7 +1602,7 @@ index b0b7e37..c9fe6cf 100644
          </div></div>`;
      }
      if ((fr.files || []).length) {
-@@ -2567,6 +2989,11 @@ function showTaskModal(status) {
+@@ -2567,6 +3057,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -1532,13 +1614,14 @@ index b0b7e37..c9fe6cf 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +3023,14 @@ function showTaskModal(status) {
+@@ -2596,6 +3091,15 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
 +    try {
 +      const repos = (await api('GET', '/api/projects')).projects || [];
 +      const rsel = $('#m-task-repo');
++      if (rsel && focusCtx.project) setTimeout(() => { rsel.value = focusCtx.project.path; }, 60);
 +      if (rsel && repos.length) {
 +        rsel.innerHTML = `<option value="">— None: fresh workspace (default) —</option>` +
 +          repos.map(r => `<option value="${esc(r.path)}">${esc(r.name)}</option>`).join('');
@@ -1547,15 +1630,16 @@ index b0b7e37..c9fe6cf 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +3102,7 @@ async function submitTask() {
+@@ -2667,6 +3171,8 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
 +    repo_path: $('#m-task-repo') ? ($('#m-task-repo').value || null) : null,
++    workflow_id: focusCtx.workflow ? focusCtx.workflow.id : null,
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -2941,14 +3377,17 @@ function viewProjects() {
+@@ -2941,14 +3447,17 @@ function viewProjects() {
    const fmtSize = b => b > 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b > 1e6 ? (b / 1e6).toFixed(0) + ' MB' : (b / 1e3).toFixed(0) + ' KB';
    const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
    let html = `
@@ -1571,11 +1655,11 @@ index b0b7e37..c9fe6cf 100644
      </div>
      <div class="panel"><table class="data-table">
 -      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Size</th><th>Modified</th></tr></thead>
-+      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Remote</th><th>Size</th><th>Modified</th></tr></thead>
++      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Focus</th><th>Remote</th><th>Size</th><th>Modified</th></tr></thead>
        <tbody>`;
    for (const p of projs) {
      const langs = Object.entries(p.languages).slice(0, 3).map(([l]) =>
-@@ -2957,10 +3396,11 @@ function viewProjects() {
+@@ -2957,10 +3466,12 @@ function viewProjects() {
        p.is_repo ? '<span style="color:var(--green)">● clean</span>' :
          '<span class="muted">○ no git</span>';
      html += `<tr class="proj-row" data-path="${esc(p.path)}">
@@ -1584,11 +1668,12 @@ index b0b7e37..c9fe6cf 100644
        <td>${langs}</td>
        <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
        <td>${status}</td>
++      <td>${p.is_repo ? `<button class="focus-btn" title="Work in this project: Workflows & Tasks scope to it; new work is assigned to it" onclick="event.stopPropagation(); setFocusProject('${esc(p.path)}','${esc(p.name)}','${esc(p.client || '')}')">🎯 ${focusCtx.project && focusCtx.project.path === p.path ? 'selected' : 'select'}</button>` : ''}</td>
 +      <td>${p.is_repo ? (p.git_remote ? '<span title="' + esc(p.git_remote) + '" style="color:var(--accent-2)">☁ backed up</span>' : '<span style="color:var(--yellow)">⚠ local only</span>') : '<span class="muted">—</span>'}</td>
        <td>${fmtSize(p.size_bytes)}</td>
        <td class="muted">${fmtDays(p.last_modified)}</td>
      </tr>`;
-@@ -2982,11 +3422,182 @@ function bindProjects() {
+@@ -2982,11 +3493,182 @@ function bindProjects() {
            <div class="kv-row"><span class="kv-key">Size</span><span class="kv-val">${(p.size_bytes / 1e6).toFixed(1)} MB</span></div>
            <div class="kv-row"><span class="kv-key">venv</span><span class="kv-val">${p.has_venv ? 'yes' : 'no'}</span></div>
            <h4 style="margin-top:12px">Languages</h4>${langs}
@@ -1771,7 +1856,7 @@ index b0b7e37..c9fe6cf 100644
  // ═══════════════════════════════ GUARDIAN ═══════════════════════════════
  const guardianState = { data: null, loading: false, fetched: false };
  async function loadGuardian() {
-@@ -3198,13 +3809,15 @@ function viewMemory() {
+@@ -3198,13 +3880,15 @@ function viewMemory() {
    const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
    const sharedCount = (specialistsState.shared || []).length;
    const tabs = [
@@ -1788,7 +1873,7 @@ index b0b7e37..c9fe6cf 100644
    else if (memoryState.tab === 'agent') body = memAgentHTML();
    else if (memoryState.tab === 'lessons') body = memLessonsHTML();
    else if (memoryState.tab === 'shared') body = memSharedHTML();
-@@ -3226,7 +3839,48 @@ async function loadAgentMemoryTab() {
+@@ -3226,7 +3910,48 @@ async function loadAgentMemoryTab() {
    if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
  }
  
@@ -1837,7 +1922,7 @@ index b0b7e37..c9fe6cf 100644
    $$('[data-memtab]').forEach(el => {
      el.onclick = () => {
        memoryState.tab = el.dataset.memtab;
-@@ -3778,28 +4432,31 @@ function renderJarvisView() {
+@@ -3778,28 +4503,31 @@ function renderJarvisView() {
          </div>
        </div>
  
@@ -1888,7 +1973,7 @@ index b0b7e37..c9fe6cf 100644
          </div>
          <div class="jarvis-feed" id="jFeed"></div>
          <div class="jarvis-chat-row">
-@@ -3839,8 +4496,36 @@ function renderJarvisView() {
+@@ -3839,8 +4567,36 @@ function renderJarvisView() {
    // Wire up controls
    jarvisBindControls();
  
@@ -1927,7 +2012,7 @@ index b0b7e37..c9fe6cf 100644
  }
  
  async function jarvisBootSequence() {
-@@ -3996,10 +4681,12 @@ function jarvisBindControls() {
+@@ -3996,10 +4752,12 @@ function jarvisBindControls() {
  
    stopBtn.addEventListener('click', () => jarvisStopStreaming());
  
@@ -1943,7 +2028,7 @@ index b0b7e37..c9fe6cf 100644
    });
  
    // Conversation mode toggle
-@@ -4012,7 +4699,8 @@ function jarvisBindControls() {
+@@ -4012,7 +4770,8 @@ function jarvisBindControls() {
  }
  
  // ===== STATUS =====
@@ -1953,7 +2038,7 @@ index b0b7e37..c9fe6cf 100644
    try {
      const s = await api('GET', '/api/jarvis/status');
      jarvisState.connected = s.connected;
-@@ -4037,8 +4725,10 @@ async function jarvisLoadStatus() {
+@@ -4037,8 +4796,10 @@ async function jarvisLoadStatus() {
      $('#jVoiceStatus').textContent = 'OFF';
    }
  
@@ -1966,7 +2051,7 @@ index b0b7e37..c9fe6cf 100644
  }
  
  async function jarvisLoadData() {
-@@ -4083,12 +4773,13 @@ function jarvisUpdateActivity() {
+@@ -4083,12 +4844,13 @@ function jarvisUpdateActivity() {
      el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
      return;
    }
@@ -1981,7 +2066,7 @@ index b0b7e37..c9fe6cf 100644
    const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
    const labelEl = $('#jState');
    if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
-@@ -4132,7 +4823,8 @@ function jarvisRenderFeed() {
+@@ -4132,7 +4894,8 @@ function jarvisRenderFeed() {
    feed.innerHTML = jarvisState.messages.map(m => {
      const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
      const cls2 = m.live ? ' live' : '';
@@ -1991,7 +2076,7 @@ index b0b7e37..c9fe6cf 100644
    }).join('');
    feed.scrollTop = feed.scrollHeight;
    const mc = $('#jMsgCount');
-@@ -4193,6 +4885,16 @@ async function jarvisStreamChat(text) {
+@@ -4193,6 +4956,16 @@ async function jarvisStreamChat(text) {
  
      liveMsg.live = false;
  
@@ -2008,7 +2093,7 @@ index b0b7e37..c9fe6cf 100644
      // Speak the response
      if (fullText && jarvisState.voiceAvailable) {
        jarvisSpeak(fullText);
-@@ -4201,7 +4903,9 @@ async function jarvisStreamChat(text) {
+@@ -4201,7 +4974,9 @@ async function jarvisStreamChat(text) {
      if (e.name === 'AbortError') {
        liveMsg.text += ' [stopped]';
      } else {
@@ -2019,7 +2104,7 @@ index b0b7e37..c9fe6cf 100644
      }
      liveMsg.live = false;
    } finally {
-@@ -4247,7 +4951,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4247,7 +5022,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
      case 'tool_call':
        const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
        if (toolName && toolName !== '_thinking') {
@@ -2028,7 +2113,7 @@ index b0b7e37..c9fe6cf 100644
        }
        break;
      case 'run.completed':
-@@ -4256,10 +4960,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4256,10 +5031,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
        liveMsg.live = false;
        break;
      case 'run.failed':
@@ -2048,7 +2133,7 @@ index b0b7e37..c9fe6cf 100644
    }
  }
  
-@@ -4307,7 +5018,12 @@ async function jarvisProcessTTSQueue() {
+@@ -4307,7 +5089,12 @@ async function jarvisProcessTTSQueue() {
      return;
    }
    jarvisState.ttsAnimating = true;
@@ -2061,7 +2146,7 @@ index b0b7e37..c9fe6cf 100644
  
    // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
    // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
-@@ -4317,6 +5033,7 @@ async function jarvisProcessTTSQueue() {
+@@ -4317,6 +5104,7 @@ async function jarvisProcessTTSQueue() {
  
    while (pending) {
      const clip = await pending;
@@ -2069,7 +2154,7 @@ index b0b7e37..c9fe6cf 100644
      // Kick off NEXT render now (runs in parallel with current playback)
      let nextPending = null;
      if (jarvisState.ttsQueue.length > 0) {
-@@ -4326,9 +5043,17 @@ async function jarvisProcessTTSQueue() {
+@@ -4326,9 +5114,17 @@ async function jarvisProcessTTSQueue() {
      }
      if (clip) await jarvisPlayClip(clip);
      pending = nextPending;
@@ -2087,7 +2172,7 @@ index b0b7e37..c9fe6cf 100644
    jarvisSetMode('idle');
    jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
    jarvisMaybeAutoListen();
-@@ -4365,7 +5090,10 @@ async function jarvisFetchClip(text) {
+@@ -4365,7 +5161,10 @@ async function jarvisFetchClip(text) {
  // both from the SAME blob — synced by construction. If WAV (/tts fallback):
  // audio only.
  function jarvisPlayClip(blob) {
@@ -2099,7 +2184,7 @@ index b0b7e37..c9fe6cf 100644
    return new Promise((resolve) => {
      let resolved = false;
      const url = URL.createObjectURL(blob);
-@@ -4377,11 +5105,15 @@ function jarvisPlayClip(blob) {
+@@ -4377,11 +5176,15 @@ function jarvisPlayClip(blob) {
      const cleanup = () => {
        if (resolved) return;
        resolved = true;
@@ -2115,7 +2200,7 @@ index b0b7e37..c9fe6cf 100644
  
      const startIfReady = () => {
        if (started || !audioReady || !videoReady) return;
-@@ -4420,10 +5152,38 @@ function jarvisAudioEl() {
+@@ -4420,10 +5223,38 @@ function jarvisAudioEl() {
    if (!jarvisState.ttsAudioEl) {
      const el = new Audio();
      jarvisState.ttsAudioEl = el;
@@ -2154,7 +2239,7 @@ index b0b7e37..c9fe6cf 100644
  function jarvisMaybeAutoListen() {
    if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
      jarvisStartRecording();
-@@ -4432,12 +5192,19 @@ function jarvisMaybeAutoListen() {
+@@ -4432,12 +5263,19 @@ function jarvisMaybeAutoListen() {
  
  function jarvisStopTTS() {
    jarvisState.ttsQueue = [];
@@ -2175,7 +2260,7 @@ index b0b7e37..c9fe6cf 100644
    jarvisSetIdleAvatar();
  }
  
-@@ -4463,12 +5230,16 @@ async function jarvisStartRecording() {
+@@ -4463,12 +5301,16 @@ async function jarvisStartRecording() {
        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
      }
      const ctx = jarvisState.audioContext;
@@ -2192,7 +2277,7 @@ index b0b7e37..c9fe6cf 100644
      jarvisMicLevelLoop();
  
      jarvisState.mediaRecorder.ondataavailable = (e) => {
-@@ -4526,6 +5297,7 @@ function jarvisMicLevelLoop() {
+@@ -4526,6 +5368,7 @@ function jarvisMicLevelLoop() {
    if (!jarvisState.micAnalyser || !jarvisState.recording) {
      const el = $('#jMicLevel');
      if (el) el.style.width = '0%';
@@ -2200,7 +2285,7 @@ index b0b7e37..c9fe6cf 100644
      return;
    }
    jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
-@@ -4534,6 +5306,18 @@ function jarvisMicLevelLoop() {
+@@ -4534,6 +5377,18 @@ function jarvisMicLevelLoop() {
    const avg = sum / jarvisState._micDataArray.length / 255;
    const el = $('#jMicLevel');
    if (el) el.style.width = (avg * 100 * 2) + '%';
@@ -2219,7 +2304,7 @@ index b0b7e37..c9fe6cf 100644
    requestAnimationFrame(jarvisMicLevelLoop);
  }
  
-@@ -4547,7 +5331,13 @@ setInterval(() => {
+@@ -4547,7 +5402,13 @@ setInterval(() => {
  }, 2000);
  
  
@@ -2234,7 +2319,22 @@ index b0b7e37..c9fe6cf 100644
  function closeModal() {
    const m = $('#modal');
    if (m) m.style.display = 'none';
-@@ -4956,7 +5746,7 @@ function viewWorkflows() {
+@@ -4937,9 +5798,13 @@ async function loadWorkflows() {
+ 
+ function viewWorkflows() {
+   if (!wfState.fetched) { loadWorkflows(); return skeletonView(); }
+-  const rows = (wfState.list || []).map(w => `
++  const wfIds = focusProjectWorkflowIds();
++  const scoped = (wfState.list || []).filter(w =>
++    !wfIds || wfIds.has(w.id) || !w.tasks_total); // empty workflows stay visible (just created)
++  const rows = scoped.map(w => `
+     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
+       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
++        <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
+         <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span></div>
+       <div class="card-body">
+         ${w.goal ? `<div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">${esc(w.goal)}</div>` : ''}
+@@ -4956,7 +5821,7 @@ function viewWorkflows() {
    return `
      <div class="view-intro" style="margin-bottom:12px">A <strong>project</strong> connects several tasks into one campaign. Tasks with dependencies wait until their inputs are DONE, then run automatically — each agent reads its predecessors' deliverable files. Example: research → ad copy → channel plan → publish plan.</div>
      <div style="display:flex;gap:10px;margin-bottom:14px">
@@ -2243,7 +2343,7 @@ index b0b7e37..c9fe6cf 100644
        <button class="btn-ghost" title="Describe the whole goal in plain words — the AI plans the task chain" onclick="describeTaskUI()">✨ Describe a goal (AI plans it)</button>
        <button class="btn-ghost" title="Creates a ready-made 4-task marketing campaign chain — edit the [brackets], then watch it run in order" onclick="createExampleCampaign()">Example: marketing campaign</button>
      </div>
-@@ -4974,6 +5764,23 @@ async function newWorkflowUI() {
+@@ -4974,6 +5839,23 @@ async function newWorkflowUI() {
    render();
  }
  
@@ -2267,7 +2367,7 @@ index b0b7e37..c9fe6cf 100644
  async function openWorkflowDetail(id) {
    let w;
    try { w = await api('GET', `/api/workflows/${id}`); }
-@@ -5006,6 +5813,22 @@ async function openWorkflowDetail(id) {
+@@ -5006,6 +5888,22 @@ async function openWorkflowDetail(id) {
          ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
          <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
        </div></div>
@@ -2290,7 +2390,7 @@ index b0b7e37..c9fe6cf 100644
      <div class="modal-actions" style="justify-content:space-between">
        <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
        <div style="display:flex;gap:10px">
-@@ -5089,8 +5912,8 @@ function viewDeliverables() {
+@@ -5089,8 +5987,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -2301,7 +2401,7 @@ index b0b7e37..c9fe6cf 100644
              : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
          </div>
          <div class="row-actions">
-@@ -5132,18 +5955,34 @@ function describeTaskUI() {
+@@ -5132,18 +6030,37 @@ function describeTaskUI() {
      <h2>✨ Describe what you want done</h2>
      <div class="view-intro" style="margin-bottom:10px">Plain words, German or English. The AI may ask up to 5 clarifying questions first (every one skippable), then plans: specialist, domain, model, priority, high-stakes flag and the full brief — you review before anything is created. Coding goals become the full pipeline (spec → implement → review → fix → verify) automatically.</div>
      <textarea class="form-textarea" id="twAsk" style="height:120px" placeholder="e.g. We have to develop our application. It has to be a webshop for clothing with a basket and payment…"></textarea>
@@ -2320,8 +2420,11 @@ index b0b7e37..c9fe6cf 100644
 +    api('GET', '/api/projects').then(d => {
 +      const ps = (d.projects || d || []).filter(x => x.is_repo);
 +      ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
-+      if (twSel.isConnected) twSel.innerHTML += ps.map(x =>
-+        `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
++      if (twSel.isConnected) {
++        twSel.innerHTML += ps.map(x =>
++          `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
++        if (focusCtx.project) twSel.value = focusCtx.project.path; // focus context
++      }
 +    }).catch(() => { });
 +  }
    const b = $('#twGo');
@@ -2337,7 +2440,7 @@ index b0b7e37..c9fe6cf 100644
        handleWizardPlan(instruction.trim(), r);
      } catch (e) {
        toast('Wizard failed: ' + e.message, 'err');
-@@ -5152,6 +5991,8 @@ function describeTaskUI() {
+@@ -5152,6 +6069,8 @@ function describeTaskUI() {
    };
  }
  
@@ -2346,7 +2449,7 @@ index b0b7e37..c9fe6cf 100644
  // Route a wizard response: one question round, or straight to the plan preview.
  function handleWizardPlan(instruction, r) {
    if (r.type === 'questions') { wizardQuestionsModal(instruction, r); return; }
-@@ -5196,7 +6037,7 @@ function wizardQuestionsModal(instruction, r) {
+@@ -5196,7 +6115,7 @@ function wizardQuestionsModal(instruction, r) {
    const submit = async (answers, btn) => {
      btn.disabled = true; btn.textContent = '✨ Planning… (up to ~3 min under load)';
      try {
@@ -2355,7 +2458,7 @@ index b0b7e37..c9fe6cf 100644
        handleWizardPlan(instruction, r2);
      } catch (e) {
        toast('Wizard failed: ' + e.message, 'err');
-@@ -5234,6 +6075,13 @@ function applyWizardTask(t, meta) {
+@@ -5234,6 +6153,13 @@ function applyWizardTask(t, meta) {
      if ($('#m-task-priority')) $('#m-task-priority').value = String(t.priority ?? 2);
      if ($('#m-task-budget') && t.budget_tokens) $('#m-task-budget').value = t.budget_tokens;
      if ($('#m-task-tags')) $('#m-task-tags').value = (t.tags || []).join(', ');
@@ -2369,7 +2472,7 @@ index b0b7e37..c9fe6cf 100644
      const ssel = $('#m-task-specialist');
      if (ssel && t.specialist) {
        if (![...ssel.options].some(o => o.value === t.specialist)) {
-@@ -5292,6 +6140,22 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5292,6 +6218,22 @@ function proposeWorkflowModal(wf, meta) {
      ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
      ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
      <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
@@ -2392,7 +2495,7 @@ index b0b7e37..c9fe6cf 100644
      <div class="form-group" style="margin-top:8px">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -5307,6 +6171,24 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5307,6 +6249,25 @@ function proposeWorkflowModal(wf, meta) {
        <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
      </div>`);
    const b = $('#wfCreateBtn');
@@ -2407,7 +2510,8 @@ index b0b7e37..c9fe6cf 100644
 +        `<option value="${esc(p.path)}" data-client="${esc(p.client || '')}">${p.client ? '🏢 ' + esc(p.client) + ' / ' : (p.personal ? '🏠 ' : '')}${esc(p.name)}</option>`).join('') +
 +        '<option value="__new__">➕ New client repository…</option>';
 +      repoSel.onchange = () => wfRepoChanged(repoSel);
-+      const pre = (meta && meta.repo_path) || wizardCtx.repo_path;
++      const pre = (meta && meta.repo_path) || wizardCtx.repo_path ||
++        (focusCtx.project && focusCtx.project.path);
 +      if (pre && [...repoSel.options].some(o => o.value === pre)) {
 +        repoSel.value = pre;
 +        wfRepoChanged(repoSel); // autofills the client field
@@ -2417,7 +2521,7 @@ index b0b7e37..c9fe6cf 100644
    const keeps = () => tasks.map((_, i) => {
      const cb = $(`#wfKeep${i}`);
      return !cb || cb.checked;
-@@ -5332,6 +6214,11 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5332,6 +6293,11 @@ function proposeWorkflowModal(wf, meta) {
        }
        return out;
      };
@@ -2429,7 +2533,7 @@ index b0b7e37..c9fe6cf 100644
      let wfLoop = null;
      if ($('#wf-loop') && $('#wf-loop').checked) {
        try {
-@@ -5341,14 +6228,15 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5341,14 +6307,15 @@ function proposeWorkflowModal(wf, meta) {
            meta: {
              title: wf.name, domain: wf.domain,
              specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
@@ -2447,7 +2551,7 @@ index b0b7e37..c9fe6cf 100644
        const ids = [];
        for (let i = 0; i < tasks.length; i++) {
          const t = tasks[i];
-@@ -5356,9 +6244,13 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5356,9 +6323,13 @@ function proposeWorkflowModal(wf, meta) {
          const created = await api('POST', '/api/tasks', {
            title: t.title, description: t.description, status: 'backlog',
            priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
@@ -2463,7 +2567,7 @@ index b0b7e37..c9fe6cf 100644
          });
          ids.push(created.id);
 diff --git a/static/index.html b/static/index.html
-index bb6661f..1698618 100644
+index bb6661f..4e66475 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -2471,7 +2575,7 @@ index bb6661f..1698618 100644
  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
 -<link rel="stylesheet" href="/static/style.css?v=5">
-+<link rel="stylesheet" href="/static/style.css?v=8">
++<link rel="stylesheet" href="/static/style.css?v=9">
  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
  </head>
  <body>
@@ -2502,7 +2606,7 @@ index bb6661f..1698618 100644
      </div>
      <div class="jarvis-nav-wrap">
        <a class="nav-item nav-jarvis" data-view="jarvis"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.2" stroke-dasharray="3 2.5"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/></svg></span>J.A.R.V.I.S<span class="jarvis-live">◉</span></a>
-@@ -68,6 +69,7 @@
+@@ -68,11 +69,13 @@
        </div>
        <div class="topbar-right">
          <div class="model-strip" id="modelStrip" title="Live Hermes sessions per model (running / cap) — caps editable in Settings" style="display:flex;gap:8px;align-items:center;font-family:var(--font-mono);font-size:11px;color:var(--text-dim)"></div>
@@ -2510,21 +2614,27 @@ index bb6661f..1698618 100644
          <div class="conn-pill" id="connPill"><span class="status-dot online" id="wsDot"></span><span id="wsLabel">LIVE</span></div>
          <span class="live-text" id="liveClock">--:--:--</span>
          <button class="btn-primary" id="spawnBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" width="13" height="13"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Spawn Agent</button>
-@@ -93,6 +95,8 @@
+       </div>
+     </header>
++    <div id="focusBar" class="focus-bar" style="display:none"></div>
+ 
+     <!-- CONTENT -->
+     <div class="content" id="content"></div>
+@@ -93,6 +96,8 @@
  
  <button id="fbBtn" onclick="feedbackModal()" title="Something wrong or annoying here? File it — your last steps get attached automatically" style="position:fixed;right:18px;bottom:18px;z-index:900;width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(20,20,32,.85);color:var(--text-dim);font-size:17px;cursor:pointer;backdrop-filter:blur(6px)">🐞</button>
  <script src="/static/nexus3d.js?v=1" type="module"></script>
 -<script src="/static/app.js?v=28"></script>
 +<script src="/static/memory3d.js?v=5" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=41"></script>
++<script src="/static/app.js?v=42"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css
-index e17c46d..f4c2b29 100644
+index e17c46d..4cd192b 100644
 --- a/static/style.css
 +++ b/static/style.css
-@@ -1229,3 +1229,103 @@ code, pre, .mono { font-family: var(--font-mono); }
+@@ -1229,3 +1229,127 @@ code, pre, .mono { font-family: var(--font-mono); }
    .spec-grid { grid-template-columns:1fr; }
    .drawer { width:100vw; }
  }
@@ -2628,6 +2738,30 @@ index e17c46d..f4c2b29 100644
 +}
 +.modal { position:relative; }
 +.modal-help { position:absolute; top:14px; right:14px; z-index:5; }
++
++/* ═══ Global focus context (Projects › Workflows › Tasks scoping) ═══ */
++.focus-bar {
++  display:flex; align-items:center; gap:8px; padding:7px 30px;
++  background:rgba(124,92,255,.07); border-bottom:1px solid rgba(124,92,255,.18);
++  font-size:12px; color:var(--text-dim);
++}
++.focus-chip {
++  display:inline-flex; align-items:center; gap:6px; padding:3px 10px;
++  border-radius:14px; border:1px solid rgba(124,92,255,.4);
++  background:rgba(20,20,36,.7); color:var(--text); font-size:12px;
++}
++.focus-chip b { font-weight:600; }
++.focus-chip .fx {
++  cursor:pointer; color:var(--text-faint); font-weight:700; padding:0 2px;
++}
++.focus-chip .fx:hover { color:var(--red, #f87171); }
++.focus-sep { color:var(--text-faint); }
++.focus-btn {
++  border:1px solid rgba(124,92,255,.35); background:rgba(20,20,36,.6);
++  color:var(--text-dim); border-radius:8px; padding:2px 8px; cursor:pointer;
++  font-size:11px; transition:all .15s;
++}
++.focus-btn:hover { color:var(--text); border-color:var(--accent); }
 diff --git a/templates.json b/templates.json
 index e4a0612..baec6b0 100644
 --- a/templates.json

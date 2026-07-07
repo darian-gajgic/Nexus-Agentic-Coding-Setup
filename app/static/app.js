@@ -135,6 +135,7 @@ async function init() {
   await loadAll();
   switchView('dashboard');
   startClock();
+  renderFocusBar();
   setInterval(tick, 3000);
   // Session strip + known-issues badge are visible immediately, not after
   // the first slow quota tick.
@@ -775,6 +776,7 @@ function kanbanTagUniverse() {
 }
 
 function taskMatchesFilters(t) {
+  if (!taskInFocus(t)) return false; // global focus context scopes first
   const f = kanbanFilters;
   if (f.q) {
     const q = f.q.toLowerCase();
@@ -1117,6 +1119,72 @@ async function deleteAttachment(kind, id, name, elId) {
   } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
+// ═══════════════════ GLOBAL FOCUS CONTEXT (Projects › Workflows › Tasks) ═══════════════════
+// Select a project and every downstream view scopes to it; select a workflow
+// and Tasks narrows further. Creation inherits the deepest selection.
+// Persisted across reloads; always visible in the bar under the topbar.
+let focusCtx = { project: null, workflow: null };
+try { focusCtx = JSON.parse(localStorage.getItem('nexusFocus') || '{}') || {}; } catch { }
+focusCtx.project = focusCtx.project || null;
+focusCtx.workflow = focusCtx.workflow || null;
+
+function saveFocus() {
+  try { localStorage.setItem('nexusFocus', JSON.stringify(focusCtx)); } catch { }
+  renderFocusBar();
+}
+
+function setFocusProject(path, name, client) {
+  if (focusCtx.project && focusCtx.project.path !== path) focusCtx.workflow = null;
+  focusCtx.project = path ? { path, name, client: client || null } : null;
+  if (!path) focusCtx.workflow = null;
+  saveFocus();
+  toast(path ? `🎯 Working in project: ${name} — Workflows & Tasks are now scoped to it` : 'Project focus cleared — showing everything', 'ok');
+  render();
+}
+
+function setFocusWorkflow(id, name) {
+  focusCtx.workflow = id ? { id, name } : null;
+  saveFocus();
+  toast(id ? `🎯 Focused workflow: ${name} — Tasks shows only its tasks` : 'Workflow focus cleared', 'ok');
+  render();
+}
+
+function renderFocusBar() {
+  const bar = document.getElementById('focusBar');
+  if (!bar) return;
+  const p = focusCtx.project, w = focusCtx.workflow;
+  if (!p && !w) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = 'flex';
+  bar.innerHTML = `<span style="font-family:var(--font-mono);font-size:10.5px;letter-spacing:.1em">🎯 WORKING IN</span>` +
+    (p ? `<span class="focus-chip">📂 <b>${esc(p.name)}</b>${p.client ? ` <span class="muted">(${esc(p.client)})</span>` : ''}<span class="fx" title="clear project focus" onclick="setFocusProject(null)">✕</span></span>` : '') +
+    (p && w ? '<span class="focus-sep">›</span>' : '') +
+    (w ? `<span class="focus-chip">⚙ <b>${esc(w.name)}</b><span class="fx" title="clear workflow focus" onclick="setFocusWorkflow(null)">✕</span></span>` : '') +
+    `<span class="muted" style="margin-left:auto;font-size:11px">new workflows & tasks are assigned here automatically</span>`;
+}
+
+// workflow ids whose tasks live in the focused project (derived — a workflow
+// has no project field; its tasks' repo_path is the truth)
+function focusProjectWorkflowIds() {
+  const p = focusCtx.project;
+  if (!p) return null;
+  const ids = new Set();
+  (state.tasks || []).forEach(t => {
+    if (t.workflow_id && t.repo_path && (t.repo_path === p.path || t.repo_path.startsWith(p.path + '/'))) {
+      ids.add(t.workflow_id);
+    }
+  });
+  return ids;
+}
+
+function taskInFocus(t) {
+  if (focusCtx.workflow) return t.workflow_id === focusCtx.workflow.id;
+  const p = focusCtx.project;
+  if (!p) return true;
+  if (t.repo_path && (t.repo_path === p.path || t.repo_path.startsWith(p.path + '/'))) return true;
+  const ids = focusProjectWorkflowIds();
+  return !!(t.workflow_id && ids && ids.has(t.workflow_id));
+}
+
 // ═══════════════════ USER MANUAL (view: manual) ═══════════════════
 function viewManual() {
   return `<div class="manual-wrap">
@@ -1296,7 +1364,7 @@ const TOURS = {
   kanban: [
     { sel: '.kanban-board, #content', title: 'Your task board', body: 'Work flows left to right: Backlog (ideas) → Todo (ready) → In Progress (an agent is working) → Review (check the result) → Done. Drag cards between columns, or let agents pull work themselves.' },
     { sel: '[onclick*="describeTaskUI"], .btn-primary', title: 'The magic entrance ✨', body: 'Don\'t build tasks by hand — click "✨ Describe a task", type what you want in normal sentences, and the AI plans it: it may ask a few clarifying questions (each with a recommended answer), then proposes the task or a whole pipeline for you to approve.' },
-    { sel: '#kWorkflow', title: 'Filters', body: 'Narrow the board to one project or one assignee. Useful once many tasks accumulate.' },
+    { sel: '#kWorkflow', title: 'Filters', body: 'Narrow the board by workflow or assignee. Tip: the 🎯 focus buttons (Projects and Workflows tabs) scope this whole board globally — the bar at the top shows what you are working in.' },
     { sel: '.kanban-card', title: 'A task card', body: 'Click any card to open its full record: description, budget, the agent working on it, attachments, its improvement loop, and every file it produced. The ⚑ flag shows which agent claimed it.' },
   ],
   workflows: [
@@ -3026,6 +3094,7 @@ function showTaskModal(status) {
     try {
       const repos = (await api('GET', '/api/projects')).projects || [];
       const rsel = $('#m-task-repo');
+      if (rsel && focusCtx.project) setTimeout(() => { rsel.value = focusCtx.project.path; }, 60);
       if (rsel && repos.length) {
         rsel.innerHTML = `<option value="">— None: fresh workspace (default) —</option>` +
           repos.map(r => `<option value="${esc(r.path)}">${esc(r.name)}</option>`).join('');
@@ -3103,6 +3172,7 @@ async function submitTask() {
   await api('POST', '/api/tasks', {
     loop_config: loopCfg,
     repo_path: $('#m-task-repo') ? ($('#m-task-repo').value || null) : null,
+    workflow_id: focusCtx.workflow ? focusCtx.workflow.id : null,
     title,
     description: $('#m-task-desc').value,
     status: $('#m-task-status').value,
@@ -3387,7 +3457,7 @@ function viewProjects() {
       <div class="stat-card"><div class="stat-num">${fmtSize(projs.reduce((a, p) => a + p.size_bytes, 0))}</div><div class="stat-label">Total Size</div></div>
     </div>
     <div class="panel"><table class="data-table">
-      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Remote</th><th>Size</th><th>Modified</th></tr></thead>
+      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Focus</th><th>Remote</th><th>Size</th><th>Modified</th></tr></thead>
       <tbody>`;
   for (const p of projs) {
     const langs = Object.entries(p.languages).slice(0, 3).map(([l]) =>
@@ -3400,6 +3470,7 @@ function viewProjects() {
       <td>${langs}</td>
       <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
       <td>${status}</td>
+      <td>${p.is_repo ? `<button class="focus-btn" title="Work in this project: Workflows & Tasks scope to it; new work is assigned to it" onclick="event.stopPropagation(); setFocusProject('${esc(p.path)}','${esc(p.name)}','${esc(p.client || '')}')">🎯 ${focusCtx.project && focusCtx.project.path === p.path ? 'selected' : 'select'}</button>` : ''}</td>
       <td>${p.is_repo ? (p.git_remote ? '<span title="' + esc(p.git_remote) + '" style="color:var(--accent-2)">☁ backed up</span>' : '<span style="color:var(--yellow)">⚠ local only</span>') : '<span class="muted">—</span>'}</td>
       <td>${fmtSize(p.size_bytes)}</td>
       <td class="muted">${fmtDays(p.last_modified)}</td>
@@ -5727,9 +5798,13 @@ async function loadWorkflows() {
 
 function viewWorkflows() {
   if (!wfState.fetched) { loadWorkflows(); return skeletonView(); }
-  const rows = (wfState.list || []).map(w => `
+  const wfIds = focusProjectWorkflowIds();
+  const scoped = (wfState.list || []).filter(w =>
+    !wfIds || wfIds.has(w.id) || !w.tasks_total); // empty workflows stay visible (just created)
+  const rows = scoped.map(w => `
     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
+        <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
         <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span></div>
       <div class="card-body">
         ${w.goal ? `<div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">${esc(w.goal)}</div>` : ''}
@@ -5970,8 +6045,11 @@ function describeTaskUI() {
     api('GET', '/api/projects').then(d => {
       const ps = (d.projects || d || []).filter(x => x.is_repo);
       ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
-      if (twSel.isConnected) twSel.innerHTML += ps.map(x =>
-        `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
+      if (twSel.isConnected) {
+        twSel.innerHTML += ps.map(x =>
+          `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
+        if (focusCtx.project) twSel.value = focusCtx.project.path; // focus context
+      }
     }).catch(() => { });
   }
   const b = $('#twGo');
@@ -6182,7 +6260,8 @@ function proposeWorkflowModal(wf, meta) {
         `<option value="${esc(p.path)}" data-client="${esc(p.client || '')}">${p.client ? '🏢 ' + esc(p.client) + ' / ' : (p.personal ? '🏠 ' : '')}${esc(p.name)}</option>`).join('') +
         '<option value="__new__">➕ New client repository…</option>';
       repoSel.onchange = () => wfRepoChanged(repoSel);
-      const pre = (meta && meta.repo_path) || wizardCtx.repo_path;
+      const pre = (meta && meta.repo_path) || wizardCtx.repo_path ||
+        (focusCtx.project && focusCtx.project.path);
       if (pre && [...repoSel.options].some(o => o.value === pre)) {
         repoSel.value = pre;
         wfRepoChanged(repoSel); // autofills the client field
