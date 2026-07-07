@@ -44,43 +44,54 @@ function glowTexture() {
   return _glowTex;
 }
 
-function textSprite(text, sub) {
+function textSprite(text, sub, hex) {
+  // Region callout in the reference style: small UPPERCASE mono label in the
+  // region's own color, underline with a leader tick, dim sub-caption.
   const c = document.createElement('canvas');
   const g = c.getContext('2d');
-  const pad = 18;
-  g.font = '600 30px "JetBrains Mono", monospace';
-  const w = Math.ceil(g.measureText(text).width) + pad * 2;
-  c.width = Math.max(w, 120);
-  c.height = 84;
-  g.font = '600 30px "JetBrains Mono", monospace';
-  g.textAlign = 'center';
-  g.shadowColor = 'rgba(124,92,255,.9)';
-  g.shadowBlur = 18;
-  g.fillStyle = 'rgba(226,226,248,.95)';
-  g.fillText(text, c.width / 2, 40);
+  const label = String(text).toUpperCase();
+  g.font = '700 26px "JetBrains Mono", monospace';
+  const w = Math.max(140, Math.ceil(g.measureText(label).width) + 46);
+  c.width = w;
+  c.height = 92;
+  const col = '#' + (hex || 0xa3e635).toString(16).padStart(6, '0');
+  g.font = '700 26px "JetBrains Mono", monospace';
+  g.textAlign = 'left';
+  g.shadowColor = col;
+  g.shadowBlur = 12;
+  g.fillStyle = col;
+  g.fillText(label, 34, 34);
   g.shadowBlur = 0;
-  g.font = '500 20px "JetBrains Mono", monospace';
-  g.fillStyle = 'rgba(148,148,190,.85)';
-  g.fillText(sub, c.width / 2, 70);
+  // underline + diagonal leader tick pointing at the region
+  g.strokeStyle = col;
+  g.globalAlpha = 0.85;
+  g.lineWidth = 2.5;
+  g.beginPath();
+  g.moveTo(6, 66); g.lineTo(26, 44); g.lineTo(w - 8, 44);
+  g.stroke();
+  g.globalAlpha = 1;
+  g.font = '500 19px "JetBrains Mono", monospace';
+  g.fillStyle = 'rgba(168,168,200,.9)';
+  g.fillText(sub, 34, 88);
   const tex = new THREE.CanvasTexture(c);
   const mat = new THREE.SpriteMaterial({
-    map: tex, transparent: true, opacity: 0.92,
+    map: tex, transparent: true, opacity: 0.95,
     depthWrite: false, depthTest: false });
   const s = new THREE.Sprite(mat);
-  s.scale.set(c.width / 14, c.height / 14, 1);
+  s.scale.set(c.width / 15, c.height / 15, 1);
+  s.center.set(0.06, 0.28); // anchor near the leader tick
   s.renderOrder = 10;
   return s;
 }
 
-const COL = {
-  user: 0x5eead4,       // operator-attributed memories — teal
-  assistant: 0x7c5cff,  // agent-attributed — violet
-  weak: [0.30, 0.24, 0.66],   // link gradient: dim indigo…
-  strong: [0.13, 0.83, 0.93], // …to bright cyan
-};
+// Region palette — each semantic cluster gets its own vivid hue, like the
+// brain-region maps this view is modeled on (lime, magenta, amber, violet,
+// cyan, rose, blue, mint). Node color = its cluster's color.
+const REGION_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6,
+                     0x22d3ee, 0xec4899, 0x60a5fa, 0x2dd4bf];
 
 function nodeColor(n) {
-  return n.by === 'user' ? COL.user : COL.assistant;
+  return REGION_HUES[(n.cluster ?? 0) % REGION_HUES.length];
 }
 
 function lerp3(a, b, t) {
@@ -105,19 +116,15 @@ function buildScene(data) {
     color: 0x3b3b5e, size: 0.9, transparent: true, opacity: 0.7 }));
   M.scene.add(M.stars);
 
-  M.grid = new THREE.GridHelper(400, 28, 0x232345, 0x15152b);
-  M.grid.position.y = -85;
-  M.grid.material.transparent = true;
-  M.grid.material.opacity = 0.5;
-  M.scene.add(M.grid);
+  // no floor grid — the reference look is pure deep space
 
-  // ── nodes at their real PCA positions ──
-  const sphereGeo = new THREE.IcosahedronGeometry(1, 2);
+  // ── nodes at their real PCA positions — small bright star-points, the
+  // galaxy look comes from the glow layer, not from big geometry ──
+  const sphereGeo = new THREE.IcosahedronGeometry(1, 1);
   nodes.forEach((n, i) => {
-    const size = 1.1 + Math.min(2.2, n.degree * 0.45);
-    const mat = new THREE.MeshStandardMaterial({
-      color: nodeColor(n), emissive: nodeColor(n), emissiveIntensity: 0.55,
-      roughness: 0.35, metalness: 0.2, transparent: true, opacity: 0.95,
+    const size = 0.45 + Math.min(0.9, n.degree * 0.16);
+    const mat = new THREE.MeshBasicMaterial({
+      color: nodeColor(n), transparent: true, opacity: 0.95,
     });
     const mesh = new THREE.Mesh(sphereGeo, mat);
     mesh.position.set(n.x, n.y, n.z);
@@ -139,33 +146,37 @@ function buildScene(data) {
   glowGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(gp), 3));
   glowGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(gc), 3));
   M.glows = new THREE.Points(glowGeo, new THREE.PointsMaterial({
-    map: glowTexture(), size: 7, vertexColors: true, transparent: true,
-    opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false,
+    map: glowTexture(), size: 8.5, vertexColors: true, transparent: true,
+    opacity: 0.75, blending: THREE.AdditiveBlending, depthWrite: false,
     sizeAttenuation: true }));
   M.group.add(M.glows);
 
-  // ── semantic region labels (computed server-side from the real terms) ──
+  // ── semantic region callouts in their region's color ──
   (data.clusters || []).forEach((cl) => {
-    const s = textSprite(cl.label, `${cl.size} memories`);
-    s.position.set(cl.x, cl.y + 9, cl.z);
+    const hue = REGION_HUES[(cl.id ?? 0) % REGION_HUES.length];
+    const s = textSprite(cl.label, `${cl.size} memories`, hue);
+    s.position.set(cl.x, cl.y + 7, cl.z);
     M.group.add(s);
     M.labels.push(s);
   });
 
-  // ── links, vertex-colored by real similarity strength ──
+  // ── links: hair-thin web, each strand tinted by its endpoints' region
+  // colors, brightness by real similarity strength ──
   const lp = [], lc = [];
   links.forEach((ln) => {
     const a = nodes[ln.a], b = nodes[ln.b];
-    const t = Math.min(1, Math.max(0, (ln.s - 0.45) / 0.5)); // 0.45→0.95 sim
-    const c = lerp3(COL.weak, COL.strong, t);
+    const t = 0.35 + 0.65 * Math.min(1, Math.max(0, (ln.s - 0.45) / 0.5));
+    const ca = new THREE.Color(nodeColor(a)).multiplyScalar(t);
+    const cb = new THREE.Color(nodeColor(b)).multiplyScalar(t);
     lp.push(a.x, a.y, a.z, b.x, b.y, b.z);
-    lc.push(...c, ...c);
+    lc.push(ca.r, ca.g, ca.b, cb.r, cb.g, cb.b);
   });
   const linkGeo = new THREE.BufferGeometry();
   linkGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(lp), 3));
   linkGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(lc), 3));
   M.linkLines = new THREE.LineSegments(linkGeo, new THREE.LineBasicMaterial({
-    vertexColors: true, transparent: true, opacity: 0.42 }));
+    vertexColors: true, transparent: true, opacity: 0.30,
+    blending: THREE.AdditiveBlending, depthWrite: false }));
   M.group.add(M.linkLines);
 
   // ── electrical pulses that travel along links ──
@@ -182,14 +193,7 @@ function buildScene(data) {
     M.pulses.push(p);
   }
 
-  M.scene.add(new THREE.AmbientLight(0x8888aa, 0.7));
-  const key = new THREE.PointLight(0x7c5cff, 900, 600);
-  key.position.set(80, 120, 80);
-  M.scene.add(key);
-  const fill = new THREE.PointLight(0x22d3ee, 500, 600);
-  fill.position.set(-100, -60, -80);
-  M.scene.add(fill);
-  M.scene.fog = new THREE.FogExp2(0x07070d, 0.0028);
+  M.scene.fog = new THREE.FogExp2(0x02080a, 0.0024);
 }
 
 function applyCamera() {
@@ -240,9 +244,9 @@ function panelHTML(n, conns) {
 function setHover(idx) {
   if (idx === M.hoverId) return;
   M.hoverId = idx;
-  M.nodeMeshes.forEach((m) => {
-    m.material.emissiveIntensity = 0.55;
-    m.scale.setScalar(m.userData.baseSize);
+  M.nodeMeshes.forEach((m, i) => {
+    const dim = M.matchSet && !M.matchSet.has(i);
+    m.scale.setScalar(m.userData.baseSize * (M.matchSet && !dim ? 2.2 : 1));
   });
   if (idx < 0) {
     M.panel.style.opacity = '0';
@@ -250,8 +254,7 @@ function setHover(idx) {
     return;
   }
   const mesh = M.nodeMeshes[idx];
-  mesh.material.emissiveIntensity = 1.6;
-  mesh.scale.setScalar(mesh.userData.baseSize * 1.6);
+  mesh.scale.setScalar(mesh.userData.baseSize * 3.2);
   const n = M.data.nodes[idx];
   const conns = M.data.links
     .filter((l) => l.a === idx || l.b === idx)
@@ -273,11 +276,11 @@ function setSearch(q) {
   }
   M.nodeMeshes.forEach((m, i) => {
     const dim = M.matchSet && !M.matchSet.has(i);
-    m.material.opacity = dim ? 0.10 : 0.95;
-    m.material.emissiveIntensity = dim ? 0.12 : (M.matchSet ? 1.4 : 0.55);
+    m.material.opacity = dim ? 0.08 : 0.95;
+    m.scale.setScalar(m.userData.baseSize * (M.matchSet && !dim ? 2.2 : 1));
   });
-  if (M.glows) M.glows.material.opacity = M.matchSet ? 0.18 : 0.55;
-  if (M.linkLines) M.linkLines.material.opacity = M.matchSet ? 0.12 : 0.42;
+  if (M.glows) M.glows.material.opacity = M.matchSet ? 0.15 : 0.75;
+  if (M.linkLines) M.linkLines.material.opacity = M.matchSet ? 0.08 : 0.30;
   return M.matchSet ? M.matchSet.size : (M.data ? M.data.nodes.length : 0);
 }
 
@@ -299,12 +302,12 @@ function animate() {
   if (performance.now() - M.lastInteract > 3000) M.cam.theta += 0.0011;
   applyCamera();
 
-  // node breathing
+  // star twinkle (respects search highlighting)
   for (const m of M.nodeMeshes) {
     const p = m.userData;
-    if (M.hoverId !== p.idx) {
-      m.scale.setScalar(p.baseSize * (1 + Math.sin(M.t * 1.6 + p.phase) * 0.07));
-    }
+    if (M.hoverId === p.idx) continue;
+    const boost = M.matchSet && M.matchSet.has(p.idx) ? 2.2 : 1;
+    m.scale.setScalar(p.baseSize * boost * (1 + Math.sin(M.t * 1.6 + p.phase) * 0.08));
   }
   // electrical signals along the links
   const nodes = M.data.nodes;
@@ -321,11 +324,22 @@ function animate() {
   }
   if (M.stars) M.stars.rotation.y += 0.00016;
 
-  // hover raycast
-  if (M.pointer && M.raycaster) {
-    M.raycaster.setFromCamera(M.pointer, M.camera);
-    const hits = M.raycaster.intersectObjects(M.nodeMeshes, false);
-    setHover(hits.length ? hits[0].object.userData.idx : -1);
+  // hover: screen-space nearest-star picking — geometric raycasts miss
+  // sub-pixel star points, so we project positions and pick within 16px
+  if (M.pointer && M.data) {
+    const w = M.canvas.clientWidth, h = M.canvas.clientHeight;
+    const px = (M.pointer.x + 1) / 2 * w, py = (1 - M.pointer.y) / 2 * h;
+    let best = -1, bestD = 16 * 16;
+    const v = new THREE.Vector3();
+    for (let i = 0; i < M.nodeMeshes.length; i++) {
+      if (M.matchSet && !M.matchSet.has(i)) continue; // dimmed = not pickable
+      v.copy(M.nodeMeshes[i].position).project(M.camera);
+      if (v.z > 1) continue; // behind camera
+      const dx = (v.x + 1) / 2 * w - px, dy = (1 - v.y) / 2 * h - py;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    setHover(best);
   }
   M.renderer.render(M.scene, M.camera);
 }
@@ -338,7 +352,7 @@ async function mount(container, data) {
   M.data = data;
 
   M.scene = new THREE.Scene();
-  M.scene.background = new THREE.Color(0x07070d);
+  M.scene.background = new THREE.Color(0x02080a); // deep teal-black space
   M.camera = new THREE.PerspectiveCamera(55, 1, 0.1, 2000);
   M.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
   M.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
@@ -355,16 +369,18 @@ async function mount(container, data) {
     'opacity:0;transition:opacity .22s;pointer-events:none;z-index:5';
   container.appendChild(M.panel);
 
-  // legend
+  // legend: the semantic regions in their own colors
   const legend = document.createElement('div');
   legend.style.cssText =
-    'position:absolute;left:18px;bottom:16px;display:flex;gap:16px;align-items:center;' +
-    'font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);pointer-events:none;z-index:5';
-  legend.innerHTML =
-    '<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#5eead4;box-shadow:0 0 6px #5eead4;margin-right:6px"></i>operator memory</span>' +
-    '<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#7c5cff;box-shadow:0 0 6px #7c5cff;margin-right:6px"></i>agent memory</span>' +
-    '<span><i style="display:inline-block;width:22px;height:3px;border-radius:2px;background:linear-gradient(90deg,#4c3da8,#22d3ee);margin-right:6px;vertical-align:2px"></i>association strength</span>' +
-    '<span style="opacity:.75">drag to orbit · scroll to zoom · hover a node</span>';
+    'position:absolute;left:18px;bottom:16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;' +
+    'font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);pointer-events:none;z-index:5;max-width:75%';
+  const regionChips = (data.clusters || []).map((cl) => {
+    const col = '#' + REGION_HUES[(cl.id ?? 0) % REGION_HUES.length].toString(16).padStart(6, '0');
+    const word = esc(String(cl.label).split(' · ')[0]);
+    return `<span><i style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col};margin-right:5px"></i>${word}</span>`;
+  }).join('');
+  legend.innerHTML = regionChips +
+    '<span style="opacity:.7">· drag orbit · scroll zoom · hover a star</span>';
   container.appendChild(legend);
 
   M.raycaster = new THREE.Raycaster();

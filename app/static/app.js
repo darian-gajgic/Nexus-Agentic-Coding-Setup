@@ -308,7 +308,6 @@ async function tick() {
     if (pendingRender && !uiLocked()) { pendingRender = false; render(); updateSidebarMini(); return; }
     if (currentView === 'dashboard') {
       updateDashboardInPlace();
-      if (window.Nexus3D) window.Nexus3D.update(state.agents);
     } else if (currentView === 'agents') {
       renderAgentsView(); // in-place patcher once built
     } else if (currentView === 'kanban') {
@@ -370,12 +369,13 @@ const VIEW_META = {
   observability: ['LLM Observability', 'Traces, tokens & cost via Langfuse'],
   issues: ['Known Issues', 'Your filed feedback with the interaction context — the improvement backlog'],
   settings: ['Settings', 'Budgets, concurrency limits and per-model effort defaults'],
+  manual: ['User Manual', 'Everything explained — from first click to full architecture'],
   jarvis: ['J.A.R.V.I.S', 'Neural voice interface'],
 };
 
 function switchView(view) {
-  if (currentView === 'dashboard' && view !== 'dashboard' && window.Nexus3D) {
-    window.Nexus3D.dispose();
+  if (currentView === 'dashboard' && view !== 'dashboard' && window.Memory3D) {
+    window.Memory3D.dispose(); // the galaxy is the dashboard centerpiece now
   }
   if (currentView === 'memory' && view !== 'memory' && window.Memory3D) {
     window.Memory3D.dispose();
@@ -410,6 +410,7 @@ function render() {
   else if (currentView === 'usage') { c.innerHTML = wrapView(viewUsage()); bindUsage(); }
   else if (currentView === 'settings') { c.innerHTML = wrapView(viewSettings()); bindSettings(); }
   else if (currentView === 'issues') { c.innerHTML = wrapView(viewKnownIssues()); }
+  else if (currentView === 'manual') { c.innerHTML = wrapView(viewManual()); }
   else if (currentView === 'observability') { c.innerHTML = wrapView(viewObservability()); bindObservability(); }
   else if (currentView === 'memory') { c.innerHTML = wrapView(viewMemory()); bindMemory(); }
   else if (currentView === 'specialists') { c.innerHTML = wrapView(viewSpecialists()); bindSpecialists(); }
@@ -433,12 +434,63 @@ function renderDashboard() {
   if (!dashBuilt) {
     c.innerHTML = wrapView(viewDashboard());
     dashBuilt = true;
-    mountNexus3D(0);
+    mountDashGalaxy(0);
+    bindHeroExpand();
     animateStatValues();
     loadOnboardingCta();
   } else {
     updateDashboardInPlace();
   }
+}
+
+// The dashboard centerpiece IS the live memory galaxy (same engine as the
+// Memory hub's 3D map — the hub keeps the full tooling: search, regions list)
+async function mountDashGalaxy(tries) {
+  const el = document.getElementById('dashGalaxy');
+  if (!el || currentView !== 'dashboard') return;
+  if (!window.Memory3D) {
+    if (tries < 24) setTimeout(() => mountDashGalaxy(tries + 1), 250);
+    else { const fb = document.getElementById('heroFallback'); if (fb) fb.style.display = 'flex'; }
+    return;
+  }
+  try {
+    const data = await api('GET', '/api/memory3d');
+    if (!document.getElementById('dashGalaxy') || currentView !== 'dashboard') return;
+    if (data.nodes && data.nodes.length) {
+      window.Memory3D.mount(el, data);
+      const hc = document.getElementById('heroMemCount');
+      if (hc) hc.textContent = `${data.count} memories`;
+    } else {
+      const fb = document.getElementById('heroFallback');
+      if (fb) fb.style.display = 'flex';
+    }
+  } catch {
+    const fb = document.getElementById('heroFallback');
+    if (fb) fb.style.display = 'flex';
+  }
+}
+
+function bindHeroExpand() {
+  const hero = document.getElementById('dashHero');
+  const btn = document.getElementById('heroExpand');
+  const c = $('#content');
+  if (!hero || !btn) return;
+  const set = (on) => {
+    hero.classList.toggle('expanded', on);
+    if (on) c.scrollTop = 0;
+  };
+  btn.onclick = () => set(!hero.classList.contains('expanded'));
+  document.addEventListener('keydown', function esc(e) {
+    if (e.key === 'Escape') set(false);
+    if (currentView !== 'dashboard') document.removeEventListener('keydown', esc);
+  });
+  // Scrolling up at the top of the page grows the galaxy to the full mid
+  // section (the widgets slide down out of the way); the ⛶ restores.
+  c.addEventListener('wheel', (e) => {
+    if (currentView !== 'dashboard') return;
+    if (e.target.closest('#dashGalaxy')) return; // over the galaxy = zoom
+    if (e.deltaY < 0 && c.scrollTop <= 2) set(true);
+  }, { passive: true });
 }
 
 // X4: "run the onboarding" call-to-action until the Business Brain is personalized
@@ -558,19 +610,14 @@ function viewDashboard() {
   const liveCount = (state.agents || []).filter(a => a.status === 'running' || a.status === 'busy').length;
 
   return `
-    <div class="hero-3d">
-      <canvas id="nexus3d"></canvas>
+    <div class="hero-3d" id="dashHero">
+      <div id="dashGalaxy" style="position:absolute;inset:0"></div>
       <div class="hero-fallback" id="heroFallback" style="display:none"><div class="hero-orb"></div></div>
-      <div class="hero-overlay">
-        <div class="hero-kicker">Nexus Core · Online</div>
-        <div class="hero-title">${(state.agents || []).length} Agents<small id="heroLive">${liveCount} active now</small></div>
+      <div class="hero-overlay" style="pointer-events:none">
+        <div class="hero-kicker">Neural Memory · Live</div>
+        <div class="hero-title"><span id="heroMemCount">—</span><small id="heroLive">${liveCount} agents active · ${(state.agents || []).length} total</small></div>
       </div>
-      <div class="hero-legend">
-        <span class="legend-chip"><i style="background:var(--green)"></i> running</span>
-        <span class="legend-chip"><i style="background:var(--yellow)"></i> busy</span>
-        <span class="legend-chip"><i style="background:#64748b"></i> idle</span>
-        <span class="legend-chip"><i style="background:var(--red)"></i> stopped</span>
-      </div>
+      <button class="hero-expand" id="heroExpand" title="Expand the memory galaxy — Esc or click again to restore">⛶</button>
       <div class="now-strip">
         <div class="now-title"><span class="status-dot online"></span> Executing right now</div>
         <div id="nowStrip">${nowRunningHTML()}</div>
@@ -1060,6 +1107,283 @@ async function deleteAttachment(kind, id, name, elId) {
     await api('DELETE', `${base}/attachments/${encodeURIComponent(name)}`);
     loadAttachmentsInto(kind, id, elId);
   } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+// ═══════════════════ USER MANUAL (view: manual) ═══════════════════
+function viewManual() {
+  return `<div class="manual-wrap">
+  <div class="view-intro" style="margin-bottom:14px">This manual explains the whole system in plain language — no IT background needed — and ends with the full technical architecture for those who want it. On any other tab, the <b>?</b> button in the top bar starts a guided walkthrough of exactly that tab.</div>
+  <div class="manual-toc">
+    <a href="#m-what">What is this?</a><a href="#m-first">First steps</a><a href="#m-tasks">Creating work</a><a href="#m-projects">Projects</a><a href="#m-results">Getting results</a><a href="#m-quality">Quality machinery</a><a href="#m-coding">Coding on your repos</a><a href="#m-jarvis">JARVIS</a><a href="#m-memory">Memory</a><a href="#m-money">Costs &amp; limits</a><a href="#m-trouble">Troubleshooting</a><a href="#m-tech">🔧 Technical architecture</a>
+  </div>
+
+  <div class="manual-sec" id="m-what">
+    <h2>🧭 What is this?</h2>
+    <div class="m-sub">Nexus Agent OS — mission control for your personal AI workforce</div>
+    <p>Nexus is the control room for a team of AI agents that do real work for you: research, writing, images, documents, and complete software projects. You describe what you want; the system plans it, splits it into steps, executes each step with the right specialist, checks the quality, and hands you the results. It runs entirely on <b>your own computer</b> — your data never leaves the machine except for the AI model calls themselves.</p>
+    <div class="m-visual">  YOU ──describe──▶ ✨ WIZARD ──plans──▶ 📋 KANBAN ──executes──▶ 🤖 AGENTS
+                                                        │                      │
+   📦 DELIVERABLES ◀──results──  ✅ QUALITY GATES  ◀──checks──┘</div>
+    <div class="m-tip">💡 The golden rule: <b>you describe, the system organizes.</b> You never have to know which model, specialist or pipeline is right — the wizard chooses, and you just approve.</div>
+  </div>
+
+  <div class="manual-sec" id="m-first">
+    <h2>🚀 First steps</h2>
+    <div class="m-sub">Your first task in three minutes</div>
+    <div class="m-steps">
+      <div class="m-step"><div>Open <b>Kanban</b> in the left menu and click <b>✨ Describe a task</b>.</div></div>
+      <div class="m-step"><div>Type your wish in normal sentences — for example <i>"Research the best 3 CRM tools for a small agency and write a comparison"</i>. Don't think in computer terms; write as if briefing a colleague.</div></div>
+      <div class="m-step"><div>The AI may ask a few questions. Every question already has a <b>★ recommended</b> answer with pros and cons — if unsure, just accept the recommendations.</div></div>
+      <div class="m-step"><div>Approve the proposed plan. The task appears on the board and an agent picks it up — you can watch it working live on the Dashboard.</div></div>
+      <div class="m-step"><div>When the card reaches <b>Review</b>, open it and read the result under <b>Files</b>. Happy? Approve it. Not happy? Click <b>Reject</b>, say what's wrong in one sentence, and the agent reworks it with your feedback.</div></div>
+    </div>
+  </div>
+
+  <div class="manual-sec" id="m-tasks">
+    <h2>📋 Creating work</h2>
+    <div class="m-sub">Tasks, the wizard, attachments and models</div>
+    <h4>The task board (Kanban)</h4>
+    <p>Work moves left to right: <b>Backlog</b> (ideas, nobody touches them) → <b>Todo</b> (ready — agents may grab these) → <b>In Progress</b> → <b>Review</b> (your turn!) → <b>Done</b>. Drag cards to move them yourself.</p>
+    <h4>Attachments — give agents your material</h4>
+    <p>Open any task and add files: PDFs, Word, Excel, PowerPoint, pictures. The agent is <b>required</b> to read them before working. Results can also come back in those formats — just ask for "a Word document" or "an Excel sheet" in the description.</p>
+    <h4>Choosing a model (optional)</h4>
+    <p>Each task can run on a different AI model: <b>glm-5.2</b> (the smart default), <b>glm-5.1</b>, or <b>glm-4.5-air</b> (fast and cheap — fine for simple mechanical work). If you don't choose, the system does.</p>
+    <div class="m-tip">💡 A good task description says: what you want, for whom, and what "done" looks like. One sentence of each is enough — the wizard fills in the rest and always shows you its assumptions.</div>
+  </div>
+
+  <div class="manual-sec" id="m-projects">
+    <h2>🧩 Projects</h2>
+    <div class="m-sub">Pipelines where one step feeds the next</div>
+    <p>A project chains tasks with <b>dependencies</b>. Each stage starts automatically once its predecessors finish, and receives their outputs as input. This is how big jobs stay organized:</p>
+    <div class="m-visual">  SPEC &amp; PLAN ──▶ IMPLEMENT ──▶ CODE REVIEW ──▶ FIX FINDINGS ──▶ FINAL VERIFICATION
+   (architect)    (builder)     (critic)        (builder)        (independent tester)</div>
+    <p>That five-stage shape is the built-in quality pipeline for software: it is enforced automatically for coding goals — the reviewer is never the person who wrote the code, and the final verifier always runs last.</p>
+    <p>Create projects with <b>✨ Describe a goal</b> on the Projects tab. You can untick optional stages before approving; quality gates are locked on purpose.</p>
+  </div>
+
+  <div class="manual-sec" id="m-results">
+    <h2>📦 Getting results</h2>
+    <div class="m-sub">Deliverables, previewing apps, chaining follow-ups</div>
+    <p>Everything agents produce is collected under <b>Deliverables</b>: reports, images, documents, whole applications. Markdown reports preview inline; everything is downloadable.</p>
+    <h4>▶ Test app — run what they built</h4>
+    <p>When a task produced a program or website, the <b>▶ Test app</b> button starts it safely on your machine and opens it in a new tab. It shuts down by itself after 30 minutes. If it shows "starting" forever, open the log in the same dialog — it tells the truth.</p>
+    <h4>Follow-ups</h4>
+    <p>Under any deliverable, <b>Chain a follow-up</b> creates a new task that receives this result as input — "now translate it", "now make a landing page from it".</p>
+  </div>
+
+  <div class="manual-sec" id="m-quality">
+    <h2>✅ Quality machinery</h2>
+    <div class="m-sub">Loops, the judge, and why results improve by themselves</div>
+    <h4>Improvement loops (🔁)</h4>
+    <p>Tasks and projects can loop: when a check fails or a judge demands changes, the system automatically sends the work back with the findings attached and re-checks afterwards — up to a bounded number of rounds. <b>Closed</b> mode does this without asking you; <b>open</b> mode waits for your click at each checkpoint. The loop designer explains its plan in plain sentences, and projects pass their loop down to their tasks unless you override it.</p>
+    <h4>The frontier judge</h4>
+    <p>High-stakes deliverables can be graded by a stronger AI (Claude) against your own quality rubric — verdict, findings, and a score. On quality-mode loops this happens automatically.</p>
+    <h4>Rejection with feedback</h4>
+    <p>Your "Reject" + one sentence is the strongest quality tool: the agent gets your words verbatim and must address them. Specialists also <b>learn</b> from this — feedback becomes lessons they apply to future work.</p>
+  </div>
+
+  <div class="manual-sec" id="m-coding">
+    <h2>🧬 Coding on your own repositories</h2>
+    <div class="m-sub">Repo-native tasks: the diff is the deliverable</div>
+    <div class="m-steps">
+      <div class="m-step"><div>Once per repository: run the <b>"🧬 Onboard a code repository"</b> template. It studies your repo (read-only) and writes an AGENTS.md — the house rules every agent will follow there.</div></div>
+      <div class="m-step"><div>On any coding task or project, pick your repo under <b>"Existing code repository"</b>.</div></div>
+      <div class="m-step"><div>Agents then work <b>inside</b> an isolated copy (a git worktree on branch <code>nexus/…</code>) — your checkout is never touched. They follow the repo's conventions and run its own tests.</div></div>
+      <div class="m-step"><div>Review the <b>changes.diff</b> in Deliverables. Merge the branch yourself when satisfied — nothing merges automatically, ever.</div></div>
+    </div>
+  </div>
+
+  <div class="manual-sec" id="m-jarvis">
+    <h2>🎙 JARVIS</h2>
+    <div class="m-sub">Talk to your AI face to face</div>
+    <p>Click the face to talk; the reply comes back as your AI speaking with lip-synced video on a live holographic stage. Toggle <b>CONV</b> for hands-free conversation (it detects when you stop speaking). Click the face mid-sentence to interrupt. Typing works too — same brain, same voice.</p>
+    <div class="m-tip">💡 The stage isn't decoration: rings pulse from your real microphone level, violet particles orbit while it thinks, and the room throbs with the actual speech amplitude.</div>
+  </div>
+
+  <div class="manual-sec" id="m-memory">
+    <h2>🧠 Memory</h2>
+    <div class="m-sub">The galaxy is real data, not art</div>
+    <p>Everything your AI remembers is a point in a 768-dimensional "meaning space". The galaxy (Dashboard, and Memory → 3D Map) projects those true positions into 3D: <b>distance = similarity of meaning</b>. Regions get their colors and names from the memories themselves. Search any topic and the matching stars flare while everything else fades. Hover a star to read the memory and its strongest associations.</p>
+  </div>
+
+  <div class="manual-sec" id="m-money">
+    <h2>💰 Costs &amp; limits</h2>
+    <div class="m-sub">Why nothing can run away</div>
+    <p>Every task has a token budget; there's a daily cap over everything; each agent lane can carry its own spending cap; and parallel sessions are limited per model. A task that hits its fence pauses as <b>blocked: budget</b> — retrying grants exactly one more slice, never an open tap. See real consumption under <b>Usage</b>; change the fences under <b>Settings</b>.</p>
+  </div>
+
+  <div class="manual-sec" id="m-trouble">
+    <h2>🛟 Troubleshooting</h2>
+    <div class="m-sub">When something looks wrong</div>
+    <ul>
+      <li><b>Task sits in "queued"</b> — check the session strip (top bar): all slots busy means it waits its turn. Minutes with an empty strip? File it with 🐞.</li>
+      <li><b>blocked: quota</b> — the AI provider is load-shedding at peak times. The system retries by itself with growing pauses; you don't need to do anything.</li>
+      <li><b>A result is missing</b> — check the task's Files section; every run also keeps a transcript (openable from the task) showing exactly what the agent did.</li>
+      <li><b>Something feels buggy or annoying</b> — the 🐞 button (bottom right, every page) files it together with your recent steps into <b>Known Issues</b>. That list is the repair queue.</li>
+      <li><b>Guardian shows drift</b> — a protected file changed unexpectedly. Open Guardian and repair or approve the change.</li>
+    </ul>
+  </div>
+
+  <div class="manual-sec" id="m-tech">
+    <h2>🔧 Technical architecture</h2>
+    <div class="m-sub">The IT chapter — how it actually works</div>
+    <h4>Components</h4>
+    <div class="m-visual">  ┌────────────────────────  YOUR MACHINE  ───────────────────────────┐
+  │                                                                    │
+  │  NEXUS (this app) ── FastAPI + SQLite + vanilla JS, port 8777      │
+  │  · control plane: kanban, dispatch queue, budgets, loops, judge    │
+  │  · worker lanes: one subprocess per agent, atomic task claiming    │
+  │  · quality gates: verify.sh (static) + Playwright suites (runtime) │
+  │            │  HTTP + SSE (localhost only)                          │
+  │            ▼                                                       │
+  │  HERMES (engine) ── agent runtime + gateway, port 8642             │
+  │  · sessions, tools (terminal/files/browser/LSP), 18 specialists    │
+  │  · skills library, delegation, per-repo AGENTS.md loading          │
+  │            │                                                       │
+  │            ├──▶ Z.AI GLM-5.2/5.1 (the only external calls)         │
+  │            ├──▶ qdrant (vector DB, Docker) + ollama ── mem0 memory  │
+  │            └──▶ guardian ── verifies/repairs all customizations    │
+  └────────────────────────────────────────────────────────────────────┘</div>
+    <h4>Why two systems?</h4>
+    <p>Nexus (control plane) and Hermes (execution engine) are separate processes on purpose — the industry-standard split. Nexus can restart a dozen times a day during development without killing a single running AI session: an interrupted task's session keeps running inside Hermes, and the respawned lane <b>harvests</b> the finished result from session history, free.</p>
+    <h4>The dispatch lifecycle</h4>
+    <div class="m-visual">  queued → dispatching → streaming → finalizing → completed
+                                        │
+             blocked_budget / blocked_quota / failed  (each self-recovering)</div>
+    <p>Dispatch is queue-only: the API claims atomically (SQLite compare-and-swap — two agents can never grab one task), and the worker lane is the sole executor. Every run writes <code>workspaces/&lt;task-id&gt;/</code> with the deliverable, an audit JSON, and real token counts from the stream.</p>
+    <h4>Self-healing</h4>
+    <p>A watchdog restarts dead/stuck lanes (~10s detection); orphaned runs are harvested rather than re-executed; stranded claims resurrect on the next worker tick; retired agents are terminal (never respawned). The loop engine sweeps every 20s and acts at most 3 times per sweep — bounded autonomy everywhere.</p>
+    <h4>Repo-native coding</h4>
+    <p>Tasks with a <code>repo_path</code> get an idempotent git worktree on branch <code>nexus/&lt;pipeline&gt;</code> (pipelines share one branch so stages build on each other; the main checkout is untouched). The framing injects the repo's AGENTS.md; dev specialists navigate by LSP symbols (serena) and ground library usage in live docs (context7). After each run: snapshot-commit of uncommitted work, then a junk-free <code>changes.diff</code> vs the base branch is captured for review. Humans merge; the system never does.</p>
+    <h4>Memory pipeline</h4>
+    <p>mem0 extracts memories from conversations → embeds them (768-dim, nomic-embed-text via ollama) → stores vectors in qdrant. The galaxy endpoint scrolls all vectors, PCA-projects to the 3 principal axes (numpy SVD), links top-3 cosine neighbors ≥0.45, k-means clusters in full 768-D, and names each cluster by its most distinctive terms (tf-idf style) — every visual property maps to a real quantity.</p>
+    <h4>Security posture</h4>
+    <p>HTTPS-only UI (self-signed, localhost); all server data HTML-escaped; command allowlists removed in favor of approval gates; secrets only in <code>~/.hermes/.env</code> (never in the repo — the setup repo ships a template and a credential scanner); guardian manifests pin every customization by SHA-256. The full reproducible install lives in the <b>Nexus-Agentic-Coding-Setup</b> repository: patches, full source, one-command installer, and this documentation.</p>
+    <p style="margin-top:10px">Deep-dive documents (in the repo): <code>docs/PROJECT-DOCUMENTATION.md</code> (this chapter, expanded), <code>SPEC-REAL-AGENTS.md</code> (dispatch contract), <code>docs/JARVIS-VOICE.md</code> (voice pipeline), <code>CLAUDE.md</code> (engineering handbook).</p>
+  </div>
+</div>`;
+}
+
+// ═══════════════════ GUIDED HELP TOURS (the ? button — context-aware) ═══════════════════
+// Each view gets a spotlight walkthrough in plain language. Steps whose
+// element is missing (empty states) are skipped automatically.
+const TOURS = {
+  dashboard: [
+    { sel: '#dashHero', title: 'The memory galaxy', body: 'This is your AI\'s actual mind, drawn live: every glowing star is one thing it remembers, placed by meaning — memories about similar topics sit close together and form colored regions. Drag inside it to look around, scroll on it to fly closer. The colored labels name each region using words taken from the memories themselves.' },
+    { sel: '#heroExpand', title: 'Make it fullscreen', body: 'Click this (or scroll up when the page is at the top) and the widgets slide away so the galaxy fills the screen. Press Esc to bring everything back.' },
+    { sel: '#nowStrip', title: 'What is running right now', body: 'Live ticker of tasks your agents are executing at this moment. If it\'s empty, nothing is running — that\'s normal when the kanban queue is empty.' },
+    { sel: '.stat-grid', title: 'The vital signs', body: 'Agents, tasks, token usage (how much AI "fuel" was consumed) and system load at a glance. These update by themselves every few seconds.' },
+    { sel: '#modelStrip', title: 'Session traffic light', body: 'How many AI conversations are running per model right now, against their limits (e.g. "5.2 2/8" = two of eight allowed). Red means saturated — new tasks briefly wait for a free slot.' },
+  ],
+  kanban: [
+    { sel: '.kanban-board, #content', title: 'Your task board', body: 'Work flows left to right: Backlog (ideas) → Todo (ready) → In Progress (an agent is working) → Review (check the result) → Done. Drag cards between columns, or let agents pull work themselves.' },
+    { sel: '[onclick*="describeTaskUI"], .btn-primary', title: 'The magic entrance ✨', body: 'Don\'t build tasks by hand — click "✨ Describe a task", type what you want in normal sentences, and the AI plans it: it may ask a few clarifying questions (each with a recommended answer), then proposes the task or a whole pipeline for you to approve.' },
+    { sel: '#kWorkflow', title: 'Filters', body: 'Narrow the board to one project or one assignee. Useful once many tasks accumulate.' },
+    { sel: '.kanban-card', title: 'A task card', body: 'Click any card to open its full record: description, budget, the agent working on it, attachments, its improvement loop, and every file it produced. The ⚑ flag shows which agent claimed it.' },
+  ],
+  workflows: [
+    { sel: '#content', title: 'Projects = task pipelines', body: 'A project chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when the stages it depends on are done, and their outputs are handed over as input.' },
+    { sel: '.btn-primary', title: 'Describe a goal', body: 'Click "✨ Describe a goal" and say what you want in plain words — e.g. "an online shop for GPUs". The AI asks smart questions, then proposes a full pipeline (plan → build → review → fix → verify) which you can trim before approving. Coding projects always get quality gates.' },
+    { sel: '.agentic-row, .wf-card', title: 'A project', body: 'Click one to see its stages, their status, the improvement loop (🔁), and attached files. Green stages are done; the diagram shows what feeds what.' },
+  ],
+  deliverables: [
+    { sel: '#content', title: 'Everything your agents produced', body: 'Every task\'s output lands here: reports, documents, images, whole applications. Click a file to preview it, or download it.' },
+    { sel: '[onclick*="testAppUI"], .btn-sm', title: '▶ Test app', body: 'When a task built a program or website, this button launches it safely on your machine and opens it in a new browser tab. It stops by itself after 30 minutes.' },
+  ],
+  agents: [
+    { sel: '#content', title: 'Your workforce', body: 'Each card is an agent lane — a worker that picks up one task at a time and executes it as a real AI session. They heal themselves: if one crashes, the watchdog restarts it within seconds.' },
+    { sel: '.agent-card', title: 'Agent details', body: 'Click a card for its memory, message history, cost, and configuration — including auto-claim (whether it grabs unassigned tasks by itself) and a token spending cap.' },
+  ],
+  memory: [
+    { sel: '[data-memtab="map3d"]', title: 'The 3D map', body: 'The same galaxy as the dashboard, with full tooling: search lights up matching memories, everything else fades to ghost-glow. Hover any star to read the memory, when it was stored, and its strongest associations.' },
+    { sel: '#mem3dSearch', title: 'Search the mind', body: 'Type any topic — matching memories flare up and the rest dim. This is a live search through everything your AI remembers.' },
+    { sel: '[data-memtab="semantic"]', title: 'The list views', body: 'The other tabs show the same memories as browsable lists: semantic memory (facts), per-agent memory, lessons your specialists learned from feedback, and shared context between agents.' },
+  ],
+  jarvis: [
+    { sel: '#jReactorWrap', title: 'Talk to your AI — literally', body: 'Click the face to start talking; click again to stop (in conversation mode it detects silence by itself). Your speech is transcribed, answered by the AI, and spoken back with lip-synced video — the face IS the answer.' },
+    { sel: '#jConvToggle', title: 'Hands-free conversation', body: 'Switch CONV on and JARVIS listens again automatically after each reply — a flowing conversation without clicking. It stops listening after 1.8s of silence.' },
+    { sel: '#jInput', title: 'Typing works too', body: 'Prefer silence? Type here — the reply still streams in live, and JARVIS speaks it if the voice pipeline is on. Click the face mid-sentence to interrupt him.' },
+    { sel: '.jarvis-stage', title: 'The stage is alive', body: 'The hologram room reacts to reality: rings pulse from your real microphone level while listening, violet particles orbit while thinking, and the room throbs with the actual voice amplitude while speaking.' },
+  ],
+  settings: [
+    { sel: '#st-taskbudget', title: 'Budgets', body: 'How many tokens (AI "fuel") one task may use by default, and the daily total across everything. A stuck or runaway task can never spend past these fences. Retrying a task automatically grants it one more slice.' },
+    { sel: '#st-total', title: 'Parallel sessions', body: 'How many AI conversations may run at once — in total and per model. The provider allows ~10 per model; staying at 8 leaves room for JARVIS and the wizard.' },
+    { sel: '.data-table', title: 'Per-model control', body: 'Give each model its own limit and default thinking effort. More effort = smarter but slower and more expensive. "(automatic)" is the recommended setting: big models get maximum effort, light models stay economical.' },
+  ],
+  issues: [
+    { sel: '#content', title: 'Your feedback backlog', body: 'Everything you filed with the 🐞 button, with the steps that led there attached. Work items from "new" → "in progress" → "resolved". This is the improvement queue for the system itself.' },
+  ],
+  usage: [
+    { sel: '#content', title: 'Where the tokens go', body: 'Real consumption per provider and model, a 14-day trend, and estimated cost. The Hermes numbers come from its own billing counters — they are exact, not estimates.' },
+  ],
+  guardian: [
+    { sel: '#content', title: 'The bodyguard', body: 'Guardian watches every protected file of your AI stack. If an update or accident changes one, it flags (or repairs) the drift. Green means everything matches the approved versions.' },
+  ],
+  agentic: [
+    { sel: '#content', title: 'The safety systems', body: 'Approval gates (agents must ask before dangerous actions), the self-healing watchdog, verification runs, the cron scheduler and cost guardrails — the machinery that makes autonomy safe. Mostly it runs itself; check the badge for pending approvals.' },
+  ],
+  specialists: [
+    { sel: '#content', title: 'Your expert team', body: 'Each specialist is a reusable expert (coder, reviewer, researcher…) with its own instructions and memory. They LEARN: feedback on their work becomes lessons they apply next time. Click one to see its playbook and what it has learned.' },
+  ],
+  skills: [
+    { sel: '#content', title: 'The skill library', body: 'Skills are how-to manuals agents load when a task matches. Click any skill to edit it, or let the ✨ wizard draft a new one following best practices — you always review before it goes live.' },
+  ],
+  manual: [
+    { sel: '#content', title: 'The manual', body: 'Everything explained for humans — from "what is this" to the full technical architecture. Use the chapter chips to jump around. The ? button on every other tab gives you a guided walkthrough of exactly that tab.' },
+  ],
+};
+
+let _tour = null;
+function startTour(view) {
+  endTour();
+  const steps = (TOURS[view] || []).filter(s => document.querySelector(s.sel));
+  if (!steps.length) { switchView('manual'); return; }
+  _tour = { steps, i: 0 };
+  const dim = document.createElement('div');
+  dim.className = 'tour-dim'; dim.id = 'tourDim';
+  dim.onclick = endTour;
+  const spot = document.createElement('div');
+  spot.className = 'tour-spot'; spot.id = 'tourSpot';
+  const card = document.createElement('div');
+  card.className = 'tour-card'; card.id = 'tourCard';
+  document.body.append(dim, spot, card);
+  showTourStep();
+}
+
+function showTourStep() {
+  if (!_tour) return;
+  const { steps, i } = _tour;
+  const st = steps[i];
+  const el = document.querySelector(st.sel);
+  if (!el) { nextTourStep(1); return; }
+  el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  const r = el.getBoundingClientRect();
+  const spot = $('#tourSpot'), card = $('#tourCard');
+  spot.style.cssText += `;left:${r.left - 6}px;top:${r.top - 6}px;width:${r.width + 12}px;height:${r.height + 12}px`;
+  // card below the target if room, else above
+  const below = r.bottom + 190 < innerHeight;
+  card.innerHTML = `
+    <h3>${esc(st.title)}</h3><p>${esc(st.body)}</p>
+    <div class="tour-nav">
+      <span class="tour-step-n">${i + 1} / ${steps.length}</span>
+      ${i > 0 ? '<button class="btn-ghost" onclick="nextTourStep(-1)">← Back</button>' : ''}
+      <button class="btn-primary" onclick="nextTourStep(1)">${i === steps.length - 1 ? 'Done ✓' : 'Next →'}</button>
+    </div>`;
+  card.style.left = Math.max(12, Math.min(innerWidth - 380, r.left)) + 'px';
+  card.style.top = (below ? r.bottom + 14 : Math.max(12, r.top - card.offsetHeight - 180)) + 'px';
+}
+
+function nextTourStep(dir) {
+  if (!_tour) return;
+  _tour.i += dir;
+  if (_tour.i < 0) _tour.i = 0;
+  if (_tour.i >= _tour.steps.length) { endTour(); return; }
+  showTourStep();
+}
+
+function endTour() {
+  _tour = null;
+  ['tourDim', 'tourSpot', 'tourCard'].forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
 }
 
 // ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
