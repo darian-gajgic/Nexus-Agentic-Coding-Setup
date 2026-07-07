@@ -166,8 +166,77 @@ index ca0c1e7..965e110 100644
          # Hermes surfaces upstream provider failures (e.g. Z.ai 429 after retries)
          # as assistant TEXT with no error event — a partial flag and/or the
          # "API call failed" wrapper string are the reliable signals.
+diff --git a/lipsync.py b/lipsync.py
+index 9893a7f..834b0fc 100644
+--- a/lipsync.py
++++ b/lipsync.py
+@@ -57,7 +57,9 @@ async def render(audio_path: str) -> Path:
+     if not status()["available"]:
+         raise RuntimeError("lip-sync pipeline not available (see /api/jarvis/lipsync/status)")
+ 
+-    out = Path(tempfile.mkstemp(suffix=".mp4", prefix="lipsync_")[1])
++    fd, out_name = tempfile.mkstemp(suffix=".mp4", prefix="lipsync_")
++    os.close(fd)  # mkstemp's fd leaked once per spoken sentence — close it
++    out = Path(out_name)
+     cmd = [
+         ML_PY, str(INFERENCE_SCRIPT),
+         "--checkpoint_path", str(WAV2LIP_CHECKPOINT),
+@@ -65,18 +67,29 @@ async def render(audio_path: str) -> Path:
+         "--audio", str(audio_path),
+         "--outfile", str(out),
+     ]
+-    async with _lock:  # one GPU inference at a time
+-        proc = await asyncio.create_subprocess_exec(
+-            *cmd,
+-            cwd=str(WAV2LIP_DIR),
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-        )
+-        stdout, _ = await proc.communicate()
+-    if proc.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+-        tail = (stdout or b"").decode(errors="replace")[-1500:]
+-        raise RuntimeError(f"Wav2Lip inference failed (rc={proc.returncode}):\n{tail}")
+-    return out
++    try:
++        async with _lock:  # one GPU inference at a time
++            proc = await asyncio.create_subprocess_exec(
++                *cmd,
++                cwd=str(WAV2LIP_DIR),
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++            )
++            try:
++                # a wedged render must never hold the lock forever — that
++                # freezes every subsequent /talk in the conversation
++                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
++            except asyncio.TimeoutError:
++                proc.kill()
++                await proc.communicate()
++                raise RuntimeError("Wav2Lip inference timed out after 120s (killed)")
++        if proc.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
++            tail = (stdout or b"").decode(errors="replace")[-1500:]
++            raise RuntimeError(f"Wav2Lip inference failed (rc={proc.returncode}):\n{tail}")
++        return out
++    except Exception:
++        out.unlink(missing_ok=True)  # no partial mp4 left behind on failure
++        raise
+ 
+ 
+ # Convenience: render from raw wav bytes (used by the endpoint)
+@@ -85,8 +98,11 @@ async def render_bytes(wav_bytes: bytes) -> bytes:
+     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as af:
+         af.write(wav_bytes)
+         audio_path = af.name
++    mp4_path = None
+     try:
+         mp4_path = await render(audio_path)
+         return mp4_path.read_bytes()
+     finally:
+         os.unlink(audio_path)
++        if mp4_path is not None:
++            mp4_path.unlink(missing_ok=True)  # was leaked on every sentence
 diff --git a/server.py b/server.py
-index 2bd943c..881f87e 100644
+index 2bd943c..7cbf6d5 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,7 @@ class TaskCreate(BaseModel):
@@ -219,7 +288,54 @@ index 2bd943c..881f87e 100644
      updates["updated_at"] = time.time()
  
      set_clause = ", ".join(f"{k} = ?" for k in updates)
-@@ -3445,6 +3456,97 @@ async def agent_config_update(agent_id: str, body: dict):
+@@ -1260,7 +1271,16 @@ async def jarvis_stt(file: UploadFile = File(...)):
+     if not _voice_ready:
+         return JSONResponse(status_code=503, content={"error": "voice pipeline not available"})
+     audio_bytes = await file.read()
+-    text = await _voice.transcribe(audio_bytes)
++    if not audio_bytes:
++        return JSONResponse(status_code=400, content={"error": "empty audio upload"})
++    if len(audio_bytes) > 25 * 1024 * 1024:
++        return JSONResponse(status_code=413, content={"error": "audio too large (25MB max)"})
++    try:
++        text = await _voice.transcribe(audio_bytes)
++    except Exception as e:
++        # unguarded, a GPU error here surfaced as a NON-JSON 500 (seen live:
++        # cudaErrorInvalidDevice 2026-07-05) and broke the frontend's .json()
++        return JSONResponse(status_code=500, content={"error": f"transcription failed: {str(e)[:200]}"})
+     return {"text": text}
+ 
+ 
+@@ -1272,24 +1292,13 @@ async def jarvis_tts(body: dict):
+     text = body.get("text", "").strip()
+     if not text:
+         return JSONResponse(status_code=400, content={"error": "empty text"})
+-    wav_bytes = await _voice.synthesize(text)
++    try:
++        wav_bytes = await _voice.synthesize(text)
++    except Exception as e:
++        return JSONResponse(status_code=500, content={"error": f"synthesis failed: {str(e)[:200]}"})
+     return RawResponse(content=wav_bytes, media_type="audio/wav")
+ 
+ 
+-@app.post("/api/jarvis/voice/talk")
+-async def jarvis_voice_talk(body: dict):
+-    """Full voice turn: transcribe audio → Hermes chat → synthesize reply.
+-    Returns the text response. The frontend plays TTS separately via /tts.
+-    """
+-    if not _voice_ready:
+-        return JSONResponse(status_code=503, content={"error": "voice pipeline not available"})
+-
+-    # This endpoint receives pre-transcribed text (the browser does STT
+-    # via /stt, then sends the text here for Hermes chat streaming).
+-    # The actual orchestration is done in the frontend for lower latency.
+-    return JSONResponse(status_code=400, content={"error": "use /stt + /chat/stream + /tts instead"})
+-
+-
+ # ===== JARVIS Neural Lip-Sync (Wav2Lip) =====
+ 
+ _lipsync_ready = False
+@@ -3445,6 +3454,148 @@ async def agent_config_update(agent_id: str, body: dict):
  import tools_hub
  
  
@@ -305,7 +421,58 @@ index 2bd943c..881f87e 100644
 +                "created_at": pl.get("created_at") or "",
 +                "degree": degree.get(i, 0),
 +            })
-+        data = {"nodes": nodes, "links": links,
++
++        # ── semantic regions: k-means in the FULL 768-dim space, named by
++        # their most distinctive real words (tf-idf-ish) — the map's
++        # "continent labels", computed, never invented ──
++        clusters = []
++        try:
++            n = len(vecs)
++            k_c = max(3, min(8, n // 40))
++            rng = np.random.RandomState(42)
++            cent = vecs[rng.choice(n, k_c, replace=False)]
++            assign = np.zeros(n, dtype=int)
++            for _ in range(12):
++                assign = np.argmax(vecs @ cent.T, axis=1)
++                for c in range(k_c):
++                    m = vecs[assign == c]
++                    if len(m):
++                        v = m.mean(axis=0)
++                        cent[c] = v / (np.linalg.norm(v) + 1e-9)
++            import re as _re
++            _STOP = set(("the a an and or of to in for on with is are was were be been "
++                         "this that it its as at by from user agent memory not has have "
++                         "had do does did will would can could should about into when "
++                         "which their there they them he she his her you your i we our "
++                         "than then also only more most some any all no yes if but so "
++                         "after before during between over under out up down new one two "
++                         "using use used via each per s t").split())
++            docs = []
++            for p in pts:
++                pl = p.get("payload") or {}
++                txt = str(pl.get("text_lemmatized") or pl.get("data") or "").lower()
++                docs.append(set(w for w in _re.findall(r"[a-z][a-z0-9_-]{2,}", txt)
++                                if w not in _STOP))
++            import collections as _col
++            global_df = _col.Counter(w for d in docs for w in d)
++            for c in range(k_c):
++                idxs = [i for i in range(n) if assign[i] == c]
++                if len(idxs) < 4:
++                    continue
++                local = _col.Counter(w for i in idxs for w in docs[i])
++                scored = sorted(local.items(),
++                                key=lambda kv: kv[1] * (kv[1] / (global_df[kv[0]] + 1)),
++                                reverse=True)[:3]
++                cx = coords[idxs].mean(axis=0)
++                clusters.append({
++                    "label": " · ".join(w for w, _ in scored) or f"region {c+1}",
++                    "x": round(float(cx[0]), 2), "y": round(float(cx[1]), 2),
++                    "z": round(float(cx[2]), 2), "size": len(idxs),
++                })
++        except Exception:
++            clusters = []
++
++        data = {"nodes": nodes, "links": links, "clusters": clusters,
 +                "count": len(nodes), "dims": 768, "generated_at": time.time()}
 +        _MEM3D_CACHE.update(ts=time.time(), data=data)
 +        return data
@@ -318,20 +485,23 @@ index 2bd943c..881f87e 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..5e9a675 100644
+index b0b7e37..dd98a29 100644
 --- a/static/app.js
 +++ b/static/app.js
-@@ -377,6 +377,9 @@ function switchView(view) {
+@@ -377,6 +377,12 @@ function switchView(view) {
    if (currentView === 'dashboard' && view !== 'dashboard' && window.Nexus3D) {
      window.Nexus3D.dispose();
    }
 +  if (currentView === 'memory' && view !== 'memory' && window.Memory3D) {
 +    window.Memory3D.dispose();
 +  }
++  if (currentView === 'jarvis' && view !== 'jarvis') {
++    jarvisTeardown();
++  }
    currentView = view;
    agentsBuilt = false;
    dashBuilt = false;
-@@ -958,6 +961,11 @@ function openTaskDetail(id) {
+@@ -958,6 +964,11 @@ function openTaskDetail(id) {
        <div class="chip c-accent" style="white-space:normal">${esc(t.rubric_score)}</div></div>` : ''}
      ${t.learn_section ? `<div class="form-group"><label class="form-label">Learn (for you two)</label>
        <div style="background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.25);border-radius:8px;padding:10px 12px;font-size:12.5px;white-space:pre-wrap">${esc(t.learn_section)}</div></div>` : ''}
@@ -343,7 +513,7 @@ index b0b7e37..5e9a675 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -2567,6 +2575,11 @@ function showTaskModal(status) {
+@@ -2567,6 +2578,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -355,7 +525,7 @@ index b0b7e37..5e9a675 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +2609,14 @@ function showTaskModal(status) {
+@@ -2596,6 +2612,14 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
@@ -370,7 +540,7 @@ index b0b7e37..5e9a675 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +2688,7 @@ async function submitTask() {
+@@ -2667,6 +2691,7 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
@@ -378,7 +548,7 @@ index b0b7e37..5e9a675 100644
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -3198,13 +3220,15 @@ function viewMemory() {
+@@ -3198,13 +3223,15 @@ function viewMemory() {
    const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
    const sharedCount = (specialistsState.shared || []).length;
    const tabs = [
@@ -395,15 +565,19 @@ index b0b7e37..5e9a675 100644
    else if (memoryState.tab === 'agent') body = memAgentHTML();
    else if (memoryState.tab === 'lessons') body = memLessonsHTML();
    else if (memoryState.tab === 'shared') body = memSharedHTML();
-@@ -3226,7 +3250,34 @@ async function loadAgentMemoryTab() {
+@@ -3226,7 +3253,48 @@ async function loadAgentMemoryTab() {
    if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
  }
  
 +function mem3dHTML() {
 +  return `
-+    <div class="view-intro" style="margin-bottom:10px">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space (projected to its 3 principal semantic axes — nothing is arranged by hand). Lines are the strongest semantic associations; brighter means stronger. Related memories physically cluster together. <strong>Drag</strong> to orbit · <strong>scroll</strong> to zoom · <strong>hover</strong> a node for its full record.</div>
-+    <div id="mem3dStage" style="position:relative;height:calc(100vh - 285px);min-height:520px;border-radius:14px;border:1px solid rgba(124,92,255,.18);background:#07070d;overflow:hidden">
-+      <div class="loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Projecting ${'768'}-dim memory space…</div>
++    <div style="display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap">
++      <div class="view-intro" style="flex:1;min-width:320px;margin:0">Your agent's mind, spatially: every point is a real memory at its true position in mem0's 768-dimensional vector space. The floating labels are <strong>semantic regions</strong> — named by their own most distinctive words, computed, not written by anyone. <strong>Drag</strong> orbit · <strong>scroll</strong> zoom · <strong>hover</strong> for the record.</div>
++      <input class="form-input" id="mem3dSearch" placeholder="🔍 light up memories about…" style="width:250px">
++      <span id="mem3dStats" style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);white-space:nowrap"></span>
++    </div>
++    <div id="mem3dStage" style="position:relative;height:calc(100vh - 258px);min-height:600px;border-radius:14px;border:1px solid rgba(124,92,255,.18);background:#07070d;overflow:hidden">
++      <div class="loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Projecting 768-dim memory space…</div>
 +    </div>`;
 +}
 +
@@ -419,6 +593,16 @@ index b0b7e37..5e9a675 100644
 +    }
 +    stage.innerHTML = '';
 +    if (window.Memory3D) window.Memory3D.mount(stage, data);
++    const stats = document.getElementById('mem3dStats');
++    if (stats) stats.textContent =
++      `${data.count} memories · ${data.links.length} associations · ${(data.clusters || []).length} regions · 768-D live`;
++    const inp = document.getElementById('mem3dSearch');
++    if (inp) inp.oninput = () => {
++      const n = window.Memory3D.search(inp.value);
++      if (stats) stats.textContent = inp.value.trim()
++        ? `${n} of ${data.count} memories match · ${data.links.length} associations`
++        : `${data.count} memories · ${data.links.length} associations · ${(data.clusters || []).length} regions · 768-D live`;
++    };
 +  } catch (e) {
 +    stage.innerHTML = `<div class="empty" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><span class="e-ico">⚠️</span>${esc(e.message)}</div>`;
 +  }
@@ -430,7 +614,341 @@ index b0b7e37..5e9a675 100644
    $$('[data-memtab]').forEach(el => {
      el.onclick = () => {
        memoryState.tab = el.dataset.memtab;
-@@ -5089,8 +5140,8 @@ function viewDeliverables() {
+@@ -3778,28 +3846,31 @@ function renderJarvisView() {
+         </div>
+       </div>
+ 
+-      <!-- CENTER COLUMN -->
++      <!-- CENTER COLUMN — holographic stage -->
+       <div class="jarvis-center">
+-        <div class="avatar-reactor-row">
+-          <!-- Face IS the button: reactor animation wraps around the avatar.
+-               Clicking the face toggles recording (start/stop talking). -->
+-          <div class="reactor-wrap" id="jReactorWrap" title="Click to talk">
+-            <canvas id="jReactor"></canvas>
+-            <div class="avatar-wrap" id="jAvatarWrap"></div>
+-            <div class="reactor-state">
+-              <div class="st" id="jState">IDLE</div>
+-              <div class="hint" id="jHint">CLICK TO TALK</div>
++        <div id="jStage" class="jarvis-stage">
++          <!-- Jarvis3D mounts its canvas here (absolute, behind everything) -->
++          <div class="avatar-reactor-row stage-center">
++            <!-- Face IS the button: reactor animation wraps around the avatar.
++                 Clicking the face toggles recording (start/stop talking). -->
++            <div class="reactor-wrap" id="jReactorWrap" title="Click to talk">
++              <canvas id="jReactor"></canvas>
++              <div class="avatar-wrap" id="jAvatarWrap"><div class="holo-scan"></div></div>
++              <div class="reactor-state">
++                <div class="st" id="jState">IDLE</div>
++                <div class="hint" id="jHint">CLICK TO TALK</div>
++              </div>
+             </div>
+           </div>
+-        </div>
+-        <div class="voice-controls">
+-          <div class="mic-level"><i id="jMicLevel"></i></div>
+-          <span class="voice-state-label" id="jVoiceLabel">IDLE</span>
+-          <label class="conv-toggle" title="Auto-listen after JARVIS replies (hands-free conversation)">
+-            <input type="checkbox" id="jConvToggle">
+-            <span class="conv-slider"></span>
+-            <span class="conv-label">CONV</span>
+-          </label>
++          <div class="voice-controls stage-controls">
++            <div class="mic-level"><i id="jMicLevel"></i></div>
++            <span class="voice-state-label" id="jVoiceLabel">IDLE</span>
++            <label class="conv-toggle" title="Hands-free conversation: auto-listen after JARVIS replies, auto-stop on silence">
++              <input type="checkbox" id="jConvToggle">
++              <span class="conv-slider"></span>
++              <span class="conv-label">CONV</span>
++            </label>
++          </div>
+         </div>
+         <div class="jarvis-feed" id="jFeed"></div>
+         <div class="jarvis-chat-row">
+@@ -3839,8 +3910,36 @@ function renderJarvisView() {
+   // Wire up controls
+   jarvisBindControls();
+ 
+-  // Load status
+-  jarvisLoadStatus();
++  // Load status (generation token kills any previous self-poll chain —
++  // each visit used to stack another 15s polling loop forever)
++  jarvisState.statusGen = (jarvisState.statusGen || 0) + 1;
++  jarvisLoadStatus(jarvisState.statusGen);
++
++  // Holographic stage + restore feed from state (was rendered empty on
++  // re-entry while old messages silently lived on in jarvisState)
++  if (window.Jarvis3D) window.Jarvis3D.mount($('#jStage'));
++  if (jarvisState.messages.length) jarvisRenderFeed();
++  if (!jarvisState.streaming && !jarvisState.ttsAnimating) jarvisSetMode('idle');
++  else jarvisSetMode(jarvisState.mode);
++}
++
++function jarvisTeardown() {
++  // Called when leaving the view: without this the mic stayed HOT, the
++  // level RAF ran forever, TTS kept talking to nobody and each visit
++  // stacked another status-poll chain.
++  try {
++    if (jarvisState.mediaRecorder && jarvisState.recording) {
++      jarvisState.mediaRecorder.onstop = null; // don't transcribe on teardown
++      jarvisState.mediaRecorder.stop();
++      jarvisState.mediaRecorder.stream.getTracks().forEach(t => t.stop());
++    }
++  } catch { }
++  jarvisState.recording = false;
++  jarvisState.micAnalyser = null;         // ends jarvisMicLevelLoop's RAF
++  try { jarvisStopTTS(); } catch { }
++  try { jarvisStopStreaming(); } catch { }
++  jarvisState.statusGen = (jarvisState.statusGen || 0) + 1; // kill poll chain
++  if (window.Jarvis3D) window.Jarvis3D.dispose();
+ }
+ 
+ async function jarvisBootSequence() {
+@@ -3996,10 +4095,12 @@ function jarvisBindControls() {
+ 
+   stopBtn.addEventListener('click', () => jarvisStopStreaming());
+ 
+-  // Face IS the button — click the avatar to toggle recording
++  // Face IS the button — click the avatar to toggle recording.
++  // Barge-in: clicking while JARVIS is speaking interrupts it and listens.
+   $('#jReactorWrap').addEventListener('click', () => {
+-    if (jarvisState.recording) jarvisStopRecording();
+-    else jarvisStartRecording();
++    if (jarvisState.recording) { jarvisStopRecording(); return; }
++    if (jarvisState.ttsAnimating) jarvisStopTTS();
++    jarvisStartRecording();
+   });
+ 
+   // Conversation mode toggle
+@@ -4012,7 +4113,8 @@ function jarvisBindControls() {
+ }
+ 
+ // ===== STATUS =====
+-async function jarvisLoadStatus() {
++async function jarvisLoadStatus(gen) {
++  if (gen !== jarvisState.statusGen) return; // superseded poll chain — die
+   try {
+     const s = await api('GET', '/api/jarvis/status');
+     jarvisState.connected = s.connected;
+@@ -4037,8 +4139,10 @@ async function jarvisLoadStatus() {
+     $('#jVoiceStatus').textContent = 'OFF';
+   }
+ 
+-  // Update every 15s
+-  setTimeout(() => { if (currentView === 'jarvis') jarvisLoadStatus(); }, 15000);
++  // Update every 15s — only the newest generation's chain survives
++  setTimeout(() => {
++    if (currentView === 'jarvis' && gen === jarvisState.statusGen) jarvisLoadStatus(gen);
++  }, 15000);
+ }
+ 
+ async function jarvisLoadData() {
+@@ -4083,12 +4187,13 @@ function jarvisUpdateActivity() {
+     el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
+     return;
+   }
+-  el.innerHTML = items.map(a => `<div><b>${a.source}</b> ${a.message}</div>`).join('');
++  el.innerHTML = items.map(a => `<div><b>${esc(a.source)}</b> ${esc(a.message)}</div>`).join('');
+ }
+ 
+ // ===== MODE =====
+ function jarvisSetMode(mode) {
+   jarvisState.mode = mode;
++  if (window.Jarvis3D) window.Jarvis3D.setMode(mode); // holographic stage follows
+   const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
+   const labelEl = $('#jState');
+   if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
+@@ -4132,7 +4237,8 @@ function jarvisRenderFeed() {
+   feed.innerHTML = jarvisState.messages.map(m => {
+     const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
+     const cls2 = m.live ? ' live' : '';
+-    return `<div class="j-msg ${cls}${cls2}">${m.text}</div>`;
++    // esc() — transcripts and streamed LLM text were interpolated raw (XSS)
++    return `<div class="j-msg ${cls}${cls2}">${esc(m.text)}</div>`;
+   }).join('');
+   feed.scrollTop = feed.scrollHeight;
+   const mc = $('#jMsgCount');
+@@ -4247,7 +4353,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+     case 'tool_call':
+       const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
+       if (toolName && toolName !== '_thinking') {
+-        jarvisAddMessage('tool', `<b>TOOL</b> ${toolName}`);
++        jarvisAddMessage('tool', `⚙ TOOL · ${toolName}`);
+       }
+       break;
+     case 'run.completed':
+@@ -4307,7 +4413,12 @@ async function jarvisProcessTTSQueue() {
+     return;
+   }
+   jarvisState.ttsAnimating = true;
++  jarvisState.ttsStopped = false;
+   jarvisSetMode('talking');
++  if (jarvisState.audioContext && jarvisState.audioContext.state === 'suspended') {
++    jarvisState.audioContext.resume().catch(() => { });
++  }
++  jarvisTtsLevelLoop(); // stage pulses with the real voice amplitude
+ 
+   // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
+   // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
+@@ -4317,6 +4428,7 @@ async function jarvisProcessTTSQueue() {
+ 
+   while (pending) {
+     const clip = await pending;
++    if (jarvisState.ttsStopped) { pending = null; break; } // barge-in/stop
+     // Kick off NEXT render now (runs in parallel with current playback)
+     let nextPending = null;
+     if (jarvisState.ttsQueue.length > 0) {
+@@ -4326,9 +4438,17 @@ async function jarvisProcessTTSQueue() {
+     }
+     if (clip) await jarvisPlayClip(clip);
+     pending = nextPending;
++    // a sentence queued in the shift/flag race window gets picked up here
++    // instead of stranding in the queue with no drainer
++    if (!pending && jarvisState.ttsQueue.length > 0 && !jarvisState.ttsStopped) {
++      const nt = jarvisState.ttsQueue.shift();
++      $('#jTtsCount').textContent = jarvisState.ttsQueue.length;
++      pending = jarvisFetchClip(nt);
++    }
+   }
+ 
+   jarvisState.ttsAnimating = false;
++  jarvisState.ttsStopped = false;
+   jarvisSetMode('idle');
+   jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
+   jarvisMaybeAutoListen();
+@@ -4365,7 +4485,10 @@ async function jarvisFetchClip(text) {
+ // both from the SAME blob — synced by construction. If WAV (/tts fallback):
+ // audio only.
+ function jarvisPlayClip(blob) {
+-  const isVideo = blob.type === 'video/mp4' || blob.size > 20000;
++  // decide by CONTENT TYPE only: the old `size > 20000` heuristic classified
++  // every /tts WAV over ~0.45s as video, whose decode then failed → the
++  // audio-only fallback never actually played
++  const isVideo = (blob.type || '').startsWith('video');
+   return new Promise((resolve) => {
+     let resolved = false;
+     const url = URL.createObjectURL(blob);
+@@ -4377,11 +4500,15 @@ function jarvisPlayClip(blob) {
+     const cleanup = () => {
+       if (resolved) return;
+       resolved = true;
++      if (jarvisState.currentClipCleanup === cleanup) jarvisState.currentClipCleanup = null;
+       audio.oncanplay = null; audio.onended = null; audio.onerror = null;
+       if (video) { video.oncanplay = null; video.onended = null; video.onerror = null; }
+       URL.revokeObjectURL(url);
+       resolve();
+     };
++    // stop/barge-in resolves the in-flight clip immediately instead of
++    // waiting for the 30s watchdog (which wedged the pipeline)
++    jarvisState.currentClipCleanup = cleanup;
+ 
+     const startIfReady = () => {
+       if (started || !audioReady || !videoReady) return;
+@@ -4420,10 +4547,38 @@ function jarvisAudioEl() {
+   if (!jarvisState.ttsAudioEl) {
+     const el = new Audio();
+     jarvisState.ttsAudioEl = el;
++    // Route through an analyser so the holographic stage pulses with the
++    // REAL speech amplitude. createMediaElementSource is once-per-element,
++    // which is exactly why the element must stay persistent. Fail-soft.
++    try {
++      if (!jarvisState.audioContext) {
++        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
++      }
++      const ctx = jarvisState.audioContext;
++      const src = ctx.createMediaElementSource(el);
++      const an = ctx.createAnalyser();
++      an.fftSize = 128;
++      src.connect(an);
++      an.connect(ctx.destination); // rerouted — must reconnect or it goes silent
++      jarvisState.ttsAnalyser = an;
++      jarvisState._ttsData = new Uint8Array(an.frequencyBinCount);
++    } catch { }
+   }
+   return jarvisState.ttsAudioEl;
+ }
+ 
++function jarvisTtsLevelLoop() {
++  if (!jarvisState.ttsAnimating || !jarvisState.ttsAnalyser) {
++    if (window.Jarvis3D && !jarvisState.recording) window.Jarvis3D.setLevel(0);
++    return;
++  }
++  jarvisState.ttsAnalyser.getByteFrequencyData(jarvisState._ttsData);
++  let sum = 0;
++  for (let i = 0; i < jarvisState._ttsData.length; i++) sum += jarvisState._ttsData[i];
++  if (window.Jarvis3D) window.Jarvis3D.setLevel((sum / jarvisState._ttsData.length / 255) * 2.4);
++  requestAnimationFrame(jarvisTtsLevelLoop);
++}
++
+ function jarvisMaybeAutoListen() {
+   if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
+     jarvisStartRecording();
+@@ -4432,12 +4587,19 @@ function jarvisMaybeAutoListen() {
+ 
+ function jarvisStopTTS() {
+   jarvisState.ttsQueue = [];
++  jarvisState.ttsStopped = true;   // drain loop exits at the next await
+   const ttsCount = $('#jTtsCount');
+   if (ttsCount) ttsCount.textContent = 0;
+   if (jarvisState.ttsAudioEl) {
++    // pause but KEEP the element — it carries the user-gesture autoplay
++    // unlock; nulling it made the next reply's play() rejectable by Chrome
+     jarvisState.ttsAudioEl.pause();
+-    jarvisState.ttsAudioEl = null;
++    try { jarvisState.ttsAudioEl.currentTime = 0; } catch { }
+   }
++  if (jarvisState.avatarVideo) jarvisState.avatarVideo.pause();
++  // resolve the in-flight clip NOW — pausing never fires onended, so the
++  // pipeline stayed wedged (ttsAnimating=true) for up to 30s after STOP
++  if (jarvisState.currentClipCleanup) jarvisState.currentClipCleanup();
+   jarvisSetIdleAvatar();
+ }
+ 
+@@ -4463,12 +4625,16 @@ async function jarvisStartRecording() {
+       jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+     }
+     const ctx = jarvisState.audioContext;
++    if (ctx.state === 'suspended') ctx.resume().catch(() => { });
++    if (jarvisState._micSource) { try { jarvisState._micSource.disconnect(); } catch { } }
+     const micSource = ctx.createMediaStreamSource(stream);
++    jarvisState._micSource = micSource; // kept so we can disconnect (nodes accumulated per recording)
+     const analyser = ctx.createAnalyser();
+     analyser.fftSize = 256;
+     micSource.connect(analyser);
+     jarvisState.micAnalyser = analyser;
+     jarvisState._micDataArray = new Uint8Array(analyser.frequencyBinCount);
++    jarvisState._vad = { spokeAt: 0, startedAt: performance.now() };
+     jarvisMicLevelLoop();
+ 
+     jarvisState.mediaRecorder.ondataavailable = (e) => {
+@@ -4526,6 +4692,7 @@ function jarvisMicLevelLoop() {
+   if (!jarvisState.micAnalyser || !jarvisState.recording) {
+     const el = $('#jMicLevel');
+     if (el) el.style.width = '0%';
++    if (window.Jarvis3D && jarvisState.mode !== 'talking') window.Jarvis3D.setLevel(0);
+     return;
+   }
+   jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
+@@ -4534,6 +4701,18 @@ function jarvisMicLevelLoop() {
+   const avg = sum / jarvisState._micDataArray.length / 255;
+   const el = $('#jMicLevel');
+   if (el) el.style.width = (avg * 100 * 2) + '%';
++  if (window.Jarvis3D) window.Jarvis3D.setLevel(avg * 2.2); // stage reacts to the real mic
++
++  // Hands-free: in conversation mode, stop on ~1.8s of silence after speech
++  // (before this, "auto-listen" still required a click to stop — not hands-free)
++  const v = jarvisState._vad;
++  if (jarvisState.conversationMode && v) {
++    const now = performance.now();
++    if (avg > 0.06) v.spokeAt = now;
++    const spoke = v.spokeAt > 0;
++    if (spoke && now - v.spokeAt > 1800) { jarvisStopRecording(); return; }
++    if (!spoke && now - v.startedAt > 8000) { jarvisStopRecording(); return; } // nothing said
++  }
+   requestAnimationFrame(jarvisMicLevelLoop);
+ }
+ 
+@@ -5089,8 +5268,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -442,18 +960,64 @@ index b0b7e37..5e9a675 100644
          </div>
          <div class="row-actions">
 diff --git a/static/index.html b/static/index.html
-index bb6661f..8c2f0b2 100644
+index bb6661f..c6768b1 100644
 --- a/static/index.html
 +++ b/static/index.html
-@@ -93,6 +93,7 @@
+@@ -7,7 +7,7 @@
+ <link rel="preconnect" href="https://fonts.googleapis.com">
+ <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+ <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+-<link rel="stylesheet" href="/static/style.css?v=5">
++<link rel="stylesheet" href="/static/style.css?v=6">
+ <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+ </head>
+ <body>
+@@ -93,6 +93,8 @@
  
  <button id="fbBtn" onclick="feedbackModal()" title="Something wrong or annoying here? File it — your last steps get attached automatically" style="position:fixed;right:18px;bottom:18px;z-index:900;width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(20,20,32,.85);color:var(--text-dim);font-size:17px;cursor:pointer;backdrop-filter:blur(6px)">🐞</button>
  <script src="/static/nexus3d.js?v=1" type="module"></script>
 -<script src="/static/app.js?v=28"></script>
-+<script src="/static/memory3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=30"></script>
++<script src="/static/memory3d.js?v=2" type="module"></script>
++<script src="/static/jarvis3d.js?v=1" type="module"></script>
++<script src="/static/app.js?v=31"></script>
  </body>
  </html>
+diff --git a/static/style.css b/static/style.css
+index e17c46d..ee688f1 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -1229,3 +1229,31 @@ code, pre, .mono { font-family: var(--font-mono); }
+   .spec-grid { grid-template-columns:1fr; }
+   .drawer { width:100vw; }
+ }
++
++/* ═══ JARVIS v2 — holographic stage (2026-07-07) ═══ */
++.jarvis-stage {
++  position:relative; width:100%; flex:1; min-height:56vh;
++  display:flex; align-items:center; justify-content:center;
++  border-radius:16px; overflow:hidden;
++  background:radial-gradient(ellipse at 50% 65%, rgba(34,211,238,.06), transparent 60%), #05050b;
++  border:1px solid rgba(124,92,255,.16);
++  box-shadow:inset 0 0 80px rgba(7,7,13,.9);
++}
++.jarvis-stage .stage-center { position:relative; z-index:3; }
++.jarvis-stage .reactor-wrap { width:min(52vh,460px); height:min(52vh,460px); }
++.jarvis-stage .stage-controls {
++  position:absolute; top:14px; right:16px; z-index:4;
++  background:rgba(13,13,26,.6); border:1px solid rgba(124,92,255,.22);
++  border-radius:12px; padding:8px 14px; backdrop-filter:blur(10px);
++}
++/* holographic identity treatment on the face */
++.jarvis-stage .avatar-wrap { box-shadow:0 0 60px rgba(34,211,238,.25), 0 0 120px rgba(124,92,255,.15); }
++.jarvis-stage .avatar-wrap .holo-scan {
++  position:absolute; inset:0; z-index:5; border-radius:inherit; pointer-events:none;
++  background:repeating-linear-gradient(180deg, rgba(94,234,212,.05) 0 1px, transparent 1px 4px);
++  mix-blend-mode:screen; animation:holoScan 7s linear infinite;
++}
++@keyframes holoScan { 0% { background-position-y:0; } 100% { background-position-y:120px; } }
++.jarvis-stage .avatar-reactor-row { animation:holoFloat 9s ease-in-out infinite; }
++@keyframes holoFloat { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-9px); } }
++.jarvis-feed { max-height:20vh; }
 diff --git a/templates.json b/templates.json
 index e4a0612..baec6b0 100644
 --- a/templates.json
@@ -551,6 +1115,29 @@ index e4a0612..baec6b0 100644
 -]
 +]
 \ No newline at end of file
+diff --git a/voice.py b/voice.py
+index 66774f0..4ba78e0 100644
+--- a/voice.py
++++ b/voice.py
+@@ -42,7 +42,9 @@ _tts_lock = asyncio.Lock()
+ # Track when each model was last used. After IDLE_TIMEOUT seconds of inactivity,
+ # the model is unloaded from GPU memory to free VRAM for other models.
+ import time as _time
+-IDLE_TIMEOUT = 60.0  # seconds of inactivity before unloading
++IDLE_TIMEOUT = 300.0  # seconds of inactivity before unloading — MUST exceed
++# the 240s chat/stream ceiling, or models unload mid-'thinking' and the
++# first reply sentence pays a cold reload right when the user is waiting
+ _last_voice_use = 0.0  # shared: TTS + STT both count as "voice" use
+ 
+ 
+@@ -118,6 +120,7 @@ def _transcribe_sync(audio_bytes: bytes) -> str:
+         model = _get_stt()
+         segments, _info = model.transcribe(tmp_path, language="en", beam_size=3, vad_filter=True)
+         text = " ".join(s.text.strip() for s in segments).strip()
++        _touch_voice()  # completion counts as use — long turns aged out mid-flight
+         return text
+     finally:
+         try:
 diff --git a/worktree.py b/worktree.py
 index d1fcbbe..b561540 100644
 --- a/worktree.py

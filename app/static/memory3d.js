@@ -24,7 +24,53 @@ const M = {
   pointer: null, resizeObs: null, t: 0,
   cam: { theta: 0.9, phi: 1.15, dist: 150, tx: 0, ty: 0 },
   drag: null, lastInteract: 0, container: null,
+  glows: null, labels: [], flyT: -1, searchQ: '', matchSet: null,
 };
+
+// shared soft radial glow texture (fake bloom, cheap and pretty)
+let _glowTex = null;
+function glowTexture() {
+  if (_glowTex) return _glowTex;
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.25, 'rgba(255,255,255,.55)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 64, 64);
+  _glowTex = new THREE.CanvasTexture(c);
+  return _glowTex;
+}
+
+function textSprite(text, sub) {
+  const c = document.createElement('canvas');
+  const g = c.getContext('2d');
+  const pad = 18;
+  g.font = '600 30px "JetBrains Mono", monospace';
+  const w = Math.ceil(g.measureText(text).width) + pad * 2;
+  c.width = Math.max(w, 120);
+  c.height = 84;
+  g.font = '600 30px "JetBrains Mono", monospace';
+  g.textAlign = 'center';
+  g.shadowColor = 'rgba(124,92,255,.9)';
+  g.shadowBlur = 18;
+  g.fillStyle = 'rgba(226,226,248,.95)';
+  g.fillText(text, c.width / 2, 40);
+  g.shadowBlur = 0;
+  g.font = '500 20px "JetBrains Mono", monospace';
+  g.fillStyle = 'rgba(148,148,190,.85)';
+  g.fillText(sub, c.width / 2, 70);
+  const tex = new THREE.CanvasTexture(c);
+  const mat = new THREE.SpriteMaterial({
+    map: tex, transparent: true, opacity: 0.92,
+    depthWrite: false, depthTest: false });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(c.width / 14, c.height / 14, 1);
+  s.renderOrder = 10;
+  return s;
+}
 
 const COL = {
   user: 0x5eead4,       // operator-attributed memories — teal
@@ -79,6 +125,31 @@ function buildScene(data) {
     mesh.userData = { idx: i, baseSize: size, phase: Math.random() * Math.PI * 2 };
     M.group.add(mesh);
     M.nodeMeshes.push(mesh);
+  });
+
+  // ── per-node glow sprites (one Points cloud, additive = bloom feel) ──
+  const gp = [], gc = [], gs = [];
+  nodes.forEach((n, i) => {
+    gp.push(n.x, n.y, n.z);
+    const c = new THREE.Color(nodeColor(n));
+    gc.push(c.r, c.g, c.b);
+    gs.push(3.4 + Math.min(5, n.degree * 1.1));
+  });
+  const glowGeo = new THREE.BufferGeometry();
+  glowGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(gp), 3));
+  glowGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(gc), 3));
+  M.glows = new THREE.Points(glowGeo, new THREE.PointsMaterial({
+    map: glowTexture(), size: 7, vertexColors: true, transparent: true,
+    opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false,
+    sizeAttenuation: true }));
+  M.group.add(M.glows);
+
+  // ── semantic region labels (computed server-side from the real terms) ──
+  (data.clusters || []).forEach((cl) => {
+    const s = textSprite(cl.label, `${cl.size} memories`);
+    s.position.set(cl.x, cl.y + 9, cl.z);
+    M.group.add(s);
+    M.labels.push(s);
   });
 
   // ── links, vertex-colored by real similarity strength ──
@@ -191,9 +262,38 @@ function setHover(idx) {
   M.container.style.cursor = 'pointer';
 }
 
+function setSearch(q) {
+  M.searchQ = (q || '').trim().toLowerCase();
+  if (!M.searchQ) { M.matchSet = null; }
+  else {
+    M.matchSet = new Set();
+    M.data.nodes.forEach((n, i) => {
+      if ((n.text || '').toLowerCase().includes(M.searchQ)) M.matchSet.add(i);
+    });
+  }
+  M.nodeMeshes.forEach((m, i) => {
+    const dim = M.matchSet && !M.matchSet.has(i);
+    m.material.opacity = dim ? 0.10 : 0.95;
+    m.material.emissiveIntensity = dim ? 0.12 : (M.matchSet ? 1.4 : 0.55);
+  });
+  if (M.glows) M.glows.material.opacity = M.matchSet ? 0.18 : 0.55;
+  if (M.linkLines) M.linkLines.material.opacity = M.matchSet ? 0.12 : 0.42;
+  return M.matchSet ? M.matchSet.size : (M.data ? M.data.nodes.length : 0);
+}
+
 function animate() {
   M.raf = requestAnimationFrame(animate);
   M.t += 0.016;
+
+  // cinematic fly-in on mount (cancelled by the first interaction)
+  if (M.flyT >= 0) {
+    M.flyT += 0.016;
+    const k = Math.min(1, M.flyT / 2.4);
+    const ease = 1 - Math.pow(1 - k, 3);
+    M.cam.dist = 430 - (430 - 150) * ease;
+    M.cam.phi = 0.62 + (1.15 - 0.62) * ease;
+    if (k >= 1) M.flyT = -1;
+  }
 
   // idle auto-orbit resumes 3s after the last interaction
   if (performance.now() - M.lastInteract > 3000) M.cam.theta += 0.0011;
@@ -271,11 +371,13 @@ async function mount(container, data) {
   M.raycaster.params.Points = { threshold: 2 };
 
   buildScene(data);
+  M.flyT = 0; // cinematic approach from deep space
 
   // ── controls ──
   const rect = () => M.canvas.getBoundingClientRect();
   M.canvas.addEventListener('pointerdown', (e) => {
     M.drag = { x: e.clientX, y: e.clientY };
+    M.flyT = -1; // interaction cancels the fly-in
     M.lastInteract = performance.now();
     M.container.style.cursor = 'grabbing';
     M.canvas.setPointerCapture(e.pointerId);
@@ -332,7 +434,8 @@ function dispose() {
     group: null, nodeMeshes: [], linkLines: null, pulses: [], stars: null,
     grid: null, data: null, panel: null, hoverId: -1, raycaster: null,
     pointer: null, resizeObs: null, drag: null, container: null,
+    glows: null, labels: [], flyT: -1, searchQ: '', matchSet: null,
   });
 }
 
-window.Memory3D = { mount, dispose };
+window.Memory3D = { mount, dispose, search: setSearch };

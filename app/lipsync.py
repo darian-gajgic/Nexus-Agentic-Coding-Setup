@@ -57,7 +57,9 @@ async def render(audio_path: str) -> Path:
     if not status()["available"]:
         raise RuntimeError("lip-sync pipeline not available (see /api/jarvis/lipsync/status)")
 
-    out = Path(tempfile.mkstemp(suffix=".mp4", prefix="lipsync_")[1])
+    fd, out_name = tempfile.mkstemp(suffix=".mp4", prefix="lipsync_")
+    os.close(fd)  # mkstemp's fd leaked once per spoken sentence — close it
+    out = Path(out_name)
     cmd = [
         ML_PY, str(INFERENCE_SCRIPT),
         "--checkpoint_path", str(WAV2LIP_CHECKPOINT),
@@ -65,18 +67,29 @@ async def render(audio_path: str) -> Path:
         "--audio", str(audio_path),
         "--outfile", str(out),
     ]
-    async with _lock:  # one GPU inference at a time
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(WAV2LIP_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-    if proc.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
-        tail = (stdout or b"").decode(errors="replace")[-1500:]
-        raise RuntimeError(f"Wav2Lip inference failed (rc={proc.returncode}):\n{tail}")
-    return out
+    try:
+        async with _lock:  # one GPU inference at a time
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(WAV2LIP_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                # a wedged render must never hold the lock forever — that
+                # freezes every subsequent /talk in the conversation
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                raise RuntimeError("Wav2Lip inference timed out after 120s (killed)")
+        if proc.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+            tail = (stdout or b"").decode(errors="replace")[-1500:]
+            raise RuntimeError(f"Wav2Lip inference failed (rc={proc.returncode}):\n{tail}")
+        return out
+    except Exception:
+        out.unlink(missing_ok=True)  # no partial mp4 left behind on failure
+        raise
 
 
 # Convenience: render from raw wav bytes (used by the endpoint)
@@ -85,8 +98,11 @@ async def render_bytes(wav_bytes: bytes) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as af:
         af.write(wav_bytes)
         audio_path = af.name
+    mp4_path = None
     try:
         mp4_path = await render(audio_path)
         return mp4_path.read_bytes()
     finally:
         os.unlink(audio_path)
+        if mp4_path is not None:
+            mp4_path.unlink(missing_ok=True)  # was leaked on every sentence

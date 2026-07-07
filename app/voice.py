@@ -42,7 +42,9 @@ _tts_lock = asyncio.Lock()
 # Track when each model was last used. After IDLE_TIMEOUT seconds of inactivity,
 # the model is unloaded from GPU memory to free VRAM for other models.
 import time as _time
-IDLE_TIMEOUT = 60.0  # seconds of inactivity before unloading
+IDLE_TIMEOUT = 300.0  # seconds of inactivity before unloading — MUST exceed
+# the 240s chat/stream ceiling, or models unload mid-'thinking' and the
+# first reply sentence pays a cold reload right when the user is waiting
 _last_voice_use = 0.0  # shared: TTS + STT both count as "voice" use
 
 
@@ -118,6 +120,7 @@ def _transcribe_sync(audio_bytes: bytes) -> str:
         model = _get_stt()
         segments, _info = model.transcribe(tmp_path, language="en", beam_size=3, vad_filter=True)
         text = " ".join(s.text.strip() for s in segments).strip()
+        _touch_voice()  # completion counts as use — long turns aged out mid-flight
         return text
     finally:
         try:
