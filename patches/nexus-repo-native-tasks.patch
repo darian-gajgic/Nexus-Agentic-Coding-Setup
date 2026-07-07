@@ -329,7 +329,7 @@ index 1efde5b..42fdf7b 100755
  
  echo -e "${YELLOW}═══ 5. JARVIS FUNCTION INTEGRITY ═══${NC}"
 diff --git a/server.py b/server.py
-index 2bd943c..3198cce 100644
+index 2bd943c..1429864 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,24 @@ class TaskCreate(BaseModel):
@@ -565,7 +565,7 @@ index 2bd943c..3198cce 100644
      db.log_activity("info", "system", f"Workflow created: '{name}'")
      w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
      await mgr.broadcast({"type": "workflow_created", "data": w})
-@@ -3136,7 +3226,7 @@ async def update_workflow(wf_id: str, body: dict):
+@@ -3136,14 +3226,38 @@ async def update_workflow(wf_id: str, body: dict):
      w = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
      if not w:
          return JSONResponse(status_code=404, content={"error": "workflow not found"})
@@ -574,7 +574,12 @@ index 2bd943c..3198cce 100644
          if k in body:
              db.execute(f"UPDATE workflows SET {k}=?, updated_at=? WHERE id=?",
                         (body[k], time.time(), wf_id))
-@@ -3144,6 +3234,25 @@ async def update_workflow(wf_id: str, body: dict):
++    if body.get("project_path") and "client" not in body:
++        cl = _derive_client(None, body["project_path"])
++        if cl:
++            db.execute("UPDATE workflows SET client=? WHERE id=?", (cl, wf_id))
++            db.execute("UPDATE tasks SET client=COALESCE(client, ?) WHERE workflow_id=?", (cl, wf_id))
+     if "loop_config" in body:
          lc = body["loop_config"]
          db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
                     (json.dumps(lc) if isinstance(lc, dict) else None, time.time(), wf_id))
@@ -600,7 +605,7 @@ index 2bd943c..3198cce 100644
      return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
  
  
-@@ -3445,6 +3554,422 @@ async def agent_config_update(agent_id: str, body: dict):
+@@ -3445,6 +3559,433 @@ async def agent_config_update(agent_id: str, body: dict):
  import tools_hub
  
  
@@ -929,6 +934,17 @@ index 2bd943c..3198cce 100644
 +    code, out = _run_git_action(root, "git", "-c", "user.name=nexus", "-c",
 +                                "user.email=nexus@local", "commit", "-m",
 +                                f"import: promoted from Nexus task {task_id} ('{task['title'][:60]}')")
++    # the task's workflow becomes this project's history: link it (and its
++    # client scope) so the project's scoped views show where it came from
++    if task.get("workflow_id"):
++        cl = _derive_client(None, root)
++        db.execute("UPDATE workflows SET project_path=?, client=COALESCE(client, ?) WHERE id=?",
++                   (root, cl, task["workflow_id"]))
++        if cl:
++            db.execute("UPDATE tasks SET client=COALESCE(client, ?) WHERE workflow_id=?",
++                       (cl, task["workflow_id"]))
++        db.log_activity("info", "system",
++                        f"Workflow {task['workflow_id']} linked to promoted project {root}")
 +    db.log_activity("info", "system",
 +                    f"Task {task_id} promoted to repository {root} ({copied} top-level items)")
 +    return {"ok": True, "path": root, "items": copied, "note": note.strip(" ·")}
@@ -1024,7 +1040,7 @@ index 2bd943c..3198cce 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..2bbd900 100644
+index b0b7e37..28a78a3 100644
 --- a/static/app.js
 +++ b/static/app.js
 @@ -104,11 +104,19 @@ async function api(method, path, body) {
@@ -2507,7 +2523,7 @@ index b0b7e37..2bbd900 100644
          <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span></div>
        <div class="card-body">
          ${w.goal ? `<div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">${esc(w.goal)}</div>` : ''}
-@@ -4956,24 +5922,48 @@ function viewWorkflows() {
+@@ -4956,24 +5922,58 @@ function viewWorkflows() {
    return `
      <div class="view-intro" style="margin-bottom:12px">A <strong>project</strong> connects several tasks into one campaign. Tasks with dependencies wait until their inputs are DONE, then run automatically — each agent reads its predecessors' deliverable files. Example: research → ad copy → channel plan → publish plan.</div>
      <div style="display:flex;gap:10px;margin-bottom:14px">
@@ -2549,6 +2565,16 @@ index b0b7e37..2bbd900 100644
 +  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
 +}
 +
++async function setWorkflowProject(id) {
++  const v = $('#wfd-project') ? $('#wfd-project').value : '';
++  try {
++    await api('PATCH', `/api/workflows/${id}`, { project_path: v || null });
++    wfState.fetched = false;
++    state.tasks = await api('GET', '/api/tasks');
++    toast(v ? '📂 Workflow linked to the project — it now appears under its focus' : 'Project link removed', 'ok');
++  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
++}
++
 +async function setWorkflowClient(id) {
 +  const v = ($('#wfd-client') ? $('#wfd-client').value : '').trim().toLowerCase();
 +  try {
@@ -2561,7 +2587,7 @@ index b0b7e37..2bbd900 100644
  async function openWorkflowDetail(id) {
    let w;
    try { w = await api('GET', `/api/workflows/${id}`); }
-@@ -4999,6 +5989,7 @@ async function openWorkflowDetail(id) {
+@@ -4999,6 +5999,7 @@ async function openWorkflowDetail(id) {
        <span class="chip ${w.all_done ? 'c-green' : 'c-cyan'}">${w.tasks_done}/${w.tasks_total} done</span></h2>
      ${w.goal ? `<div class="view-intro" style="margin-bottom:10px">${esc(w.goal)}</div>` : ''}
      <div style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto">${taskRows || '<div class="empty">No tasks yet — add the first one.</div>'}</div>
@@ -2569,7 +2595,7 @@ index b0b7e37..2bbd900 100644
      <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Project attachments (input files EVERY task of this project reads)</label>
        <div id="wf-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Project looping (automatic improve-and-recheck rounds)</label>
-@@ -5006,6 +5997,22 @@ async function openWorkflowDetail(id) {
+@@ -5006,6 +6007,30 @@ async function openWorkflowDetail(id) {
          ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
          <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
        </div></div>
@@ -2582,6 +2608,14 @@ index b0b7e37..2bbd900 100644
 +      <div class="form-hint">Applies to ALL tasks of this project: every deliverable becomes eligible for the frontier judge. It runs automatically only when the loop is on quality + closed; otherwise it stays the manual judge button.</div>
 +    </div>
 +    <div class="form-group">
++      <label class="form-label">📂 Project (this workflow's durable home)</label>
++      <div style="display:flex;gap:8px;align-items:center">
++        <select class="form-select" id="wfd-project" style="max-width:320px"><option value="">— none —</option></select>
++        <button class="btn-sm" onclick="setWorkflowProject('${esc(w.id)}')">Set</button>
++      </div>
++      <div class="form-hint">Linking makes this workflow appear when the project is focused, and inherits the project's client scope. Legacy workflows from before the project system can be linked here.</div>
++    </div>
++    <div class="form-group">
 +      <label class="form-label">🏢 Client scope (memory isolation)</label>
 +      <div style="display:flex;gap:8px;align-items:center">
 +        <input class="form-input" id="wfd-client" value="${esc(w.client || '')}" placeholder="none — internal project" style="max-width:260px">
@@ -2592,7 +2626,23 @@ index b0b7e37..2bbd900 100644
      <div class="modal-actions" style="justify-content:space-between">
        <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
        <div style="display:flex;gap:10px">
-@@ -5089,8 +6096,8 @@ function viewDeliverables() {
+@@ -5014,6 +6039,15 @@ async function openWorkflowDetail(id) {
+       </div>
+     </div>`);
+   loadAttachmentsInto('workflow', w.id, 'wf-attach');
++  api('GET', '/api/projects').then(d => {
++    const sel = document.getElementById('wfd-project');
++    if (!sel) return;
++    const ps = (d.projects || []).filter(x => x.is_repo);
++    ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
++    sel.innerHTML = '<option value="">— none —</option>' + ps.map(x =>
++      `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
++    if (w.project_path) sel.value = w.project_path;
++  }).catch(() => { });
+ }
+ 
+ function addTaskToWorkflow(wfId) {
+@@ -5089,8 +6123,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -2603,7 +2653,7 @@ index b0b7e37..2bbd900 100644
              : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
          </div>
          <div class="row-actions">
-@@ -5132,18 +6139,37 @@ function describeTaskUI() {
+@@ -5132,18 +6166,37 @@ function describeTaskUI() {
      <h2>✨ Describe what you want done</h2>
      <div class="view-intro" style="margin-bottom:10px">Plain words, German or English. The AI may ask up to 5 clarifying questions first (every one skippable), then plans: specialist, domain, model, priority, high-stakes flag and the full brief — you review before anything is created. Coding goals become the full pipeline (spec → implement → review → fix → verify) automatically.</div>
      <textarea class="form-textarea" id="twAsk" style="height:120px" placeholder="e.g. We have to develop our application. It has to be a webshop for clothing with a basket and payment…"></textarea>
@@ -2642,7 +2692,7 @@ index b0b7e37..2bbd900 100644
        handleWizardPlan(instruction.trim(), r);
      } catch (e) {
        toast('Wizard failed: ' + e.message, 'err');
-@@ -5152,6 +6178,8 @@ function describeTaskUI() {
+@@ -5152,6 +6205,8 @@ function describeTaskUI() {
    };
  }
  
@@ -2651,7 +2701,7 @@ index b0b7e37..2bbd900 100644
  // Route a wizard response: one question round, or straight to the plan preview.
  function handleWizardPlan(instruction, r) {
    if (r.type === 'questions') { wizardQuestionsModal(instruction, r); return; }
-@@ -5196,7 +6224,7 @@ function wizardQuestionsModal(instruction, r) {
+@@ -5196,7 +6251,7 @@ function wizardQuestionsModal(instruction, r) {
    const submit = async (answers, btn) => {
      btn.disabled = true; btn.textContent = '✨ Planning… (up to ~3 min under load)';
      try {
@@ -2660,7 +2710,7 @@ index b0b7e37..2bbd900 100644
        handleWizardPlan(instruction, r2);
      } catch (e) {
        toast('Wizard failed: ' + e.message, 'err');
-@@ -5234,6 +6262,13 @@ function applyWizardTask(t, meta) {
+@@ -5234,6 +6289,13 @@ function applyWizardTask(t, meta) {
      if ($('#m-task-priority')) $('#m-task-priority').value = String(t.priority ?? 2);
      if ($('#m-task-budget') && t.budget_tokens) $('#m-task-budget').value = t.budget_tokens;
      if ($('#m-task-tags')) $('#m-task-tags').value = (t.tags || []).join(', ');
@@ -2674,7 +2724,7 @@ index b0b7e37..2bbd900 100644
      const ssel = $('#m-task-specialist');
      if (ssel && t.specialist) {
        if (![...ssel.options].some(o => o.value === t.specialist)) {
-@@ -5292,6 +6327,22 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5292,6 +6354,22 @@ function proposeWorkflowModal(wf, meta) {
      ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
      ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
      <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
@@ -2697,7 +2747,7 @@ index b0b7e37..2bbd900 100644
      <div class="form-group" style="margin-top:8px">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -5307,6 +6358,25 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5307,6 +6385,25 @@ function proposeWorkflowModal(wf, meta) {
        <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
      </div>`);
    const b = $('#wfCreateBtn');
@@ -2723,7 +2773,7 @@ index b0b7e37..2bbd900 100644
    const keeps = () => tasks.map((_, i) => {
      const cb = $(`#wfKeep${i}`);
      return !cb || cb.checked;
-@@ -5332,6 +6402,11 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5332,6 +6429,11 @@ function proposeWorkflowModal(wf, meta) {
        }
        return out;
      };
@@ -2735,7 +2785,7 @@ index b0b7e37..2bbd900 100644
      let wfLoop = null;
      if ($('#wf-loop') && $('#wf-loop').checked) {
        try {
-@@ -5341,14 +6416,16 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5341,14 +6443,16 @@ function proposeWorkflowModal(wf, meta) {
            meta: {
              title: wf.name, domain: wf.domain,
              specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
@@ -2754,7 +2804,7 @@ index b0b7e37..2bbd900 100644
        const ids = [];
        for (let i = 0; i < tasks.length; i++) {
          const t = tasks[i];
-@@ -5356,9 +6433,13 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5356,9 +6460,13 @@ function proposeWorkflowModal(wf, meta) {
          const created = await api('POST', '/api/tasks', {
            title: t.title, description: t.description, status: 'backlog',
            priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
@@ -2770,7 +2820,7 @@ index b0b7e37..2bbd900 100644
          });
          ids.push(created.id);
 diff --git a/static/index.html b/static/index.html
-index bb6661f..ee0f046 100644
+index bb6661f..187f36e 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -2830,7 +2880,7 @@ index bb6661f..ee0f046 100644
 -<script src="/static/app.js?v=28"></script>
 +<script src="/static/memory3d.js?v=5" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=44"></script>
++<script src="/static/app.js?v=45"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css

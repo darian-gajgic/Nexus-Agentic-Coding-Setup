@@ -3230,6 +3230,11 @@ async def update_workflow(wf_id: str, body: dict):
         if k in body:
             db.execute(f"UPDATE workflows SET {k}=?, updated_at=? WHERE id=?",
                        (body[k], time.time(), wf_id))
+    if body.get("project_path") and "client" not in body:
+        cl = _derive_client(None, body["project_path"])
+        if cl:
+            db.execute("UPDATE workflows SET client=? WHERE id=?", (cl, wf_id))
+            db.execute("UPDATE tasks SET client=COALESCE(client, ?) WHERE workflow_id=?", (cl, wf_id))
     if "loop_config" in body:
         lc = body["loop_config"]
         db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
@@ -3879,6 +3884,17 @@ async def task_promote(task_id: str, body: dict):
     code, out = _run_git_action(root, "git", "-c", "user.name=nexus", "-c",
                                 "user.email=nexus@local", "commit", "-m",
                                 f"import: promoted from Nexus task {task_id} ('{task['title'][:60]}')")
+    # the task's workflow becomes this project's history: link it (and its
+    # client scope) so the project's scoped views show where it came from
+    if task.get("workflow_id"):
+        cl = _derive_client(None, root)
+        db.execute("UPDATE workflows SET project_path=?, client=COALESCE(client, ?) WHERE id=?",
+                   (root, cl, task["workflow_id"]))
+        if cl:
+            db.execute("UPDATE tasks SET client=COALESCE(client, ?) WHERE workflow_id=?",
+                       (cl, task["workflow_id"]))
+        db.log_activity("info", "system",
+                        f"Workflow {task['workflow_id']} linked to promoted project {root}")
     db.log_activity("info", "system",
                     f"Task {task_id} promoted to repository {root} ({copied} top-level items)")
     return {"ok": True, "path": root, "items": copied, "note": note.strip(" ·")}

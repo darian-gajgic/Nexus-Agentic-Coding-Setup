@@ -5955,6 +5955,16 @@ async function setWorkflowHighStakes(id, on) {
   } catch (e) { toast('Update failed: ' + e.message, 'err'); }
 }
 
+async function setWorkflowProject(id) {
+  const v = $('#wfd-project') ? $('#wfd-project').value : '';
+  try {
+    await api('PATCH', `/api/workflows/${id}`, { project_path: v || null });
+    wfState.fetched = false;
+    state.tasks = await api('GET', '/api/tasks');
+    toast(v ? '📂 Workflow linked to the project — it now appears under its focus' : 'Project link removed', 'ok');
+  } catch (e) { toast('Update failed: ' + e.message, 'err'); }
+}
+
 async function setWorkflowClient(id) {
   const v = ($('#wfd-client') ? $('#wfd-client').value : '').trim().toLowerCase();
   try {
@@ -6006,6 +6016,14 @@ async function openWorkflowDetail(id) {
       <div class="form-hint">Applies to ALL tasks of this project: every deliverable becomes eligible for the frontier judge. It runs automatically only when the loop is on quality + closed; otherwise it stays the manual judge button.</div>
     </div>
     <div class="form-group">
+      <label class="form-label">📂 Project (this workflow's durable home)</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select class="form-select" id="wfd-project" style="max-width:320px"><option value="">— none —</option></select>
+        <button class="btn-sm" onclick="setWorkflowProject('${esc(w.id)}')">Set</button>
+      </div>
+      <div class="form-hint">Linking makes this workflow appear when the project is focused, and inherits the project's client scope. Legacy workflows from before the project system can be linked here.</div>
+    </div>
+    <div class="form-group">
       <label class="form-label">🏢 Client scope (memory isolation)</label>
       <div style="display:flex;gap:8px;align-items:center">
         <input class="form-input" id="wfd-client" value="${esc(w.client || '')}" placeholder="none — internal project" style="max-width:260px">
@@ -6021,6 +6039,15 @@ async function openWorkflowDetail(id) {
       </div>
     </div>`);
   loadAttachmentsInto('workflow', w.id, 'wf-attach');
+  api('GET', '/api/projects').then(d => {
+    const sel = document.getElementById('wfd-project');
+    if (!sel) return;
+    const ps = (d.projects || []).filter(x => x.is_repo);
+    ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
+    sel.innerHTML = '<option value="">— none —</option>' + ps.map(x =>
+      `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
+    if (w.project_path) sel.value = w.project_path;
+  }).catch(() => { });
 }
 
 function addTaskToWorkflow(wfId) {
