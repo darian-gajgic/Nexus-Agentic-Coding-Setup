@@ -3661,6 +3661,87 @@ async def memory3d(force: bool = False):
             "error": f"memory map unavailable: {str(e)[:120]} (is qdrant running?)"})
 
 
+# ── Code-project git actions: offsite backup + delivery workflow ──
+
+def _valid_repo_path(path: str):
+    """Path must be a git repo inside $HOME — never operate elsewhere."""
+    import worktree as _wt
+    p = os.path.realpath(os.path.expanduser(path or ""))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not p.startswith(home + os.sep):
+        return None
+    return p if _wt.is_repo(p) else None
+
+
+def _run_git_action(cwd: str, *cmd: str, timeout: int = 120):
+    import subprocess
+    r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-800:]
+
+
+@app.post("/api/projects/publish")
+async def project_publish(body: dict):
+    """Create a PRIVATE GitHub repo for a local-only repository and push it —
+    the offsite backup + future handover vehicle. Explicit button, never auto."""
+    import re
+    p = _valid_repo_path(body.get("path"))
+    if not p:
+        return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
+    name = (body.get("name") or os.path.basename(p)).strip()
+    if not re.match(r"^[A-Za-z0-9._-]{1,90}$", name):
+        return JSONResponse(status_code=400, content={"error": "invalid repository name"})
+    code, out = _run_git_action(p, "git", "remote", "get-url", "origin")
+    if code == 0:
+        return JSONResponse(status_code=409, content={"error": f"repo already has a remote: {out}"})
+    code, out = _run_git_action(p, "gh", "repo", "create", name,
+                                "--private", "--source", ".", "--push", timeout=180)
+    if code != 0:
+        return JSONResponse(status_code=502, content={"error": f"publish failed: {out}"})
+    db.log_activity("info", "system", f"Published {os.path.basename(p)} to GitHub (private) as {name}")
+    return {"ok": True, "output": out}
+
+
+@app.post("/api/projects/push")
+async def project_push(body: dict):
+    """Push the current branch + tags to origin — the post-merge backup step."""
+    p = _valid_repo_path(body.get("path"))
+    if not p:
+        return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
+    code, _ = _run_git_action(p, "git", "remote", "get-url", "origin")
+    if code != 0:
+        return JSONResponse(status_code=400, content={"error": "no remote — publish to GitHub first"})
+    code, branch = _run_git_action(p, "git", "symbolic-ref", "--short", "HEAD")
+    code2, out = _run_git_action(p, "git", "push", "-u", "origin",
+                                 branch if code == 0 else "HEAD", "--follow-tags", timeout=180)
+    if code2 != 0:
+        return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
+    db.log_activity("info", "system", f"Pushed {os.path.basename(p)} ({branch}) to origin")
+    return {"ok": True, "output": out or "up to date"}
+
+
+@app.post("/api/projects/tag")
+async def project_tag(body: dict):
+    """Annotated release tag + push — marks the exact delivered state
+    (invoice ↔ code state, reproducible forever)."""
+    import re
+    p = _valid_repo_path(body.get("path"))
+    if not p:
+        return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
+    tag = (body.get("tag") or "").strip()
+    if not re.match(r"^v?[0-9][A-Za-z0-9._-]{0,40}$", tag):
+        return JSONResponse(status_code=400, content={"error": "tag should look like v1.0 / v2.1.3"})
+    msg = (body.get("message") or f"Release {tag}").strip()[:200]
+    code, out = _run_git_action(p, "git", "tag", "-a", tag, "-m", msg)
+    if code != 0:
+        return JSONResponse(status_code=409, content={"error": f"tag failed: {out}"})
+    code, rout = _run_git_action(p, "git", "push", "origin", tag, timeout=120)
+    pushed = code == 0
+    db.log_activity("info", "system",
+                    f"Tagged {os.path.basename(p)} {tag}" + ("" if pushed else " (local only — no remote)"))
+    return {"ok": True, "pushed": pushed,
+            "output": rout if pushed else "tag created locally; publish/push to back it up"}
+
+
 @app.get("/api/tools")
 async def api_tools():
     """Live health-checked registry of all integrated tools."""

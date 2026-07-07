@@ -1191,6 +1191,13 @@ function viewManual() {
       <div class="m-step"><div>Agents then work <b>inside</b> an isolated copy (a git worktree on branch <code>nexus/…</code>) — your checkout is never touched. They follow the repo's conventions and run its own tests.</div></div>
       <div class="m-step"><div>Review the <b>changes.diff</b> in Deliverables. Merge the branch yourself when satisfied — nothing merges automatically, ever.</div></div>
     </div>
+    <h4>Backup & delivery workflow (Projects tab → click a repo)</h4>
+    <div class="m-steps">
+      <div class="m-step"><div><b>Publish to GitHub</b> — once per repo: creates a PRIVATE GitHub repository and pushes everything. From then on this repo is backed up offsite and has a handover vehicle.</div></div>
+      <div class="m-step"><div><b>Push</b> — after every merge: one click sends your latest state (and tags) to GitHub. The push IS the backup.</div></div>
+      <div class="m-step"><div><b>Tag release</b> — when you deliver: marks the exact shipped code state (e.g. v1.0) forever. "What did we ship for invoice #12?" always has a precise answer.</div></div>
+      <div class="m-step"><div><b>Handover</b> — at contract end: transfer the GitHub repository to the client's organization (repo Settings → Transfer ownership). Ownership should mirror the contract.</div></div>
+    </div>
   </div>
 
   <div class="manual-sec" id="m-jarvis">
@@ -1329,6 +1336,11 @@ const TOURS = {
   ],
   skills: [
     { sel: '#content', title: 'The skill library', body: 'Skills are how-to manuals agents load when a task matches. Click any skill to edit it, or let the ✨ wizard draft a new one following best practices — you always review before it goes live.' },
+  ],
+  projects: [
+    { sel: '.stats-strip', title: 'Your code projects', body: 'Every git repository and project folder on this machine. "Uncommitted" counts repos with unsaved changes - worth a look before ending the day.' },
+    { sel: '.data-table', title: 'The Remote column', body: '"☁ backed up" = this repo also lives on GitHub (offsite backup). "⚠ local only" = it exists ONLY on this disk - click the row and publish it. For client work, local-only is a risk you do not want.' },
+    { sel: '.proj-row', title: 'The delivery workflow', body: 'Click any repo: Publish (once - creates a private GitHub repo), Push (after every merged change - that push IS your backup), Tag release (when you deliver - marks the exact shipped state forever). Handover later = transfer the GitHub repo to the client organization.' },
   ],
   manual: [
     { sel: '#content', title: 'The manual', body: 'Everything explained for humans — from "what is this" to the full technical architecture. Use the chapter chips to jump around. The ? button on every other tab gives you a guided walkthrough of exactly that tab.' },
@@ -3362,7 +3374,7 @@ function viewProjects() {
       <div class="stat-card"><div class="stat-num">${fmtSize(projs.reduce((a, p) => a + p.size_bytes, 0))}</div><div class="stat-label">Total Size</div></div>
     </div>
     <div class="panel"><table class="data-table">
-      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Size</th><th>Modified</th></tr></thead>
+      <thead><tr><th>Project</th><th>Languages</th><th>Branch</th><th>Status</th><th>Remote</th><th>Size</th><th>Modified</th></tr></thead>
       <tbody>`;
   for (const p of projs) {
     const langs = Object.entries(p.languages).slice(0, 3).map(([l]) =>
@@ -3375,6 +3387,7 @@ function viewProjects() {
       <td>${langs}</td>
       <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
       <td>${status}</td>
+      <td>${p.is_repo ? (p.git_remote ? '<span title="' + esc(p.git_remote) + '" style="color:var(--accent-2)">☁ backed up</span>' : '<span style="color:var(--yellow)">⚠ local only</span>') : '<span class="muted">—</span>'}</td>
       <td>${fmtSize(p.size_bytes)}</td>
       <td class="muted">${fmtDays(p.last_modified)}</td>
     </tr>`;
@@ -3396,9 +3409,48 @@ function bindProjects() {
           <div class="kv-row"><span class="kv-key">Size</span><span class="kv-val">${(p.size_bytes / 1e6).toFixed(1)} MB</span></div>
           <div class="kv-row"><span class="kv-key">venv</span><span class="kv-val">${p.has_venv ? 'yes' : 'no'}</span></div>
           <h4 style="margin-top:12px">Languages</h4>${langs}
+          ${p.is_repo ? `
+          <h4 style="margin-top:14px">Git workflow</h4>
+          <div class="form-hint" style="margin-bottom:8px">${p.git_remote
+            ? 'Backed up to a remote. Push after merges; tag what you deliver.'
+            : '⚠ This repository exists ONLY on this machine — a disk failure loses it. Publish creates a PRIVATE GitHub repo and pushes everything (your offsite backup and the future handover vehicle).'}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${!p.git_remote ? `<button class="btn-primary" onclick="publishRepoUI('${esc(p.path)}','${esc(p.name)}')">☁ Publish to GitHub (private)</button>` : `
+            <button class="btn-primary" onclick="pushRepoUI('${esc(p.path)}')">⬆ Push to remote</button>
+            <button class="btn-ghost" onclick="tagRepoUI('${esc(p.path)}','${esc(p.name)}')">🏷 Tag release</button>`}
+          </div>` : ''}
         </div>`);
     };
   });
+}
+
+async function publishRepoUI(path, name) {
+  const repoName = prompt('GitHub repository name (private):', name);
+  if (!repoName) return;
+  toast('Publishing to GitHub…', 'info');
+  try {
+    await api('POST', '/api/projects/publish', { path, name: repoName });
+    toast('☁ Published privately to GitHub — this repo is now backed up offsite', 'ok', 5000);
+    closeModal(); projectsState.fetched = false; render();
+  } catch (e) { toast('Publish failed: ' + e.message, 'err', 6000); }
+}
+
+async function pushRepoUI(path) {
+  toast('Pushing…', 'info');
+  try {
+    const r = await api('POST', '/api/projects/push', { path });
+    toast('⬆ ' + (r.output || 'pushed'), 'ok', 4000);
+  } catch (e) { toast('Push failed: ' + e.message, 'err', 6000); }
+}
+
+async function tagRepoUI(path, name) {
+  const tag = prompt(`Release tag for ${name} (marks the exact delivered state):`, 'v1.0');
+  if (!tag) return;
+  const msg = prompt('Short release note (what was delivered):', `Release ${tag}`) || `Release ${tag}`;
+  try {
+    const r = await api('POST', '/api/projects/tag', { path, tag, message: msg });
+    toast('🏷 ' + tag + ' — ' + (r.pushed ? 'tagged and pushed' : r.output), 'ok', 5000);
+  } catch (e) { toast('Tag failed: ' + e.message, 'err', 6000); }
 }
 
 // ═══════════════════════════════ GUARDIAN ═══════════════════════════════
