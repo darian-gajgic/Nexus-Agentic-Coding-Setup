@@ -2282,6 +2282,13 @@ def _retry_task(task_id: str, feedback: str | None):
         fb = ("Frontier judge findings (attached automatically — fix every blocker):\n"
               + task["judge_output"][-3000:])
     ws = task.get("workspace_path")
+    if ws and os.path.isdir(ws) and not task.get("repo_path"):
+        # review engine: each rework round becomes a comparable version
+        import review as _review
+        snap = _review.snapshot_workspace(ws)
+        if snap:
+            db.log_activity("info", "system",
+                            f"Task {task_id}: workspace snapshotted to {os.path.basename(snap)} for review")
     if ws and os.path.isfile(os.path.join(ws, "deliverable.md")):
         n = 1 + len([f for f in os.listdir(ws) if _re.match(r"deliverable\.v\d+\.md$", f)])
         os.rename(os.path.join(ws, "deliverable.md"),
@@ -3177,12 +3184,13 @@ async def create_workflow(body: dict):
     wid = f"wf-{uuid.uuid4().hex[:8]}"
     now = time.time()
     lc = body.get("loop_config")
-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
                 json.dumps(lc) if isinstance(lc, dict) else None,
                 1 if body.get("high_stakes") else 0,
-                ((body.get("client") or "").strip().lower() or None)))
+                ((body.get("client") or "").strip().lower() or None),
+                ((body.get("project_path") or "").strip() or None)))
     db.log_activity("info", "system", f"Workflow created: '{name}'")
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     await mgr.broadcast({"type": "workflow_created", "data": w})
@@ -3218,7 +3226,7 @@ async def update_workflow(wf_id: str, body: dict):
     w = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
     if not w:
         return JSONResponse(status_code=404, content={"error": "workflow not found"})
-    for k in ("name", "goal", "domain", "status"):
+    for k in ("name", "goal", "domain", "status", "project_path"):
         if k in body:
             db.execute(f"UPDATE workflows SET {k}=?, updated_at=? WHERE id=?",
                        (body[k], time.time(), wf_id))
@@ -3726,6 +3734,40 @@ async def memory3d(force: bool = False):
     except Exception as e:
         return JSONResponse(status_code=503, content={
             "error": f"memory map unavailable: {str(e)[:120]} (is qdrant running?)"})
+
+
+# ── Result review: the PR-review experience for every output type ──
+import review as review_engine
+
+
+@app.get("/api/tasks/{task_id}/review")
+async def task_review(task_id: str):
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task or not task.get("workspace_path"):
+        return JSONResponse(status_code=404, content={"error": "task or workspace not found"})
+    try:
+        return review_engine.build_task_review(task)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"review failed: {str(e)[:200]}"})
+
+
+@app.get("/api/workflows/{wf_id}/review")
+async def workflow_review(wf_id: str):
+    """Aggregated change review across all member tasks (newest first)."""
+    tasks = db.query_all(
+        "SELECT * FROM tasks WHERE workflow_id=? AND workspace_path IS NOT NULL "
+        "ORDER BY COALESCE(completed_at, updated_at) DESC LIMIT 12", (wf_id,))
+    out = []
+    for t in tasks:
+        try:
+            r = review_engine.build_task_review(t)
+            out.append({"task_id": t["id"], "title": t["title"], "status": t["status"],
+                        "mode": r["mode"], "files": len(r.get("files") or []),
+                        "additions": r.get("additions", 0), "deletions": r.get("deletions", 0)})
+        except Exception as e:
+            out.append({"task_id": t["id"], "title": t["title"], "status": t["status"],
+                        "error": str(e)[:120]})
+    return {"tasks": out}
 
 
 # ── Code-project git actions: offsite backup + delivery workflow ──
