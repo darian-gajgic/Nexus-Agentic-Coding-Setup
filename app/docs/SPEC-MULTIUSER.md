@@ -53,9 +53,17 @@ stays shared. Single-user mode without login stays the default.
   counts, WS task/workflow events. Cross-user access → 404 (no existence
   disclosure).
 - Shared (by design, household trust): agents fleet, monitor, scheduler,
-  approvals, watchdog, verify runs, specialists/lessons/skills, shared-context
+  watchdog, verify runs, specialists/lessons/skills, shared-context
   (team memory), settings (writes admin-only), guardian, usage, tools,
   programs. User management admin-only.
+- **Approvals (gap fix 2026-07-07):** per-user, fail-closed (`WHERE
+  user_id=?`) — deliverable approvals carry the owner's work ("Open
+  deliverable" in Agentic showed it to everyone). Create stamps the caller
+  (a payload.task_id must be the caller's own task), the high-stakes
+  dispatch approval inherits the task owner, deciding a foreign approval
+  is 404 (it would ship/retry THEIR task), WS approval events target the
+  owner's sockets, legacy rows backfilled (task-linked → task owner, rest
+  → u_owner). The Agentic nav badge counts only your own pending rows.
 - New rows are stamped with the creating user; engine-created rows (loop
   retries, wizard-accepted plans) inherit from their source row.
 - **Projects (gap fix 2026-07-07):** the Projects view scans the shared

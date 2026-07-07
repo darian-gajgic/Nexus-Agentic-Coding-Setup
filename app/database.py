@@ -316,6 +316,19 @@ def init_db():
         created_at REAL
     )""")
 
+    # Approvals are per-user (gap fix: deliverable approvals surfaced the
+    # owner's work in every user's Agentic view). Backfill: a task-linked
+    # approval belongs to its task's owner, anything else to u_owner.
+    # Queries are fail-closed (WHERE user_id=?), so the backfill must leave
+    # no NULLs behind.
+    appr_cols = {r[1] for r in conn.execute("PRAGMA table_info(approvals)").fetchall()}
+    if "user_id" not in appr_cols:
+        conn.execute("ALTER TABLE approvals ADD COLUMN user_id TEXT")
+    conn.execute(
+        "UPDATE approvals SET user_id = COALESCE("
+        "(SELECT t.user_id FROM tasks t WHERE t.id = json_extract(approvals.payload, '$.task_id')),"
+        " 'u_owner') WHERE user_id IS NULL")
+
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
     dispatch_defaults = [

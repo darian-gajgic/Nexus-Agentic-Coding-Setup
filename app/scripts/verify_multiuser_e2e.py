@@ -73,6 +73,7 @@ def cleanup(single_user_start=True, owner_token=None):
     for w in db.query_all("SELECT id FROM workflows WHERE name LIKE 'mu-probe%'"):
         db.execute("DELETE FROM workflows WHERE id=?", (w["id"],))
     db.execute("DELETE FROM known_issues WHERE feedback LIKE 'mu-probe%'")
+    db.execute("DELETE FROM approvals WHERE description LIKE 'mu-probe%'")
     probe_uids = [u["id"] for u in db.query_all(
         "SELECT id FROM users WHERE username LIKE 'probe-%'")]
     for uid in probe_uids:
@@ -269,6 +270,32 @@ def phase_a(single_user_start=True):
            scopes.get("users", {}).get(sa) == alice_id and scopes.get("users", {}).get(sb) == bob_id)
     except Exception as e:
         ok("JARVIS sessions user-scope-published", False, str(e)[:80])
+
+    # approvals (gap fix: deliverable approvals used to show in EVERY user's
+    # Agentic view, with an "Open deliverable" button on the owner's work)
+    # action_type generic (not 'deliverable') so deciding it below doesn't
+    # fire the real ship/retry side-effects on the probe task — the leak
+    # surface (task-linked row + Open-deliverable button) is the same
+    ap = alice.post("/api/approvals", json={
+        "action_type": "generic", "risk_level": "high",
+        "description": "mu-probe deliverable ready for review",
+        "payload": {"task_id": ta["id"]}}).json()
+    ok("alice's approval created + stamped", ap.get("user_id") == alice_id,
+       str(ap.get("user_id")))
+    b_appr = bob.get("/api/approvals?status=pending").json()["approvals"]
+    ok("bob's Agentic approvals exclude alice's", ap["id"] not in [x["id"] for x in b_appr],
+       f"{len(b_appr)} rows")
+    ok("alice sees her own approval", ap["id"] in
+       [x["id"] for x in alice.get("/api/approvals?status=pending").json()["approvals"]])
+    r = bob.patch(f"/api/approvals/{ap['id']}", json={"status": "approved"})
+    ok("bob cannot decide alice's approval = 404", r.status_code == 404, f"{r.status_code}")
+    r = bob.post("/api/approvals", json={
+        "action_type": "deliverable", "description": "mu-probe hijack",
+        "payload": {"task_id": ta["id"]}})
+    ok("bob cannot open an approval on alice's task", r.status_code == 404, f"{r.status_code}")
+    r = alice.patch(f"/api/approvals/{ap['id']}", json={"status": "rejected",
+                                                        "decided_by": "probe"})
+    ok("alice decides her own approval", r.status_code == 200, r.text[:80])
 
     # admin boundary
     ok("member cannot list users", bob.get("/api/users").status_code == 403)

@@ -649,10 +649,11 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
         # surfaces it in the approvals UI (+ nav badge) until a human decides.
         db.execute(
             "INSERT INTO approvals (id, agent_id, action_type, description, payload, "
-            "status, risk_level, requested_at) VALUES (?,?,?,?,?,?,?,?)",
+            "status, risk_level, requested_at, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
             (f"appr-{uuid.uuid4().hex[:10]}", agent_id, "deliverable",
              f"High-stakes deliverable ready for review: '{task['title']}'",
-             json.dumps({"task_id": task_id}), "pending", "high", time.time()))
+             json.dumps({"task_id": task_id}), "pending", "high", time.time(),
+             task.get("user_id")))  # the approval belongs to the task's owner
         db.log_activity("warn", agent_id,
                         f"Task {task_id} awaits approval (high-stakes) — nothing ships unjudged",
                         user_id=task.get("user_id"))
