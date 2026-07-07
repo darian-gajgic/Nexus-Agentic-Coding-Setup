@@ -77,7 +77,11 @@ def _glm_draft(specialist, goal, outcome):
         'nothing notable to learn, return {"lesson": null}.\n'
         "- The lesson must be a SINGLE atomic behavior rule (one idea), self-contained, phrased as "
         'guidance for next time (e.g. "Prefer X over Y for Z because ..." or "Avoid X because Y").\n'
-        "- Do NOT invent anything not supported by the outcome.\n\n"
+        "- Do NOT invent anything not supported by the outcome.\n"
+        "- GENERALIZE: lessons become GLOBAL knowledge shared across all future work. Strip client "
+        "names, company/product names, and any proprietary specifics — state the transferable craft "
+        "rule instead. If the lesson cannot be stated without client-identifying details, return "
+        '{"lesson": null} (client facts belong in that client\'s own memory, not in lessons).\n\n'
         'Respond ONLY as JSON: {"lesson": "<atomic rule or null>", "insight": "<what was learned, one '
         'sentence>", "confidence": <0.0-1.0>, "type": "rule|fact"}'
     )

@@ -326,6 +326,35 @@ DOC_TOOLS_PY = str(Path(__file__).resolve().parent / ".venv" / "bin" / "python")
 import worktree as wt
 
 
+_CLIENT_SCOPES_FILE = os.path.expanduser("~/.hermes/client-scopes.json")
+
+
+def _publish_client_scope(session_id: str, client: str | None):
+    """Session→client map for the mem0-client provider (M3 isolation).
+    Memories extracted from this session get stamped with the client tag;
+    retrieval in OTHER clients' (and personal) sessions filters them out.
+    Same bridge-file pattern as model-efforts.json; pruned at 800 entries."""
+    if not client:
+        return
+    try:
+        data = {"sessions": {}, "updated": {}}
+        if os.path.isfile(_CLIENT_SCOPES_FILE):
+            with open(_CLIENT_SCOPES_FILE) as f:
+                data = json.load(f)
+        sessions = data.get("sessions") or {}
+        updated = data.get("updated") or {}
+        sessions[session_id] = client
+        updated[session_id] = time.time()
+        if len(sessions) > 800:
+            for sid in sorted(updated, key=updated.get)[:len(sessions) - 800]:
+                sessions.pop(sid, None)
+                updated.pop(sid, None)
+        with open(_CLIENT_SCOPES_FILE, "w") as f:
+            json.dump({"sessions": sessions, "updated": updated}, f, indent=1)
+    except Exception as e:
+        db.log_activity("warn", "system", f"client-scope publish failed: {str(e)[:80]}")
+
+
 def _repo_slug(task: dict) -> str:
     """Pipeline tasks share one branch (stages build on each other); loose
     tasks get their own."""
@@ -726,6 +755,8 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             session_id = create_session(f"nexus:{task_id}", model=task.get("model"))
             _set_task(task_id, session_id=session_id)
             task["session_id"] = session_id
+        # M3: client-tagged sessions get isolated memory (mem0-client provider)
+        _publish_client_scope(session_id, task.get("client"))
         _set_dispatch(dispatch_id, session_id=session_id, state="streaming",
                       heartbeat_at=time.time())
         _set_task(task_id, dispatch_state="streaming", dispatch_error=None)

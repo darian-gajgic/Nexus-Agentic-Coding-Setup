@@ -43,15 +43,9 @@ mkdir -p "$GUARDIAN_DIR"
 cp -a "$REPO/guardian/." "$GUARDIAN_DIR/"
 
 # 3. Nexus (code only; build its venv separately) ---------------------------
-# In Nexus-Agentic-Coding-Setup the app tree lives at ../app (newer than the
-# old nexus/ subtree and including the repo-native coding feature).
 say "Installing Nexus into $NEXUS_DIR"
 mkdir -p "$NEXUS_DIR"
-if [ -d "$REPO/../app" ]; then
-  cp -a "$REPO/../app/." "$NEXUS_DIR/"
-else
-  cp -a "$REPO/nexus/." "$NEXUS_DIR/"
-fi
+cp -a "$REPO/nexus/." "$NEXUS_DIR/"
 
 # 4. Rewrite hard-coded paths ($SRC_HOME -> your $HOME) ----------------------
 if [ "$SRC_HOME" != "$HOME" ]; then

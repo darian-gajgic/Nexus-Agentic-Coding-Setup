@@ -188,7 +188,7 @@
     {
       "path": "~/.hermes/scripts/reflect.py",
       "golden": "reflect.py",
-      "sha256": "9b52f3992b3aadf2ae97d5b7c8d65bcfb7533fd93ca82813830a190797ec6df6",
+      "sha256": "a48ce98fc1d62e55635ca5efa1c901e68af1cf2241d408f72fab548726bb11e2",
       "mode": "755",
       "restore_mode": "whole"
     },
@@ -198,6 +198,12 @@
       "sha256": "16465da2aa6beccc8df32f688de7aaf0fea954d5e28fb353586ca69d04dbab7b",
       "mode": "755",
       "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/plugins/mem0-client/__init__.py",
+      "golden": "mem0_client__init__.py",
+      "sha256": "b0d2a29c230123f3c4f77105264440a1d4e7db6a8d76bdbb8e3e2ab1eb5a06c0",
+      "note": "M3 client-isolated mem0 provider (activated via memory.provider: mem0-client)"
     }
   ],
   "packages": [

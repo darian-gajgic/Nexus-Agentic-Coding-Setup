@@ -121,7 +121,7 @@ memory:
   user_profile_enabled: true
   memory_char_limit: 6000
   user_char_limit: 3000
-  provider: mem0
+  provider: mem0-client
   nudge_interval: 10
   flush_min_turns: 6
 delegation:
