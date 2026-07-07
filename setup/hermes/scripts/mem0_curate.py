@@ -7,8 +7,14 @@ stored in qdrant exactly like recalled memories. Human-curated (called from the
 nexus Specialists tab), so writes are deliberate — not the append-all log.
 
 Usage:
-  mem0_curate.py add    --agent-id <name> --text "<lesson>"
+  mem0_curate.py add    [--agent-id <name>] --text "<lesson>" [--metadata '<json>']
+  mem0_curate.py update --id <memory-id> --text "<new text>"
   mem0_curate.py delete --id <memory-id>
+
+add without --agent-id stores an unscoped (user-level) memory — used by the
+nexus galaxy merge. --metadata merges extra payload tags (e.g. the nexus
+user/client scope stamps). update re-embeds the new text through the mem0
+backend (nomic-embed-text) and PRESERVES the point's existing payload tags.
 
 Prints a JSON result line. Run with the Hermes venv python.
 """
@@ -36,9 +42,13 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("add")
-    a.add_argument("--agent-id", required=True)
+    a.add_argument("--agent-id", default=None)
     a.add_argument("--text", required=True)
-    a.add_argument("--source", default="curated")  # provenance: curated | reflection-approved
+    a.add_argument("--source", default="curated")  # provenance: curated | reflection-approved | merge
+    a.add_argument("--metadata", default=None)     # JSON dict merged into the payload tags
+    u = sub.add_parser("update")
+    u.add_argument("--id", required=True)
+    u.add_argument("--text", required=True)
     d = sub.add_parser("delete")
     d.add_argument("--id", required=True)
     args = ap.parse_args()
@@ -47,20 +57,33 @@ def main():
             text = args.text.strip()
             if not text:
                 print(json.dumps({"ok": False, "error": "empty text"})); return
+            metadata = {"channel": "nexus", "attributed_to": "user", "source": args.source,
+                        "trust": "human-approved"}
+            if args.metadata:
+                extra = json.loads(args.metadata)
+                if not isinstance(extra, dict):
+                    print(json.dumps({"ok": False, "error": "--metadata must be a JSON object"})); return
+                metadata.update(extra)
             p = _provider(args.agent_id)
             res = p._backend.add(
                 [{"role": "user", "content": text}],
                 user_id=p._user_id,
-                agent_id=p._agent_id,          # the specialist scope
-                infer=False,                    # store the curated lesson verbatim
-                metadata={"channel": "nexus", "attributed_to": "user", "source": args.source,
-                          "trust": "human-approved"},
+                agent_id=p._agent_id,          # the specialist scope (None = unscoped)
+                infer=False,                    # store the curated text verbatim
+                metadata=metadata,
             )
             rid = None
             results = res.get("results") if isinstance(res, dict) else res
             if results:
                 rid = results[0].get("id")
             print(json.dumps({"ok": True, "id": rid, "agent_id": p._agent_id}))
+        elif args.cmd == "update":
+            text = args.text.strip()
+            if not text:
+                print(json.dumps({"ok": False, "error": "empty text"})); return
+            p = _provider()
+            p._backend.update(args.id, text)   # re-embeds; existing payload preserved
+            print(json.dumps({"ok": True, "id": args.id}))
         elif args.cmd == "delete":
             p = _provider()
             p._backend.delete(args.id)

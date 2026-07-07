@@ -1320,6 +1320,123 @@ def get_memory():
     return out
 
 
+# ── Galaxy memory editing (SPEC-BLOCK2 R2) ────────────────────────────────
+# Mutations go through the mem0 backend (mem0_curate.py subprocess) so edits
+# are re-embedded (nomic-embed-text) and payload tags survive — never raw
+# qdrant payload writes.
+
+def _qdrant_point(point_id: str):
+    """Fetch one qdrant point (payload only). None if missing."""
+    import urllib.request
+    import urllib.parse
+    base = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+    try:
+        url = (f"{base}/collections/mem0/points/"
+               f"{urllib.parse.quote(str(point_id), safe='')}")
+        with urllib.request.urlopen(url, timeout=6) as r:
+            res = json.loads(r.read()).get("result") or {}
+        return res if res.get("id") is not None else None
+    except Exception:
+        return None
+
+
+def _memory_access(point_id: str):
+    """Block-2 ownership (mirrors the Block-1 read filter): my user tag →
+    mine; a FOREIGN tag is invisible (404, no existence disclosure); an
+    untagged point is shared by design — every user SEES it, but only admins
+    may rewrite what everyone reads (403). Returns (point, error|None)."""
+    pt = _qdrant_point(point_id)
+    if not pt:
+        return None, JSONResponse(status_code=404, content={"error": "memory not found"})
+    pl = pt.get("payload") or {}
+    tag = pl.get("user")
+    if tag and tag != auth.current_user_id():
+        return None, JSONResponse(status_code=404, content={"error": "memory not found"})
+    if not tag and not auth.is_admin():
+        return None, JSONResponse(status_code=403,
+                                  content={"error": "shared memory — only an admin can change it"})
+    return pt, None
+
+
+async def _memory_changed(action: str, point_id):
+    _MEM3D_CACHE.clear()  # every user's galaxy re-derives (shared points affect all)
+    db.log_activity("info", "system", f"Memory {action}: {point_id}")
+    try:
+        await mgr.broadcast({"type": "memory_updated",
+                             "data": {"action": action, "id": point_id}},
+                            user_id=auth.current_user_id())
+    except Exception:
+        pass
+
+
+@app.patch("/api/memory/{point_id}")
+async def edit_memory(point_id: str, body: dict):
+    pt, err = _memory_access(point_id)
+    if err:
+        return err
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+    res = _run_curate("update", "--id", str(point_id), "--text", text[:4000])
+    if not res.get("ok"):
+        return JSONResponse(status_code=500, content=res)
+    await _memory_changed("edited", point_id)
+    return {"ok": True, "id": point_id}
+
+
+@app.delete("/api/memory/{point_id}")
+async def delete_memory(point_id: str):
+    pt, err = _memory_access(point_id)
+    if err:
+        return err
+    res = _run_curate("delete", "--id", str(point_id))
+    if not res.get("ok"):
+        return JSONResponse(status_code=500, content=res)
+    await _memory_changed("deleted", point_id)
+    return {"ok": True, "id": point_id}
+
+
+@app.post("/api/memory/merge")
+async def merge_memory(body: dict):
+    """Create ONE merged point from 2-8 sources, then delete the sources —
+    only after the merged add succeeded. The operator edits the merged text
+    in the UI before confirming; the server never invents content."""
+    ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i).strip()]
+    text = str((body or {}).get("text") or "").strip()
+    if not (2 <= len(ids) <= 8):
+        return JSONResponse(status_code=400, content={"error": "merge needs 2-8 memory ids"})
+    if len(set(ids)) != len(ids):
+        return JSONResponse(status_code=400, content={"error": "duplicate ids"})
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "merged text is required"})
+    pts = []
+    for pid in ids:
+        pt, err = _memory_access(pid)
+        if err:
+            return err
+        pts.append(pt)
+    payloads = [(p.get("payload") or {}) for p in pts]
+    meta = {"channel": "nexus", "attributed_to": "user", "source": "merge"}
+    if any(pl.get("user") for pl in payloads):
+        meta["user"] = auth.current_user_id()  # shared stays shared ONLY if every source was
+    clients = {pl.get("client") for pl in payloads}
+    if len(clients) == 1 and next(iter(clients)):
+        meta["client"] = next(iter(clients))
+    agent_ids = {pl.get("agent_id") for pl in payloads}
+    args = ["add", "--text", text[:4000], "--metadata", json.dumps(meta)]
+    if len(agent_ids) == 1 and next(iter(agent_ids)):
+        args += ["--agent-id", next(iter(agent_ids))]  # e.g. merging one specialist's lessons
+    res = _run_curate(*args)
+    if not res.get("ok"):
+        return JSONResponse(status_code=500, content=res)
+    deleted, failed = [], []
+    for pid in ids:
+        r = _run_curate("delete", "--id", pid)
+        (deleted if r.get("ok") else failed).append(pid)
+    await _memory_changed("merged", res.get("id"))
+    return {"ok": True, "id": res.get("id"), "deleted": deleted, "failed": failed}
+
+
 @app.get("/api/activity")
 async def get_activity(limit: int = 50):
     # Own rows + system-wide rows (user_id IS NULL). Other users' task
@@ -2607,6 +2724,24 @@ def _retry_task(task_id: str, feedback: str | None):
     if not fb and task.get("judge_verdict") in ("REVISE", "REWRITE") and task.get("judge_output"):
         fb = ("Frontier judge findings (attached automatically — fix every blocker):\n"
               + task["judge_output"][-3000:])
+    # Review v2 (SPEC-BLOCK2 R1.5): OPEN per-line comments ride every retry —
+    # operator retry, approval-reject and loop-engine rounds all pass through
+    # here, so line feedback can never be lost on the way to the agent.
+    open_comments = db.query_all(
+        "SELECT * FROM review_comments WHERE task_id=? AND status='open' "
+        "ORDER BY file_path, COALESCE(line_no, 0), created_at", (task_id,))
+    if open_comments:
+        notes = []
+        for c in open_comments:
+            loc = f"{c['file_path']}:{c['line_no']}" if c.get("line_no") else c["file_path"]
+            excerpt = (c.get("line_text") or "").strip()
+            quoted = f' "{excerpt[:160]}"' if excerpt else ""
+            notes.append(f"- {loc} [{c.get('side') or 'new'}]{quoted} → {c['body']}")
+        fb = ((fb + "\n\n") if fb else "") + \
+            "Reviewer LINE COMMENTS (address EVERY one):\n" + "\n".join(notes)
+        db.execute(
+            "UPDATE review_comments SET status='consumed', consumed_at=? "
+            "WHERE task_id=? AND status='open'", (time.time(), task_id))
     ws = task.get("workspace_path")
     if ws and os.path.isdir(ws) and not task.get("repo_path"):
         # review engine: each rework round becomes a comparable version
@@ -2638,7 +2773,7 @@ def _retry_task(task_id: str, feedback: str | None):
         "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
         "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, retry_feedback=?, "
         "updated_at=? WHERE id=?",
-        (fb[:4000] or None, now, task_id))
+        (fb[:8000] or None, now, task_id))  # 8000: line comments ride along (SPEC-BLOCK2 R1.5)
     # The old deliverable's pending approval is now moot — expire it so the
     # Agentic tab never offers a decision on superseded work.
     db.execute(
@@ -4494,6 +4629,103 @@ async def task_review(task_id: str):
         return JSONResponse(status_code=500, content={"error": f"review failed: {str(e)[:200]}"})
 
 
+# ── Review v2: per-line comments (SPEC-BLOCK2 R1.4) ──
+# Comments anchor to a diff line (file, side, line no) and feed the next
+# retry via _retry_task. All routes are _owned_task-gated (foreign = 404).
+
+_COMMENT_MAX_BODY = 2000
+_COMMENT_MAX_OPEN = 200
+
+
+@app.get("/api/tasks/{task_id}/review/comments")
+async def list_review_comments(task_id: str):
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    rows = db.query_all(
+        "SELECT * FROM review_comments WHERE task_id=? "
+        "ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, file_path, "
+        "COALESCE(line_no, 0), created_at", (task_id,))
+    return {"comments": rows,
+            "open": sum(1 for r in rows if r["status"] == "open")}
+
+
+@app.post("/api/tasks/{task_id}/review/comments")
+async def create_review_comment(task_id: str, body: dict):
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    text = str((body or {}).get("body") or "").strip()
+    file_path = str((body or {}).get("file_path") or "").strip()
+    side = (body or {}).get("side") or "new"
+    if not text or not file_path:
+        return JSONResponse(status_code=400, content={"error": "file_path and body are required"})
+    if side not in ("old", "new"):
+        return JSONResponse(status_code=400, content={"error": "side must be old|new"})
+    line_no = (body or {}).get("line_no")
+    try:
+        line_no = int(line_no) if line_no is not None else None
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "line_no must be an integer"})
+    n_open = db.query_one(
+        "SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? AND status='open'",
+        (task_id,))["n"]
+    if n_open >= _COMMENT_MAX_OPEN:
+        return JSONResponse(status_code=409, content={"error": f"comment limit reached ({_COMMENT_MAX_OPEN} open)"})
+    row = {
+        "id": f"rc-{uuid.uuid4().hex[:12]}",
+        "task_id": task_id,
+        "user_id": auth.current_user_id(),
+        "file_path": file_path[:500],
+        "side": side,
+        "line_no": line_no,
+        "line_text": str((body or {}).get("line_text") or "")[:500],
+        "body": text[:_COMMENT_MAX_BODY],
+        "status": "open",
+        "consumed_at": None,
+        "created_at": time.time(),
+    }
+    db.execute(
+        "INSERT INTO review_comments (id, task_id, user_id, file_path, side, "
+        "line_no, line_text, body, status, consumed_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (row["id"], row["task_id"], row["user_id"], row["file_path"], row["side"],
+         row["line_no"], row["line_text"], row["body"], row["status"],
+         row["consumed_at"], row["created_at"]))
+    return {"ok": True, "comment": row}
+
+
+def _owned_comment(task_id: str, comment_id: str):
+    """Comment must exist under an owned task — foreign anything = 404."""
+    if not _owned_task(task_id):
+        return None
+    return db.query_one(
+        "SELECT * FROM review_comments WHERE id=? AND task_id=?",
+        (comment_id, task_id))
+
+
+@app.patch("/api/tasks/{task_id}/review/comments/{comment_id}")
+async def edit_review_comment(task_id: str, comment_id: str, body: dict):
+    c = _owned_comment(task_id, comment_id)
+    if not c:
+        return JSONResponse(status_code=404, content={"error": "comment not found"})
+    if c["status"] != "open":
+        return JSONResponse(status_code=409, content={"error": "comment already consumed by a retry"})
+    text = str((body or {}).get("body") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "body is required"})
+    db.execute("UPDATE review_comments SET body=? WHERE id=?",
+               (text[:_COMMENT_MAX_BODY], comment_id))
+    return {"ok": True}
+
+
+@app.delete("/api/tasks/{task_id}/review/comments/{comment_id}")
+async def delete_review_comment(task_id: str, comment_id: str):
+    c = _owned_comment(task_id, comment_id)
+    if not c:
+        return JSONResponse(status_code=404, content={"error": "comment not found"})
+    db.execute("DELETE FROM review_comments WHERE id=?", (comment_id,))
+    return {"ok": True}
+
+
 @app.get("/api/workflows/{wf_id}/review")
 async def workflow_review(wf_id: str):
     """Aggregated change review across all member tasks (newest first)."""
@@ -4769,6 +5001,105 @@ async def project_tag(body: dict):
                     f"Tagged {os.path.basename(p)} {tag}" + ("" if pushed else " (local only — no remote)"))
     return {"ok": True, "pushed": pushed,
             "output": rout if pushed else "tag created locally; publish/push to back it up"}
+
+
+def _resolve_cli(tokens: list[str]) -> list[str]:
+    """Under the systemd unit PATH may lack ~/.local/bin (gh, cjudge live there)."""
+    import shutil as _sh
+    if tokens and not _sh.which(tokens[0]):
+        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+        if os.path.isfile(candidate):
+            tokens[0] = candidate
+    return tokens
+
+
+@app.post("/api/tasks/{task_id}/pr")
+async def task_create_pr(task_id: str):
+    """SPEC-BLOCK2 R3.1: push the task's nexus/<slug> branch to origin and
+    open a GitHub PR via gh — the repo-task counterpart of approve-and-merge,
+    for projects whose review happens on GitHub. Operator-triggered only
+    (confirm-gated in the UI). settings pr.cmd stubs the gh step for gates."""
+    task = _owned_task(task_id)
+    if not task or not task.get("repo_path"):
+        return JSONResponse(status_code=404, content={"error": "task not found or not repo-native"})
+    repo = _visible_repo_path(task["repo_path"])
+    if not repo:
+        return JSONResponse(status_code=404, content={"error": "project not found"})
+    if task.get("pr_url"):
+        return {"ok": True, "url": task["pr_url"], "existing": True}
+    import worktree as _wt
+    branch = f"nexus/{hd._repo_slug(task)}"
+    code, _ = _run_git_action(repo, "git", "rev-parse", "--verify", "--quiet", branch)
+    if code != 0:
+        return JSONResponse(status_code=409,
+                            content={"error": f"no task branch ({branch}) — dispatch the task first"})
+    base = _wt.base_branch(repo)
+    code, ahead = _run_git_action(repo, "git", "rev-list", "--count", f"{base}..{branch}")
+    if code == 0 and ahead.strip() == "0":
+        return JSONResponse(status_code=409,
+                            content={"error": f"the task branch has no commits beyond {base}"})
+    code, _ = _run_git_action(repo, "git", "remote", "get-url", "origin")
+    if code != 0:
+        return JSONResponse(status_code=409,
+                            content={"error": "no origin remote — ☁ Publish the project first"})
+    code, out = _run_git_action(repo, "git", "push", "-u", "origin", branch, timeout=180)
+    if code != 0:
+        return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
+    # PR body: brief + review stats + line-comment audit trail pointer
+    stats = ""
+    try:
+        r = review_engine.build_task_review(task)
+        stats = (f"{len(r.get('files') or [])} file(s) changed, "
+                 f"+{r.get('additions', 0)} / −{r.get('deletions', 0)}")
+    except Exception:
+        pass
+    cm = db.query_one(
+        "SELECT COUNT(*) AS n, SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS o "
+        "FROM review_comments WHERE task_id=?", (task_id,))
+    title = (task.get("title") or task_id).strip()[:120]
+    body_lines = [f"## {title}", "", (task.get("description") or "").strip()[:1500], ""]
+    if stats:
+        body_lines.append(f"**Changes:** {stats}")
+    if cm and (cm["n"] or 0) > 0:
+        body_lines.append(f"**Nexus review:** {cm['n']} line comment(s), {cm['o'] or 0} still open")
+    body_lines += ["", "---",
+                   f"Created by Nexus Agent OS · task `{task_id}` · branch `{branch}`"]
+    ws = task.get("workspace_path")
+    bodyfile = os.path.join(ws if ws and os.path.isdir(ws) else "/tmp", "_pr_body.md")
+    with open(bodyfile, "w") as f:
+        f.write("\n".join(body_lines))
+    import shlex
+    template = db.get_setting(
+        "pr.cmd",
+        "gh pr create --head {branch} --base {base} --title {title} --body-file {bodyfile}")
+    # .replace, not .format: task titles may legally contain braces
+    tokens = _resolve_cli([
+        t.replace("{branch}", branch).replace("{base}", base)
+         .replace("{title}", title).replace("{bodyfile}", bodyfile)
+         .replace("{repo}", repo)
+        for t in shlex.split(template)])
+    try:
+        r = _sp.run(tokens, cwd=repo, capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"pr command failed: {str(e)[:200]}"})
+    combined = ((r.stdout or "") + (r.stderr or "")).strip()
+    m = _re.search(r"https://\S+", r.stdout or "")
+    if r.returncode != 0 or not m:
+        if "already exists" in combined:  # PR was opened earlier outside nexus
+            vr = _sp.run(_resolve_cli(["gh", "pr", "view", branch, "--json", "url",
+                                       "-q", ".url"]),
+                         cwd=repo, capture_output=True, text=True, timeout=60)
+            m = _re.search(r"https://\S+", vr.stdout or "")
+        if not m:
+            return JSONResponse(status_code=502,
+                                content={"error": f"PR creation failed: {combined[-400:]}"})
+    url = m.group(0).rstrip(".,)")
+    db.execute("UPDATE tasks SET pr_url=?, updated_at=? WHERE id=?",
+               (url, time.time(), task_id))
+    db.log_activity("info", "system", f"PR opened for task {task_id}: {url}")
+    t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
+    return {"ok": True, "url": url}
 
 
 @app.get("/api/tools")
