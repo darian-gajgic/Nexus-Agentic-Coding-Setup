@@ -57,18 +57,21 @@ instruction — this repo is the canonical record):
 - **Non-breaking:** a task without `repo_path` behaves byte-identically to
   before; verified by the full 109-check gate.
 
-## Install on a new machine (complete package)
+## Install on a new machine — FULL project (Hermes + Nexus)
 ```bash
 git clone git@github.com:dariannixda-eng/Nexus-Agentic-Coding-Setup.git
 cd Nexus-Agentic-Coding-Setup
-bash install.sh            # installs to ~/nexus-agent-os
-systemctl --user start nexus   # dashboard: https://127.0.0.1:8777
+# then follow setup/CLAUDE.md — or open the repo in Claude Code and say
+# "set this up": the runbook installs Hermes (pinned @ 048270fa069f), local
+# models, qdrant, ALL customizations (18 specialists, skills, plugins,
+# guardian core-mods, systemd units) AND Nexus from app/ — pausing once for
+# you to paste API keys into ~/.hermes/.env (template: setup/.env.example).
 ```
-Prerequisites the installer expects (it warns, doesn't install them):
-**Hermes Agent** with its gateway on `localhost:8642` and a GLM key
-(use the hermes-team-setup repo for that), plus `python3`, `git`, `openssl`.
-Recommended: serena + context7 MCP servers configured in Hermes — the dev
-specialists use them for symbol navigation and current docs.
+Nexus-only quick path (machine already runs Hermes): `bash install.sh`.
+
+Excluded by design (re-downloadable or secret): Hermes upstream clone, ollama
+models, Docker images, JARVIS voice models, API keys (.env), TLS certs, and
+runtime data (nexus.db, workspaces, Hermes state.db).
 
 ## Repo layout
 - `app/` — the COMPLETE Nexus Agent OS source tree (2.2 MB, runtime data

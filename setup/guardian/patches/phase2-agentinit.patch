@@ -1,0 +1,50 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 045fcfc..1c011f0 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -225,6 +225,9 @@ def init_agent(
+     skip_context_files: bool = False,
+     load_soul_identity: bool = False,
+     skip_memory: bool = False,
++    provider_memory: bool = False,
++    memory_agent_id: str = None,
++    memory_read_only: bool = False,
+     session_db=None,
+     parent_session_id: str = None,
+     iteration_budget: "IterationBudget" = None,
+@@ -1236,6 +1239,9 @@ def init_agent(
+     agent._memory_nudge_interval = 10
+     agent._turns_since_memory = 0
+     agent._iters_since_skill = 0
++    # When a specialist subagent runs with scoped provider memory, suppress the
++    # per-turn append-all auto-write (retrieval stays on; writes become curated/opt-in).
++    agent._memory_read_only = bool(memory_read_only)
+     if not skip_memory:
+         try:
+             mem_config = _agent_cfg.get("memory", {})
+@@ -1257,8 +1263,12 @@ def init_agent(
+     # Memory provider plugin (external — one at a time, alongside built-in)
+     # Reads memory.provider from config to select which plugin to activate.
+     agent._memory_manager = None
+-    if not skip_memory:
++    # Enable the mem0 provider when memory is on OR when a specialist child asks for
++    # scoped provider memory (provider_memory=True) — the local MEMORY.md store above
++    # stays gated on skip_memory alone, so a specialist never loads MEMORY.md/USER.md.
++    if (not skip_memory) or provider_memory:
+         try:
++            mem_config = _agent_cfg.get("memory", {})
+             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+ 
+             if _mem_provider_name and _mem_provider_name.strip():
+@@ -1290,6 +1300,11 @@ def init_agent(
+                     # Thread gateway user identity for per-user memory scoping
+                     if agent._user_id:
+                         _init_kwargs["user_id"] = agent._user_id
++                    # Specialist scoping: a delegated specialist reads/writes its own
++                    # private memory under its role agent_id (layered on the shared base).
++                    if memory_agent_id:
++                        _init_kwargs["agent_id"] = memory_agent_id
++                        _init_kwargs["agent_context"] = memory_agent_id
+                     if agent._user_id_alt:
+                         _init_kwargs["user_id_alt"] = agent._user_id_alt
+                     if agent._user_name:

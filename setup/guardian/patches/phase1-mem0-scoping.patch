@@ -1,0 +1,125 @@
+diff --git a/plugins/memory/mem0/__init__.py b/plugins/memory/mem0/__init__.py
+index 3647496..fae2c62 100644
+--- a/plugins/memory/mem0/__init__.py
++++ b/plugins/memory/mem0/__init__.py
+@@ -54,6 +54,27 @@ _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
+ # wrote this exact placeholder) still allow gateway-native ids to flow
+ # through instead of silently overriding them with the placeholder.
+ _DEFAULT_USER_ID = "hermes-user"
++# Curated cross-cutting scope that specialists read as their shared base — kept
++# separate from the primary agent's raw conversational memory ("hermes") so a
++# specialist inherits the team's real context, not conversational noise.
++# Curated via nexus / mem0_curate.py under agent_id="team-shared".
++_TEAM_SHARED = "team-shared"
++
++
++def _log_lesson_usage(ids):
++    """Best-effort append of retrieved specialist-lesson ids so the pruning job
++    (~/.hermes/scripts/prune_lessons.py) can retire lessons that go old + unused."""
++    ids = [i for i in (ids or []) if i]
++    if not ids:
++        return
++    try:
++        import datetime as _dt
++        d = os.path.expanduser("~/.hermes/agents")
++        os.makedirs(d, exist_ok=True)
++        with open(os.path.join(d, ".lesson_usage.jsonl"), "a") as _f:
++            _f.write(json.dumps({"ids": ids, "ts": _dt.datetime.now().isoformat(timespec="seconds")}) + "\n")
++    except Exception:
++        pass
+ 
+ 
+ def _is_client_error(exc: Exception) -> bool:
+@@ -357,7 +378,11 @@ class Mem0MemoryProvider(MemoryProvider):
+         if configured == _DEFAULT_USER_ID:
+             configured = None
+         self._user_id = configured or kwargs.get("user_id") or _DEFAULT_USER_ID
+-        self._agent_id = self._config.get("agent_id", "hermes")
++        # Shared base scope (the historical fixed id, e.g. "hermes"). A specialist
++        # subagent overrides agent_id per-call via kwargs so its private lessons
++        # write and read under its own role scope, layered on the shared base.
++        self._shared_agent_id = self._config.get("agent_id", "hermes")
++        self._agent_id = kwargs.get("agent_id") or self._shared_agent_id
+         self._channel = kwargs.get("platform") or "cli"
+         self._backend = self._create_backend()
+         if self._backend and not self._atexit_registered:
+@@ -372,6 +397,48 @@ class Mem0MemoryProvider(MemoryProvider):
+         # cross-agent recall.
+         return {"user_id": self._user_id}
+ 
++    def _is_specialist(self) -> bool:
++        return bool(self._agent_id) and self._agent_id != self._shared_agent_id
++
++    @staticmethod
++    def _merge_scoped(primary, secondary, limit):
++        """Merge two result lists — role-private first — dedup by id, cap to limit."""
++        seen, out = set(), []
++        for r in list(primary) + list(secondary):
++            rid = r.get("id")
++            if rid is not None and rid in seen:
++                continue
++            if rid is not None:
++                seen.add(rid)
++            out.append(r)
++            if len(out) >= limit:
++                break
++        return out
++
++    def _scoped_search(self, query, top_k, rerank, backend=None):
++        """Two-scope recall for specialists: role-private first, then the shared
++        base (agent_id == shared). The primary/base agent keeps the wider
++        user_id-only recall unchanged (zero regression)."""
++        backend = backend or self._backend
++        if backend is None:
++            return []
++        if not self._is_specialist():
++            return backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank) or []
++        priv = backend.search(query, filters={"user_id": self._user_id, "agent_id": self._agent_id}, top_k=top_k, rerank=rerank) or []
++        base = backend.search(query, filters={"user_id": self._user_id, "agent_id": _TEAM_SHARED}, top_k=top_k, rerank=rerank) or []
++        _log_lesson_usage([r.get("id") for r in priv])  # track this specialist's own lessons that surface
++        return self._merge_scoped(priv, base, top_k)
++
++    def _scoped_get_all(self, page, page_size):
++        """Two-scope listing for specialists: role-private + shared base merged."""
++        backend = self._backend
++        if not self._is_specialist():
++            return backend.get_all(filters=self._read_filters(), page=page, page_size=page_size)
++        priv = backend.get_all(filters={"user_id": self._user_id, "agent_id": self._agent_id}, page=page, page_size=page_size)
++        base = backend.get_all(filters={"user_id": self._user_id, "agent_id": _TEAM_SHARED}, page=page, page_size=page_size)
++        merged = self._merge_scoped(priv.get("results", []), base.get("results", []), page_size)
++        return {"results": merged, "count": priv.get("count", 0) + base.get("count", 0)}
++
+     def _write_metadata(self) -> Dict[str, Any]:
+         # Tag every write with the gateway channel so the dashboard can offer
+         # per-channel filtered views without coupling identity to the channel.
+@@ -425,9 +492,7 @@ class Mem0MemoryProvider(MemoryProvider):
+         def _run():
+             body = ""
+             try:
+-                results = backend.search(
+-                    query, filters=self._read_filters(), top_k=10, rerank=True,
+-                )
++                results = self._scoped_search(query, top_k=10, rerank=True, backend=backend)
+                 lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
+                 if lines:
+                     body = "## Mem0 Memory\n" + "\n".join(f"- {l}" for l in lines)
+@@ -520,9 +585,7 @@ class Mem0MemoryProvider(MemoryProvider):
+             try:
+                 page = max(1, int(args.get("page", 1)))
+                 page_size = min(max(1, int(args.get("page_size", 100))), 200)
+-                response = self._backend.get_all(
+-                    filters=self._read_filters(), page=page, page_size=page_size,
+-                )
++                response = self._scoped_get_all(page, page_size)
+                 self._record_success()
+                 results = response.get("results", [])
+                 if not results:
+@@ -550,7 +613,7 @@ class Mem0MemoryProvider(MemoryProvider):
+                     rerank = rerank_raw.lower() not in ("false", "0", "no")
+                 else:
+                     rerank = bool(rerank_raw)
+-                results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
++                results = self._scoped_search(query, top_k=top_k, rerank=rerank)
+                 self._record_success()
+                 if not results:
+                     return json.dumps({"result": "No relevant memories found."})

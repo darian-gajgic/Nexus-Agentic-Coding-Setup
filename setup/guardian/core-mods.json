@@ -1,0 +1,45 @@
+{
+  "repo": "~/.hermes/hermes-agent",
+  "mods": [
+    {
+      "name": "mem0-per-agent-scoping",
+      "description": "mem0 provider honors a per-call agent_id and does two-scope recall \u2014 a specialist reads its own private lessons layered on the shared base, while the primary agent is unchanged. Foundation of per-specialist memory.",
+      "file": "plugins/memory/mem0/__init__.py",
+      "patch": "phase1-mem0-scoping.patch",
+      "sentinel": "_shared_agent_id",
+      "impact_if_dropped": "Per-agent/specialist memory stops working: every agent collapses to one shared 'hermes' scope with no private lessons."
+    },
+    {
+      "name": "specialist-mem-gate-agentinit",
+      "file": "agent/agent_init.py",
+      "patch": "phase2-agentinit.patch",
+      "sentinel": "(not skip_memory) or provider_memory",
+      "description": "init_agent: provider_memory/memory_agent_id/memory_read_only params + split memory gate so a specialist gets scoped mem0 retrieval without loading MEMORY.md.",
+      "impact_if_dropped": "Specialist subagents lose scoped memory + read-only writes; the delegation memory gate breaks."
+    },
+    {
+      "name": "specialist-mem-readonly-runagent",
+      "file": "run_agent.py",
+      "patch": "phase2-runagent.patch",
+      "sentinel": "getattr(self, \"_memory_read_only\", False)",
+      "description": "run_agent: thread the 3 memory params + gate the per-turn sync_all write behind _memory_read_only (keeps retrieval, drops append-all).",
+      "impact_if_dropped": "Specialist subagents resume uncurated append-all memory writes instead of read-only recall."
+    },
+    {
+      "name": "specialist-binding-delegate",
+      "file": "tools/delegate_tool.py",
+      "patch": "phase2-delegate.patch",
+      "sentinel": "provider_memory=bool(memory_agent_id)",
+      "description": "delegate_tool: bind a specialist to a child \u2014 inject its playbook (standing rules), scope its mem0 agent_id (read-only), and pass its tool allowlist.",
+      "impact_if_dropped": "Delegated subagents can't run as specialists (no playbook, no scoped memory, no tool allowlist)."
+    },
+    {
+      "name": "langfuse-observability-fixes",
+      "file": "plugins/observability/langfuse/__init__.py",
+      "patch": "langfuse-observability-fixes.patch",
+      "sentinel": "_extract_reasoning",
+      "description": "Langfuse plugin: (1) drop the two deprecated set_trace_io() calls (trace I/O is derived from the as_root root observation on Langfuse 3.205.0); (2) _serialize_assistant_message reads reasoning via _extract_reasoning() so GLM(Z.AI)/DeepSeek/Kimi chain-of-thought (returned in reasoning_content, not reasoning) is captured instead of logged as null.",
+      "impact_if_dropped": "The set_trace_io DeprecationWarning returns and GLM/DeepSeek/Kimi reasoning is logged as reasoning:null in every trace."
+    }
+  ]
+}

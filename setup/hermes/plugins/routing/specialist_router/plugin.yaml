@@ -1,0 +1,13 @@
+name: specialist_router
+version: "1.0.0"
+description: >
+  Keyword-gated forced specialist router. When the user's message contains a
+  trigger phrase ("use a specialist" / "use an agent" / ...), it runs one forced
+  classification call (select_specialist, enum built at runtime from
+  ~/.hermes/agents/*.md + a "none" escape) and, if a specialist fits, rewrites the
+  incoming message to prepend a mandatory delegate_task directive naming it.
+  Reliable routing decision (forced tool call), general (new agents work with zero
+  config), non-breaking (fires only for real user messages; fail-soft).
+author: sinep
+hooks:
+  - pre_gateway_dispatch

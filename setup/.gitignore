@@ -1,0 +1,40 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+auth.json
+*.key
+*.pem
+*secret*
+*credential*
+*token*
+!*JARVIS_HUD_TOKEN*
+
+# ── Runtime state / personal data ─────────────────────────────────────
+*.db
+*.db-*
+*.db-wal
+*.db-shm
+sessions/
+reports/
+logs/
+*.log
+.hermes_history
+.reflection_log.jsonl
+.pending_lessons.json
+.lesson_usage*
+.reflect_state.json
+jarvis_session.json
+
+# ── Environments / build artifacts / models (re-downloadable) ─────────
+venv/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+models/
+bin/
+!/bin/
+lsp/
+*.bak
+*.bak-*

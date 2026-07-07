@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Hermes auto-reflection every 30 min
+[Timer]
+# OnCalendar (not OnUnitActiveSec): monotonic intervals pause during suspend
+# and ignore Persistent=; wall-clock halves + catch-up keep the reflection
+# queue moving on a laptop that sleeps often.
+OnCalendar=*:00/30
+Persistent=true
+[Install]
+WantedBy=timers.target

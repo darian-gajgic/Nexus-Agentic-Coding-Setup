@@ -1,0 +1,292 @@
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index b3172e51a..e2630b991 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -658,6 +658,31 @@ def check_delegate_requirements() -> bool:
+     return True
+ 
+ 
++def _log_specialist_completion(specialist, goal, outcome):
++    """Append a completed SPECIALIST task to the reflector log (fail-soft).
++
++    The offline reflector (~/.hermes/scripts/reflect.py) reads this to draft
++    candidate lessons for human approval in nexus. Only specialist children are
++    logged; dynamic subagents are not.
++    """
++    if not specialist:
++        return
++    try:
++        import datetime as _dt
++        d = os.path.expanduser("~/.hermes/agents")
++        os.makedirs(d, exist_ok=True)
++        with open(os.path.join(d, ".reflection_log.jsonl"), "a") as _f:
++            _f.write(json.dumps({
++                "specialist": specialist,
++                "goal": (goal or "")[:600],
++                "outcome": (outcome or "")[:2000],
++                "ts": _dt.datetime.now().isoformat(timespec="seconds"),
++            }) + "\n")
++    except Exception as e:
++        # Fail-soft, not fail-mute: a broken reflector feed must be visible.
++        logger.warning("reflection-log append failed for %r: %s", specialist, e)
++
++
+ def _build_child_system_prompt(
+     goal: str,
+     context: Optional[str] = None,
+@@ -666,6 +691,7 @@ def _build_child_system_prompt(
+     role: str = "leaf",
+     max_spawn_depth: int = 2,
+     child_depth: int = 1,
++    playbook: Optional[str] = None,
+ ) -> str:
+     """Build a focused system prompt for a child agent.
+ 
+@@ -688,6 +714,13 @@ def _build_child_system_prompt(
+             f"{workspace_path}\n"
+             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+         )
++    if playbook and playbook.strip():
++        parts.append(
++            "\n## STANDING RULES (your specialist playbook)\n"
++            "You are running as a defined specialist. Treat these standing rules as "
++            "authoritative for every task of this kind:\n\n"
++            f"{playbook.strip()}"
++        )
+     parts.append(
+         "\nComplete this task using the tools available to you. "
+         "When finished, provide a clear, concise summary of:\n"
+@@ -1062,6 +1095,14 @@ def _build_child_agent(
+     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
+     # toolset subject to depth/kill-switch bounds applied below.
+     role: str = "leaf",
++    # Specialist binding: when a resolved specialist drives this child, its
++    # playbook (standing rules) is injected into the prompt and its mem0 scope
++    # (agent_id) gives it private + shared-base recall (read-only by default,
++    # so it never spams the append-all log). None => today's dynamic subagent.
++    specialist: Optional[str] = None,
++    playbook: Optional[str] = None,
++    memory_agent_id: Optional[str] = None,
++    memory_read_only: bool = True,
+ ):
+     """
+     Build a child AIAgent on the main thread (thread-safe construction).
+@@ -1149,6 +1190,7 @@ def _build_child_agent(
+         role=effective_role,
+         max_spawn_depth=max_spawn,
+         child_depth=child_depth,
++        playbook=playbook,
+     )
+     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
+     parent_api_key = getattr(parent_agent, "api_key", None)
+@@ -1320,6 +1362,13 @@ def _build_child_agent(
+         platform="subagent",
+         skip_context_files=True,
+         skip_memory=True,
++        # Specialist memory: enable the mem0 PROVIDER (scoped to the role agent_id)
++        # only when a specialist drives this child. skip_memory stays True so the
++        # local MEMORY.md never loads, and the mem0 WRITE tools remain blocked by
++        # DELEGATE_BLOCKED_TOOLS — so this is scoped retrieval, not append-all writes.
++        provider_memory=bool(memory_agent_id),
++        memory_agent_id=memory_agent_id,
++        memory_read_only=memory_read_only,
+         clarify_callback=None,
+         thinking_callback=child_thinking_cb,
+         session_db=getattr(parent_agent, "_session_db", None),
+@@ -1333,6 +1382,7 @@ def _build_child_agent(
+         iteration_budget=None,  # fresh budget per subagent
+     )
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
++    child._specialist = specialist  # None for dynamic subagents; role name when bound
+     # Now the child exists, its session id can ride on every relayed event
+     # (including the spawn_requested below — first emit happens after this).
+     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+@@ -2349,6 +2399,7 @@ def delegate_task(
+     acp_command: Optional[str] = None,
+     acp_args: Optional[List[str]] = None,
+     role: Optional[str] = None,
++    specialist: Optional[str] = None,
+     background: Optional[bool] = None,
+     parent_agent=None,
+ ) -> str:
+@@ -2380,6 +2431,7 @@ def delegate_task(
+ 
+     # Normalise the top-level role once; per-task overrides re-normalise.
+     top_role = _normalize_role(role)
++    top_specialist = specialist
+ 
+     # Background (async) delegation now applies to BOTH single tasks and
+     # batches. A batch simply becomes N independent async dispatches: each
+@@ -2450,7 +2502,7 @@ def delegate_task(
+             )
+         task_list = tasks
+     elif goal and isinstance(goal, str) and goal.strip():
+-        task_list = [{"goal": goal, "context": context, "role": top_role}]
++        task_list = [{"goal": goal, "context": context, "role": top_role, "specialist": top_specialist}]
+     else:
+         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+ 
+@@ -2490,13 +2542,16 @@ def delegate_task(
+             # Per-task role beats top-level; normalise again so unknown
+             # per-task values warn and degrade to leaf uniformly.
+             effective_role = _normalize_role(t.get("role") or top_role)
++            # get-or-create: resolve a predefined specialist for this task (chosen by
++            # name by the delegating model). None => today's dynamic ephemeral subagent.
++            _spec = _resolve_task_specialist(t.get("specialist") or top_specialist)
+             child = _build_child_agent(
+                 task_index=i,
+                 goal=t["goal"],
+                 context=t.get("context"),
+-                # Subagents always inherit the parent's toolsets; the model
+-                # cannot choose or narrow them (no model-facing toolsets arg).
+-                toolsets=None,
++                # Specialist's tool allowlist when bound; else inherit parent's toolsets
++                # (the model cannot otherwise choose or narrow them).
++                toolsets=(_spec["toolsets"] if _spec else None),
+                 model=creds["model"],
+                 max_iterations=effective_max_iter,
+                 task_count=n_tasks,
+@@ -2514,6 +2569,9 @@ def delegate_task(
+                     else (acp_args if acp_args is not None else creds.get("args"))
+                 ),
+                 role=effective_role,
++                specialist=(_spec["name"] if _spec else None),
++                playbook=(_spec["playbook"] if _spec else None),
++                memory_agent_id=(_spec["agent_id"] if _spec else None),
+             )
+             # Override with correct parent tool names (before child construction mutated global)
+             child._delegate_saved_tool_names = _parent_tool_names
+@@ -2537,6 +2595,20 @@ def delegate_task(
+             _i, _t, child = children[0]
+             result = _run_single_child(_i, _t["goal"], child, parent_agent)
+             results.append(result)
++            # Feed the offline reflector when a SPECIALIST child finished ok.
++            # The batch path logs inside its futures loop; single-task (the
++            # common case — nexus delegates one task per specialist) must log
++            # here or reflection never sees these completions.
++            try:
++                _sp = getattr(child, "_specialist", None)
++                logger.info("reflector single-task hook: specialist=%r status=%r",
++                            _sp, result.get("status"))
++                if _sp and result.get("status") not in ("error", "interrupted"):
++                    _log_specialist_completion(
++                        _sp, _t.get("goal"), result.get("summary")
++                    )
++            except Exception as e:
++                logger.warning("reflector single-task hook failed: %s", e)
+         else:
+             # Batch -- run in parallel with per-task progress lines
+             completed_count = 0
+@@ -2566,6 +2638,7 @@ def delegate_task(
+                 # Map task_index -> child agent, so fabricated entries for
+                 # still-pending futures can carry the correct _delegate_role.
+                 _child_by_index = {i: child for (i, _, child) in children}
++                _task_by_index = {i: t for (i, t, _) in children}
+ 
+                 pending = set(futures.keys())
+                 while pending:
+@@ -2604,6 +2677,20 @@ def delegate_task(
+                                 }
+                             results.append(entry)
+                             completed_count += 1
++                            # A future that finished OK before the interrupt is
++                            # still a real specialist completion — feed the
++                            # reflector like the normal collection loop does.
++                            try:
++                                _sc = _child_by_index.get(entry.get("task_index"))
++                                _sp = getattr(_sc, "_specialist", None)
++                                if _sp and entry.get("status") not in ("error", "interrupted"):
++                                    _log_specialist_completion(
++                                        _sp,
++                                        (_task_by_index.get(entry.get("task_index")) or {}).get("goal"),
++                                        entry.get("summary"),
++                                    )
++                            except Exception:
++                                pass
+                         break
+ 
+                     from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
+@@ -2629,6 +2716,18 @@ def delegate_task(
+                             }
+                         results.append(entry)
+                         completed_count += 1
++                        # Feed the offline reflector when a SPECIALIST child finished ok.
++                        try:
++                            _sc = _child_by_index.get(entry.get("task_index"))
++                            _sp = getattr(_sc, "_specialist", None)
++                            if _sp and entry.get("status") not in ("error", "interrupted"):
++                                _log_specialist_completion(
++                                    _sp,
++                                    (_task_by_index.get(entry.get("task_index")) or {}).get("goal"),
++                                    entry.get("summary"),
++                                )
++                        except Exception:
++                            pass
+ 
+                         # Print per-task completion line above the spinner
+                         idx = entry["task_index"]
+@@ -3352,11 +3451,36 @@ def _build_dynamic_schema_overrides() -> dict:
+             overrides_params["properties"]["tasks"] = tasks_schema
+ 
+     return {
+-        "description": _build_top_level_description(),
++        "description": _build_top_level_description() + _specialist_registry_block(),
+         "parameters": overrides_params,
+     }
+ 
+ 
++def _specialist_registry_block():
++    """Registry of predefined specialists, appended to the tool description so the
++    delegating model can select one by name. Empty on a stock setup. Fail-soft."""
++    try:
++        from tools.specialist_resolver import registry_block
++        return registry_block()
++    except Exception:
++        return ""
++
++
++def _resolve_task_specialist(name):
++    """Resolve a specialist name to its dict (or None -> dynamic subagent).
++    Fail-soft but not mute: a requested specialist that doesn't bind means the
++    child silently loses its playbook/memory — that must be visible in logs."""
++    try:
++        from tools.specialist_resolver import resolve_specialist
++        spec = resolve_specialist(name)
++        if name and not spec:
++            logger.info("specialist %r did not resolve — running as dynamic subagent", name)
++        return spec
++    except Exception as e:
++        logger.warning("specialist resolution failed for %r: %s", name, e)
++        return None
++
++
+ DELEGATE_TASK_SCHEMA = {
+     "name": "delegate_task",
+     # NOTE: description / tasks.description / role.description are placeholder
+@@ -3419,6 +3543,10 @@ DELEGATE_TASK_SCHEMA = {
+                             "enum": ["leaf", "orchestrator"],
+                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                         },
++                        "specialist": {
++                            "type": "string",
++                            "description": "Per-task specialist name (see this tool's specialist list). Reuses that specialist's memory + rules for this task.",
++                        },
+                     },
+                     "required": ["goal"],
+                 },
+@@ -3432,6 +3560,15 @@ DELEGATE_TASK_SCHEMA = {
+                 "enum": ["leaf", "orchestrator"],
+                 "description": "(rebuilt at get_definitions() time)",
+             },
++            "specialist": {
++                "type": "string",
++                "description": (
++                    "Optional. Name of a predefined specialist to run this delegation as "
++                    "(see the specialist list appended to this tool's description). Reusing a "
++                    "specialist gives the subagent its own accumulated memory + standing rules. "
++                    "Omit for a one-off dynamic subagent."
++                ),
++            },
+             "background": {
+                 "type": "boolean",
+                 "description": (

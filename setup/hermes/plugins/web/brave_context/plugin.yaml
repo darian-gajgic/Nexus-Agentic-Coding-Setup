@@ -1,0 +1,13 @@
+name: web-brave-enhanced
+version: 1.1.0
+description: >
+  Enhanced Brave backend that OVERRIDES the built-in brave-free provider.
+  web_search uses Brave's /res/v1/llm/context (real page content, ~4k tokens
+  per result, not snippets); web_extract uses a local full-page reader
+  (trafilatura -> Jina). Registers under the name "brave-free" so Hermes'
+  legacy backend allowlist actually routes to it. safesearch=off on every
+  Brave request. Requires BRAVE_SEARCH_API_KEY.
+author: sinep
+kind: backend
+provides_web_providers:
+  - brave-free

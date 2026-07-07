@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Hermes lesson pruning weekly
+[Timer]
+# OnCalendar (not OnUnitActiveSec): monotonic timers pause during suspend AND
+# ignore Persistent=, so on this suspend-heavy laptop a weekly interval timer
+# drifts indefinitely. Persistent=true fires a missed run at next wake.
+OnCalendar=Sun 20:00
+Persistent=true
+[Install]
+WantedBy=timers.target

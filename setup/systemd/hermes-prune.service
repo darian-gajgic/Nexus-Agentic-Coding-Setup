@@ -1,0 +1,7 @@
+[Unit]
+Description=Hermes specialist lesson pruning (soft-archive old + unused lessons)
+After=hermes-gateway.service
+[Service]
+Type=oneshot
+Environment=PATH=/home/sinep/.local/bin:/usr/bin:/bin
+ExecStart=/home/sinep/.hermes/hermes-agent/venv/bin/python /home/sinep/.hermes/scripts/prune_lessons.py

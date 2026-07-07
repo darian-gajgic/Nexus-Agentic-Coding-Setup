@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes specialist auto-reflection (drafts candidate lessons for human approval)
+# No unit ordering: reflect.py talks to Z.ai + ollama + qdrant (not the
+# gateway), fails soft, and since the halt-on-unavailable fix an entry it
+# cannot judge is retried on the next run instead of being lost.
+[Service]
+Type=oneshot
+Environment=PATH=/home/sinep/.local/bin:/usr/bin:/bin
+ExecStart=/home/sinep/.hermes/hermes-agent/venv/bin/python /home/sinep/.hermes/scripts/reflect.py
