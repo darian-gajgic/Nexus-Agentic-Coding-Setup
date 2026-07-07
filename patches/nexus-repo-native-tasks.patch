@@ -11,10 +11,27 @@ index 404486a..d2db200 100644
      for col, typedef in task_migrations:
          if col not in existing_task_cols:
 diff --git a/hermes_dispatch.py b/hermes_dispatch.py
-index ca0c1e7..e862da1 100644
+index ca0c1e7..44a168e 100644
 --- a/hermes_dispatch.py
 +++ b/hermes_dispatch.py
-@@ -314,6 +314,36 @@ def deps_satisfied(task: dict) -> bool:
+@@ -236,8 +236,14 @@ def slot_available(model: str | None) -> bool:
+     m = model or DEFAULT_MODEL
+     # Per-model override (settings key dispatch.max_concurrent.<model>) beats
+     # the global per-model cap — Z.AI's concurrency limit is per model (~10).
+-    per_model_cap = int(db.get_setting(f"dispatch.max_concurrent.{m}", "0")
+-                        or db.get_setting("dispatch.max_concurrent_per_model", "8"))
++    # Only a positive integer counts as an override: absent/empty/"0" all fall
++    # through to the global cap (the string "0" is truthy — a plain `or` chain
++    # here once produced cap=0 and deadlocked every lane).
++    raw = (db.get_setting(f"dispatch.max_concurrent.{m}", "") or "").strip()
++    if raw.isdigit() and int(raw) > 0:
++        per_model_cap = int(raw)
++    else:
++        per_model_cap = int(db.get_setting("dispatch.max_concurrent_per_model", "8"))
+     total_cap = int(db.get_setting("dispatch.max_concurrent_total", "8"))
+     counts = slots_in_use()
+     if sum(counts.values()) >= total_cap:
+@@ -314,6 +320,36 @@ def deps_satisfied(task: dict) -> bool:
  
  DOC_TOOLS_PY = "/home/sinep/nexus-agent-os/.venv/bin/python"
  
@@ -51,7 +68,7 @@ index ca0c1e7..e862da1 100644
  
  def _attachment_lines(task: dict, workspace: Path) -> list[str]:
      """Operator-attached input files: the task's own + its project's."""
-@@ -330,19 +360,41 @@ def _attachment_lines(task: dict, workspace: Path) -> list[str]:
+@@ -330,19 +366,41 @@ def _attachment_lines(task: dict, workspace: Path) -> list[str]:
      return out
  
  
@@ -102,7 +119,7 @@ index ca0c1e7..e862da1 100644
      parts.append(
          "When the task needs a STRUCTURED FACT — exchange rates, weather, country/market "
          "data, public holidays, economic indicators, paper/package/repo metadata, "
-@@ -672,7 +724,16 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
+@@ -672,7 +730,16 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                          f"{'Resuming' if resume else 'Dispatched'} task {task_id} "
                          f"('{task['title']}') via Hermes session {session_id}")
  
@@ -120,7 +137,7 @@ index ca0c1e7..e862da1 100644
          if resume:
              input_text = (f"You were interrupted mid-task. Continue task {task_id} now and "
                            "finish it. The original instructions still apply: write the final "
-@@ -686,6 +747,23 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
+@@ -686,6 +753,23 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
  
          _set_task(task_id, dispatch_state="finalizing")
          content = result.get("content") or ""
