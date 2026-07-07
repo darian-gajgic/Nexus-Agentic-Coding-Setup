@@ -2376,7 +2376,7 @@ async function loadTaskExtras(t) {
   // specialists into the picker (cached across modal opens)
   try {
     if (!specialistNamesCache) {
-      const r = await api('GET', '/api/specialists');
+      const r = await api('GET', '/api/specialists/names');
       specialistNamesCache = (r.specialists || []).map(s => s.name);
     }
     const sel = $('#td-specialist');
@@ -3466,7 +3466,7 @@ function showTaskModal(status) {
   (async () => {
     try {
       if (!specialistNamesCache) {
-        const r = await api('GET', '/api/specialists');
+        const r = await api('GET', '/api/specialists/names');
         specialistNamesCache = (r.specialists || []).map(s => s.name);
       }
       const sel = $('#m-task-specialist');
@@ -5801,7 +5801,9 @@ function closeModal() {
 }
 
 // ═══════════════════════════════ SPECIALISTS ═══════════════════════════════
-const specialistsState = { data: null, loading: false, fetched: false };
+const specialistsState = { data: null, loading: false, fetched: false, tab: 'team' };
+// Evals (Block 3 R3): fixed per-domain briefs scored by the judge vs the rubric
+const evalsState = { corpus: null, runs: null, loading: false, fetched: false, pollTimer: null };
 async function loadSpecialists() {
   if (specialistsState.loading) return;
   specialistsState.loading = true; render();
@@ -5848,7 +5850,16 @@ function learningPipelineHTML(pendingCount) {
     </div>`).join('')}</div>`;
 }
 
+function specTabsHTML() {
+  const runsRunning = (evalsState.runs || []).some(r => ['running', 'cancelling'].includes(r.status));
+  return `<div class="subtabs" style="margin-bottom:12px">
+    <button class="subtab ${specialistsState.tab === 'team' ? 'active' : ''}" data-spectab="team">🧑‍🔬 Team</button>
+    <button class="subtab ${specialistsState.tab === 'evals' ? 'active' : ''}" data-spectab="evals">📏 Evals${runsRunning ? '<span class="n">▶</span>' : ''}</button>
+  </div>`;
+}
+
 function viewSpecialists() {
+  if (specialistsState.tab === 'evals') return specTabsHTML() + evalsTabHTML();
   const d = specialistsState.data;
   if (!specialistsState.fetched && !specialistsState.loading) loadSpecialists();
   if (specialistsState.loading || !d) return skeletonView();
@@ -5898,7 +5909,7 @@ function viewSpecialists() {
       <div style="margin-top:10px;display:flex;gap:8px"><input class="form-input" id="sharedText" placeholder="Add a shared fact…" style="flex:1"><button class="btn-primary" id="sharedAdd">Add</button></div>
     </div></div>`;
 
-  return `
+  return specTabsHTML() + `
     <div class="stats-strip">
       <div class="stat-card"><div class="stat-num" style="color:#b3a1ff">${specs.length}</div><div class="stat-label">Specialists</div></div>
       <div class="stat-card green"><div class="stat-num green">${totalLessons}</div><div class="stat-label">Lessons learned</div></div>
@@ -5992,6 +6003,14 @@ async function createSpecialist() {
 }
 
 function bindSpecialists() {
+  $$('[data-spectab]').forEach(el => {
+    el.onclick = () => {
+      specialistsState.tab = el.dataset.spectab;
+      if (specialistsState.tab === 'evals' && !evalsState.fetched) loadEvals();
+      render();
+    };
+  });
+  if (specialistsState.tab === 'evals') { bindEvals(); return; }
   document.querySelectorAll('.spec-edit').forEach(el => {
     el.onclick = () => editSpecialist(el.getAttribute('data-name'));
   });
@@ -6023,6 +6042,188 @@ async function addSharedContext() {
 async function deleteSharedContext(id) {
   try { await api('DELETE', `/api/shared-context/${id}`); specialistsState.fetched = false; loadSpecialists(); }
   catch (e) { toast('Failed: ' + e, 'err'); }
+}
+
+// ═══════════════════ EVALS (Block 3 R3) — measure prompt/playbook changes ═══════════════════
+async function loadEvals() {
+  if (evalsState.loading) return;
+  evalsState.loading = true;
+  try {
+    const [c, r] = await Promise.all([api('GET', '/api/evals'), api('GET', '/api/evals/runs')]);
+    evalsState.corpus = c.domains || [];
+    evalsState.runs = r.runs || [];
+    evalsState.fetched = true;
+    evalsState.error = null;
+  } catch (e) { evalsState.corpus = evalsState.corpus || []; evalsState.runs = evalsState.runs || []; evalsState.error = e.message; }
+  evalsState.loading = false;
+  if (currentView === 'specialists' && specialistsState.tab === 'evals' && !uiLocked()) render();
+  evalsAutoPoll();
+}
+
+// While a run is executing, refresh every 8s so progress/scores appear live.
+function evalsAutoPoll() {
+  const active = (evalsState.runs || []).some(r => ['running', 'cancelling'].includes(r.status));
+  if (active && !evalsState.pollTimer) {
+    evalsState.pollTimer = setInterval(() => loadEvals(), 8000);
+  } else if (!active && evalsState.pollTimer) {
+    clearInterval(evalsState.pollTimer);
+    evalsState.pollTimer = null;
+  }
+}
+
+function runPct(r) { return r.score_max ? Math.round(100 * r.score_total / r.score_max) : null; }
+const evWhen = ts => ts ? new Date(ts * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
+function evalsTabHTML() {
+  if (!evalsState.fetched && !evalsState.loading) loadEvals();
+  if (!evalsState.corpus) return skeletonView();
+  const corpus = (evalsState.corpus || []).filter(d => d.cases.length || d.has_rubric);
+  const runs = evalsState.runs || [];
+  const activeRun = runs.find(r => ['running', 'cancelling'].includes(r.status));
+  const byDomain = {};
+  runs.filter(r => r.status === 'completed' && r.score_max)
+    .forEach(r => { (byDomain[r.domain] = byDomain[r.domain] || []).push(r); }); // newest first
+  const totalCases = corpus.reduce((n, d) => n + d.cases.length, 0);
+  const cards = corpus.map(d => {
+    const hist = byDomain[d.domain] || [];
+    const pct = hist[0] ? runPct(hist[0]) : null;
+    const dpct = hist[1] ? runPct(hist[0]) - runPct(hist[1]) : null;
+    const trend = hist.slice(0, 5).reverse().map(runPct).join('% → ');
+    return `
+    <div class="agentic-card">
+      <div class="card-head"><h3>📏 ${esc(d.domain)}</h3>
+        ${pct != null ? `<span class="chip ${pct >= 75 ? 'c-green' : pct >= 55 ? 'c-orange' : 'c-red'}" title="last completed run, rubric score">${pct}%${dpct != null ? ` (${dpct >= 0 ? '+' : ''}${dpct} vs prev)` : ''}</span>` : '<span class="chip">never run</span>'}
+      </div>
+      <div class="card-body">
+        <div style="font-size:12px;color:var(--text-dim)">${d.cases.length} fixed brief(s)${d.has_rubric ? '' : ' · <span style="color:var(--red,#f87171)">no RUBRIC.md — cannot score</span>'}</div>
+        ${hist.length > 1 ? `<div style="font-size:11px;font-family:var(--font-mono);color:var(--text-faint);margin-top:4px" title="score history, oldest → newest">${trend}%</div>` : ''}
+        <div style="margin-top:8px">
+          <button class="btn-sm" style="border-color:var(--accent)" ${(!d.cases.length || !d.has_rubric || activeRun) ? 'disabled' : ''} onclick="evalsRunModal('${esc(d.domain)}')">▶ Run evals</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  const runRows = runs.slice(0, 20).map(r => {
+    const pct = runPct(r);
+    const st = { running: 'c-cyan', cancelling: 'c-orange', completed: 'c-green', failed: 'c-red', cancelled: '' }[r.status] || '';
+    return `
+    <div class="agentic-row" style="cursor:pointer" onclick="evalRunDetail('${esc(r.id)}')">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong>${esc(r.domain)}</strong>
+        <span class="chip ${st}">${r.status === 'running' ? `running ${r.cases_done}/${r.cases_total}` : esc(r.status)}</span>
+        ${pct != null ? `<span class="chip">${pct}% (${r.score_total}/${r.score_max})</span>` : ''}
+        ${r.status === 'completed' ? `<span class="chip">${r.ship_count}/${r.cases_total} SHIP</span>` : ''}
+        <span class="chip" title="config fingerprint — same hash = same playbook/rubric/specialist config">⚙ ${esc((r.fingerprint || {}).combined || '?')}</span>
+        <span style="flex:1"></span>
+        <span class="muted" style="font-size:11px">${evWhen(r.started_at)}</span>
+        ${['running', 'cancelling'].includes(r.status) ? `<button class="btn-sm danger" onclick="event.stopPropagation();evalsCancel('${esc(r.id)}')">⏹ Cancel</button>` : ''}
+      </div>
+      ${r.notes ? `<div style="font-size:11.5px;color:var(--text-dim)">📝 ${esc(r.notes)}</div>` : ''}
+      ${r.error ? `<div style="font-size:11.5px;color:var(--red,#f87171)">${esc(r.error)}</div>` : ''}
+    </div>`;
+  }).join('');
+  const scored = runs.filter(r => r.status === 'completed' && r.score_max);
+  return `
+    <div class="stats-strip">
+      <div class="stat-card"><div class="stat-num" style="color:#b3a1ff">${corpus.length}</div><div class="stat-label">Domains</div></div>
+      <div class="stat-card blue"><div class="stat-num" style="color:var(--blue)">${totalCases}</div><div class="stat-label">Fixed briefs</div></div>
+      <div class="stat-card green"><div class="stat-num green">${scored.length}</div><div class="stat-label">Scored runs</div></div>
+      <div class="stat-card ${activeRun ? 'orange' : ''}"><div class="stat-num" style="color:${activeRun ? 'var(--yellow)' : 'var(--text)'}">${activeRun ? `${activeRun.cases_done}/${activeRun.cases_total}` : '—'}</div><div class="stat-label">Running now</div></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px">
+      <div class="view-intro" style="margin-bottom:0">The eval corpus is a set of <strong>fixed briefs per domain</strong> (<code>~/knowledge/domains/&lt;domain&gt;/evals/</code>). A run executes each brief through the real task pipeline (playbook + specialist), then the <strong>frontier judge scores it against the domain rubric</strong>. Changed a playbook, rubric or specialist? Run the domain's evals and compare with the previous run — the ⚙ fingerprint tells you which config each score measured. Scores wobble between runs; read trends, not single points.</div>
+      <button class="btn-ghost" id="evRefresh" style="white-space:nowrap">↻ Refresh</button>
+    </div>
+    ${evalsState.error ? `<div class="chip c-red" style="margin-bottom:10px">${esc(evalsState.error)}</div>` : ''}
+    <div class="agentic-grid" style="margin-bottom:16px">${cards || '<div class="empty"><span class="e-ico">📏</span>No eval corpus found — add briefs under ~/knowledge/domains/&lt;domain&gt;/evals/.</div>'}</div>
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">Run history</span><span style="font-size:10.5px;color:var(--text-faint)">click a run for per-case scores + judge output</span></div>
+      <div style="padding:8px 18px 14px;display:flex;flex-direction:column;gap:6px">${runRows || '<div style="color:var(--text-faint);font-size:12.5px;padding:8px 0">No runs yet — pick a domain above and press ▶ Run evals.</div>'}</div>
+    </div>`;
+}
+
+function bindEvals() {
+  const rb = $('#evRefresh');
+  if (rb) rb.onclick = () => { evalsState.fetched = false; loadEvals(); };
+}
+
+function evalsRunModal(domain) {
+  const d = (evalsState.corpus || []).find(x => x.domain === domain);
+  if (!d) return;
+  showModal(`
+    <h2>▶ Run evals: ${esc(domain)}</h2>
+    <div class="view-intro" style="margin-bottom:10px">Each brief runs through the REAL task pipeline (playbook + specialist), then the frontier judge scores the result against the ${esc(domain)} rubric. Cases run one after another — expect ~3–8 min per case.</div>
+    ${d.cases.map(c => `
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;margin-top:4px">
+        <input type="checkbox" class="ev-case" data-id="${esc(c.id)}" checked>
+        <strong>${esc(c.title)}</strong>
+        ${c.specialist ? `<span class="chip c-cyan">${esc(c.specialist)}</span>` : ''}
+        ${c.model ? `<span class="chip c-blue">${esc(c.model)}</span>` : ''}
+      </label>`).join('')}
+    <div class="form-group" style="margin-top:10px">
+      <label class="form-label">📝 What changed since the last run? (stored on the run)</label>
+      <input class="form-input" id="ev-notes" placeholder="e.g. rewrote PLAYBOOK proof-density rules">
+    </div>
+    <div class="form-hint">Costs real GLM tokens + one frontier-judge call per case.</div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="ev-start">▶ Start run</button>
+    </div>`);
+  const b = $('#ev-start');
+  if (b) b.onclick = async () => {
+    const cases = $$('.ev-case').filter(x => x.checked).map(x => x.dataset.id);
+    if (!cases.length) { toast('Pick at least one case', 'err'); return; }
+    b.disabled = true; b.textContent = 'Starting…';
+    try {
+      await api('POST', '/api/evals/run', { domain, cases, notes: ($('#ev-notes') || {}).value || '' });
+      closeModal();
+      toast('Eval run started — it works case by case in the background', 'ok');
+      evalsState.fetched = false;
+      loadEvals();
+    } catch (e) {
+      toast('Start failed: ' + e.message, 'err');
+      b.disabled = false; b.textContent = '▶ Start run';
+    }
+  };
+}
+
+async function evalRunDetail(id) {
+  let d;
+  try { d = await api('GET', `/api/evals/runs/${id}`); }
+  catch (e) { toast('Load failed: ' + e.message, 'err'); return; }
+  const r = d.run;
+  const results = d.results || [];
+  const pct = runPct(r);
+  const rows = results.map(x => `
+    <div class="agentic-row">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong>${esc(x.case_title || x.case_id)}</strong>
+        <span class="chip ${{ scored: 'c-green', judging: 'c-cyan', generating: 'c-cyan', error: 'c-red' }[x.status] || ''}">${esc(x.status)}</span>
+        ${x.verdict ? `<span class="chip ${x.verdict === 'SHIP' ? 'c-green' : 'c-orange'}">${esc(x.verdict)}</span>` : ''}
+        ${x.score != null ? `<span class="chip">${x.score}/${x.score_max}</span>` : ''}
+        ${x.gates_failed ? `<span class="chip c-red">${x.gates_failed} gate FAIL</span>` : ''}
+        ${x.specialist ? `<span class="chip c-cyan">${esc(x.specialist)}</span>` : ''}
+        ${x.tokens_used ? `<span class="muted" style="font-size:11px">${Math.round(x.tokens_used / 1000)}k tok</span>` : ''}
+        ${x.deliverable_path ? `<a class="btn-sm" style="text-decoration:none" href="/api/evals/runs/${esc(r.id)}/file?case=${encodeURIComponent(x.case_id)}" target="_blank">📄 deliverable</a>` : ''}
+      </div>
+      ${x.error ? `<div style="font-size:11.5px;color:var(--red,#f87171)">${esc(x.error)}</div>` : ''}
+      ${x.judge_output ? `<details style="margin-top:4px"><summary style="cursor:pointer;font-size:11.5px;color:var(--text-dim)">judge output</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:300px;overflow:auto">${esc(x.judge_output)}</pre></details>` : ''}
+    </div>`).join('');
+  const fp = r.fingerprint || {};
+  showModal(`
+    <h2>📏 Eval run — ${esc(r.domain)} ${pct != null ? `<span class="chip ${pct >= 75 ? 'c-green' : 'c-orange'}">${pct}%</span>` : ''}</h2>
+    <div class="view-intro" style="margin-bottom:6px">${esc(r.notes || 'no notes recorded — next time say what changed, future-you will thank you')}</div>
+    <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-faint);margin-bottom:8px">config ⚙ ${esc(fp.combined || '?')} · playbook ${esc(fp.playbook || '—')} · rubric ${esc(fp.rubric || '—')} · ${evWhen(r.started_at)}</div>
+    <div style="display:flex;flex-direction:column;gap:6px;max-height:440px;overflow-y:auto">${rows || '<div class="empty">no cases</div>'}</div>
+    <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+}
+
+async function evalsCancel(id) {
+  try {
+    await api('POST', `/api/evals/runs/${id}/cancel`);
+    toast('Cancelling after the current case…', 'ok');
+    loadEvals();
+  } catch (e) { toast('Cancel failed: ' + e.message, 'err'); }
 }
 
 function reviewLesson(id) {
@@ -6181,6 +6382,23 @@ async function loadWorkflows() {
   if (currentView === 'workflows') render();
 }
 
+// ── Mid-run replanning (R2): checkpoint state parsed off the workflow row ──
+function parseReplan(w) {
+  try {
+    const r = JSON.parse(w.replan || 'null');
+    return r && typeof r === 'object' ? r : null;
+  } catch { return null; }
+}
+
+function replanChipHTML(w) {
+  const rp = parseReplan(w);
+  if (!rp) return '';
+  if (rp.status === 'needed') return ' <span class="chip c-orange" title="a stage failed — open the project to replan">⚠ replan</span>';
+  if (rp.status === 'drafting') return ' <span class="chip c-cyan" title="the wizard is drafting a recovery plan">✨ drafting…</span>';
+  if (rp.status === 'proposed') return ' <span class="chip c-accent" title="a recovery plan awaits your review">📋 replan ready</span>';
+  return '';
+}
+
 function viewWorkflows() {
   if (!wfState.fetched) { loadWorkflows(); return skeletonView(); }
   const wfIds = focusProjectWorkflowIds();
@@ -6192,7 +6410,7 @@ function viewWorkflows() {
     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
         <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
-        <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span></div>
+        <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span>${replanChipHTML(w)}</div>
       <div class="card-body">
         ${w.goal ? `<div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">${esc(w.goal)}</div>` : ''}
         <div class="agentic-row slim">
@@ -6271,19 +6489,40 @@ async function openWorkflowDetail(id) {
         ((w.tasks || []).find(x => x.id === d) || {}).title || d);
     } catch { return []; }
   };
-  const taskRows = (w.tasks || []).map((t, i) => `
-    <div class="agentic-row" style="cursor:pointer" onclick="closeModal();openTaskDetail('${esc(t.id)}')">
+  const live = (w.tasks || []).filter(t => t.status !== 'archived');
+  const archived = (w.tasks || []).filter(t => t.status === 'archived');
+  const taskRow = (t, i) => `
+    <div class="agentic-row" style="cursor:pointer${t.status === 'archived' ? ';opacity:.5' : ''}" onclick="closeModal();openTaskDetail('${esc(t.id)}')">
       <div><span class="muted" style="font-family:var(--font-mono)">${i + 1}.</span> <strong>${esc(t.title)}</strong>
-        <span class="chip ${{ done: 'c-green', in_progress: 'c-cyan', review: 'c-orange' }[t.status] || ''}">${esc(t.status)}</span>
+        <span class="chip ${{ done: 'c-green', in_progress: 'c-cyan', review: 'c-orange' }[t.status] || ''}">${t.status === 'archived' ? 'superseded' : esc(t.status)}</span>
         ${dispatchChip(t)}
         ${t.high_stakes ? '<span title="pauses for approval">⚖</span>' : ''}
         ${t.model ? `<span class="chip c-blue">${esc(t.model)}</span>` : ''}</div>
       ${depNames(t).length ? `<div style="font-size:11px;color:var(--text-faint)">⛓ waits for: ${depNames(t).map(esc).join(' · ')}</div>` : ''}
-    </div>`).join('');
+    </div>`;
+  const taskRows = live.map(taskRow).join('')
+    + (archived.length ? `
+      <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint);margin-top:6px">Superseded by replan (kept for audit)</div>
+      ${archived.map(taskRow).join('')}` : '');
+  const rp = parseReplan(w);
+  const rpPanel = rp && ['needed', 'drafting', 'proposed'].includes(rp.status) ? `
+    <div class="agentic-row" style="border-color:var(--orange,#fb923c);margin-bottom:8px">
+      <div><strong>⚠ Replanning checkpoint</strong> <span class="chip c-orange">${esc(rp.status)}</span></div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:4px">${esc(rp.reason || '')}</div>
+      ${rp.error ? `<div style="font-size:11.5px;color:var(--red,#f87171);margin-top:4px">last draft failed: ${esc(rp.error)}</div>` : ''}
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center">
+        ${rp.status === 'proposed' ? `<button class="btn-primary sm" onclick="replanReviewModal('${esc(w.id)}')">📋 Review recovery plan (${((rp.proposal || {}).tasks || []).length} tasks)</button>` : ''}
+        ${rp.status === 'drafting'
+      ? '<span class="chip c-cyan">✨ drafting… (~1–3 min — this panel updates by itself)</span>'
+      : `<button class="btn-sm" style="border-color:var(--accent)" onclick="replanDraftUI('${esc(w.id)}')">✨ ${rp.status === 'proposed' ? 'Draft again' : 'Draft a recovery plan'}</button>`}
+        <button class="btn-ghost sm" onclick="replanDismissUI('${esc(w.id)}')">Dismiss — I'll handle it manually</button>
+      </div>
+    </div>` : '';
   showModal(`
     <h2 style="display:flex;align-items:center;gap:10px">⚑ ${esc(w.name)}
       <span class="chip ${w.all_done ? 'c-green' : 'c-cyan'}">${w.tasks_done}/${w.tasks_total} done</span></h2>
     ${w.goal ? `<div class="view-intro" style="margin-bottom:10px">${esc(w.goal)}</div>` : ''}
+    ${rpPanel}
     <div style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto">${taskRows || '<div class="empty">No tasks yet — add the first one.</div>'}</div>
     <div style="margin:8px 0"><button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">🔍 Review results — what every stage changed</button></div>
     <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Project attachments (input files EVERY task of this project reads)</label>
@@ -6334,6 +6573,110 @@ async function openWorkflowDetail(id) {
       `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
     if (w.project_path) sel.value = w.project_path;
   }).catch(() => { });
+}
+
+// ── Replanning actions (R2.2/R2.3): draft → review/edit → apply, all human-gated ──
+async function replanDraftUI(id) {
+  try {
+    await api('POST', `/api/workflows/${id}/replan/draft`);
+    closeModal();
+    toast('Drafting a recovery plan — the wizard replans the remaining work (~1–3 min)', 'ok');
+    replanPoll(id);
+  } catch (e) { toast('Draft failed: ' + e.message, 'err'); }
+}
+
+function replanPoll(id) {
+  let n = 0;
+  const t = setInterval(async () => {
+    if (++n > 40) { clearInterval(t); return; }
+    try {
+      const w = await api('GET', `/api/workflows/${id}`);
+      const rp = parseReplan(w);
+      if (rp && rp.status === 'drafting') return;
+      clearInterval(t);
+      wfState.fetched = false;
+      if (rp && rp.status === 'proposed') {
+        toast('Recovery plan ready — review it in the project panel', 'ok');
+      } else if (rp && rp.error) {
+        toast('Replan draft failed: ' + rp.error, 'err');
+      }
+      if (currentView === 'workflows' && !uiLocked()) render();
+    } catch { /* transient — keep polling */ }
+  }, 6000);
+}
+
+async function replanDismissUI(id) {
+  if (!confirm('Dismiss this replanning checkpoint? It will not re-flag for the same failure — a new failure re-arms it.')) return;
+  try {
+    await api('POST', `/api/workflows/${id}/replan/dismiss`);
+    wfState.fetched = false;
+    toast('Checkpoint dismissed', 'ok');
+    openWorkflowDetail(id);
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+// The proposal opens in the SAME plan editor as the wizard (R1) — review,
+// edit, then Apply archives the unfinished old tasks and creates the new ones.
+async function replanReviewModal(id) {
+  let w;
+  try { w = await api('GET', `/api/workflows/${id}`); }
+  catch (e) { toast('Load failed: ' + e.message, 'err'); return; }
+  const rp = parseReplan(w);
+  if (!rp || rp.status !== 'proposed' || !rp.proposal) { toast('No proposal to review', 'err'); return; }
+  const doneTasks = (w.tasks || []).filter(t => t.status === 'done');
+  planEd = {
+    mode: 'replan', domain: w.domain || 'general', name: w.name,
+    tasks: JSON.parse(JSON.stringify(rp.proposal.tasks || [])),
+    keep: (rp.proposal.tasks || []).map(() => true),
+    editing: null, edited: false,
+    repairs: rp.proposal.repairs || [],
+    roster: specialistNamesCache || [],
+  };
+  planEdLoadRoster().then(() => planEdRender());
+  const doneRows = doneTasks.map(t => `
+    <div class="agentic-row" style="opacity:.75">
+      <div>✅ <strong>${esc(t.title)}</strong> <span class="chip c-green">done — kept</span></div>
+    </div>`).join('');
+  const assumptions = rp.proposal.assumptions || [];
+  showModal(`
+    <h2>📋 Recovery plan: ${esc(w.name)}</h2>
+    <div class="view-intro" style="margin-bottom:8px">${esc(rp.reason || '')}</div>
+    ${doneRows ? `<div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint);margin-bottom:4px">Kept from the old plan — their deliverables feed the new tasks</div><div style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">${doneRows}</div>` : ''}
+    ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}</div>` : ''}
+    <div id="wfRepairs" style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px"></div>
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint);margin-bottom:4px">New recovery tasks — these replace every unfinished task</div>
+    <div id="wfStages" style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto"></div>
+    <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
+      <button class="btn-sm" id="wfAddTask">➕ Add a task</button>
+      <span class="form-hint" style="margin:0">Applying archives the old unfinished tasks (kept for audit) and creates these in Backlog.</span>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="wfCreateBtn">Apply replan (${(rp.proposal.tasks || []).length} tasks)</button>
+    </div>`);
+  planEdRender();
+  const addBtn = $('#wfAddTask');
+  if (addBtn) addBtn.onclick = () => planEdAddTask();
+  const b = $('#wfCreateBtn');
+  if (b) b.onclick = async () => {
+    if (planEd.editing != null) { toast('Finish the open ✏️ edit first', 'err'); return; }
+    const finalTasks = planEdFinalTasks();
+    if (!finalTasks.length) { toast('Keep at least one task', 'err'); return; }
+    b.disabled = true; b.textContent = 'Applying…';
+    try {
+      const r = await api('POST', `/api/workflows/${id}/replan/apply`, { tasks: finalTasks });
+      if ((r.repairs || []).length) toast('Plan checker adjusted the applied plan: ' + r.repairs.join(' · '), 'info');
+      wfState.fetched = false;
+      state.tasks = await api('GET', '/api/tasks');
+      planEd = null;
+      closeModal();
+      toast('Replan applied — recovery tasks are in Backlog; move the first one to Todo to resume', 'ok');
+      openWorkflowDetail(id);
+    } catch (e) {
+      toast('Apply failed: ' + e.message, 'err');
+      b.disabled = false; b.textContent = 'Apply replan';
+    }
+  };
 }
 
 function addTaskToWorkflow(wfId) {
@@ -6604,43 +6947,232 @@ function wizStages(tasks) {
   return level;
 }
 
-// Multi-step goal → staged DAG preview (assumptions + auto-repairs shown), create on confirm
-function proposeWorkflowModal(wf, meta) {
-  const tasks = wf.tasks || [];
-  const levels = wizStages(tasks);
-  const isCoding = tasks.some(t => t.specialist === 'code-implementer');
-  const mandatory = i => isCoding &&
-    (tasks[i].specialist === 'code-reviewer' || tasks[i].specialist === 'acceptance-verifier');
-  const row = (t, i) => `
+// ═══════════ PLAN EDITOR (R1) — shared by wizard proposal + replan review ═══════════
+// planEd holds the mutable plan while a proposal modal is open. The editor
+// enforces the earlier-index invariant in the UI itself (deps pick from EARLIER
+// tasks only); everything else — specialist whitelist, model floors, mandatory
+// quality gates — is re-checked server-side by /api/tasks/wizard/revalidate.
+let planEd = null;
+
+async function planEdLoadRoster() {
+  if (!specialistNamesCache) {
+    try {
+      const r = await api('GET', '/api/specialists/names');
+      specialistNamesCache = (r.specialists || []).map(s => s.name);
+    } catch { specialistNamesCache = []; }
+  }
+  if (planEd) { planEd.roster = specialistNamesCache; }
+}
+
+function planEdIsCoding() {
+  return planEd.tasks.some((t, i) => planEd.keep[i] && t.specialist === 'code-implementer');
+}
+function planEdMandatory(i) {
+  const t = planEd.tasks[i];
+  return planEdIsCoding() &&
+    (t.specialist === 'code-reviewer' || t.specialist === 'acceptance-verifier');
+}
+
+function planEdRowHTML(t, i) {
+  const locked = planEdMandatory(i);
+  return `
     <div class="agentic-row">
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-        <input type="checkbox" id="wfKeep${i}" checked ${mandatory(i) ? 'disabled title="quality gate — required"' : ''}>
-        <span class="muted" style="font-family:var(--font-mono)">${i + 1}.</span> <strong>${esc(t.title)}</strong>
+        <input type="checkbox" id="wfKeep${i}" ${planEd.keep[i] ? 'checked' : ''} ${locked ? 'disabled title="quality gate — required"' : ''}>
+        <span class="muted" style="font-family:var(--font-mono)">${i + 1}.</span> <strong>${esc(t.title || '(untitled task)')}</strong>
         ${t.specialist ? `<span class="chip c-cyan">${esc(t.specialist)}</span>` : ''}
         ${t.high_stakes ? '<span title="pauses for approval">⚖</span>' : ''}
         ${t.model ? `<span class="chip c-blue">${esc(t.model)}</span>` : ''}
         <span class="task-tag">${esc(t.domain || 'general')}</span>
-        ${mandatory(i) ? '<span class="chip" title="quality gate — required">🔒 gate</span>' : ''}</div>
+        ${locked ? '<span class="chip" title="quality gate — required">🔒 gate</span>' : ''}
+        <span style="flex:1"></span>
+        <button class="btn-icon pe-edit" data-i="${i}" title="Edit this task">✏️</button>
+        ${t._added ? `<button class="btn-icon pe-del" data-i="${i}" title="Remove this task">🗑</button>` : ''}
+      </div>
       ${(t.depends_on_idx || []).length ? `<div style="font-size:11px;color:var(--text-faint)">⛓ waits for: ${t.depends_on_idx.map(x => x + 1).join(', ')}</div>` : ''}
       <div style="font-size:11.5px;color:var(--text-dim);white-space:pre-wrap">${esc((t.description || '').slice(0, 220))}${(t.description || '').length > 220 ? '…' : ''}</div>
     </div>`;
+}
+
+function planEdEditorHTML(t, i) {
+  const locked = planEdMandatory(i);
+  const roster = planEd.roster || specialistNamesCache || [];
+  const deps = new Set(t.depends_on_idx || []);
+  const depBoxes = planEd.tasks.slice(0, i).map((d, di) => `
+    <label style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;margin:2px 10px 2px 0">
+      <input type="checkbox" class="pe-dep" data-d="${di}" ${deps.has(di) ? 'checked' : ''}> ${di + 1}. ${esc((d.title || '').slice(0, 40))}
+    </label>`).join('') || '<span class="muted" style="font-size:11.5px">first task — nothing earlier to wait for</span>';
+  return `
+    <div class="agentic-row" style="border-color:var(--accent)">
+      <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-faint)">✏️ Editing task ${i + 1}${locked ? ' — quality gate (specialist locked)' : ''}</div>
+      <input class="form-input" id="pe-title" value="${esc(t.title || '')}" placeholder="Task title" style="margin-top:6px">
+      <textarea class="form-textarea" id="pe-desc" style="height:110px;margin-top:6px" placeholder="Complete brief — the executing agent starts fresh and sees only this + predecessor deliverables">${esc(t.description || '')}</textarea>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+        <select class="form-select" id="pe-spec" style="max-width:220px" ${locked ? 'disabled' : ''}>
+          <option value="">— Agent decides —</option>
+          ${roster.map(n => `<option value="${esc(n)}" ${t.specialist === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}
+        </select>
+        <select class="form-select" id="pe-domain" style="max-width:190px">
+          ${NEXUS_DOMAINS.map(d => `<option value="${d}" ${(t.domain || 'general') === d ? 'selected' : ''}>${d}</option>`).join('')}
+        </select>
+        <select class="form-select" id="pe-model" style="max-width:230px">
+          <option value="">glm-5.2 — default (real work)</option>
+          <option value="glm-5.1" ${t.model === 'glm-5.1' ? 'selected' : ''}>glm-5.1 — lighter tasks</option>
+          <option value="glm-4.5-air" ${t.model === 'glm-4.5-air' ? 'selected' : ''}>glm-4.5-air — mechanical work</option>
+        </select>
+        <input class="form-input" id="pe-budget" type="number" min="0" step="100000" value="${t.budget_tokens || ''}" placeholder="token budget (default)" style="max-width:190px">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px"><input type="checkbox" id="pe-hs" ${t.high_stakes ? 'checked' : ''}> ⚖ high-stakes</label>
+      </div>
+      <div style="margin-top:8px"><span style="font-size:11.5px;color:var(--text-faint)">⛓ waits for:</span><br>${depBoxes}</div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+        <button class="btn-ghost sm" id="pe-cancel">Cancel</button>
+        <button class="btn-primary sm" id="pe-save">Apply edit</button>
+      </div>
+    </div>`;
+}
+
+function planEdStagesHTML() {
+  const tasks = planEd.tasks;
+  const levels = wizStages(tasks);
   const maxLevel = levels.length ? Math.max(...levels) : 0;
-  const stages = [];
+  const out = [];
   for (let s = 0; s <= maxLevel; s++) {
     const members = tasks.map((t, i) => ({ t, i })).filter(x => levels[x.i] === s);
     if (!members.length) continue;
-    stages.push(`
+    out.push(`
       <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint);margin-top:${s ? 8 : 0}px">${s ? '↓ ' : ''}Stage ${s + 1}${members.length > 1 ? ' (parallel)' : ''}</div>
-      ${members.map(x => row(x.t, x.i)).join('')}`);
+      ${members.map(x => planEd.editing === x.i ? planEdEditorHTML(x.t, x.i) : planEdRowHTML(x.t, x.i)).join('')}`);
   }
+  return out.join('');
+}
+
+function planEdRender() {
+  const c = $('#wfStages');
+  if (!c || !planEd) return;
+  c.innerHTML = planEdStagesHTML();
+  planEdBindStages();
+  const b = $('#wfCreateBtn');
+  if (b) b.textContent = (planEd.mode === 'replan' ? 'Apply replan' : 'Create project')
+    + ` (${planEd.keep.filter(Boolean).length} tasks)`;
+  const rb = $('#wfRepairs');
+  if (rb) rb.innerHTML = (planEd.repairs || []).length
+    ? `🔧 wizard auto-fixed: ${planEd.repairs.map(esc).join(' · ')}` : '';
+}
+
+function planEdBindStages() {
+  planEd.tasks.forEach((_, i) => {
+    const cb = $(`#wfKeep${i}`);
+    if (cb) cb.onchange = () => { planEd.keep[i] = cb.checked; planEd.edited = true; planEdRender(); };
+  });
+  $$('.pe-edit').forEach(el => el.onclick = () => {
+    if (planEd.editing != null) { toast('Finish the open edit first', 'err'); return; }
+    planEd.editing = +el.dataset.i; planEdRender();
+  });
+  $$('.pe-del').forEach(el => el.onclick = () => planEdRemove(+el.dataset.i));
+  const save = $('#pe-save'), cancel = $('#pe-cancel');
+  if (cancel) cancel.onclick = () => {
+    const i = planEd.editing;
+    planEd.editing = null;
+    const t = i != null ? planEd.tasks[i] : null;
+    if (t && t._added && !(t.title || '').trim() && !(t.description || '').trim()) planEdRemove(i); // abandoned blank add
+    else planEdRender();
+  };
+  if (save) save.onclick = () => {
+    const i = planEd.editing;
+    const t = planEd.tasks[i];
+    const title = (($('#pe-title') || {}).value || '').trim();
+    const desc = (($('#pe-desc') || {}).value || '').trim();
+    if (!title) { toast('Give the task a title', 'err'); return; }
+    if (!desc) { toast('Write the brief — the executing agent sees nothing else', 'err'); return; }
+    t.title = title; t.description = desc;
+    if (!planEdMandatory(i)) t.specialist = ($('#pe-spec') || {}).value || null;
+    t.domain = ($('#pe-domain') || {}).value || 'general';
+    t.model = ($('#pe-model') || {}).value || null;
+    t.high_stakes = !!($('#pe-hs') || {}).checked;
+    const bud = parseInt(($('#pe-budget') || {}).value);
+    t.budget_tokens = Number.isFinite(bud) && bud > 0 ? bud : null;
+    t.depends_on_idx = $$('.pe-dep').filter(x => x.checked).map(x => +x.dataset.d).sort((a, b2) => a - b2);
+    planEd.editing = null;
+    planEd.edited = true;
+    planEdRender();
+  };
+}
+
+function planEdAddTask() {
+  if (!planEd) return;
+  if (planEd.editing != null) { toast('Finish the open edit first', 'err'); return; }
+  const last = planEd.tasks.length - 1;
+  planEd.tasks.push({
+    title: '', description: '', domain: planEd.domain || 'general', specialist: null,
+    high_stakes: false, model: null, priority: 2, budget_tokens: null, tags: [],
+    depends_on_idx: last >= 0 ? [last] : [], _added: true,
+  });
+  planEd.keep.push(true);
+  planEd.editing = planEd.tasks.length - 1;
+  planEd.edited = true;
+  planEdRender();
+}
+
+function planEdRemove(i) {
+  planEd.tasks.splice(i, 1);
+  planEd.keep.splice(i, 1);
+  planEd.tasks.forEach((t, j) => {
+    if (j >= i) t.depends_on_idx = (t.depends_on_idx || []).filter(d => d !== i).map(d => d > i ? d - 1 : d);
+  });
+  if (planEd.editing === i) planEd.editing = null;
+  else if (planEd.editing != null && planEd.editing > i) planEd.editing -= 1;
+  planEd.edited = true;
+  planEdRender();
+}
+
+// Unticked tasks are spliced out of the DAG: dependents inherit their
+// dependencies (transitively), so the chain never breaks.
+function planEdFinalTasks() {
+  const { tasks, keep } = planEd;
+  const eff = (i, seen) => {
+    const out = new Set();
+    for (const d of (tasks[i].depends_on_idx || [])) {
+      if (seen.has(d)) continue;
+      seen.add(d);
+      if (keep[d]) out.add(d);
+      else eff(d, seen).forEach(x => out.add(x));
+    }
+    return out;
+  };
+  const remap = {};
+  let n = 0;
+  tasks.forEach((_, i) => { if (keep[i]) remap[i] = n++; });
+  return tasks.map((t, i) => ({ t, i })).filter(x => keep[x.i]).map(x => {
+    const { _added, ...clean } = x.t;
+    return { ...clean, depends_on_idx: [...eff(x.i, new Set())].map(d => remap[d]).sort((a, b2) => a - b2) };
+  });
+}
+
+// Multi-step goal → staged DAG preview (assumptions + auto-repairs shown), full
+// plan editing (R1), create on confirm
+function proposeWorkflowModal(wf, meta) {
+  const tasks = wf.tasks || [];
+  const isCoding = tasks.some(t => t.specialist === 'code-implementer');
+  planEd = {
+    mode: 'wizard', domain: wf.domain || 'general', name: wf.name,
+    tasks: JSON.parse(JSON.stringify(tasks)),
+    keep: tasks.map(() => true),
+    editing: null, edited: false,
+    repairs: (meta && meta.repairs) || [],
+    roster: specialistNamesCache || [],
+  };
+  planEdLoadRoster().then(() => planEdRender());
   const assumptions = (meta && meta.assumptions) || [];
-  const repairs = (meta && meta.repairs) || [];
   showModal(`
     <h2>✨ Proposed project: ${esc(wf.name)}</h2>
     <div class="view-intro" style="margin-bottom:8px">${esc(wf.goal || '')}</div>
-    ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
-    ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
-    <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
+    ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase — or ✏️ edit the affected task right here.</span></div>` : ''}
+    <div id="wfRepairs" style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px"></div>
+    <div id="wfStages" style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto"></div>
+    <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
+      <button class="btn-sm" id="wfAddTask">➕ Add a task</button>
+      <span class="form-hint" style="margin:0">✏️ edit any task — the plan checker re-verifies edited plans (quality gates, wiring) before anything is created.</span>
+    </div>
     ${isCoding ? `
     <div class="form-group" style="margin-top:8px">
       <label class="form-label">🧬 Existing code repository</label>
@@ -6671,6 +7203,9 @@ function proposeWorkflowModal(wf, meta) {
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
       <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
     </div>`);
+  planEdRender();
+  const addBtn = $('#wfAddTask');
+  if (addBtn) addBtn.onclick = () => planEdAddTask();
   const b = $('#wfCreateBtn');
   // repo picker options (coding projects only)
   const repoSel = $('#wf-repo');
@@ -6692,31 +7227,35 @@ function proposeWorkflowModal(wf, meta) {
       }
     }).catch(() => { });
   }
-  const keeps = () => tasks.map((_, i) => {
-    const cb = $(`#wfKeep${i}`);
-    return !cb || cb.checked;
-  });
-  tasks.forEach((_, i) => {
-    const cb = $(`#wfKeep${i}`);
-    if (cb) cb.onchange = () => {
-      if (b) b.textContent = `Create project (${keeps().filter(Boolean).length} tasks)`;
-    };
-  });
   if (b) b.onclick = async () => {
-    b.disabled = true; b.textContent = 'Creating…';
-    const keep = keeps();
-    // Skipped tasks are spliced out of the DAG: their dependents inherit
-    // their dependencies (transitively), so the chain never breaks.
-    const eff = (i, seen) => {
-      const out = new Set();
-      for (const d of (tasks[i].depends_on_idx || [])) {
-        if (seen.has(d)) continue;
-        seen.add(d);
-        if (keep[d]) out.add(d);
-        else eff(d, seen).forEach(x => out.add(x));
+    if (planEd.editing != null) { toast('Finish the open ✏️ edit first', 'err'); return; }
+    let finalTasks = planEdFinalTasks();
+    if (!finalTasks.length) { toast('Keep at least one task', 'err'); return; }
+    // R1.3: an EDITED plan goes back through the deterministic plan checker
+    // (same _repair_workflow that guards wizard output). If it changed
+    // anything, show the repaired plan and let the operator confirm again.
+    if (planEd.edited) {
+      b.disabled = true; b.textContent = 'Checking the edited plan…';
+      let r;
+      try {
+        r = await api('POST', '/api/tasks/wizard/revalidate', { name: wf.name, tasks: finalTasks });
+      } catch (e) {
+        toast('Plan check failed: ' + e.message, 'err');
+        b.disabled = false; planEdRender(); return;
       }
-      return out;
-    };
+      planEd.tasks = r.tasks || [];
+      planEd.keep = planEd.tasks.map(() => true);
+      planEd.edited = false;
+      planEd.repairs = r.repairs || [];
+      b.disabled = false;
+      planEdRender();
+      if ((r.repairs || []).length) {
+        toast('The plan checker adjusted your edits — review, then press Create again', 'info');
+        return;
+      }
+      finalTasks = planEdFinalTasks();
+    }
+    b.disabled = true; b.textContent = 'Creating…';
     const projHigh = !!($('#wf-highstakes') && $('#wf-highstakes').checked);
     const projClient = $('#wf-client') ? ($('#wf-client').value.trim().toLowerCase() || null) : null;
     const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
@@ -6730,8 +7269,8 @@ function proposeWorkflowModal(wf, meta) {
           mode: 'closed',
           meta: {
             title: wf.name, domain: wf.domain,
-            specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
-            high_stakes: projHigh || tasks.some((t, i) => keep[i] && t.high_stakes),
+            specialists: finalTasks.map(t => t.specialist).filter(Boolean),
+            high_stakes: projHigh || finalTasks.some(t => t.high_stakes),
           },
         });
       } catch (e) { toast('Loop design failed (project created without loop): ' + e.message, 'err'); }
@@ -6742,9 +7281,7 @@ function proposeWorkflowModal(wf, meta) {
           high_stakes: projHigh, client: projClient,
           project_path: repo || (focusCtx.project && focusCtx.project.path) || null });
       const ids = [];
-      for (let i = 0; i < tasks.length; i++) {
-        const t = tasks[i];
-        if (!keep[i]) { ids.push(null); continue; }
+      for (const t of finalTasks) {
         const created = await api('POST', '/api/tasks', {
           title: t.title, description: t.description, status: 'backlog',
           priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
@@ -6755,12 +7292,13 @@ function proposeWorkflowModal(wf, meta) {
           // share one branch, so review/fix/verify see each other's work)
           repo_path: repo && DEV_SPECIALISTS.has(t.specialist) ? repo : null,
           client: projClient,
-          depends_on: [...eff(i, new Set())].sort((a, b2) => a - b2).map(x => ids[x]).filter(Boolean),
+          depends_on: (t.depends_on_idx || []).map(x => ids[x]).filter(Boolean),
         });
         ids.push(created.id);
       }
       wfState.fetched = false;
       state.tasks = await api('GET', '/api/tasks');
+      planEd = null;
       closeModal();
       toast(`Project "${wf.name}" created — fill the [brackets], then move task 1 to Todo`, 'ok');
       switchView('workflows');
