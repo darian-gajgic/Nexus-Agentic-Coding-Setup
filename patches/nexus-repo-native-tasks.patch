@@ -964,7 +964,7 @@ index 2bd943c..e605294 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..e2fc0a5 100644
+index b0b7e37..c9fe6cf 100644
 --- a/static/app.js
 +++ b/static/app.js
 @@ -104,11 +104,19 @@ async function api(method, path, body) {
@@ -997,12 +997,14 @@ index b0b7e37..e2fc0a5 100644
      } else if (currentView === 'agents') {
        renderAgentsView(); // in-place patcher once built
      } else if (currentView === 'kanban') {
-@@ -354,7 +361,7 @@ let quotaTickCounter = 0;
+@@ -353,8 +360,8 @@ let quotaTickCounter = 0;
+ // ===== VIEW ROUTER =====
  const VIEW_META = {
    dashboard: ['Dashboard', 'Mission control — live overview of your agent OS'],
-   kanban: ['Kanban Board', 'Plan, assign and track work across the fleet'],
+-  kanban: ['Kanban Board', 'Plan, assign and track work across the fleet'],
 -  workflows: ['Projects', 'Connect tasks into campaigns — dependencies run in order, outputs feed forward'],
-+  workflows: ['Pipelines', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
++  kanban: ['Tasks', 'The task board: plan, assign and track every unit of work'],
++  workflows: ['Workflows', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
    deliverables: ['Deliverables', 'Every agent output in one place — read, download, chain'],
    agents: ['Agent Fleet', 'Click any agent for memory, messages & cost'],
    agentic: ['Agentic Capabilities', 'Approvals · verification · scheduling · self-healing · cost control'],
@@ -1011,7 +1013,7 @@ index b0b7e37..e2fc0a5 100644
    tools: ['Tools Hub', 'Connected tools & integration health'],
    programs: ['Programs', 'Registered workloads'],
 -  projects: ['Projects', 'Code projects on this machine'],
-+  projects: ['Repositories', 'Your code repositories — infra and client projects, with backup & delivery workflow'],
++  projects: ['Projects', 'Your durable projects — client and personal, with backup & delivery workflow'],
    guardian: ['Guardian', 'Change protection & automatic drift repair'],
    usage: ['Usage & Cost', 'Token consumption & estimated spend'],
    observability: ['LLM Observability', 'Traces, tokens & cost via Langfuse'],
@@ -1195,7 +1197,7 @@ index b0b7e37..e2fc0a5 100644
 +  </div>
 +
 +  <div class="manual-sec" id="m-projects">
-+    <h2>🧩 Pipelines</h2>
++    <h2>🧩 Workflows</h2>
 +    <div class="m-sub">Rounds of work where one step feeds the next — they visit your durable projects</div>
 +    <p>A project chains tasks with <b>dependencies</b>. Each stage starts automatically once its predecessors finish, and receives their outputs as input. This is how big jobs stay organized:</p>
 +    <div class="m-visual">  SPEC &amp; PLAN ──▶ IMPLEMENT ──▶ CODE REVIEW ──▶ FIX FINDINGS ──▶ FINAL VERIFICATION
@@ -1228,7 +1230,7 @@ index b0b7e37..e2fc0a5 100644
 +  <div class="manual-sec" id="m-coding">
 +    <h2>🧬 Coding on your own repositories</h2>
 +    <div class="m-sub">Repo-native tasks: the diff is the deliverable</div>
-+    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Repositories tab or the wizard's repo dropdown) — never in a loose workspace. Personal long-lived work (uni projects, own experiments) gets the same treatment via 🏠 personal projects (~/Projects, no client, personal memory). Small iterative jobs (diagnose → try → feedback, like fixing a car) don't need a project at all: one task + Reject-with-feedback rounds. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
++    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Projects tab or the wizard's repo dropdown) — never in a loose workspace. Personal long-lived work (uni projects, own experiments) gets the same treatment via 🏠 personal projects (~/Projects, no client, personal memory). Small iterative jobs (diagnose → try → feedback, like fixing a car) don't need a project at all: one task + Reject-with-feedback rounds. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
 +    <div class="m-steps">
 +      <div class="m-step"><div>Once per repository: run the <b>"🧬 Onboard a code repository"</b> template. It studies your repo (read-only) and writes an AGENTS.md — the house rules every agent will follow there.</div></div>
 +      <div class="m-step"><div>On any coding task or project, pick your repo under <b>"Existing code repository"</b>.</div></div>
@@ -1335,7 +1337,7 @@ index b0b7e37..e2fc0a5 100644
 +    { sel: '.kanban-card', title: 'A task card', body: 'Click any card to open its full record: description, budget, the agent working on it, attachments, its improvement loop, and every file it produced. The ⚑ flag shows which agent claimed it.' },
 +  ],
 +  workflows: [
-+    { sel: '#content', title: 'Pipelines = rounds of work', body: 'A pipeline chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when its inputs are ready. Pipelines VISIT your durable projects (Repositories tab): build v1, fix a bug, iterate a campaign — the project accumulates the results, pipelines come and go.' },
++    { sel: '#content', title: 'Workflows = rounds of work', body: 'A workflow chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when its inputs are ready. Pipelines VISIT your durable projects (Projects tab): build v1, fix a bug, iterate a campaign — the project accumulates the results, pipelines come and go.' },
 +    { sel: '.btn-primary', title: 'Describe a goal', body: 'Click "✨ Describe a goal" and say what you want in plain words — e.g. "an online shop for GPUs". The AI asks smart questions, then proposes a full pipeline (plan → build → review → fix → verify) which you can trim before approving. Coding projects always get quality gates.' },
 +    { sel: '.agentic-row, .wf-card', title: 'A project', body: 'Click one to see its stages, their status, the improvement loop (🔁), and attached files. Green stages are done; the diagram shows what feeds what.' },
 +  ],
@@ -1558,7 +1560,7 @@ index b0b7e37..e2fc0a5 100644
    const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
    let html = `
 +    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
-+      <button class="btn-primary" onclick="newClientProjectUI()">➕ New client project</button>
++      <button class="btn-primary" onclick="newClientProjectUI()">➕ New project</button>
 +    </div>
      <div class="stats-strip">
 -      <div class="stat-card"><div class="stat-num" style="color:#b3a1ff">${projs.length}</div><div class="stat-label">Projects</div></div>
@@ -1644,7 +1646,7 @@ index b0b7e37..e2fc0a5 100644
 +
 +function newClientProjectUI() {
 +  showModal(`
-+    <h2>➕ New client project</h2>
++    <h2>➕ New project</h2>
 +    <div class="view-intro" style="margin-bottom:10px">Creates <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code> as a proper git repository (README, .gitignore, first commit) — the repo-first rule: client code is versioned and backable from minute one. Every work round then targets this repo via the wizard.</div>
 +    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
 +      <input type="checkbox" id="ncp-personal" onchange="const c=$('#ncp-client'); if(c){c.disabled=this.checked; c.value=this.checked?'':c.value;}">
@@ -2232,6 +2234,15 @@ index b0b7e37..e2fc0a5 100644
  function closeModal() {
    const m = $('#modal');
    if (m) m.style.display = 'none';
+@@ -4956,7 +5746,7 @@ function viewWorkflows() {
+   return `
+     <div class="view-intro" style="margin-bottom:12px">A <strong>project</strong> connects several tasks into one campaign. Tasks with dependencies wait until their inputs are DONE, then run automatically — each agent reads its predecessors' deliverable files. Example: research → ad copy → channel plan → publish plan.</div>
+     <div style="display:flex;gap:10px;margin-bottom:14px">
+-      <button class="btn-primary" onclick="newWorkflowUI()">+ New project</button>
++      <button class="btn-primary" onclick="newWorkflowUI()">➕ Create workflow</button>
+       <button class="btn-ghost" title="Describe the whole goal in plain words — the AI plans the task chain" onclick="describeTaskUI()">✨ Describe a goal (AI plans it)</button>
+       <button class="btn-ghost" title="Creates a ready-made 4-task marketing campaign chain — edit the [brackets], then watch it run in order" onclick="createExampleCampaign()">Example: marketing campaign</button>
+     </div>
 @@ -4974,6 +5764,23 @@ async function newWorkflowUI() {
    render();
  }
@@ -2452,7 +2463,7 @@ index b0b7e37..e2fc0a5 100644
          });
          ids.push(created.id);
 diff --git a/static/index.html b/static/index.html
-index bb6661f..a282c7c 100644
+index bb6661f..1698618 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -2464,21 +2475,23 @@ index bb6661f..a282c7c 100644
  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
  </head>
  <body>
-@@ -26,7 +26,7 @@
+@@ -25,8 +25,9 @@
+     <div class="nav-items">
        <div class="nav-group">Command</div>
        <a class="nav-item active" data-view="dashboard"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.8"/></svg></span>Dashboard</a>
-       <a class="nav-item" data-view="kanban"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3.5" y="4" width="5" height="12" rx="1.5"/><rect x="9.5" y="4" width="5" height="16" rx="1.5"/><rect x="15.5" y="4" width="5" height="9" rx="1.5"/></svg></span>Kanban</a>
+-      <a class="nav-item" data-view="kanban"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3.5" y="4" width="5" height="12" rx="1.5"/><rect x="9.5" y="4" width="5" height="16" rx="1.5"/><rect x="15.5" y="4" width="5" height="9" rx="1.5"/></svg></span>Kanban</a>
 -      <a class="nav-item" data-view="workflows"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="6" r="2.2"/><circle cx="18.5" cy="6" r="2.2"/><circle cx="12" cy="18" r="2.2"/><line x1="7" y1="7.5" x2="10.7" y2="16.2"/><line x1="17" y1="7.5" x2="13.3" y2="16.2"/><line x1="7.7" y1="6" x2="16.3" y2="6"/></svg></span>Projects</a>
-+      <a class="nav-item" data-view="workflows"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="6" r="2.2"/><circle cx="18.5" cy="6" r="2.2"/><circle cx="12" cy="18" r="2.2"/><line x1="7" y1="7.5" x2="10.7" y2="16.2"/><line x1="17" y1="7.5" x2="13.3" y2="16.2"/><line x1="7.7" y1="6" x2="16.3" y2="6"/></svg></span>Pipelines</a>
++      <a class="nav-item" data-view="projects"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7.2a2 2 0 0 1 2-2h4l2.2 2.3h6.8a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg></span>Projects</a>
++      <a class="nav-item" data-view="workflows"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="6" r="2.2"/><circle cx="18.5" cy="6" r="2.2"/><circle cx="12" cy="18" r="2.2"/><line x1="7" y1="7.5" x2="10.7" y2="16.2"/><line x1="17" y1="7.5" x2="13.3" y2="16.2"/><line x1="7.7" y1="6" x2="16.3" y2="6"/></svg></span>Workflows</a>
++      <a class="nav-item" data-view="kanban"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3.5" y="4" width="5" height="12" rx="1.5"/><rect x="9.5" y="4" width="5" height="16" rx="1.5"/><rect x="15.5" y="4" width="5" height="9" rx="1.5"/></svg></span>Tasks</a>
        <a class="nav-item" data-view="deliverables"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><polyline points="4 7.5 12 12 20 7.5"/><line x1="12" y1="12" x2="12" y2="21"/></svg></span>Deliverables</a>
        <a class="nav-item" data-view="agents"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="2.6"/><circle cx="5" cy="5.5" r="1.8"/><circle cx="19" cy="5.5" r="1.8"/><circle cx="12" cy="20" r="1.8"/><line x1="6.3" y1="6.8" x2="10.1" y2="10.2"/><line x1="17.7" y1="6.8" x2="13.9" y2="10.2"/><line x1="12" y1="14.6" x2="12" y2="18.2"/></svg></span>Agents</a>
        <a class="nav-item" data-view="agentic"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="9" ry="3.8"/><ellipse cx="12" cy="12" rx="9" ry="3.8" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="9" ry="3.8" transform="rotate(120 12 12)"/></svg></span>Agentic <span class="badge" id="apprBadge" style="display:none">0</span></a>
-@@ -38,13 +38,14 @@
+@@ -38,13 +39,13 @@
        <a class="nav-item" data-view="monitor"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12.5" rx="2"/><polyline points="6.5 12 9 9.5 11.5 13 14 8.5 17.5 12"/><line x1="9" y1="20.5" x2="15" y2="20.5"/><line x1="12" y1="16.5" x2="12" y2="20.5"/></svg></span>Monitor</a>
        <a class="nav-item" data-view="tools"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9.5" cy="7" r="2.2" fill="var(--bg-2)"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2.2" fill="var(--bg-2)"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="7.5" cy="17" r="2.2" fill="var(--bg-2)"/></svg></span>Tools</a>
        <a class="nav-item" data-view="programs"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><polyline points="7 9 10 12 7 15"/><line x1="12.5" y1="15" x2="17" y2="15"/></svg></span>Programs</a>
 -      <a class="nav-item" data-view="projects"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7.2a2 2 0 0 1 2-2h4l2.2 2.3h6.8a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg></span>Projects</a>
-+      <a class="nav-item" data-view="projects"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7.2a2 2 0 0 1 2-2h4l2.2 2.3h6.8a2 2 0 0 1 2 2v8.3a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg></span>Repositories</a>
        <a class="nav-item" data-view="guardian"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.8l7.2 2.9v5.6c0 4.9-3.4 7.9-7.2 9.9-3.8-2-7.2-5-7.2-9.9V5.7z"/><polyline points="8.8 11.8 11.2 14.2 15.4 9.6"/></svg></span>Guardian</a>
        <div class="nav-group">Insights</div>
        <a class="nav-item" data-view="usage"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><line x1="5.5" y1="20" x2="5.5" y2="13"/><line x1="10.5" y1="20" x2="10.5" y2="9"/><line x1="15.5" y1="20" x2="15.5" y2="15"/><line x1="20.5" y1="20" x2="20.5" y2="5.5"/></svg></span>Usage</a>
@@ -2504,7 +2517,7 @@ index bb6661f..a282c7c 100644
 -<script src="/static/app.js?v=28"></script>
 +<script src="/static/memory3d.js?v=5" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=40"></script>
++<script src="/static/app.js?v=41"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css
