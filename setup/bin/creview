@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# creview — frontier Claude adversarially reviews the current change against SPEC.md.
+# Part of the GLM<->Claude bridge (docs: ~/knowledge/WORKFLOW.md).
+# Usage: creview [base-ref]
+#   no arg: reviews uncommitted work if any, else the last commit
+set -euo pipefail
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "creview: run inside a git repo" >&2; exit 1; }
+
+BASE="${1:-}"
+if [ -n "$BASE" ]; then
+  SCOPE="the diff against '$BASE' (run: git diff $BASE)"
+elif [ -n "$(git status --porcelain)" ]; then
+  SCOPE="the uncommitted work (run: git diff HEAD; also git status --short — read important untracked files directly)"
+else
+  SCOPE="the last commit (run: git show HEAD)"
+fi
+
+PROMPT="You are the frontier reviewer — a second, stronger model adversarially reviewing code produced by a weaker one (GLM-5.2). Review $SCOPE in this repository.
+
+Steps:
+1. If SPEC.md exists at the repo root, read it — it is the requirements contract. If not, review against sound engineering practice plus ~/knowledge/domains/software-engineering/RUBRIC.md.
+2. Inspect the change with the commands above. Read surrounding code where needed to judge correctness in context — a diff can look fine and still break its callers.
+3. Requirement coverage: map every numbered SPEC requirement to met / partial / missing, with evidence (file:line).
+4. Hunt what weaker models typically get wrong: edge cases, error paths, off-by-ones, unsafe input handling, tests that assert too little or game the outcome, silent scope creep, dead code, secrets in code.
+5. Output sections, in order: VERDICT (SHIP | FIX FIRST | REJECT) · Requirement coverage · Blocking findings (file:line, why, concrete fix) · Non-blocking findings · What I checked and found clean.
+
+Do not rewrite the code. Do not modify any files. Be specific enough that each fix needs no interpretation."
+
+exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES -u ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
+  -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_SUBAGENT_MODEL -u CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY \
+  -u CLAUDE_CODE_EFFORT_LEVEL -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u CLAUDE_CODE_WORKFLOWS \
+  -u CLAUDE_CODE_ALWAYS_ENABLE_EFFORT -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC -u API_TIMEOUT_MS \
+  -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+  claude -p "$PROMPT"

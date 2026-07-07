@@ -1,0 +1,12 @@
+name: web-local-reader
+version: 1.0.0
+description: >
+  Keyless web content extraction for web_extract. trafilatura (fully local,
+  private, unlimited) first, with automatic Jina AI Reader fallback
+  (https://r.jina.ai, keyless, renders JavaScript). No API key, no
+  self-hosting. Optional: `pip install trafilatura` for local-first extraction;
+  optional JINA_API_KEY raises the Jina rate limit.
+author: sinep
+kind: backend
+provides_web_providers:
+  - local-reader

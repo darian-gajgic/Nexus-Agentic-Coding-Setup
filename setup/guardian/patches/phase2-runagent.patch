@@ -1,0 +1,52 @@
+diff --git a/run_agent.py b/run_agent.py
+index aaafd469a..d0827e95e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -485,6 +485,9 @@ class AIAgent:
+         skip_context_files: bool = False,
+         load_soul_identity: bool = False,
+         skip_memory: bool = False,
++        provider_memory: bool = False,
++        memory_agent_id: str = None,
++        memory_read_only: bool = False,
+         session_db=None,
+         parent_session_id: str = None,
+         iteration_budget: "IterationBudget" = None,
+@@ -560,6 +563,9 @@ class AIAgent:
+             skip_context_files=skip_context_files,
+             load_soul_identity=load_soul_identity,
+             skip_memory=skip_memory,
++            provider_memory=provider_memory,
++            memory_agent_id=memory_agent_id,
++            memory_read_only=memory_read_only,
+             session_db=session_db,
+             parent_session_id=parent_session_id,
+             iteration_budget=iteration_budget,
+@@ -3370,11 +3376,14 @@ class AIAgent:
+             sync_kwargs = {"session_id": self.session_id or ""}
+             if messages is not None:
+                 sync_kwargs["messages"] = messages
+-            self._memory_manager.sync_all(
+-                user_text,
+-                response_text,
+-                **sync_kwargs,
+-            )
++            # Read-only specialist scope: keep retrieval (prefetch below) but skip the
++            # per-turn append-all write so role memory stays curated, not a log.
++            if not getattr(self, "_memory_read_only", False):
++                self._memory_manager.sync_all(
++                    user_text,
++                    response_text,
++                    **sync_kwargs,
++                )
+             self._memory_manager.queue_prefetch_all(
+                 user_text,
+                 session_id=self.session_id or "",
+@@ -5644,6 +5653,7 @@ class AIAgent:
+             acp_command=function_args.get("acp_command"),
+             acp_args=function_args.get("acp_args"),
+             role=function_args.get("role"),
++            specialist=function_args.get("specialist"),
+             background=(not _is_subagent),
+             parent_agent=self,
+         )

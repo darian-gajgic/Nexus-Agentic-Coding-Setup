@@ -1,0 +1,135 @@
+diff --git a/plugins/observability/langfuse/__init__.py b/plugins/observability/langfuse/__init__.py
+index 31904d47e..6cfb5c40e 100644
+--- a/plugins/observability/langfuse/__init__.py
++++ b/plugins/observability/langfuse/__init__.py
+@@ -530,10 +530,103 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+     return serialized
+ 
+ 
++def _mget(obj: Any, key: str) -> Any:
++    """Attribute-or-key access so both objects and dict-shaped messages work."""
++    if isinstance(obj, dict):
++        return obj.get(key)
++    return getattr(obj, key, None)
++
++
++def _reasoning_details_text(details: Any) -> Optional[str]:
++    """Flatten a ``reasoning_details`` list into a single string.
++
++    Shape: ``[{"type": "reasoning.text", "text": "..."}, ...]``. Recognised text
++    keys, in order: ``text`` (OpenRouter unified), ``thinking`` (Anthropic-shaped
++    blocks), ``summary`` / ``content`` (other providers). Returns None when there
++    is nothing usable.
++    """
++    if not isinstance(details, (list, tuple)):
++        return None
++    parts = []
++    for item in details:
++        if isinstance(item, dict):
++            piece = (
++                item.get("text")
++                or item.get("thinking")
++                or item.get("summary")
++                or item.get("content")
++            )
++            if isinstance(piece, str) and piece.strip():
++                parts.append(piece)
++    return "\n\n".join(parts) if parts else None
++
++
++def _extract_reasoning(message: Any) -> Optional[str]:
++    """Best-effort chain-of-thought text from an assistant message, or None.
++
++    Providers disagree on where reasoning lives, and Hermes' chat transport keeps
++    ``reasoning`` distinct from ``reasoning_content`` / ``reasoning_details``:
++
++      * Anthropic / Gemini / Bedrock            -> ``message.reasoning``
++      * GLM (Z.AI) / DeepSeek / Moonshot (Kimi) -> ``message.reasoning_content``
++      * OpenRouter unified                      -> ``message.reasoning_details`` (list)
++
++    ``NormalizedResponse`` carries the latter two in ``provider_data`` and
++    re-exposes them via ``.reasoning_content`` / ``.reasoning_details`` properties,
++    so a plain ``getattr(message, "reasoning", None)`` silently misses GLM /
++    DeepSeek / Kimi thinking — the bug this fixes. Check every known location in
++    precedence order. Fail-open (never raise): observability must not break a turn.
++    """
++    try:
++        # 1. Native single-field reasoning (already-normalized providers).
++        reasoning = _mget(message, "reasoning")
++        if isinstance(reasoning, str) and reasoning.strip():
++            return reasoning
++
++        # 2. reasoning_content — NormalizedResponse property, raw SDK attr, or key
++        #    (GLM/Z.AI, DeepSeek, Moonshot/Kimi thinking mode).
++        rc = _mget(message, "reasoning_content")
++        if isinstance(rc, str) and rc.strip():
++            return rc
++
++        # 3. reasoning_details (OpenRouter unified) — property, attr, or key.
++        text = _reasoning_details_text(_mget(message, "reasoning_details"))
++        if text:
++            return text
++
++        # 4. provider_data passthrough (defensive: a pre-property NormalizedResponse
++        #    or a raw dict that carries provider_data).
++        pd = _mget(message, "provider_data")
++        if isinstance(pd, dict):
++            rc = pd.get("reasoning_content")
++            if isinstance(rc, str) and rc.strip():
++                return rc
++            text = _reasoning_details_text(pd.get("reasoning_details"))
++            if text:
++                return text
++
++        # 5. pydantic ``model_extra`` passthrough (OpenAI SDK objects stash unknown
++        #    fields here; some proxies deliver reasoning_content this way).
++        model_extra = _mget(message, "model_extra")
++        if isinstance(model_extra, dict):
++            rc = model_extra.get("reasoning_content")
++            if isinstance(rc, str) and rc.strip():
++                return rc
++            r = model_extra.get("reasoning")
++            if isinstance(r, str) and r.strip():
++                return r
++    except Exception:  # pragma: no cover - fail-open
++        return None
++    return None
++
++
+ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
+     return {
+         "content": _safe_value(getattr(message, "content", None)),
+-        "reasoning": _safe_value(getattr(message, "reasoning", None)),
++        # Read reasoning from every provider location, not just ``.reasoning``:
++        # GLM/Z.AI, DeepSeek and Kimi return it in ``reasoning_content`` (kept in
++        # NormalizedResponse.provider_data), which the plain attribute read missed.
++        "reasoning": _safe_value(_extract_reasoning(message)),
+         "tool_calls": _serialize_tool_calls(getattr(message, "tool_calls", None)),
+     }
+ 
+@@ -658,11 +751,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
+         )
+         root_span = root_ctx.__enter__()
+ 
+-    try:
+-        root_span.set_trace_io(input=trace_input)
+-    except Exception:
+-        pass
+-
++    # Trace-level input is derived by the Langfuse backend from the root
++    # observation's input (set via start_as_current_observation(input=...)
++    # above); the deprecated set_trace_io() override is intentionally omitted.
+     _debug(f"started trace {trace_id} for {task_key}")
+     return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+ 
+@@ -754,7 +845,9 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
+                 _end_observation(observation)
+         final_output = _merge_trace_output(output, state)
+         if final_output is not None:
+-            state.root_span.set_trace_io(output=final_output)
++            # Trace-level output is derived by the Langfuse backend from the
++            # root observation's output; update() below sets it. The deprecated
++            # set_trace_io() override is intentionally omitted.
+             state.root_span.update(output=final_output)
+         state.root_span.end()
+     except Exception as exc:  # pragma: no cover - fail-open

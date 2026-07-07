@@ -1,0 +1,15 @@
+# Qdrant vector store for mem0 (SERVER mode, so both the Hermes gateway AND the
+# nexus Memory tab can read it concurrently — embedded/file mode is single-process).
+# Localhost-bound; restart:always so it auto-starts on boot with the Docker daemon.
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    restart: always
+    ports:
+      - 127.0.0.1:6333:6333
+      - 127.0.0.1:6334:6334
+    volumes:
+      - qdrant_storage:/qdrant/storage
+volumes:
+  qdrant_storage:
+    driver: local

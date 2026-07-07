@@ -1,0 +1,275 @@
+{
+  "version": 1,
+  "created": "2026-07-05",
+  "description": "Every change made to the Hermes setup during the 2026-07 hardening session. The guardian reconciler reads this to verify + restore changes after a Hermes update or a reboot.",
+  "hermes_repo": "~/.hermes/hermes-agent",
+  "hermes_venv_python": "~/.hermes/hermes-agent/venv/bin/python",
+  "config_file": "~/.hermes/config.yaml",
+  "env_file": "~/.hermes/.env",
+  "config_values": [
+    {
+      "path": "agent.reasoning_effort",
+      "expected": "xhigh",
+      "enforce": true
+    },
+    {
+      "path": "auxiliary.vision.provider",
+      "expected": "custom",
+      "enforce": true
+    },
+    {
+      "path": "auxiliary.vision.base_url",
+      "expected": "http://localhost:11434/v1",
+      "enforce": true
+    },
+    {
+      "path": "auxiliary.vision.model",
+      "expected": "qwen3-vl:8b",
+      "enforce": true
+    },
+    {
+      "path": "memory.provider",
+      "expected": "mem0",
+      "enforce": true
+    },
+    {
+      "path": "updates.pre_update_backup",
+      "expected": true,
+      "enforce": true
+    },
+    {
+      "path": "tool_loop_guardrails.hard_stop_enabled",
+      "expected": true,
+      "enforce": true
+    },
+    {
+      "path": "security.tirith_enabled",
+      "expected": true,
+      "enforce": true
+    },
+    {
+      "path": "security.tirith_fail_open",
+      "expected": false,
+      "enforce": true
+    },
+    {
+      "path": "security.redact_secrets",
+      "expected": true,
+      "enforce": true
+    }
+  ],
+  "config_contains": [
+    {
+      "path": "plugins.enabled",
+      "must_include": "observability/langfuse",
+      "enforce": true
+    },
+    {
+      "path": "mcp_servers.playwright.args",
+      "must_include": "@playwright/mcp@0.0.77",
+      "enforce": false
+    },
+    {
+      "path": "mcp_servers.context7.args",
+      "must_include": "@upstash/context7-mcp@3.2.2",
+      "enforce": false
+    }
+  ],
+  "config_absent": [
+    {
+      "path": "fallback_model",
+      "reason": "removed 2026-07-05 (silent-truncation local fallback); rely on server default"
+    },
+    {
+      "path": "command_allowlist",
+      "reason": "removed 2026-07-06 (remediation S1/C4): the two category entries auto-approved every interpreter -e/-c/heredoc unprompted; an 'always' answer at a future approval prompt regrows this key \u2014 treat any reappearance as drift and re-review"
+    }
+  ],
+  "skills_disabled_must_exclude": [
+    "github-issues",
+    "local-vision-models",
+    "parallel-delegated-build"
+  ],
+  "env_present": [
+    "HERMES_LANGFUSE_PUBLIC_KEY",
+    "HERMES_LANGFUSE_SECRET_KEY",
+    "HERMES_LANGFUSE_BASE_URL",
+    "HERMES_LANGFUSE_ENV",
+    "API_SERVER_KEY",
+    "JARVIS_HUD_TOKEN",
+    "BRAVE_SEARCH_API_KEY",
+    "GLM_API_KEY",
+    "SUPERMEMORY_API_KEY"
+  ],
+  "files": [
+    {
+      "path": "~/.hermes/plugins/model-providers/zai/__init__.py",
+      "golden": "zai_override__init__.py",
+      "sha256": "23be76dfd95f02aaaaa66cd6d2dccb7a700454586cc4a59b65096068dfdc71ef",
+      "mode": "0o664",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/scripts/pixel_qa.py",
+      "golden": "pixel_qa.py",
+      "sha256": "248d5106e27b0f141591567bebaae9bd0f7cf1c049b72aa456ff561ee626039c",
+      "mode": "0o664",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/scripts/reinstall-extras.sh",
+      "golden": "reinstall-extras.sh",
+      "sha256": "a814b1b356adcdba7fcba4476eebed2333c165b68a9173d751d9d93b9e5f1636",
+      "mode": "0o775",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/skills/client-delivery-gate/SKILL.md",
+      "golden": "client-delivery-gate_SKILL.md",
+      "sha256": "06e3b0c9291536b5d26946307560b0e407c0b7d1af0e0b1d197bf8cc551017f0",
+      "mode": "0o664",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/skills/software-development/hermes-agent-skill-authoring/SKILL.md",
+      "golden": "hermes-agent-skill-authoring_SKILL.md",
+      "sha256": "c88397ce7508959f20f996ec9cd6ad7058b40db4e933ca983d99b1d0bf4d2d04",
+      "mode": "0o664",
+      "patches": [
+        {
+          "find": "/home/bb/hermes-agent",
+          "replace": "~/.hermes/hermes-agent"
+        }
+      ],
+      "restore_mode": "patch"
+    },
+    {
+      "path": "~/langfuse/docker-compose.yml",
+      "golden": "langfuse-docker-compose.yml",
+      "sha256": "3dd6cb911e0b1dd9ac5de45528198c46dbca2417a208b81a4593e5d8b7283c4f",
+      "mode": "0o664",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/scripts/mem0_dump.py",
+      "golden": "mem0_dump.py",
+      "sha256": "3d16ab46c748e06cdc554fdfcfdb142e99d4bd80726c0b46febb9048a4522840",
+      "mode": "0o775",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/qdrant/docker-compose.yml",
+      "golden": "qdrant-docker-compose.yml",
+      "sha256": "4789af2a1bbed07fe0e82affb9c6d70cafb7b1cb75768067f7a41eb213acdf57",
+      "mode": "0o664",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/mem0.json",
+      "golden": "mem0.json",
+      "sha256": "344fe41be39919af84d58dfd3807f75e20f89cdade0fb4cc2540ea109e27603c",
+      "mode": "0o600",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/hermes-agent/tools/specialist_resolver.py",
+      "golden": "specialist_resolver.py",
+      "sha256": "dd5ba414e7bb9f54a587be29290ff6468beb81b4de4a384a33646b5e49ab13bf",
+      "mode": "644",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/scripts/mem0_curate.py",
+      "golden": "mem0_curate.py",
+      "sha256": "14b0bdc8e971f4277a201298641ef2768ccfa326b2d7fec0682db25a0805cfa4",
+      "mode": "755",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/scripts/reflect.py",
+      "golden": "reflect.py",
+      "sha256": "9b52f3992b3aadf2ae97d5b7c8d65bcfb7533fd93ca82813830a190797ec6df6",
+      "mode": "755",
+      "restore_mode": "whole"
+    },
+    {
+      "path": "~/.hermes/scripts/prune_lessons.py",
+      "golden": "prune_lessons.py",
+      "sha256": "16465da2aa6beccc8df32f688de7aaf0fea954d5e28fb353586ca69d04dbab7b",
+      "mode": "755",
+      "restore_mode": "whole"
+    }
+  ],
+  "packages": [
+    {
+      "spec": "langfuse==4.13.0",
+      "import": "langfuse"
+    },
+    {
+      "spec": "ollama==0.6.2",
+      "import": "ollama"
+    },
+    {
+      "spec": "mem0ai==2.0.10",
+      "import": "mem0"
+    },
+    {
+      "spec": "qdrant-client==1.18.0",
+      "import": "qdrant_client"
+    }
+  ],
+  "services": [
+    {
+      "unit": "hermes-gateway.service",
+      "scope": "user",
+      "restorable": false,
+      "note": "Hermes-managed"
+    },
+    {
+      "unit": "nexus.service",
+      "scope": "user",
+      "restorable": true
+    },
+    {
+      "unit": "hermes-guardian.timer",
+      "scope": "user",
+      "restorable": true
+    },
+    {
+      "unit": "docker.service",
+      "scope": "system",
+      "restorable": false,
+      "note": "check only; Langfuse depends on it"
+    },
+    {
+      "unit": "hermes-reflect.timer",
+      "scope": "user",
+      "restorable": true
+    },
+    {
+      "unit": "hermes-prune.timer",
+      "scope": "user",
+      "restorable": true
+    }
+  ],
+  "notes": [
+    "Config values SURVIVE hermes update (deep-merge); guardian verifies + reports drift.",
+    "Files SURVIVE update but guardian restores from golden/ if ever deleted.",
+    "Packages langfuse+ollama are NOT in the lockfile; a VENV REBUILD prunes them -> guardian reinstalls.",
+    "nexus edits are committed to git (e141022); guardian checks the service + files, not git.",
+    "mem0 uses qdrant SERVER mode (localhost:6333, docker, restart:always) so nexus can read memories concurrently; embedded store kept at ~/.hermes/mem0_qdrant as a backup."
+  ],
+  "containers": [
+    {
+      "name": "qdrant",
+      "compose_dir": "~/qdrant",
+      "ready_url": "http://localhost:6333/readyz"
+    },
+    {
+      "name": "langfuse-web",
+      "compose_dir": "~/langfuse",
+      "ready_url": "http://localhost:3000/api/public/health"
+    }
+  ],
+  "skills_disabled_enforce": true
+}

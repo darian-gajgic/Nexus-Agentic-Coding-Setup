@@ -1,0 +1,13 @@
+name: computer-use-wayland-portal
+version: 1.0.0
+description: >
+  Makes Hermes computer_use work on GNOME Wayland. Monkey-patches CuaDriverBackend
+  so capture() uses get_desktop_state (xdg-desktop-portal Screenshot, full desktop)
+  and click/type/key/scroll/drag route through wl-inject (xdg-desktop-portal
+  RemoteDesktop input over D-Bus), with automatic capture->input coordinate scaling
+  (e.g. 2560x1600 physical -> 1920x1200 logical, x0.75). No-ops off GNOME Wayland,
+  leaving the stock X11 path untouched. One "Allow" consent click per Hermes run.
+  Fully userspace/reversible; requires ~/.local/bin/wl-inject. See
+  ~/.claude/.../memory/hermes-cua-wayland-capture-fix.md.
+author: sinep
+kind: standalone

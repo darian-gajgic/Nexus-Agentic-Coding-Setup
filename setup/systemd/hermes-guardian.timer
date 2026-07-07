@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Hermes Guardian on boot and every 15 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

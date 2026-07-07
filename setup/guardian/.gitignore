@@ -1,0 +1,6 @@
+reports/
+latest-report.json
+state.json
+core-mods-state.json
+__pycache__/
+*.pyc

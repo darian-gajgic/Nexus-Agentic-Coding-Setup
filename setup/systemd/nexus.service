@@ -1,0 +1,17 @@
+[Unit]
+Description=NEXUS Agent OS (Agentic OS dashboard)
+# User units cannot order against system units (docker.service) and user-scope
+# network-online.target has no wait service — only the gateway ordering below
+# is real. Nexus itself is fail-soft toward qdrant/Langfuse/gateway anyway.
+After=hermes-gateway.service
+Wants=hermes-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sinep/nexus-agent-os
+ExecStart=/home/sinep/nexus-agent-os/start.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
