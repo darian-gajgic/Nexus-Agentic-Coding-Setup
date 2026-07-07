@@ -1243,6 +1243,8 @@ function viewManual() {
     <p>Everything agents produce is collected under <b>Deliverables</b>: reports, images, documents, whole applications. Markdown reports preview inline; everything is downloadable.</p>
     <h4>▶ Test app — run what they built</h4>
     <p>When a task produced a program or website, the <b>▶ Test app</b> button starts it safely on your machine and opens it in a new tab. It shuts down by itself after 30 minutes. If it shows "starting" forever, open the log in the same dialog — it tells the truth.</p>
+    <h4>🔍 Review changes — the pull-request view for everything</h4>
+    <p>Every task's detail (and every workflow via "Review results") offers a per-file comparison against the previous version: code shows real line-by-line diffs (green added, red removed), <b>PDFs are compared by their extracted text</b>, images side-by-side, and each rework round becomes a new version automatically. Judge the update like a programmer judges a pull request — then approve or reject with feedback.</p>
     <h4>Follow-ups</h4>
     <p>Under any deliverable, <b>Chain a follow-up</b> creates a new task that receives this result as input — "now translate it", "now make a landing page from it".</p>
   </div>
@@ -1730,6 +1732,101 @@ async function kiDelete(id) {
   catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
+// ═══════════════════ RESULT REVIEW (PR-style comparison, all output types) ═══════════════════
+let _review = null;
+
+async function reviewTaskUI(taskId, title) {
+  showModal(`<h2>🔍 Review changes — ${esc(title || taskId)}</h2>
+    <div class="loading" style="padding:40px;text-align:center">Comparing versions…</div>`);
+  try {
+    const r = await api('GET', `/api/tasks/${taskId}/review`);
+    _review = { r, taskId, sel: 0 };
+    renderReviewModal(title || taskId);
+  } catch (e) {
+    showModal(`<h2>🔍 Review</h2><div class="empty">${esc(e.message)}</div>
+      <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+  }
+}
+
+function renderReviewModal(title) {
+  const { r } = _review;
+  const files = r.files || [];
+  const statChip = f => `<span class="review-stat"><span class="rf-add">+${f.additions}</span> <span class="rf-del">−${f.deletions}</span></span>`;
+  const icon = f => f.status === 'added' ? '🟢' : f.status === 'deleted' ? '🔴' : '🟡';
+  showModal(`
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔍 ${esc(title)}
+      <span class="chip">${esc(r.mode === 'git' ? 'git diff' : 'version comparison')}</span>
+      <span class="review-stat" style="margin-left:auto"><span class="rf-add">+${r.additions || 0}</span> <span class="rf-del">−${r.deletions || 0}</span> · ${files.length} file(s)</span></h2>
+    <div class="view-intro" style="margin-bottom:10px">${esc(r.source || '')}${r.note ? ' — ' + esc(r.note) : ''}. 🟢 added · 🟡 changed · 🔴 removed — click a file to inspect it.</div>
+    ${files.length ? `
+    <div class="review-layout">
+      <div class="review-files">
+        ${files.map((f, i) => `
+          <div class="review-file ${i === _review.sel ? 'active' : ''}" onclick="_review.sel=${i};renderReviewFilePane()" id="rf-${i}">
+            <span>${icon(f)}</span><span class="rf-path" title="${esc(f.path)}">${esc(f.path)}</span>${statChip(f)}
+          </div>`).join('')}
+      </div>
+      <div class="review-pane" id="reviewPane"></div>
+    </div>` : '<div class="empty"><span class="e-ico">✓</span>No changes to review — output is identical to the previous version.</div>'}
+    <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+  if (files.length) renderReviewFilePane();
+}
+
+function renderReviewFilePane() {
+  const { r, sel } = _review;
+  const f = (r.files || [])[sel];
+  const pane = document.getElementById('reviewPane');
+  if (!f || !pane) return;
+  document.querySelectorAll('.review-file').forEach((el, i) =>
+    el.classList.toggle('active', i === sel));
+  let html = `<div style="margin-bottom:8px;font-size:12px;color:var(--text-dim)">
+    <b>${esc(f.path)}</b> · ${esc(f.status)}${f.kind === 'pdf' ? ' · 📄 PDF (compared by extracted text)' : ''}</div>`;
+  if (f.kind === 'image') {
+    html += `<div style="display:flex;gap:14px;flex-wrap:wrap">
+      ${f.old_size != null ? `<div><div class="muted" style="font-size:11px">previous (${(f.old_size / 1024).toFixed(0)} KB)</div></div>` : ''}
+      ${f.new_url ? `<div><div class="muted" style="font-size:11px">current (${((f.new_size || 0) / 1024).toFixed(0)} KB)</div><img src="${esc(f.new_url)}" style="max-width:420px;max-height:320px;border-radius:10px;border:1px solid var(--border)"></div>` : ''}
+    </div>`;
+  } else if (f.binary && !(f.hunks || []).length) {
+    html += `<div class="empty" style="padding:20px">Binary file — ${f.status}${f.old_size != null ? `, ${(f.old_size / 1024).toFixed(0)} KB` : ''}${f.new_size != null ? ` → ${(f.new_size / 1024).toFixed(0)} KB` : ''}</div>`;
+  } else if (!(f.hunks || []).length) {
+    html += `<div class="empty" style="padding:20px">${f.status === 'added' ? 'New file (preview it under the task\'s Files section).' : 'No line-level comparison available.'}</div>`;
+  } else {
+    html += (f.hunks || []).map(h => `
+      <div class="diff-hunk">
+        <div class="diff-hunk-head">${esc(h.header)}</div>
+        ${(h.lines || []).map(l => `
+          <div class="diff-line ${l.t === '+' ? 'add' : l.t === '-' ? 'del' : ''}">
+            <span class="diff-sign">${l.t === ' ' ? '' : esc(l.t)}</span><pre>${esc(l.s)}</pre>
+          </div>`).join('')}
+      </div>`).join('');
+  }
+  pane.innerHTML = html;
+  pane.scrollTop = 0;
+}
+
+async function reviewWorkflowUI(wfId, name) {
+  showModal(`<h2>🔍 Review results — ${esc(name)}</h2>
+    <div class="loading" style="padding:40px;text-align:center">Collecting member task changes…</div>`);
+  try {
+    const r = await api('GET', `/api/workflows/${wfId}/review`);
+    const rows = (r.tasks || []).map(t => `
+      <div class="agentic-row" style="cursor:pointer" onclick="reviewTaskUI('${esc(t.task_id)}','${esc((t.title || '').slice(0, 60))}')">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <strong style="flex:1">${esc(t.title)}</strong>
+          <span class="chip ${t.status === 'done' ? 'c-green' : ''}">${esc(t.status)}</span>
+          ${t.error ? `<span class="chip c-red">${esc(t.error)}</span>`
+        : `<span class="chip">${esc(t.mode === 'git' ? 'git' : 'versions')}</span>
+           <span class="review-stat">${t.files} file(s) · <span class="rf-add">+${t.additions}</span> <span class="rf-del">−${t.deletions}</span></span>`}
+        </div>
+      </div>`).join('');
+    showModal(`<h2>🔍 Review results — ${esc(name)}</h2>
+      <div class="view-intro" style="margin-bottom:10px">Each stage's changes since its previous version — click one for the file-by-file comparison.</div>
+      <div style="display:flex;flex-direction:column;gap:6px;max-height:55vh;overflow-y:auto">
+        ${rows || '<div class="empty">No task output yet.</div>'}</div>
+      <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+  } catch (e) { toast('Review failed: ' + e.message, 'err'); }
+}
+
 // ═══════════════════ APP PREVIEW (▶ test a task's program output live) ═══════════════════
 let appPreviewPoll = null;
 
@@ -2026,7 +2123,8 @@ async function loadTaskExtras(t) {
         </div></div>`;
     }
     if ((fr.files || []).length) {
-      html += `<div class="form-group"><label class="form-label">Deliverable files (workspace)</label>
+      html += `<div class="form-group"><label class="form-label" style="display:flex;align-items:center;gap:10px">Deliverable files (workspace)
+        <button class="btn-sm" style="border-color:var(--accent)" title="PR-style comparison: what changed since the previous version — per file, for code AND documents" onclick="reviewTaskUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">🔍 Review changes</button></label>
         <div style="display:flex;flex-direction:column;gap:4px">` +
         fr.files.map(f => `<a href="/api/tasks/${esc(t.id)}/files/${encPath(f.name)}" target="_blank"
           style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📄 ${esc(f.name)} <span class="muted">(${(f.size / 1024).toFixed(1)} KB)</span></a>`).join('') +
@@ -5799,8 +5897,10 @@ async function loadWorkflows() {
 function viewWorkflows() {
   if (!wfState.fetched) { loadWorkflows(); return skeletonView(); }
   const wfIds = focusProjectWorkflowIds();
+  const fp = focusCtx.project;
   const scoped = (wfState.list || []).filter(w =>
-    !wfIds || wfIds.has(w.id) || !w.tasks_total); // empty workflows stay visible (just created)
+    !fp || w.project_path === fp.path || (wfIds && wfIds.has(w.id)));
+  const scopeNote = fp ? `<div class="view-intro" style="margin-bottom:8px">Scoped to 📂 <b>${esc(fp.name)}</b> — ${scoped.length} of ${(wfState.list || []).length} workflows. <span class="fx" style="cursor:pointer;color:var(--accent-2)" onclick="setFocusProject(null)">show all</span></div>` : '';
   const rows = scoped.map(w => `
     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
@@ -5825,17 +5925,24 @@ function viewWorkflows() {
       <button class="btn-ghost" title="Describe the whole goal in plain words — the AI plans the task chain" onclick="describeTaskUI()">✨ Describe a goal (AI plans it)</button>
       <button class="btn-ghost" title="Creates a ready-made 4-task marketing campaign chain — edit the [brackets], then watch it run in order" onclick="createExampleCampaign()">Example: marketing campaign</button>
     </div>
-    <div class="agentic-grid">${rows || '<div class="empty"><span class="e-ico">⚑</span>No projects yet — create one, or start from the example campaign.</div>'}</div>`;
+    ${scopeNote}
+    <div class="agentic-grid">${rows || `<div class="empty"><span class="e-ico">⚑</span>${focusCtx.project ? 'No workflows in this project yet — ✨ Describe a goal creates the first round.' : 'No workflows yet — create one, or start from the example campaign.'}</div>`}</div>`;
 }
 function bindWorkflows() { /* inline onclick */ }
 
 async function newWorkflowUI() {
-  const name = prompt('Project name (e.g. "Q3 marketing campaign"):');
+  const name = prompt('Workflow name (e.g. "Q3 marketing campaign"):');
   if (!name || !name.trim()) return;
   const goal = prompt('Goal in one sentence (what does DONE look like?):') || '';
-  await api('POST', '/api/workflows', { name: name.trim(), goal: goal.trim() });
+  await api('POST', '/api/workflows', {
+    name: name.trim(), goal: goal.trim(),
+    project_path: focusCtx.project ? focusCtx.project.path : null,
+    client: focusCtx.project ? (focusCtx.project.client || null) : null,
+  });
   wfState.fetched = false;
-  toast('Project created — open it and add tasks', 'ok');
+  toast(focusCtx.project
+    ? `Workflow created in 📂 ${focusCtx.project.name} — open it and add tasks`
+    : 'Workflow created — open it and add tasks', 'ok');
   render();
 }
 
@@ -5881,6 +5988,7 @@ async function openWorkflowDetail(id) {
       <span class="chip ${w.all_done ? 'c-green' : 'c-cyan'}">${w.tasks_done}/${w.tasks_total} done</span></h2>
     ${w.goal ? `<div class="view-intro" style="margin-bottom:10px">${esc(w.goal)}</div>` : ''}
     <div style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto">${taskRows || '<div class="empty">No tasks yet — add the first one.</div>'}</div>
+    <div style="margin:8px 0"><button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">🔍 Review results — what every stage changed</button></div>
     <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Project attachments (input files EVERY task of this project reads)</label>
       <div id="wf-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
     <div class="form-group"><label class="form-label">🔁 Project looping (automatic improve-and-recheck rounds)</label>
@@ -6315,7 +6423,8 @@ function proposeWorkflowModal(wf, meta) {
     try {
       const w = await api('POST', '/api/workflows',
         { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop,
-          high_stakes: projHigh, client: projClient });
+          high_stakes: projHigh, client: projClient,
+          project_path: repo || (focusCtx.project && focusCtx.project.path) || null });
       const ids = [];
       for (let i = 0; i < tasks.length; i++) {
         const t = tasks[i];

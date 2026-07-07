@@ -1353,3 +1353,31 @@ code, pre, .mono { font-family: var(--font-mono); }
   font-size:11px; transition:all .15s;
 }
 .focus-btn:hover { color:var(--text); border-color:var(--accent); }
+
+/* ═══ Result review (PR-style comparison for every output type) ═══ */
+.review-layout { display:flex; gap:14px; min-height:380px; max-height:62vh; }
+.review-files {
+  flex:0 0 250px; overflow-y:auto; border-right:1px solid var(--border);
+  padding-right:10px; display:flex; flex-direction:column; gap:2px;
+}
+.review-file {
+  display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px;
+  cursor:pointer; font-size:11.5px; font-family:var(--font-mono);
+  color:var(--text-dim); border:1px solid transparent;
+}
+.review-file:hover { background:rgba(124,92,255,.08); }
+.review-file.active { background:rgba(124,92,255,.14); border-color:rgba(124,92,255,.4); color:var(--text); }
+.review-file .rf-path { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rf-add { color:#4ade80; } .rf-del { color:#f87171; }
+.review-pane { flex:1; overflow:auto; }
+.diff-hunk { margin-bottom:14px; border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.diff-hunk-head {
+  font-family:var(--font-mono); font-size:10.5px; color:var(--accent-2);
+  background:rgba(94,234,212,.06); padding:4px 10px; border-bottom:1px solid var(--border);
+}
+.diff-line { display:flex; font-family:var(--font-mono); font-size:11.5px; line-height:1.6; }
+.diff-line pre { margin:0; padding:0 10px; white-space:pre-wrap; word-break:break-all; flex:1; }
+.diff-line.add { background:rgba(74,222,128,.10); } .diff-line.add .diff-sign { color:#4ade80; }
+.diff-line.del { background:rgba(248,113,113,.10); } .diff-line.del .diff-sign { color:#f87171; }
+.diff-sign { flex:0 0 22px; text-align:center; color:var(--text-faint); user-select:none; }
+.review-stat { font-family:var(--font-mono); font-size:11px; }

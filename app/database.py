@@ -244,6 +244,8 @@ def init_db():
         conn.execute("ALTER TABLE workflows ADD COLUMN high_stakes INTEGER DEFAULT 0")
     if "client" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN client TEXT")
+    if "project_path" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN project_path TEXT")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (
