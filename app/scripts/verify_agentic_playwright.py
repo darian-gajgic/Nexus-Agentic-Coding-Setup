@@ -8,8 +8,10 @@ Captures console errors as evidence.
 """
 import asyncio, sys, os
 from playwright.async_api import async_playwright
+from _gate_auth import owner_cookie, playwright_cookies
 
 BASE = "https://127.0.0.1:8777"
+CK = owner_cookie()  # {} while login is off; owner session when multi-user is live
 SHOTS = os.path.expanduser("~/.hermes/cache/screenshots")
 os.makedirs(SHOTS, exist_ok=True)
 P, F = 0, 0
@@ -26,6 +28,7 @@ async def main():
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1440, "height": 900},
                                       ignore_https_errors=True)
+        await page.context.add_cookies(playwright_cookies(BASE))
         page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         page.on("pageerror", lambda e: console_errors.append(f"PAGEERROR: {e}"))
 
@@ -44,7 +47,7 @@ async def main():
 
         # Create an approval via API, then approve it from the UI
         import requests
-        r = requests.post(f"{BASE}/api/approvals", verify=False, json={
+        r = requests.post(f"{BASE}/api/approvals", verify=False, cookies=CK, json={
             "agent_id": "agent-alpha", "action_type": "deploy",
             "description": "deploy v3 to staging (e2e test)", "risk_level": "high"}).json()
         aid = r["id"]
@@ -70,8 +73,8 @@ async def main():
         await page.wait_for_timeout(600)
         ok("scheduler job created from UI", await page.locator('text=e2e-job').count() > 0)
         # clean up
-        jid = [j["id"] for j in requests.get(f"{BASE}/api/scheduler", verify=False).json()["jobs"] if j["name"] == "e2e-job"]
-        if jid: requests.delete(f"{BASE}/api/scheduler/{jid[0]}", verify=False)
+        jid = [j["id"] for j in requests.get(f"{BASE}/api/scheduler", verify=False, cookies=CK).json()["jobs"] if j["name"] == "e2e-job"]
+        if jid: requests.delete(f"{BASE}/api/scheduler/{jid[0]}", verify=False, cookies=CK)
 
         # Kanban view shows claim/verify fields (the enhanced card)
         await page.click('a.nav-item[data-view="kanban"]')

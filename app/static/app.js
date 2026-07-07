@@ -1245,8 +1245,11 @@ function loadFocus() {
   try {
     let raw = localStorage.getItem(focusKey());
     if (raw == null) {
+      // The legacy un-namespaced key predates multi-user, so it can only be
+      // the OWNER's focus — migrating it to whoever logs in next on this
+      // browser would hand another user the owner's project context.
       const legacy = localStorage.getItem('nexusFocus');
-      if (legacy != null) {
+      if (legacy != null && focusKey() === 'nexusFocus:u_owner') {
         localStorage.setItem(focusKey(), legacy);
         localStorage.removeItem('nexusFocus');
         raw = legacy;
@@ -1256,6 +1259,18 @@ function loadFocus() {
   } catch { focusCtx = {}; }
   focusCtx.project = focusCtx.project || null;
   focusCtx.workflow = focusCtx.workflow || null;
+}
+
+// Called wherever the (user-scoped) projects list arrives: focus pointing at
+// a project this user cannot see — stale localStorage, ownership change — is
+// cleared instead of silently scoping their boards to an invisible project.
+function pruneStaleFocus(projects) {
+  if (!focusCtx.project || !Array.isArray(projects)) return;
+  if (!projects.some(p => p && p.path === focusCtx.project.path)) {
+    focusCtx.project = null;
+    focusCtx.workflow = null;
+    saveFocus();
+  }
 }
 
 function saveFocus() {
@@ -3460,6 +3475,7 @@ function showTaskModal(status) {
     } catch { /* optional */ }
     try {
       const repos = (await api('GET', '/api/projects')).projects || [];
+      pruneStaleFocus(repos);
       const rsel = $('#m-task-repo');
       if (rsel && repos.length) {
         rsel.innerHTML = `<option value="">— None: fresh workspace (default) —</option>` +
@@ -3804,6 +3820,7 @@ async function loadProjects() {
   projectsState.loading = true; projectsState.data = null; render();
   try { projectsState.data = await api('GET', '/api/projects'); }
   catch { projectsState.data = { projects: [] }; }
+  pruneStaleFocus((projectsState.data || {}).projects);
   projectsState.loading = false; projectsState.fetched = true; render();
 }
 function viewProjects() {
@@ -6448,6 +6465,7 @@ function describeTaskUI() {
   const twSel = $('#twRepo');
   if (twSel) {
     api('GET', '/api/projects').then(d => {
+      pruneStaleFocus(d.projects);
       const ps = (d.projects || d || []).filter(x => x.is_repo);
       ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
       if (twSel.isConnected) {
@@ -6658,6 +6676,7 @@ function proposeWorkflowModal(wf, meta) {
   const repoSel = $('#wf-repo');
   if (repoSel) {
     api('GET', '/api/projects').then(d => {
+      pruneStaleFocus(d.projects);
       const ps = (d.projects || d || []).filter(p => p.is_repo);
       ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0)); // client repos first
       if (!repoSel.isConnected) return;

@@ -6,8 +6,10 @@ import requests
 from playwright.async_api import async_playwright
 import urllib3
 urllib3.disable_warnings()
+from _gate_auth import owner_cookie, playwright_cookies
 
 BASE = "https://127.0.0.1:8777"
+CK = owner_cookie()  # {} while login is off; owner session when multi-user is live
 SHOTS = os.path.expanduser("~/.hermes/cache/screenshots/nexus-after")
 os.makedirs(SHOTS, exist_ok=True)
 P, F = 0, 0
@@ -16,13 +18,13 @@ console_errors = []
 # Self-sufficiency: the board starts EMPTY since the real-agents migration —
 # ensure at least one lane + one kanban card exist for the click-through checks.
 _spawned_lane = None
-if not [a for a in requests.get(BASE + "/api/agents", verify=False, timeout=10).json()
+if not [a for a in requests.get(BASE + "/api/agents", verify=False, timeout=10, cookies=CK).json()
         if a.get("status") != "retired"]:
-    _spawned_lane = requests.post(BASE + "/api/agents", verify=False, timeout=15,
+    _spawned_lane = requests.post(BASE + "/api/agents", verify=False, timeout=15, cookies=CK,
                                   json={"name": "UI-Gate-Lane", "auto_claim": False}).json()["id"]
 _spawned_task = None
-if not requests.get(BASE + "/api/tasks", verify=False, timeout=10).json():
-    _spawned_task = requests.post(BASE + "/api/tasks", verify=False, timeout=15,
+if not requests.get(BASE + "/api/tasks", verify=False, timeout=10, cookies=CK).json():
+    _spawned_task = requests.post(BASE + "/api/tasks", verify=False, timeout=15, cookies=CK,
                                   json={"title": "UI gate probe card",
                                         "status": "backlog"}).json()["id"]
 
@@ -37,6 +39,7 @@ async def main():
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1600, "height": 1000},
                                       ignore_https_errors=True)
+        await page.context.add_cookies(playwright_cookies(BASE))
         page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         page.on("pageerror", lambda e: console_errors.append(f"PAGEERROR: {e}"))
         await page.goto(BASE, wait_until="networkidle")
@@ -137,9 +140,9 @@ async def main():
 
 asyncio.run(main())
 if _spawned_lane:
-    requests.post(f"{BASE}/api/agents/{_spawned_lane}/retire", verify=False, timeout=10)
-    requests.delete(f"{BASE}/api/agents/{_spawned_lane}", verify=False, timeout=10)
+    requests.post(f"{BASE}/api/agents/{_spawned_lane}/retire", verify=False, timeout=10, cookies=CK)
+    requests.delete(f"{BASE}/api/agents/{_spawned_lane}", verify=False, timeout=10, cookies=CK)
 if _spawned_task:
-    requests.delete(f"{BASE}/api/tasks/{_spawned_task}", verify=False, timeout=10)
+    requests.delete(f"{BASE}/api/tasks/{_spawned_task}", verify=False, timeout=10, cookies=CK)
 print(f"\n=== V3 INTERACTION RESULT: {P} passed, {F} failed ===")
 sys.exit(1 if F else 0)

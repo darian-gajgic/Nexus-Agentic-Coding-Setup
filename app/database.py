@@ -304,6 +304,18 @@ def init_db():
     for tbl in ("tasks", "workflows", "known_issues"):
         conn.execute(f"UPDATE {tbl} SET user_id='u_owner' WHERE user_id IS NULL")
 
+    # Project ownership (Block 1 gap fix): the Projects view scans the shared
+    # filesystem, so visibility needs its own map. Paths NOT in this table
+    # belong to u_owner (the machine's home directory IS the operator's) —
+    # rows are only written when a project is created through Nexus, so a
+    # directory the operator makes by hand stays his without bookkeeping.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS project_owners (
+        path TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at REAL
+    )""")
+
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
     dispatch_defaults = [

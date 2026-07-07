@@ -366,8 +366,12 @@ def publish_session_scope(session_id: str, client: str | None = None,
                 sessions.pop(sid, None)
                 users.pop(sid, None)
                 updated.pop(sid, None)
+        # rewrite the three maps but PRESERVE any other top-level keys the
+        # file carries (e.g. "default_user", the unmapped-session fallback
+        # written by the mem0 user backfill migration)
+        data.update({"sessions": sessions, "users": users, "updated": updated})
         with open(_CLIENT_SCOPES_FILE, "w") as f:
-            json.dump({"sessions": sessions, "users": users, "updated": updated}, f, indent=1)
+            json.dump(data, f, indent=1)
     except Exception as e:
         db.log_activity("warn", "system", f"session-scope publish failed: {str(e)[:80]}")
 

@@ -24,10 +24,13 @@ def ok(name, cond, extra=""):
     if cond: P += 1; print(f"  PASS  {name}")
     else:    F += 1; print(f"  FAIL  {name}  {extra}")
 
-def post(path, **kw): return requests.post(BASE+path, timeout=35, verify=False, **kw)
-def patch(path, **kw): return requests.patch(BASE+path, timeout=10, verify=False, **kw)
-def get(path, **kw):  return requests.get(BASE+path, timeout=10, verify=False, **kw)
-def dele(path, **kw): return requests.delete(BASE+path, timeout=10, verify=False, **kw)
+from _gate_auth import owner_cookie  # noqa: E402 — same-dir import
+CK = owner_cookie()  # {} while login is off; owner session when multi-user is live
+
+def post(path, **kw): return requests.post(BASE+path, timeout=35, verify=False, cookies=CK, **kw)
+def patch(path, **kw): return requests.patch(BASE+path, timeout=10, verify=False, cookies=CK, **kw)
+def get(path, **kw):  return requests.get(BASE+path, timeout=10, verify=False, cookies=CK, **kw)
+def dele(path, **kw): return requests.delete(BASE+path, timeout=10, verify=False, cookies=CK, **kw)
 
 def task_by_id(tid):
     return next((x for x in get("/api/tasks").json() if x["id"] == tid), {})
@@ -262,7 +265,7 @@ post(f"/api/tasks/{tE}/retry", json={})
 t = task_by_id(tE)
 ok("retry auto-attaches judge findings", "judge findings" in (t.get("retry_feedback") or "").lower(),
    str(t.get("retry_feedback"))[:80])
-ap3 = requests.get(BASE + "/api/approvals", params={"status": "expired"}, timeout=10, verify=False).json()["approvals"]
+ap3 = requests.get(BASE + "/api/approvals", params={"status": "expired"}, timeout=10, verify=False, cookies=CK).json()["approvals"]
 ok("stale approval expired on retry", any(a["id"] == "appr-e2estub3" for a in ap3),
    str([a["id"] for a in ap3][:5]))
 # WIN/LESSON: numbers are required for wins; entry lands in the file
