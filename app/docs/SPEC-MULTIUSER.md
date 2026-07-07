@@ -55,9 +55,22 @@ stays shared. Single-user mode without login stays the default.
 - Shared (by design, household trust): agents fleet, monitor, scheduler,
   approvals, watchdog, verify runs, specialists/lessons/skills, shared-context
   (team memory), settings (writes admin-only), guardian, usage, tools,
-  programs, projects git-ops. User management admin-only.
+  programs. User management admin-only.
 - New rows are stamped with the creating user; engine-created rows (loop
   retries, wizard-accepted plans) inherit from their source row.
+- **Projects (gap fix 2026-07-07):** the Projects view scans the shared
+  filesystem, so visibility comes from the `project_owners` table
+  (path → user_id). A path WITHOUT a row belongs to `u_owner` (the home
+  directory is the operator's); Nexus writes a row for every project it
+  creates (`_create_repo`: create-client + task promote). Enforced at
+  `GET /api/projects` (list + all repo dropdowns feed from it) and at every
+  path-accepting endpoint: projects history/publish/push/tag, task
+  create/patch `repo_path`, wizard `repo_path` (foreign = silently dropped,
+  like invalid), workflow create/patch `project_path`, agent worktree.
+  Foreign paths answer exactly like nonexistent ones. Frontend: the legacy
+  un-namespaced focus key migrates only to `u_owner`, and a focus pointing
+  at a project the user can no longer see is pruned when the projects list
+  arrives.
 
 ## 5. Per-user JARVIS
 
@@ -80,6 +93,18 @@ Same bridge-file mechanism as client scoping, one level up:
 - Guardian golden + manifest sha updated for the plugin edit.
 - `/api/memory` and `/api/memory3d` apply the same rule server-side
   (memory3d cache keyed per user).
+- **Legacy backfill (gap fix 2026-07-07):** the pre-Block-1 backlog (358
+  untagged points — all the operator's) was handed to `u_owner` by
+  `scripts/migrate_mem0_user_backfill.py` (one-time, idempotent, undo log in
+  `logs/`), mirroring the tasks/workflows backfill — so a new user's memory
+  views start EMPTY. Companion: the migration writes a top-level
+  `"default_user": "u_owner"` into the scopes file and the provider falls
+  back to it for sessions with no `users` entry — the operator's local
+  Hermes CLI keeps its memories. Nexus publishes a user scope for EVERY
+  session it creates (dispatch, JARVIS, and the task/skill/specialist
+  wizards), so the fallback can never apply to another user's requests.
+  Memories added outside a session (shared-context, curator lessons) remain
+  untagged = deliberately global.
 
 ## 7. Service exposure — Tailscale ONLY (never public)
 

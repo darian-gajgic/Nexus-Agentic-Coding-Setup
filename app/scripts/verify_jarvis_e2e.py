@@ -9,6 +9,7 @@ Exercises the full runtime path and captures evidence screenshots:
 Reports a pass/fail per check + saves evidence screenshots."""
 import time, json, sys, base64
 from playwright.sync_api import sync_playwright
+from _gate_auth import playwright_cookies
 
 SCREENSHOTS = "/home/sinep/.hermes/cache/screenshots"
 results = {}
@@ -19,6 +20,7 @@ with sync_playwright() as p:
         "--autoplay-policy=no-user-gesture-required",
     ])
     pg = b.new_page(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+    pg.context.add_cookies(playwright_cookies("https://localhost:8777"))
     errors = []
     pg.on("pageerror", lambda e: errors.append(str(e)))
 

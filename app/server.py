@@ -477,6 +477,9 @@ async def create_task(body: TaskCreate):
     err = _foreign_refs_error(body.workflow_id, body.depends_on)
     if err:
         return JSONResponse(status_code=404, content={"error": err})
+    if body.repo_path and not _visible_repo_path(body.repo_path):
+        return JSONResponse(status_code=400, content={
+            "error": f"repo_path is not one of your git repositories: {body.repo_path}"})
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
     uid = auth.current_user_id()
@@ -541,11 +544,9 @@ async def update_task(task_id: str, body: TaskUpdate):
         updates["client"] = (body.client or "").strip().lower() or None
     if body.repo_path is not None:
         rp = (body.repo_path or "").strip()
-        if rp:
-            import worktree as _wt
-            if not _wt.is_repo(rp):
-                return JSONResponse(status_code=400, content={
-                    "error": f"repo_path is not a git repository: {rp}"})
+        if rp and not _visible_repo_path(rp):
+            return JSONResponse(status_code=400, content={
+                "error": f"repo_path is not one of your git repositories: {rp}"})
         updates["repo_path"] = rp or None
     updates["updated_at"] = time.time()
 
@@ -1156,8 +1157,11 @@ async def specialist_wizard(body: dict):
                       "First read 2-3 existing definitions in ~/.hermes/agents/ as structural "
                       "reference, then produce the complete new definition.")
 
+    uid = auth.current_user_id()  # contextvar doesn't reach the executor thread
+
     def _run():
         sid = hd.create_session("nexus:specialist-wizard")
+        hd.publish_session_scope(sid, user=uid)  # never the scopes-file default
         try:
             return hd.stream_turn(sid, input_text, system_message=_WIZARD_FRAMING, max_seconds=240)
         finally:
@@ -1902,7 +1906,8 @@ async def agent_worktree(agent_id: str, body: dict):
     repo = body.get("repo_path")
     if not repo:
         return JSONResponse(status_code=400, content={"error": "repo_path required"})
-    if not _wt.is_repo(repo):
+    repo = _visible_repo_path(repo)
+    if not repo:
         return JSONResponse(status_code=400, content={"error": "not a git repo"})
     info = _wt.create_worktree(repo, agent_id)
     if not info:
@@ -3342,7 +3347,9 @@ async def task_wizard(body: dict):
     # asks bug-repro questions instead of stack questions.
     repo_path = (body.get("repo_path") or "").strip()
     repo_block = ""
-    valid_repo = _valid_repo_path(repo_path) if repo_path else None
+    # ownership-gated: a foreign repo path adds no context and is never
+    # written onto the planned tasks (same silent drop as an invalid path)
+    valid_repo = _visible_repo_path(repo_path) if repo_path else None
     if valid_repo:
         repo_block = _wizard_repo_context(valid_repo)
 
@@ -3359,6 +3366,11 @@ async def task_wizard(body: dict):
         "Reply now with the required JSON object only."
     )
 
+    # Captured OUTSIDE the executor threads below: the request contextvar
+    # does not propagate into run_in_executor, where current_user_id()
+    # would silently fall back to the owner.
+    wizard_uid = auth.current_user_id()
+
     async def _call(allow_questions: bool) -> dict:
         framing = _task_wizard_framing(allow_questions)
 
@@ -3366,6 +3378,9 @@ async def task_wizard(body: dict):
             # Session-level system prompt = persistent role lock (stronger
             # than the per-turn framing alone).
             sid = hd.create_session("nexus:task-wizard", system_prompt=_WIZARD_ROLE_LOCK)
+            # user-scope the throwaway session: its memory reads/writes stay
+            # the requesting user's, never the scopes-file default (owner)
+            hd.publish_session_scope(sid, user=wizard_uid)
             try:
                 # 300s: a 5-task project plan at xhigh effort exceeds 180s
                 # under evening Z.ai load — the old cap 502'd mid-generation.
@@ -3495,6 +3510,9 @@ async def create_workflow(body: dict):
     name = (body.get("name") or "").strip()
     if not name:
         return JSONResponse(status_code=400, content={"error": "name required"})
+    if (body.get("project_path") or "").strip() and not _project_visible(body["project_path"]):
+        return JSONResponse(status_code=400, content={
+            "error": "project_path is not one of your projects"})
     wid = f"wf-{uuid.uuid4().hex[:8]}"
     now = time.time()
     uid = auth.current_user_id()
@@ -3541,6 +3559,9 @@ async def update_workflow(wf_id: str, body: dict):
     w = _owned_workflow(wf_id)
     if not w:
         return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    if (body.get("project_path") or "").strip() and not _project_visible(body["project_path"]):
+        return JSONResponse(status_code=400, content={
+            "error": "project_path is not one of your projects"})
     for k in ("name", "goal", "domain", "status", "project_path"):
         if k in body:
             db.execute(f"UPDATE workflows SET {k}=?, updated_at=? WHERE id=?",
@@ -3746,8 +3767,11 @@ async def hermes_skill_wizard(body: dict):
                       "First read 2-3 existing ~/.hermes/skills/*/SKILL.md as structural "
                       "reference, then produce the complete new SKILL.md.")
 
+    uid = auth.current_user_id()  # contextvar doesn't reach the executor thread
+
     def _run():
         sid = hd.create_session("nexus:skill-wizard")
+        hd.publish_session_scope(sid, user=uid)  # never the scopes-file default
         try:
             return hd.stream_turn(sid, input_text, system_message=_SKILL_FRAMING, max_seconds=240)
         finally:
@@ -4122,6 +4146,49 @@ def _valid_repo_path(path: str):
     return p if _wt.is_repo(p) else None
 
 
+# ── Project ownership (Block 1 gap fix) ────────────────────────────────────
+# Projects are filesystem directories, so visibility comes from the
+# project_owners map: rows are written when Nexus creates a project; any
+# path WITHOUT a row belongs to u_owner (the home directory is the
+# operator's). Every endpoint that accepts a project/repo path goes through
+# these gates, so another user can neither list nor act on foreign projects.
+
+def _project_owner(path: str) -> str:
+    """Owner of a project path (checks the path, then its ancestors up to
+    $HOME so a path inside a project resolves to the project's owner)."""
+    p = os.path.realpath(os.path.expanduser(path or ""))
+    home = os.path.realpath(os.path.expanduser("~"))
+    while p.startswith(home + os.sep):
+        row = db.query_one("SELECT user_id FROM project_owners WHERE path=?", (p,))
+        if row:
+            return row["user_id"]
+        p = os.path.dirname(p)
+    return auth.DEFAULT_USER_ID
+
+
+def _project_visible(path: str) -> bool:
+    """May the CURRENT user see/use this project path? (Must be under $HOME.)"""
+    p = os.path.realpath(os.path.expanduser(path or ""))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not p.startswith(home + os.sep):
+        return False
+    return _project_owner(p) == auth.current_user_id()
+
+
+def _visible_repo_path(path: str):
+    """_valid_repo_path + ownership: same None on failure either way, so a
+    foreign repo is indistinguishable from a nonexistent one."""
+    p = _valid_repo_path(path)
+    return p if p and _project_owner(p) == auth.current_user_id() else None
+
+
+def _tag_project_owner(path: str, user_id: str | None = None):
+    db.execute("INSERT OR REPLACE INTO project_owners (path, user_id, created_at) "
+               "VALUES (?,?,?)",
+               (os.path.realpath(os.path.expanduser(path)),
+                user_id or auth.current_user_id(), time.time()))
+
+
 def _run_git_action(cwd: str, *cmd: str, timeout: int = 120):
     import subprocess
     r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
@@ -4161,6 +4228,7 @@ def _create_repo(client: str, name: str, publish: bool):
         code, out = _run_git_action(root, *cmd)
         if code != 0:
             return None, f"git setup failed: {out}"
+    _tag_project_owner(root)  # Block 1: the creator owns the new project
     pub_note = ""
     if publish:
         gh_name = f"{client}-{name}" if client else name
@@ -4239,7 +4307,7 @@ async def task_promote(task_id: str, body: dict):
 async def project_history(path: str):
     """Every pipeline and task that ever targeted this project — the work log
     per client project (rounds of improvement, and invoicing evidence)."""
-    p = _valid_repo_path(path)
+    p = _visible_repo_path(path)
     if not p:
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
     tasks = db.query_all(
@@ -4264,7 +4332,7 @@ async def project_publish(body: dict):
     """Create a PRIVATE GitHub repo for a local-only repository and push it —
     the offsite backup + future handover vehicle. Explicit button, never auto."""
     import re
-    p = _valid_repo_path(body.get("path"))
+    p = _visible_repo_path(body.get("path"))
     if not p:
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
     name = (body.get("name") or os.path.basename(p)).strip()
@@ -4284,7 +4352,7 @@ async def project_publish(body: dict):
 @app.post("/api/projects/push")
 async def project_push(body: dict):
     """Push the current branch + tags to origin — the post-merge backup step."""
-    p = _valid_repo_path(body.get("path"))
+    p = _visible_repo_path(body.get("path"))
     if not p:
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
     code, _ = _run_git_action(p, "git", "remote", "get-url", "origin")
@@ -4304,7 +4372,7 @@ async def project_tag(body: dict):
     """Annotated release tag + push — marks the exact delivered state
     (invoice ↔ code state, reproducible forever)."""
     import re
-    p = _valid_repo_path(body.get("path"))
+    p = _visible_repo_path(body.get("path"))
     if not p:
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
     tag = (body.get("tag") or "").strip()
@@ -4349,8 +4417,14 @@ async def api_skills():
 
 @app.get("/api/projects")
 async def api_projects():
-    """Project directories under the user's home, with git/language metadata."""
-    return {"projects": tools_hub.get_projects()}
+    """Project directories under the user's home, with git/language metadata.
+    User-scoped (Block 1 gap fix): the scan sees the whole filesystem, but a
+    user is only shown projects they own — untagged paths belong to u_owner."""
+    me = auth.current_user_id()
+    owners = {r["path"]: r["user_id"]
+              for r in db.query_all("SELECT path, user_id FROM project_owners")}
+    return {"projects": [p for p in tools_hub.get_projects()
+                         if owners.get(p["path"], auth.DEFAULT_USER_ID) == me]}
 
 
 @app.get("/api/usage")

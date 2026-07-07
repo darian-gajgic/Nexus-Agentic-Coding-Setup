@@ -16,7 +16,12 @@ Phases
                            real UI sign-in as the probe user works
   D  mem0 isolation      — REAL provider code (Hermes venv) + REAL scopes file
                            + REAL qdrant: A's stamped memory is invisible in
-                           B's session (read filter) — proven live vs qdrant
+                           B's session (read filter) — proven live vs qdrant;
+                           unmapped sessions fall back to default_user (owner)
+  E  Projects + memory   — the two gap fixes: a second user sees 0 projects
+     views (gap fixes)     (filesystem scan is ownership-filtered, path
+                           endpoints reject foreign repos) and 0 memories
+                           (legacy qdrant backlog backfilled to u_owner)
 """
 import asyncio
 import json
@@ -50,10 +55,17 @@ ALICE_PW = "probe-" + _secrets.token_urlsafe(9)
 BOB_PW = "probe-" + _secrets.token_urlsafe(9)
 
 
-def cleanup():
-    """Restore single-user state no matter what happened above."""
-    print("\n=== CLEANUP (restore single-user) ===")
+def cleanup(single_user_start=True, owner_token=None):
+    """Restore the PRE-PROBE state no matter what happened above: on a
+    single-user machine that means back to no-login (password cleared);
+    on a machine already running real multi-user (Block 1 live), real
+    users, passwords and live sessions are left untouched — only probe
+    artifacts (and the probe-minted owner session) are removed."""
+    print("\n=== CLEANUP (restore pre-probe state) ===")
     import shutil
+    # phase E probe project (real dir under ~/Projects + its ownership row)
+    shutil.rmtree(os.path.expanduser("~/Projects/mu-probe-proj"), ignore_errors=True)
+    db.execute("DELETE FROM project_owners WHERE path LIKE '%mu-probe%'")
     for t in db.query_all("SELECT id, workspace_path FROM tasks WHERE title LIKE 'mu-probe%'"):
         if t.get("workspace_path") and "/workspaces/" in t["workspace_path"]:
             shutil.rmtree(t["workspace_path"], ignore_errors=True)
@@ -66,8 +78,12 @@ def cleanup():
     for uid in probe_uids:
         db.execute("DELETE FROM auth_sessions WHERE user_id=?", (uid,))
         db.execute("DELETE FROM users WHERE id=?", (uid,))
-    db.execute("UPDATE users SET password_hash='' WHERE id='u_owner'")
-    db.execute("DELETE FROM auth_sessions")
+    if single_user_start:
+        db.execute("UPDATE users SET password_hash='' WHERE id='u_owner'")
+        db.execute("DELETE FROM auth_sessions")
+    elif owner_token:
+        import auth as _auth
+        _auth.destroy_session(owner_token)
     # probe entries out of the scopes bridge file
     try:
         data = json.load(open(SCOPES_FILE))
@@ -90,7 +106,10 @@ def cleanup():
     except Exception:
         pass
     left = db.query_one("SELECT COUNT(*) n FROM users WHERE active=1")["n"]
-    print(f"  users left: {left} (expect 1) — owner password cleared, sessions dropped")
+    if single_user_start:
+        print(f"  users left: {left} (expect 1) — owner password cleared, sessions dropped")
+    else:
+        print(f"  users left: {left} (real users) — probe rows removed, real sessions kept")
 
 
 def new_client():
@@ -102,34 +121,49 @@ def login(c, username, password):
     return r.status_code == 200
 
 
-def phase_a():
+def phase_a(single_user_start=True):
     print("\n=== A. HTTP isolation ===")
+    import auth as _auth
     anon = new_client()
+    owner_token = None
 
-    st = anon.get("/api/auth/state").json()
-    ok("starts in single-user mode", st["auth_required"] is False and st["user"]["id"] == "u_owner",
-       json.dumps(st)[:120])
+    if single_user_start:
+        st = anon.get("/api/auth/state").json()
+        ok("starts in single-user mode", st["auth_required"] is False and st["user"]["id"] == "u_owner",
+           json.dumps(st)[:120])
+        # owner (auto-identity) sets a password, then creates the two probe
+        # users; setting the password mints the owner's session cookie (by
+        # design — the auth flip must not log the acting admin out)
+        r = anon.post("/api/auth/password", json={"current": "", "password": OWNER_TEMP_PW})
+        ok("owner password set", r.status_code == 200, r.text[:100])
+        owner = anon
+    else:
+        # machine already runs REAL multi-user (Block 1 live): never touch
+        # the real password/sessions — mint the owner a direct session token
+        st = anon.get("/api/auth/state").json()
+        ok("multi-user already live (login wall up)",
+           st["auth_required"] is True and st["user"] is None, json.dumps(st)[:120])
+        owner = new_client()
+        owner_token = _auth.create_session("u_owner", "mu-probe-owner")
+        owner.cookies.set("nexus_session", owner_token)
+        ok("owner session established (direct token, real password untouched)",
+           (owner.get("/api/auth/state").json().get("user") or {}).get("id") == "u_owner")
 
-    # owner (auto-identity) sets a password, then creates the two probe users
-    r = anon.post("/api/auth/password", json={"current": "", "password": OWNER_TEMP_PW})
-    ok("owner password set", r.status_code == 200, r.text[:100])
-    r = anon.post("/api/users", json={"username": "probe-alice", "display_name": "Probe Alice",
-                                      "password": ALICE_PW, "role": "member"})
+    r = owner.post("/api/users", json={"username": "probe-alice", "display_name": "Probe Alice",
+                                       "password": ALICE_PW, "role": "member"})
     ok("alice created", r.status_code == 200, r.text[:100])
     alice_id = r.json().get("id")
-    r = anon.post("/api/users", json={"username": "probe-bob", "display_name": "Probe Bob",
-                                      "password": BOB_PW, "role": "member"})
+    r = owner.post("/api/users", json={"username": "probe-bob", "display_name": "Probe Bob",
+                                       "password": BOB_PW, "role": "member"})
     ok("bob created", r.status_code == 200, r.text[:100])
     bob_id = r.json().get("id")
 
     time.sleep(2.2)  # auth_required micro-cache TTL
-    # setting the password minted the operator a session cookie (by design —
-    # the auth flip must not log the acting admin out); `anon` is now the
-    # OWNER's client. A truly fresh client is what sees the login wall.
-    st = anon.get("/api/auth/state").json()
-    ok("operator stays signed in through the flip",
-       st["auth_required"] is True and (st.get("user") or {}).get("id") == "u_owner",
-       json.dumps(st)[:120])
+    if single_user_start:
+        st = owner.get("/api/auth/state").json()
+        ok("operator stays signed in through the flip",
+           st["auth_required"] is True and (st.get("user") or {}).get("id") == "u_owner",
+           json.dumps(st)[:120])
     fresh = new_client()
     st = fresh.get("/api/auth/state").json()
     ok("login now required", st["auth_required"] is True and st["user"] is None, json.dumps(st)[:120])
@@ -243,7 +277,7 @@ def phase_a():
     ok("member cannot write settings", bob.patch("/api/settings", json={
         "dispatch.daily_cap": "1"}).status_code == 403)
 
-    return alice_id, bob_id, alice, bob, ta
+    return alice_id, bob_id, alice, bob, ta, owner, owner_token
 
 
 async def phase_b_ws(alice, bob, alice_id):
@@ -369,6 +403,15 @@ hits_a = pa._backend.search("favourite plant monstera",
                             filters={{"user_id": pa._user_id}}, top_k=10, rerank=False)
 out["a_sees"] = ["mu-probe-fact" in json.dumps(h) for h in hits_a].count(True)
 
+# UNMAPPED session (local CLI shape): resolves to the scopes-file
+# default_user (the owner after the backfill migration) — so it must
+# NOT see alice's user-tagged probe fact either
+pc = mod.ClientScopedMem0Provider(); pc.initialize("mu-probe-unmapped")
+out["unmapped_user"] = pc._user_now()
+hits_c = pc._backend.search("favourite plant monstera",
+                            filters={{"user_id": pc._user_id}}, top_k=10, rerank=False)
+out["c_sees"] = ["mu-probe-fact" in json.dumps(h) for h in hits_c].count(True)
+
 print("DRIVER_RESULT " + json.dumps(out))
 '''
     r = subprocess.run([HERMES_PY, "-c", driver], capture_output=True, text=True, timeout=180)
@@ -384,6 +427,11 @@ print("DRIVER_RESULT " + json.dumps(out))
     ok("user A finds their memory", out.get("a_sees", 0) >= 1, f"a_sees={out.get('a_sees')}")
     ok("user B's session filters it out (0 rows)", out.get("b_sees") == 0,
        f"b_sees={out.get('b_sees')}")
+    ok("unmapped session resolves to the scopes-file default_user",
+       out.get("unmapped_user") == scopes.get("default_user"),
+       f"{out.get('unmapped_user')} vs {scopes.get('default_user')}")
+    ok("unmapped (CLI) session cannot see A's tagged memory", out.get("c_sees") == 0,
+       f"c_sees={out.get('c_sees')}")
 
     # cleanup + independent verification straight against qdrant:
     # find probe points by payload text, delete by id, verify gone
@@ -417,26 +465,105 @@ print("DRIVER_RESULT " + json.dumps(out))
         ok("qdrant has no probe leftovers", False, str(e)[:80])
 
 
+def phase_e_projects_memory(owner, alice, bob):
+    """The two Block-1 gap fixes, proven live: (1) the Projects view / repo
+    endpoints are ownership-scoped, (2) the legacy mem0 backlog is
+    owner-tagged so a second user's memory views start empty."""
+    print("\n=== E. Projects + memory views (gap fixes) ===")
+
+    own = owner.get("/api/projects").json()["projects"]
+    ok("owner sees the machine's projects", len(own) > 0, f"{len(own)} projects")
+    bobp = bob.get("/api/projects").json()["projects"]
+    ok("second user sees 0 projects", bobp == [], f"{len(bobp)} leaked")
+
+    repo = next((p["path"] for p in own if p.get("is_repo")), None)
+    ok("owner has a repo to probe with", bool(repo))
+    if repo:
+        r = bob.post("/api/projects/publish", json={"path": repo, "name": "mu-probe-hijack"})
+        ok("foreign repo publish rejected", r.status_code == 400, f"{r.status_code}")
+        r = bob.post("/api/projects/push", json={"path": repo})
+        ok("foreign repo push rejected", r.status_code == 400, f"{r.status_code}")
+        r = bob.post("/api/projects/tag", json={"path": repo, "tag": "v0.0", "message": "x"})
+        ok("foreign repo tag rejected", r.status_code == 400, f"{r.status_code}")
+        r = bob.get("/api/projects/history", params={"path": repo})
+        ok("foreign repo history rejected", r.status_code == 400, f"{r.status_code}")
+        r = bob.post("/api/tasks", json={"title": "mu-probe repo hijack", "repo_path": repo})
+        ok("task create with a foreign repo rejected", r.status_code == 400, f"{r.status_code}")
+        r = bob.post("/api/workflows", json={"name": "mu-probe wf hijack", "project_path": repo})
+        ok("workflow create with a foreign project rejected", r.status_code == 400, f"{r.status_code}")
+
+    # a second user's OWN project: created, visible to them alone
+    r = alice.post("/api/projects/create-client", json={"name": "mu-probe-proj"})
+    ok("second user creates their own project", r.status_code == 200 and r.json().get("ok"),
+       r.text[:100])
+    apaths = [p["path"] for p in alice.get("/api/projects").json()["projects"]]
+    aproj = next((p for p in apaths if p.endswith("/mu-probe-proj")), None)
+    ok("creator sees their new project", bool(aproj), f"{len(apaths)} visible")
+    ok("other user does NOT see it", not any(
+        "mu-probe-proj" in p["path"] for p in bob.get("/api/projects").json()["projects"]))
+    ok("owner does NOT see it either", not any(
+        "mu-probe-proj" in p["path"] for p in owner.get("/api/projects").json()["projects"]))
+    if aproj:
+        r = alice.get("/api/projects/history", params={"path": aproj})
+        ok("creator can use their own project", r.status_code == 200, f"{r.status_code}")
+
+    # memory views: legacy qdrant backlog is owner-tagged (one-time backfill),
+    # so the second user starts EMPTY. Untagged rows are shared/global BY
+    # DESIGN (shared-context, curator lessons) — if the ==0 check ever fails
+    # right after intentionally adding a global memory, that is why.
+    import urllib.request
+    req = urllib.request.Request(
+        f"{QDRANT}/collections/mem0/points/count",
+        data=json.dumps({"exact": True,
+                         "filter": {"must": [{"is_empty": {"key": "user"}}]}}).encode(),
+        headers={"Content-Type": "application/json"})
+    untagged = json.loads(urllib.request.urlopen(req, timeout=10).read())["result"]["count"]
+    ok("legacy mem0 backlog fully owner-tagged (0 untagged in qdrant)", untagged == 0,
+       f"{untagged} untagged")
+    bmem = bob.get("/api/memory").json()
+    ok("second user's memory list is empty", bmem.get("count") == 0,
+       f"count={bmem.get('count')}")
+    ok("second user sees exactly the global (untagged) rows",
+       bmem.get("count") == untagged, f"{bmem.get('count')} vs {untagged} untagged")
+    omem = owner.get("/api/memory").json()
+    ok("owner still sees the legacy memories", (omem.get("count") or 0) >= 300,
+       f"count={omem.get('count')}")
+    b3d = bob.get("/api/memory3d?force=1").json()
+    ok("second user's galaxy is empty", not b3d.get("nodes"),
+       f"{len(b3d.get('nodes') or [])} nodes")
+
+
 def main():
     print("=== Block 1 multi-user isolation probe ===")
     print(f"(owner temp password, in case of a crash: {OWNER_TEMP_PW} — "
           "or run scripts/auth_reset.py)")
     n = db.query_one("SELECT COUNT(*) n FROM users WHERE active=1")["n"]
-    if n != 1:
-        print(f"ABORT: expected single-user start state, found {n} active users. "
-              "Run scripts/auth_reset.py first.")
+    if n < 1 or db.query_all("SELECT 1 FROM users WHERE username LIKE 'probe-%'"):
+        print(f"ABORT: unclean start state ({n} active users, probe leftovers?). "
+              "Run scripts/auth_reset.py or remove probe-* users first.")
         sys.exit(2)
+    single = n == 1
+    if not single:
+        print(f"({n} active users — real multi-user is live; probe preserves "
+              "real users, passwords and sessions)")
+    single_ctx = {"single": single, "owner_token": None}
     try:
-        alice_id, bob_id, alice, bob, ta = phase_a()
+        alice_id, bob_id, alice, bob, ta, owner, owner_token = phase_a(single)
+        single_ctx["owner_token"] = owner_token
         asyncio.run(phase_b_ws(alice, bob, alice_id))
         asyncio.run(phase_c_login_ui())
         phase_d_mem0(alice_id, bob_id)
+        phase_e_projects_memory(owner, alice, bob)
     finally:
-        cleanup()
+        cleanup(single, single_ctx["owner_token"])
     time.sleep(2.2)  # let the auth micro-cache observe the restored state
     st = new_client().get("/api/auth/state").json()
-    ok("system restored to single-user (no login)", st["auth_required"] is False
-       and (st.get("user") or {}).get("id") == "u_owner", json.dumps(st)[:120])
+    if single:
+        ok("system restored to single-user (no login)", st["auth_required"] is False
+           and (st.get("user") or {}).get("id") == "u_owner", json.dumps(st)[:120])
+    else:
+        ok("system left in real multi-user mode (login wall up)",
+           st["auth_required"] is True and st["user"] is None, json.dumps(st)[:120])
     print(f"\n=== MULTI-USER ISOLATION RESULT: {PASS} passed, {FAIL} failed ===")
     sys.exit(1 if FAIL else 0)
 

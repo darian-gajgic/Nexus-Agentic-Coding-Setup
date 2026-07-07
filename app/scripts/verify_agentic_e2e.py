@@ -15,10 +15,13 @@ def ok(name, cond, extra=""):
     if cond: P += 1; print(f"  PASS  {name}")
     else:    F += 1; print(f"  FAIL  {name}  {extra}")
 
-def post(path, **kw): return requests.post(BASE+path, timeout=35, verify=False, **kw)
-def patch(path, **kw): return requests.patch(BASE+path, timeout=10, verify=False, **kw)
-def get(path, **kw):  return requests.get(BASE+path, timeout=10, verify=False, **kw)
-def dele(path, **kw): return requests.delete(BASE+path, timeout=10, verify=False, **kw)
+from _gate_auth import owner_cookie  # noqa: E402 — same-dir import
+CK = owner_cookie()  # {} while login is off; owner session when multi-user is live
+
+def post(path, **kw): return requests.post(BASE+path, timeout=35, verify=False, cookies=CK, **kw)
+def patch(path, **kw): return requests.patch(BASE+path, timeout=10, verify=False, cookies=CK, **kw)
+def get(path, **kw):  return requests.get(BASE+path, timeout=10, verify=False, cookies=CK, **kw)
+def dele(path, **kw): return requests.delete(BASE+path, timeout=10, verify=False, cookies=CK, **kw)
 
 # --- setup: two lanes (auto_claim OFF so they never grab our test task) + a task ---
 spawned = []
