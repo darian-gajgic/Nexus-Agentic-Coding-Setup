@@ -3589,10 +3589,39 @@ async def memory3d(force: bool = False):
             # per-node region → the frontend colors the galaxy by cluster
             for i, node in enumerate(nodes):
                 node["cluster"] = int(assign[i])
+
+            # ── color groups: identity-first, semantics-second ──
+            # Each specialist's memories get their OWN color (they grow into
+            # it as they learn). Any identity holding >50% of the map (today:
+            # hermes itself) is split by semantic cluster so it stays a
+            # colorful galaxy. Groups are ranked by size; the frontend gives
+            # rank 0 cyan and extends the cyan family until >=20% of nodes.
+            label_by_cluster = {c["id"]: c["label"].split(" · ")[0] for c in clusters}
+            raw_groups: dict = {}
+            for i, node in enumerate(nodes):
+                aid = (node.get("agent") or "unknown").lower()
+                raw_groups.setdefault(aid, []).append(i)
+            final: dict = {}
+            half = len(nodes) / 2
+            for aid, idxs in raw_groups.items():
+                if len(idxs) > half:
+                    for i in idxs:
+                        key = f"{aid} · {label_by_cluster.get(int(assign[i]), 'misc')}"
+                        final.setdefault(key, []).append(i)
+                else:
+                    final[aid] = idxs
+            ranked = sorted(final.items(), key=lambda kv: -len(kv[1]))
+            groups = []
+            for rank, (label, idxs) in enumerate(ranked):
+                groups.append({"label": label, "size": len(idxs)})
+                for i in idxs:
+                    nodes[i]["group"] = rank
         except Exception:
             clusters = []
+            groups = []
 
         data = {"nodes": nodes, "links": links, "clusters": clusters,
+                "groups": groups,
                 "count": len(nodes), "dims": 768, "generated_at": time.time()}
         _MEM3D_CACHE.update(ts=time.time(), data=data)
         return data
