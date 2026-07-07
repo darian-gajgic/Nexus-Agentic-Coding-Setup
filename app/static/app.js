@@ -104,11 +104,19 @@ async function api(method, path, body) {
     throw e;
   }
   if (!res.ok) {
+    // surface the server's actual error message — it was discarded here,
+    // so every endpoint's helpful detail died as "API /x: 400"
+    let detail = '';
+    try {
+      const j = await res.json();
+      detail = j.error || j.detail || '';
+      if (typeof detail !== 'string') detail = JSON.stringify(detail).slice(0, 200);
+    } catch { }
     if (method !== 'GET' && Date.now() - _lastErrToast > 2000) {
       _lastErrToast = Date.now();
-      toast(`${method} ${path} failed (${res.status})`, 'err');
+      toast(detail ? `${detail}` : `${method} ${path} failed (${res.status})`, 'err', 5000);
     }
-    throw new Error(`API ${path}: ${res.status}`);
+    throw new Error(detail || `API ${path}: ${res.status}`);
   }
   return res.json();
 }
@@ -3438,7 +3446,7 @@ async function wfRepoChanged(repoSel) {
     if (!name) return;
     try {
       const r = await api('POST', '/api/projects/create-client',
-        { client: client.trim().toLowerCase(), name: name.trim().toLowerCase(), publish: true });
+        { client: slugify(client), name: slugify(name), publish: true });
       const opt = document.createElement('option');
       opt.value = r.path;
       opt.textContent = `🏢 ${r.client} / ${name.trim().toLowerCase()}`;
@@ -3455,6 +3463,12 @@ async function wfRepoChanged(repoSel) {
   if (sel && sel.dataset.client && $('#wf-client') && !$('#wf-client').value.trim()) {
     $('#wf-client').value = sel.dataset.client;
   }
+}
+
+// "Acme GmbH / Web Shop!" → "acme-gmbh" / "web-shop" — typing naturally just works
+function slugify(s) {
+  return String(s || '').trim().toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 60);
 }
 
 function newClientProjectUI() {
@@ -3474,8 +3488,8 @@ function newClientProjectUI() {
       <button class="btn-primary" id="ncp-create">Create repository</button>
     </div>`);
   $('#ncp-create').onclick = async () => {
-    const client = $('#ncp-client').value.trim().toLowerCase();
-    const name = $('#ncp-name').value.trim().toLowerCase();
+    const client = slugify($('#ncp-client').value);
+    const name = slugify($('#ncp-name').value);
     if (!client || !name) { toast('Client and project name required', 'err'); return; }
     $('#ncp-create').disabled = true; $('#ncp-create').textContent = 'Creating…';
     try {
@@ -3509,8 +3523,8 @@ async function promoteTaskUI(taskId, title) {
       <button class="btn-primary" id="pr-go">Promote</button>
     </div>`);
   $('#pr-go').onclick = async () => {
-    const client = $('#pr-client').value.trim().toLowerCase();
-    const name = $('#pr-name').value.trim().toLowerCase();
+    const client = slugify($('#pr-client').value);
+    const name = slugify($('#pr-name').value);
     if (!client || !name) { toast('Client and project name required', 'err'); return; }
     $('#pr-go').disabled = true; $('#pr-go').textContent = 'Promoting…';
     try {

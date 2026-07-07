@@ -820,10 +820,32 @@ index 2bd943c..c366604 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..8787e7e 100644
+index b0b7e37..87e474c 100644
 --- a/static/app.js
 +++ b/static/app.js
-@@ -308,7 +308,6 @@ async function tick() {
+@@ -104,11 +104,19 @@ async function api(method, path, body) {
+     throw e;
+   }
+   if (!res.ok) {
++    // surface the server's actual error message — it was discarded here,
++    // so every endpoint's helpful detail died as "API /x: 400"
++    let detail = '';
++    try {
++      const j = await res.json();
++      detail = j.error || j.detail || '';
++      if (typeof detail !== 'string') detail = JSON.stringify(detail).slice(0, 200);
++    } catch { }
+     if (method !== 'GET' && Date.now() - _lastErrToast > 2000) {
+       _lastErrToast = Date.now();
+-      toast(`${method} ${path} failed (${res.status})`, 'err');
++      toast(detail ? `${detail}` : `${method} ${path} failed (${res.status})`, 'err', 5000);
+     }
+-    throw new Error(`API ${path}: ${res.status}`);
++    throw new Error(detail || `API ${path}: ${res.status}`);
+   }
+   return res.json();
+ }
+@@ -308,7 +316,6 @@ async function tick() {
      if (pendingRender && !uiLocked()) { pendingRender = false; render(); updateSidebarMini(); return; }
      if (currentView === 'dashboard') {
        updateDashboardInPlace();
@@ -831,7 +853,7 @@ index b0b7e37..8787e7e 100644
      } else if (currentView === 'agents') {
        renderAgentsView(); // in-place patcher once built
      } else if (currentView === 'kanban') {
-@@ -364,18 +363,25 @@ const VIEW_META = {
+@@ -364,18 +371,25 @@ const VIEW_META = {
    monitor: ['System Monitor', 'Live host telemetry'],
    tools: ['Tools Hub', 'Connected tools & integration health'],
    programs: ['Programs', 'Registered workloads'],
@@ -860,7 +882,7 @@ index b0b7e37..8787e7e 100644
    }
    currentView = view;
    agentsBuilt = false;
-@@ -404,6 +410,7 @@ function render() {
+@@ -404,6 +418,7 @@ function render() {
    else if (currentView === 'usage') { c.innerHTML = wrapView(viewUsage()); bindUsage(); }
    else if (currentView === 'settings') { c.innerHTML = wrapView(viewSettings()); bindSettings(); }
    else if (currentView === 'issues') { c.innerHTML = wrapView(viewKnownIssues()); }
@@ -868,7 +890,7 @@ index b0b7e37..8787e7e 100644
    else if (currentView === 'observability') { c.innerHTML = wrapView(viewObservability()); bindObservability(); }
    else if (currentView === 'memory') { c.innerHTML = wrapView(viewMemory()); bindMemory(); }
    else if (currentView === 'specialists') { c.innerHTML = wrapView(viewSpecialists()); bindSpecialists(); }
-@@ -427,7 +434,8 @@ function renderDashboard() {
+@@ -427,7 +442,8 @@ function renderDashboard() {
    if (!dashBuilt) {
      c.innerHTML = wrapView(viewDashboard());
      dashBuilt = true;
@@ -878,7 +900,7 @@ index b0b7e37..8787e7e 100644
      animateStatValues();
      loadOnboardingCta();
    } else {
-@@ -435,6 +443,56 @@ function renderDashboard() {
+@@ -435,6 +451,56 @@ function renderDashboard() {
    }
  }
  
@@ -935,7 +957,7 @@ index b0b7e37..8787e7e 100644
  // X4: "run the onboarding" call-to-action until the Business Brain is personalized
  async function loadOnboardingCta() {
    const box = $('#onboardingCta');
-@@ -552,19 +610,14 @@ function viewDashboard() {
+@@ -552,19 +618,14 @@ function viewDashboard() {
    const liveCount = (state.agents || []).filter(a => a.status === 'running' || a.status === 'busy').length;
  
    return `
@@ -961,7 +983,7 @@ index b0b7e37..8787e7e 100644
        <div class="now-strip">
          <div class="now-title"><span class="status-dot online"></span> Executing right now</div>
          <div id="nowStrip">${nowRunningHTML()}</div>
-@@ -958,6 +1011,11 @@ function openTaskDetail(id) {
+@@ -958,6 +1019,11 @@ function openTaskDetail(id) {
        <div class="chip c-accent" style="white-space:normal">${esc(t.rubric_score)}</div></div>` : ''}
      ${t.learn_section ? `<div class="form-group"><label class="form-label">Learn (for you two)</label>
        <div style="background:rgba(124,92,255,.08);border:1px solid rgba(124,92,255,.25);border-radius:8px;padding:10px 12px;font-size:12.5px;white-space:pre-wrap">${esc(t.learn_section)}</div></div>` : ''}
@@ -973,7 +995,7 @@ index b0b7e37..8787e7e 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -1051,6 +1109,361 @@ async function deleteAttachment(kind, id, name, elId) {
+@@ -1051,6 +1117,361 @@ async function deleteAttachment(kind, id, name, elId) {
    } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
  }
  
@@ -1335,7 +1357,7 @@ index b0b7e37..8787e7e 100644
  // ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
  const KNOWN_MODELS = ['glm-5.2', 'glm-5.1', 'glm-4.5-air'];
  const settingsState = { fetched: false, dispatch: {}, model: {} };
-@@ -1533,6 +1946,7 @@ async function loadTaskExtras(t) {
+@@ -1533,6 +1954,7 @@ async function loadTaskExtras(t) {
            ${run && run.ready ? `<span class="chip c-green">running</span><a class="btn-sm" href="${esc(run.url)}" target="_blank" style="text-decoration:none">↗ Open</a>
              <button class="btn-sm danger" onclick="stopAppUI('${esc(t.id)}')">⏹ Stop</button>`
        : `<button class="btn-sm" style="border-color:var(--accent-2)" onclick="testAppUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">▶ Test app</button>`}
@@ -1343,7 +1365,7 @@ index b0b7e37..8787e7e 100644
          </div></div>`;
      }
      if ((fr.files || []).length) {
-@@ -2567,6 +2981,11 @@ function showTaskModal(status) {
+@@ -2567,6 +2989,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -1355,7 +1377,7 @@ index b0b7e37..8787e7e 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +3015,14 @@ function showTaskModal(status) {
+@@ -2596,6 +3023,14 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
@@ -1370,7 +1392,7 @@ index b0b7e37..8787e7e 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +3094,7 @@ async function submitTask() {
+@@ -2667,6 +3102,7 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
@@ -1378,7 +1400,7 @@ index b0b7e37..8787e7e 100644
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -2941,14 +3369,17 @@ function viewProjects() {
+@@ -2941,14 +3377,17 @@ function viewProjects() {
    const fmtSize = b => b > 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b > 1e6 ? (b / 1e6).toFixed(0) + ' MB' : (b / 1e3).toFixed(0) + ' KB';
    const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
    let html = `
@@ -1398,7 +1420,7 @@ index b0b7e37..8787e7e 100644
        <tbody>`;
    for (const p of projs) {
      const langs = Object.entries(p.languages).slice(0, 3).map(([l]) =>
-@@ -2957,10 +3388,11 @@ function viewProjects() {
+@@ -2957,10 +3396,11 @@ function viewProjects() {
        p.is_repo ? '<span style="color:var(--green)">● clean</span>' :
          '<span class="muted">○ no git</span>';
      html += `<tr class="proj-row" data-path="${esc(p.path)}">
@@ -1411,7 +1433,7 @@ index b0b7e37..8787e7e 100644
        <td>${fmtSize(p.size_bytes)}</td>
        <td class="muted">${fmtDays(p.last_modified)}</td>
      </tr>`;
-@@ -2982,11 +3414,146 @@ function bindProjects() {
+@@ -2982,11 +3422,152 @@ function bindProjects() {
            <div class="kv-row"><span class="kv-key">Size</span><span class="kv-val">${(p.size_bytes / 1e6).toFixed(1)} MB</span></div>
            <div class="kv-row"><span class="kv-key">venv</span><span class="kv-val">${p.has_venv ? 'yes' : 'no'}</span></div>
            <h4 style="margin-top:12px">Languages</h4>${langs}
@@ -1439,7 +1461,7 @@ index b0b7e37..8787e7e 100644
 +    if (!name) return;
 +    try {
 +      const r = await api('POST', '/api/projects/create-client',
-+        { client: client.trim().toLowerCase(), name: name.trim().toLowerCase(), publish: true });
++        { client: slugify(client), name: slugify(name), publish: true });
 +      const opt = document.createElement('option');
 +      opt.value = r.path;
 +      opt.textContent = `🏢 ${r.client} / ${name.trim().toLowerCase()}`;
@@ -1456,6 +1478,12 @@ index b0b7e37..8787e7e 100644
 +  if (sel && sel.dataset.client && $('#wf-client') && !$('#wf-client').value.trim()) {
 +    $('#wf-client').value = sel.dataset.client;
 +  }
++}
++
++// "Acme GmbH / Web Shop!" → "acme-gmbh" / "web-shop" — typing naturally just works
++function slugify(s) {
++  return String(s || '').trim().toLowerCase()
++    .replace(/[^a-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 60);
 +}
 +
 +function newClientProjectUI() {
@@ -1475,8 +1503,8 @@ index b0b7e37..8787e7e 100644
 +      <button class="btn-primary" id="ncp-create">Create repository</button>
 +    </div>`);
 +  $('#ncp-create').onclick = async () => {
-+    const client = $('#ncp-client').value.trim().toLowerCase();
-+    const name = $('#ncp-name').value.trim().toLowerCase();
++    const client = slugify($('#ncp-client').value);
++    const name = slugify($('#ncp-name').value);
 +    if (!client || !name) { toast('Client and project name required', 'err'); return; }
 +    $('#ncp-create').disabled = true; $('#ncp-create').textContent = 'Creating…';
 +    try {
@@ -1510,8 +1538,8 @@ index b0b7e37..8787e7e 100644
 +      <button class="btn-primary" id="pr-go">Promote</button>
 +    </div>`);
 +  $('#pr-go').onclick = async () => {
-+    const client = $('#pr-client').value.trim().toLowerCase();
-+    const name = $('#pr-name').value.trim().toLowerCase();
++    const client = slugify($('#pr-client').value);
++    const name = slugify($('#pr-name').value);
 +    if (!client || !name) { toast('Client and project name required', 'err'); return; }
 +    $('#pr-go').disabled = true; $('#pr-go').textContent = 'Promoting…';
 +    try {
@@ -1558,7 +1586,7 @@ index b0b7e37..8787e7e 100644
  // ═══════════════════════════════ GUARDIAN ═══════════════════════════════
  const guardianState = { data: null, loading: false, fetched: false };
  async function loadGuardian() {
-@@ -3198,13 +3765,15 @@ function viewMemory() {
+@@ -3198,13 +3779,15 @@ function viewMemory() {
    const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
    const sharedCount = (specialistsState.shared || []).length;
    const tabs = [
@@ -1575,7 +1603,7 @@ index b0b7e37..8787e7e 100644
    else if (memoryState.tab === 'agent') body = memAgentHTML();
    else if (memoryState.tab === 'lessons') body = memLessonsHTML();
    else if (memoryState.tab === 'shared') body = memSharedHTML();
-@@ -3226,7 +3795,48 @@ async function loadAgentMemoryTab() {
+@@ -3226,7 +3809,48 @@ async function loadAgentMemoryTab() {
    if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
  }
  
@@ -1624,7 +1652,7 @@ index b0b7e37..8787e7e 100644
    $$('[data-memtab]').forEach(el => {
      el.onclick = () => {
        memoryState.tab = el.dataset.memtab;
-@@ -3778,28 +4388,31 @@ function renderJarvisView() {
+@@ -3778,28 +4402,31 @@ function renderJarvisView() {
          </div>
        </div>
  
@@ -1675,7 +1703,7 @@ index b0b7e37..8787e7e 100644
          </div>
          <div class="jarvis-feed" id="jFeed"></div>
          <div class="jarvis-chat-row">
-@@ -3839,8 +4452,36 @@ function renderJarvisView() {
+@@ -3839,8 +4466,36 @@ function renderJarvisView() {
    // Wire up controls
    jarvisBindControls();
  
@@ -1714,7 +1742,7 @@ index b0b7e37..8787e7e 100644
  }
  
  async function jarvisBootSequence() {
-@@ -3996,10 +4637,12 @@ function jarvisBindControls() {
+@@ -3996,10 +4651,12 @@ function jarvisBindControls() {
  
    stopBtn.addEventListener('click', () => jarvisStopStreaming());
  
@@ -1730,7 +1758,7 @@ index b0b7e37..8787e7e 100644
    });
  
    // Conversation mode toggle
-@@ -4012,7 +4655,8 @@ function jarvisBindControls() {
+@@ -4012,7 +4669,8 @@ function jarvisBindControls() {
  }
  
  // ===== STATUS =====
@@ -1740,7 +1768,7 @@ index b0b7e37..8787e7e 100644
    try {
      const s = await api('GET', '/api/jarvis/status');
      jarvisState.connected = s.connected;
-@@ -4037,8 +4681,10 @@ async function jarvisLoadStatus() {
+@@ -4037,8 +4695,10 @@ async function jarvisLoadStatus() {
      $('#jVoiceStatus').textContent = 'OFF';
    }
  
@@ -1753,7 +1781,7 @@ index b0b7e37..8787e7e 100644
  }
  
  async function jarvisLoadData() {
-@@ -4083,12 +4729,13 @@ function jarvisUpdateActivity() {
+@@ -4083,12 +4743,13 @@ function jarvisUpdateActivity() {
      el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
      return;
    }
@@ -1768,7 +1796,7 @@ index b0b7e37..8787e7e 100644
    const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
    const labelEl = $('#jState');
    if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
-@@ -4132,7 +4779,8 @@ function jarvisRenderFeed() {
+@@ -4132,7 +4793,8 @@ function jarvisRenderFeed() {
    feed.innerHTML = jarvisState.messages.map(m => {
      const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
      const cls2 = m.live ? ' live' : '';
@@ -1778,7 +1806,7 @@ index b0b7e37..8787e7e 100644
    }).join('');
    feed.scrollTop = feed.scrollHeight;
    const mc = $('#jMsgCount');
-@@ -4193,6 +4841,16 @@ async function jarvisStreamChat(text) {
+@@ -4193,6 +4855,16 @@ async function jarvisStreamChat(text) {
  
      liveMsg.live = false;
  
@@ -1795,7 +1823,7 @@ index b0b7e37..8787e7e 100644
      // Speak the response
      if (fullText && jarvisState.voiceAvailable) {
        jarvisSpeak(fullText);
-@@ -4201,7 +4859,9 @@ async function jarvisStreamChat(text) {
+@@ -4201,7 +4873,9 @@ async function jarvisStreamChat(text) {
      if (e.name === 'AbortError') {
        liveMsg.text += ' [stopped]';
      } else {
@@ -1806,7 +1834,7 @@ index b0b7e37..8787e7e 100644
      }
      liveMsg.live = false;
    } finally {
-@@ -4247,7 +4907,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4247,7 +4921,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
      case 'tool_call':
        const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
        if (toolName && toolName !== '_thinking') {
@@ -1815,7 +1843,7 @@ index b0b7e37..8787e7e 100644
        }
        break;
      case 'run.completed':
-@@ -4256,10 +4916,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4256,10 +4930,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
        liveMsg.live = false;
        break;
      case 'run.failed':
@@ -1835,7 +1863,7 @@ index b0b7e37..8787e7e 100644
    }
  }
  
-@@ -4307,7 +4974,12 @@ async function jarvisProcessTTSQueue() {
+@@ -4307,7 +4988,12 @@ async function jarvisProcessTTSQueue() {
      return;
    }
    jarvisState.ttsAnimating = true;
@@ -1848,7 +1876,7 @@ index b0b7e37..8787e7e 100644
  
    // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
    // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
-@@ -4317,6 +4989,7 @@ async function jarvisProcessTTSQueue() {
+@@ -4317,6 +5003,7 @@ async function jarvisProcessTTSQueue() {
  
    while (pending) {
      const clip = await pending;
@@ -1856,7 +1884,7 @@ index b0b7e37..8787e7e 100644
      // Kick off NEXT render now (runs in parallel with current playback)
      let nextPending = null;
      if (jarvisState.ttsQueue.length > 0) {
-@@ -4326,9 +4999,17 @@ async function jarvisProcessTTSQueue() {
+@@ -4326,9 +5013,17 @@ async function jarvisProcessTTSQueue() {
      }
      if (clip) await jarvisPlayClip(clip);
      pending = nextPending;
@@ -1874,7 +1902,7 @@ index b0b7e37..8787e7e 100644
    jarvisSetMode('idle');
    jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
    jarvisMaybeAutoListen();
-@@ -4365,7 +5046,10 @@ async function jarvisFetchClip(text) {
+@@ -4365,7 +5060,10 @@ async function jarvisFetchClip(text) {
  // both from the SAME blob — synced by construction. If WAV (/tts fallback):
  // audio only.
  function jarvisPlayClip(blob) {
@@ -1886,7 +1914,7 @@ index b0b7e37..8787e7e 100644
    return new Promise((resolve) => {
      let resolved = false;
      const url = URL.createObjectURL(blob);
-@@ -4377,11 +5061,15 @@ function jarvisPlayClip(blob) {
+@@ -4377,11 +5075,15 @@ function jarvisPlayClip(blob) {
      const cleanup = () => {
        if (resolved) return;
        resolved = true;
@@ -1902,7 +1930,7 @@ index b0b7e37..8787e7e 100644
  
      const startIfReady = () => {
        if (started || !audioReady || !videoReady) return;
-@@ -4420,10 +5108,38 @@ function jarvisAudioEl() {
+@@ -4420,10 +5122,38 @@ function jarvisAudioEl() {
    if (!jarvisState.ttsAudioEl) {
      const el = new Audio();
      jarvisState.ttsAudioEl = el;
@@ -1941,7 +1969,7 @@ index b0b7e37..8787e7e 100644
  function jarvisMaybeAutoListen() {
    if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
      jarvisStartRecording();
-@@ -4432,12 +5148,19 @@ function jarvisMaybeAutoListen() {
+@@ -4432,12 +5162,19 @@ function jarvisMaybeAutoListen() {
  
  function jarvisStopTTS() {
    jarvisState.ttsQueue = [];
@@ -1962,7 +1990,7 @@ index b0b7e37..8787e7e 100644
    jarvisSetIdleAvatar();
  }
  
-@@ -4463,12 +5186,16 @@ async function jarvisStartRecording() {
+@@ -4463,12 +5200,16 @@ async function jarvisStartRecording() {
        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
      }
      const ctx = jarvisState.audioContext;
@@ -1979,7 +2007,7 @@ index b0b7e37..8787e7e 100644
      jarvisMicLevelLoop();
  
      jarvisState.mediaRecorder.ondataavailable = (e) => {
-@@ -4526,6 +5253,7 @@ function jarvisMicLevelLoop() {
+@@ -4526,6 +5267,7 @@ function jarvisMicLevelLoop() {
    if (!jarvisState.micAnalyser || !jarvisState.recording) {
      const el = $('#jMicLevel');
      if (el) el.style.width = '0%';
@@ -1987,7 +2015,7 @@ index b0b7e37..8787e7e 100644
      return;
    }
    jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
-@@ -4534,6 +5262,18 @@ function jarvisMicLevelLoop() {
+@@ -4534,6 +5276,18 @@ function jarvisMicLevelLoop() {
    const avg = sum / jarvisState._micDataArray.length / 255;
    const el = $('#jMicLevel');
    if (el) el.style.width = (avg * 100 * 2) + '%';
@@ -2006,7 +2034,7 @@ index b0b7e37..8787e7e 100644
    requestAnimationFrame(jarvisMicLevelLoop);
  }
  
-@@ -4547,7 +5287,13 @@ setInterval(() => {
+@@ -4547,7 +5301,13 @@ setInterval(() => {
  }, 2000);
  
  
@@ -2021,7 +2049,7 @@ index b0b7e37..8787e7e 100644
  function closeModal() {
    const m = $('#modal');
    if (m) m.style.display = 'none';
-@@ -4974,6 +5720,23 @@ async function newWorkflowUI() {
+@@ -4974,6 +5734,23 @@ async function newWorkflowUI() {
    render();
  }
  
@@ -2045,7 +2073,7 @@ index b0b7e37..8787e7e 100644
  async function openWorkflowDetail(id) {
    let w;
    try { w = await api('GET', `/api/workflows/${id}`); }
-@@ -5006,6 +5769,22 @@ async function openWorkflowDetail(id) {
+@@ -5006,6 +5783,22 @@ async function openWorkflowDetail(id) {
          ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
          <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
        </div></div>
@@ -2068,7 +2096,7 @@ index b0b7e37..8787e7e 100644
      <div class="modal-actions" style="justify-content:space-between">
        <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
        <div style="display:flex;gap:10px">
-@@ -5089,8 +5868,8 @@ function viewDeliverables() {
+@@ -5089,8 +5882,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -2079,7 +2107,7 @@ index b0b7e37..8787e7e 100644
              : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
          </div>
          <div class="row-actions">
-@@ -5292,6 +6071,22 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5292,6 +6085,22 @@ function proposeWorkflowModal(wf, meta) {
      ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase, or edit the task description after creation.</span></div>` : ''}
      ${repairs.length ? `<div style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px">🔧 wizard auto-fixed: ${repairs.map(esc).join(' · ')}</div>` : ''}
      <div style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto">${stages.join('')}</div>
@@ -2102,7 +2130,7 @@ index b0b7e37..8787e7e 100644
      <div class="form-group" style="margin-top:8px">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -5307,6 +6102,19 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5307,6 +6116,19 @@ function proposeWorkflowModal(wf, meta) {
        <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
      </div>`);
    const b = $('#wfCreateBtn');
@@ -2122,7 +2150,7 @@ index b0b7e37..8787e7e 100644
    const keeps = () => tasks.map((_, i) => {
      const cb = $(`#wfKeep${i}`);
      return !cb || cb.checked;
-@@ -5332,6 +6140,11 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5332,6 +6154,11 @@ function proposeWorkflowModal(wf, meta) {
        }
        return out;
      };
@@ -2134,7 +2162,7 @@ index b0b7e37..8787e7e 100644
      let wfLoop = null;
      if ($('#wf-loop') && $('#wf-loop').checked) {
        try {
-@@ -5341,14 +6154,15 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5341,14 +6168,15 @@ function proposeWorkflowModal(wf, meta) {
            meta: {
              title: wf.name, domain: wf.domain,
              specialists: tasks.filter((_, i) => keep[i]).map(t => t.specialist).filter(Boolean),
@@ -2152,7 +2180,7 @@ index b0b7e37..8787e7e 100644
        const ids = [];
        for (let i = 0; i < tasks.length; i++) {
          const t = tasks[i];
-@@ -5356,9 +6170,13 @@ function proposeWorkflowModal(wf, meta) {
+@@ -5356,9 +6184,13 @@ function proposeWorkflowModal(wf, meta) {
          const created = await api('POST', '/api/tasks', {
            title: t.title, description: t.description, status: 'backlog',
            priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
@@ -2168,7 +2196,7 @@ index b0b7e37..8787e7e 100644
          });
          ids.push(created.id);
 diff --git a/static/index.html b/static/index.html
-index bb6661f..e94c7e5 100644
+index bb6661f..ec8207f 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -2211,7 +2239,7 @@ index bb6661f..e94c7e5 100644
 -<script src="/static/app.js?v=28"></script>
 +<script src="/static/memory3d.js?v=5" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=38"></script>
++<script src="/static/app.js?v=39"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css
