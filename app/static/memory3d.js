@@ -22,7 +22,7 @@ const M = {
   group: null, nodeMeshes: [], linkLines: null, pulses: [], stars: null,
   grid: null, data: null, panel: null, hoverId: -1, raycaster: null,
   pointer: null, resizeObs: null, t: 0,
-  cam: { theta: 0.9, phi: 1.15, dist: 150, tx: 0, ty: 0 },
+  cam: { theta: 0.9, phi: 1.15, dist: 115, tx: 0, ty: 0 },
   drag: null, lastInteract: 0, container: null,
   glows: null, labels: [], flyT: -1, searchQ: '', matchSet: null,
 };
@@ -85,13 +85,21 @@ function textSprite(text, sub, hex) {
 }
 
 // Region palette — each semantic cluster gets its own vivid hue, like the
-// brain-region maps this view is modeled on (lime, magenta, amber, violet,
-// cyan, rose, blue, mint). Node color = its cluster's color.
-const REGION_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6,
-                     0x22d3ee, 0xec4899, 0x60a5fa, 0x2dd4bf];
+// brain-region maps this view is modeled on. CYAN is first: it goes to the
+// LARGEST region (operator's request), then hues by descending region size.
+const REGION_HUES = [0x22d3ee, 0xa3e635, 0xf43f5e, 0xf59e0b,
+                     0x8b5cf6, 0xec4899, 0x60a5fa, 0x2dd4bf];
+
+function buildHueMap(clusters) {
+  // biggest region → cyan, second → lime, …
+  M.hueByCluster = {};
+  [...(clusters || [])].sort((a, b) => b.size - a.size).forEach((cl, rank) => {
+    M.hueByCluster[cl.id] = REGION_HUES[rank % REGION_HUES.length];
+  });
+}
 
 function nodeColor(n) {
-  return REGION_HUES[(n.cluster ?? 0) % REGION_HUES.length];
+  return (M.hueByCluster && M.hueByCluster[n.cluster]) ?? REGION_HUES[0];
 }
 
 function lerp3(a, b, t) {
@@ -100,6 +108,7 @@ function lerp3(a, b, t) {
 
 function buildScene(data) {
   const { nodes, links } = data;
+  buildHueMap(data.clusters);
   M.group = new THREE.Group();
   M.scene.add(M.group);
 
@@ -122,7 +131,7 @@ function buildScene(data) {
   // galaxy look comes from the glow layer, not from big geometry ──
   const sphereGeo = new THREE.IcosahedronGeometry(1, 1);
   nodes.forEach((n, i) => {
-    const size = 0.45 + Math.min(0.9, n.degree * 0.16);
+    const size = 0.6 + Math.min(1.1, n.degree * 0.2);
     const mat = new THREE.MeshBasicMaterial({
       color: nodeColor(n), transparent: true, opacity: 0.95,
     });
@@ -153,7 +162,7 @@ function buildScene(data) {
 
   // ── semantic region callouts in their region's color ──
   (data.clusters || []).forEach((cl) => {
-    const hue = REGION_HUES[(cl.id ?? 0) % REGION_HUES.length];
+    const hue = (M.hueByCluster && M.hueByCluster[cl.id]) ?? REGION_HUES[0];
     const s = textSprite(cl.label, `${cl.size} memories`, hue);
     s.position.set(cl.x, cl.y + 7, cl.z);
     M.group.add(s);
@@ -193,13 +202,13 @@ function buildScene(data) {
     M.pulses.push(p);
   }
 
-  M.scene.fog = new THREE.FogExp2(0x02080a, 0.0024);
+  M.scene.fog = new THREE.FogExp2(0x02080a, 0.0012);
 }
 
 function applyCamera() {
   const c = M.cam;
   c.phi = Math.max(0.15, Math.min(Math.PI - 0.15, c.phi));
-  c.dist = Math.max(30, Math.min(420, c.dist));
+  c.dist = Math.max(24, Math.min(760, c.dist));
   M.camera.position.set(
     c.tx + c.dist * Math.sin(c.phi) * Math.cos(c.theta),
     c.ty + c.dist * Math.cos(c.phi),
@@ -293,7 +302,7 @@ function animate() {
     M.flyT += 0.016;
     const k = Math.min(1, M.flyT / 2.4);
     const ease = 1 - Math.pow(1 - k, 3);
-    M.cam.dist = 430 - (430 - 150) * ease;
+    M.cam.dist = 640 - (640 - 115) * ease;
     M.cam.phi = 0.62 + (1.15 - 0.62) * ease;
     if (k >= 1) M.flyT = -1;
   }
@@ -363,7 +372,7 @@ async function mount(container, data) {
   // hover info panel (glass card, pointer-transparent so orbiting works through it)
   M.panel = document.createElement('div');
   M.panel.style.cssText =
-    'position:absolute;top:18px;right:18px;width:330px;max-width:44%;padding:16px 18px;' +
+    'position:absolute;top:18px;left:18px;width:330px;max-width:44%;padding:16px 18px;' +
     'background:rgba(13,13,26,.82);border:1px solid rgba(124,92,255,.35);border-radius:14px;' +
     'backdrop-filter:blur(14px);box-shadow:0 8px 40px rgba(0,0,0,.5),0 0 24px rgba(124,92,255,.12);' +
     'opacity:0;transition:opacity .22s;pointer-events:none;z-index:5';
@@ -375,7 +384,7 @@ async function mount(container, data) {
     'position:absolute;left:18px;bottom:16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;' +
     'font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);pointer-events:none;z-index:5;max-width:75%';
   const regionChips = (data.clusters || []).map((cl) => {
-    const col = '#' + REGION_HUES[(cl.id ?? 0) % REGION_HUES.length].toString(16).padStart(6, '0');
+    const col = '#' + (((M.hueByCluster && M.hueByCluster[cl.id]) ?? REGION_HUES[0])).toString(16).padStart(6, '0');
     const word = esc(String(cl.label).split(' · ')[0]);
     return `<span><i style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col};margin-right:5px"></i>${word}</span>`;
   }).join('');

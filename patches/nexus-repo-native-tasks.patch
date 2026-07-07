@@ -236,7 +236,7 @@ index 9893a7f..834b0fc 100644
 +        if mp4_path is not None:
 +            mp4_path.unlink(missing_ok=True)  # was leaked on every sentence
 diff --git a/server.py b/server.py
-index 2bd943c..60975df 100644
+index 2bd943c..09fe9dc 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,7 @@ class TaskCreate(BaseModel):
@@ -335,7 +335,7 @@ index 2bd943c..60975df 100644
  # ===== JARVIS Neural Lip-Sync (Wav2Lip) =====
  
  _lipsync_ready = False
-@@ -3445,6 +3454,152 @@ async def agent_config_update(agent_id: str, body: dict):
+@@ -3445,6 +3454,153 @@ async def agent_config_update(agent_id: str, body: dict):
  import tools_hub
  
  
@@ -381,8 +381,9 @@ index 2bd943c..60975df 100644
 +        # PCA via SVD — the 3 principal semantic axes of the whole memory
 +        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
 +        coords = centered @ vt[:3].T
-+        # normalize into a comfortable room size (~[-60, 60])
-+        coords = coords / (np.abs(coords).max() + 1e-9) * 60.0
++        # normalize into a spacious room (~[-120, 120]) — operator asked for
++        # 2x the spread between stars
++        coords = coords / (np.abs(coords).max() + 1e-9) * 120.0
 +
 +        # top-k similarity links (real cosine, deduped pairs)
 +        sims = vecs @ vecs.T
@@ -489,7 +490,7 @@ index 2bd943c..60975df 100644
  async def api_tools():
      """Live health-checked registry of all integrated tools."""
 diff --git a/static/app.js b/static/app.js
-index b0b7e37..c9b3232 100644
+index b0b7e37..dd3d392 100644
 --- a/static/app.js
 +++ b/static/app.js
 @@ -308,7 +308,6 @@ async function tick() {
@@ -635,7 +636,7 @@ index b0b7e37..c9b3232 100644
      <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
        <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
      <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
-@@ -1051,6 +1109,283 @@ async function deleteAttachment(kind, id, name, elId) {
+@@ -1051,6 +1109,329 @@ async function deleteAttachment(kind, id, name, elId) {
    } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
  }
  
@@ -863,10 +864,56 @@ index b0b7e37..c9b3232 100644
 +  ],
 +};
 +
++// ── Popup tours: when a modal/drawer is open, the ? explains THAT window ──
++Object.assign(TOURS, {
++  'task-detail-modal': [
++    { sel: '#td-status, .modal-content', title: 'Status & priority', body: 'Status is the kanban column this task sits in — moving it here is the same as dragging the card. Priority orders it against other waiting tasks (1 is most urgent).' },
++    { sel: '#td-model', title: 'Which AI model works on it', body: 'glm-5.2 is the smart default for real work. glm-4.5-air is faster and cheaper — fine for simple mechanical jobs. Each model has its own traffic lane, so light tasks never queue behind heavy ones.' },
++    { sel: '#td-budget', title: 'The spending fence', body: 'The maximum tokens (AI fuel) this task may consume. Empty = the default from Settings. If it runs out, the task pauses as "blocked: budget" — retrying grants exactly one more slice, so nothing ever runs away.' },
++    { sel: '#td-depends', title: 'Dependencies', body: 'Tasks selected here must finish first; their results are handed to this task as input automatically. This is how pipelines pass work along.' },
++    { sel: '[id^="attachRow"], .attach-list, #td-attachments', title: 'Attachments', body: 'Give the agent your material: PDFs, Office files, images. It is REQUIRED to read them before working. Results can come back in these formats too — just ask in the description.' },
++    { sel: '[onclick*="loopViewerModal"], [onclick*="viewLoop"]', title: 'The improvement loop 🔁', body: 'Shows how this task self-corrects: which check triggers a rework, how many rounds are allowed, and whether it runs automatically (closed) or waits for you (open). You can regenerate or disable it here.' },
++    { sel: '[onclick*="retryTask"], [onclick*="dispatchTask"]', title: 'Dispatch / Retry', body: 'Dispatch sends the task to an agent now. Retry re-runs a finished/failed task — add a sentence of feedback first and the agent must address it. Retry also grants a fresh budget slice.' },
++    { sel: '.modal-content', title: 'Files & transcript', body: 'Every file the task produced is listed at the bottom with previews and downloads. The transcript link shows the agent\'s full working session — every command, every step, complete transparency.' },
++  ],
++  'task-create-modal': [
++    { sel: '#m-task-title, .modal-content input', title: 'Title & description', body: 'Say what you want, for whom, and what "done" looks like — one sentence each is plenty. Tip: the ✨ wizard on the board does this planning for you and asks the right questions.' },
++    { sel: '#m-task-specialist', title: 'Specialist', body: 'Pick an expert (coder, researcher, reviewer…) or leave it on "Agent decides". Specialists carry their own instructions and remember lessons from your past feedback.' },
++    { sel: '#m-task-repo', title: '🧬 Existing code repository', body: 'For coding on YOUR projects: pick a repo and the agent works inside an isolated copy (a git branch), follows the repo\'s house rules, runs its tests, and delivers a reviewable diff. Your checkout is never touched.' },
++    { sel: '#m-task-loop', title: 'Looping', body: 'Enable and the task self-corrects: failed checks send it back with the findings attached, automatically (closed mode) or with your approval (open mode). Choose quality (more rounds, judge involved) or speed.' },
++  ],
++  'wizard-modal': [
++    { sel: '.modal-content h2, .modal-content', title: 'The proposed plan', body: 'The AI turned your description into stages. Each row is one task; arrows show what feeds what. Locked rows are quality gates (review, verification) — they exist so mistakes get caught before they reach you.' },
++    { sel: '.modal-content input[type="checkbox"]', title: 'Trim it', body: 'Untick optional stages you don\'t want — dependents automatically reconnect around removed ones. Assumptions the AI made are listed; if one is wrong, cancel and rephrase your description.' },
++    { sel: '.modal-actions .btn-primary', title: 'Approve', body: 'Creates all tasks with their dependencies. Stages start on their own as their inputs become ready — watch progress on the board or the project page.' },
++  ],
++  'agent-drawer': [
++    { sel: '#drawerBody .kv-row, #drawerBody', title: 'The agent\'s vitals', body: 'PID is its live process; heartbeat shows it\'s healthy (the watchdog restarts it within seconds if not); tasks done/failed is its track record.' },
++    { sel: '#cfg-autoclaim', title: 'Auto-claim', body: 'On = this agent grabs unassigned Todo tasks by itself. Off = it only works on tasks you assign to it explicitly.' },
++    { sel: '#cfg-maxtokens', title: 'Spending cap', body: 'A hard token ceiling for this lane. When reached, the watchdog pauses it as cost_capped — a per-worker fence on top of task budgets.' },
++    { sel: '.dtab', title: 'Memory · Messages · Cost', body: 'The tabs show what this agent remembers, its message history with other agents, and exactly what it has consumed.' },
++  ],
++});
++
++function tourContext() {
++  // a visible popup wins over the underlying view
++  const modal = document.getElementById('modal');
++  if (modal && modal.style.display !== 'none' && modal.style.display !== '') {
++    const mc = modal.innerHTML || '';
++    if (document.getElementById('td-budget')) return 'task-detail-modal';
++    if (document.getElementById('m-task-title') || document.getElementById('m-task-loop')) return 'task-create-modal';
++    if (mc.includes('stage') || mc.includes('Assumptions') || mc.includes('pipeline')) return 'wizard-modal';
++  }
++  const drawer = document.getElementById('drawer');
++  if (drawer && drawer.classList.contains('open')) return 'agent-drawer';
++  return currentView;
++}
++
 +let _tour = null;
 +function startTour(view) {
 +  endTour();
-+  const steps = (TOURS[view] || []).filter(s => document.querySelector(s.sel));
++  const ctx = view === currentView ? tourContext() : view;
++  const steps = (TOURS[ctx] || []).filter(s => document.querySelector(s.sel));
 +  if (!steps.length) { switchView('manual'); return; }
 +  _tour = { steps, i: 0 };
 +  const dim = document.createElement('div');
@@ -919,7 +966,7 @@ index b0b7e37..c9b3232 100644
  // ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
  const KNOWN_MODELS = ['glm-5.2', 'glm-5.1', 'glm-4.5-air'];
  const settingsState = { fetched: false, dispatch: {}, model: {} };
-@@ -2567,6 +2902,11 @@ function showTaskModal(status) {
+@@ -2567,6 +2948,11 @@ function showTaskModal(status) {
        <label class="form-label">Tags (comma-separated)</label>
        <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
      </div>
@@ -931,7 +978,7 @@ index b0b7e37..c9b3232 100644
      <div class="form-group">
        <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
        <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
-@@ -2596,6 +2936,14 @@ function showTaskModal(status) {
+@@ -2596,6 +2982,14 @@ function showTaskModal(status) {
        if (sel) sel.innerHTML = `<option value="">— Agent decides —</option>` +
          specialistNamesCache.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
      } catch { /* optional */ }
@@ -946,7 +993,7 @@ index b0b7e37..c9b3232 100644
      try {
        if (!templateCache) templateCache = (await api('GET', '/api/templates')).templates || [];
        const tsel = $('#m-task-template');
-@@ -2667,6 +3015,7 @@ async function submitTask() {
+@@ -2667,6 +3061,7 @@ async function submitTask() {
    closeModal();
    await api('POST', '/api/tasks', {
      loop_config: loopCfg,
@@ -954,7 +1001,7 @@ index b0b7e37..c9b3232 100644
      title,
      description: $('#m-task-desc').value,
      status: $('#m-task-status').value,
-@@ -3198,13 +3547,15 @@ function viewMemory() {
+@@ -3198,13 +3593,15 @@ function viewMemory() {
    const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
    const sharedCount = (specialistsState.shared || []).length;
    const tabs = [
@@ -971,7 +1018,7 @@ index b0b7e37..c9b3232 100644
    else if (memoryState.tab === 'agent') body = memAgentHTML();
    else if (memoryState.tab === 'lessons') body = memLessonsHTML();
    else if (memoryState.tab === 'shared') body = memSharedHTML();
-@@ -3226,7 +3577,48 @@ async function loadAgentMemoryTab() {
+@@ -3226,7 +3623,48 @@ async function loadAgentMemoryTab() {
    if (currentView === 'memory' && memoryState.tab === 'agent') { render(); }
  }
  
@@ -1020,7 +1067,7 @@ index b0b7e37..c9b3232 100644
    $$('[data-memtab]').forEach(el => {
      el.onclick = () => {
        memoryState.tab = el.dataset.memtab;
-@@ -3778,28 +4170,31 @@ function renderJarvisView() {
+@@ -3778,28 +4216,31 @@ function renderJarvisView() {
          </div>
        </div>
  
@@ -1071,7 +1118,7 @@ index b0b7e37..c9b3232 100644
          </div>
          <div class="jarvis-feed" id="jFeed"></div>
          <div class="jarvis-chat-row">
-@@ -3839,8 +4234,36 @@ function renderJarvisView() {
+@@ -3839,8 +4280,36 @@ function renderJarvisView() {
    // Wire up controls
    jarvisBindControls();
  
@@ -1110,7 +1157,7 @@ index b0b7e37..c9b3232 100644
  }
  
  async function jarvisBootSequence() {
-@@ -3996,10 +4419,12 @@ function jarvisBindControls() {
+@@ -3996,10 +4465,12 @@ function jarvisBindControls() {
  
    stopBtn.addEventListener('click', () => jarvisStopStreaming());
  
@@ -1126,7 +1173,7 @@ index b0b7e37..c9b3232 100644
    });
  
    // Conversation mode toggle
-@@ -4012,7 +4437,8 @@ function jarvisBindControls() {
+@@ -4012,7 +4483,8 @@ function jarvisBindControls() {
  }
  
  // ===== STATUS =====
@@ -1136,7 +1183,7 @@ index b0b7e37..c9b3232 100644
    try {
      const s = await api('GET', '/api/jarvis/status');
      jarvisState.connected = s.connected;
-@@ -4037,8 +4463,10 @@ async function jarvisLoadStatus() {
+@@ -4037,8 +4509,10 @@ async function jarvisLoadStatus() {
      $('#jVoiceStatus').textContent = 'OFF';
    }
  
@@ -1149,7 +1196,7 @@ index b0b7e37..c9b3232 100644
  }
  
  async function jarvisLoadData() {
-@@ -4083,12 +4511,13 @@ function jarvisUpdateActivity() {
+@@ -4083,12 +4557,13 @@ function jarvisUpdateActivity() {
      el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
      return;
    }
@@ -1164,7 +1211,7 @@ index b0b7e37..c9b3232 100644
    const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
    const labelEl = $('#jState');
    if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
-@@ -4132,7 +4561,8 @@ function jarvisRenderFeed() {
+@@ -4132,7 +4607,8 @@ function jarvisRenderFeed() {
    feed.innerHTML = jarvisState.messages.map(m => {
      const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
      const cls2 = m.live ? ' live' : '';
@@ -1174,7 +1221,35 @@ index b0b7e37..c9b3232 100644
    }).join('');
    feed.scrollTop = feed.scrollHeight;
    const mc = $('#jMsgCount');
-@@ -4247,7 +4677,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+@@ -4193,6 +4669,16 @@ async function jarvisStreamChat(text) {
+ 
+     liveMsg.live = false;
+ 
++    // Empty reply = the provider dropped the run (peak-time 429 load-shedding
++    // after retries). The empty bubble rendered as a lone dot with no text —
++    // replace it with an honest, actionable message instead.
++    if (!liveMsg.text.trim()) {
++      const i = jarvisState.messages.indexOf(liveMsg);
++      if (i >= 0) jarvisState.messages.splice(i, 1);
++      jarvisAddMessage('error',
++        '⚠ No reply arrived — the AI provider is overloaded right now (peak-time load shedding). Wait a few seconds and send it again.');
++    }
++
+     // Speak the response
+     if (fullText && jarvisState.voiceAvailable) {
+       jarvisSpeak(fullText);
+@@ -4201,7 +4687,9 @@ async function jarvisStreamChat(text) {
+     if (e.name === 'AbortError') {
+       liveMsg.text += ' [stopped]';
+     } else {
+-      jarvisAddMessage('error', `Stream error: ${e.message}`);
++      const i = jarvisState.messages.indexOf(liveMsg);
++      if (i >= 0 && !liveMsg.text.trim()) jarvisState.messages.splice(i, 1);
++      jarvisAddMessage('error', `Stream error: ${e.message} — try again.`);
+     }
+     liveMsg.live = false;
+   } finally {
+@@ -4247,7 +4735,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
      case 'tool_call':
        const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
        if (toolName && toolName !== '_thinking') {
@@ -1183,7 +1258,27 @@ index b0b7e37..c9b3232 100644
        }
        break;
      case 'run.completed':
-@@ -4307,7 +4737,12 @@ async function jarvisProcessTTSQueue() {
+@@ -4256,10 +4744,17 @@ async function jarvisHandleSSE(event, data, liveMsg) {
+       liveMsg.live = false;
+       break;
+     case 'run.failed':
+-    case 'error':
+-      jarvisAddMessage('error', parsed.error || parsed.detail || 'Unknown error');
++    case 'error': {
++      // error payloads can be nested objects — never render [object Object]
++      const raw = parsed.error ?? parsed.detail ?? parsed.message ?? 'Unknown error';
++      const msg = typeof raw === 'string' ? raw : (raw.message || JSON.stringify(raw).slice(0, 200));
++      jarvisAddMessage('error',
++        /429|1305|overload/i.test(msg)
++          ? '⚠ The AI provider is overloaded right now (peak-time load shedding). Wait a few seconds and try again.'
++          : msg);
+       liveMsg.live = false;
+       break;
++    }
+   }
+ }
+ 
+@@ -4307,7 +4802,12 @@ async function jarvisProcessTTSQueue() {
      return;
    }
    jarvisState.ttsAnimating = true;
@@ -1196,7 +1291,7 @@ index b0b7e37..c9b3232 100644
  
    // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
    // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
-@@ -4317,6 +4752,7 @@ async function jarvisProcessTTSQueue() {
+@@ -4317,6 +4817,7 @@ async function jarvisProcessTTSQueue() {
  
    while (pending) {
      const clip = await pending;
@@ -1204,7 +1299,7 @@ index b0b7e37..c9b3232 100644
      // Kick off NEXT render now (runs in parallel with current playback)
      let nextPending = null;
      if (jarvisState.ttsQueue.length > 0) {
-@@ -4326,9 +4762,17 @@ async function jarvisProcessTTSQueue() {
+@@ -4326,9 +4827,17 @@ async function jarvisProcessTTSQueue() {
      }
      if (clip) await jarvisPlayClip(clip);
      pending = nextPending;
@@ -1222,7 +1317,7 @@ index b0b7e37..c9b3232 100644
    jarvisSetMode('idle');
    jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
    jarvisMaybeAutoListen();
-@@ -4365,7 +4809,10 @@ async function jarvisFetchClip(text) {
+@@ -4365,7 +4874,10 @@ async function jarvisFetchClip(text) {
  // both from the SAME blob — synced by construction. If WAV (/tts fallback):
  // audio only.
  function jarvisPlayClip(blob) {
@@ -1234,7 +1329,7 @@ index b0b7e37..c9b3232 100644
    return new Promise((resolve) => {
      let resolved = false;
      const url = URL.createObjectURL(blob);
-@@ -4377,11 +4824,15 @@ function jarvisPlayClip(blob) {
+@@ -4377,11 +4889,15 @@ function jarvisPlayClip(blob) {
      const cleanup = () => {
        if (resolved) return;
        resolved = true;
@@ -1250,7 +1345,7 @@ index b0b7e37..c9b3232 100644
  
      const startIfReady = () => {
        if (started || !audioReady || !videoReady) return;
-@@ -4420,10 +4871,38 @@ function jarvisAudioEl() {
+@@ -4420,10 +4936,38 @@ function jarvisAudioEl() {
    if (!jarvisState.ttsAudioEl) {
      const el = new Audio();
      jarvisState.ttsAudioEl = el;
@@ -1289,7 +1384,7 @@ index b0b7e37..c9b3232 100644
  function jarvisMaybeAutoListen() {
    if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
      jarvisStartRecording();
-@@ -4432,12 +4911,19 @@ function jarvisMaybeAutoListen() {
+@@ -4432,12 +4976,19 @@ function jarvisMaybeAutoListen() {
  
  function jarvisStopTTS() {
    jarvisState.ttsQueue = [];
@@ -1310,7 +1405,7 @@ index b0b7e37..c9b3232 100644
    jarvisSetIdleAvatar();
  }
  
-@@ -4463,12 +4949,16 @@ async function jarvisStartRecording() {
+@@ -4463,12 +5014,16 @@ async function jarvisStartRecording() {
        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
      }
      const ctx = jarvisState.audioContext;
@@ -1327,7 +1422,7 @@ index b0b7e37..c9b3232 100644
      jarvisMicLevelLoop();
  
      jarvisState.mediaRecorder.ondataavailable = (e) => {
-@@ -4526,6 +5016,7 @@ function jarvisMicLevelLoop() {
+@@ -4526,6 +5081,7 @@ function jarvisMicLevelLoop() {
    if (!jarvisState.micAnalyser || !jarvisState.recording) {
      const el = $('#jMicLevel');
      if (el) el.style.width = '0%';
@@ -1335,7 +1430,7 @@ index b0b7e37..c9b3232 100644
      return;
    }
    jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
-@@ -4534,6 +5025,18 @@ function jarvisMicLevelLoop() {
+@@ -4534,6 +5090,18 @@ function jarvisMicLevelLoop() {
    const avg = sum / jarvisState._micDataArray.length / 255;
    const el = $('#jMicLevel');
    if (el) el.style.width = (avg * 100 * 2) + '%';
@@ -1354,7 +1449,22 @@ index b0b7e37..c9b3232 100644
    requestAnimationFrame(jarvisMicLevelLoop);
  }
  
-@@ -5089,8 +5592,8 @@ function viewDeliverables() {
+@@ -4547,7 +5115,13 @@ setInterval(() => {
+ }, 2000);
+ 
+ 
+-function showModal(html) { const c = $('#modalContent'); if (c) c.innerHTML = html; $('#modal').style.display = 'flex'; }
++function showModal(html) {
++  const c = $('#modalContent');
++  // every popup carries its own ? — the topbar one is under the overlay
++  if (c) c.innerHTML = html +
++    '<button class="help-btn modal-help" onclick="startTour(currentView)" title="Explain this window step by step">?</button>';
++  $('#modal').style.display = 'flex';
++}
+ function closeModal() {
+   const m = $('#modal');
+   if (m) m.style.display = 'none';
+@@ -5089,8 +5663,8 @@ function viewDeliverables() {
          <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
            ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -1366,7 +1476,7 @@ index b0b7e37..c9b3232 100644
          </div>
          <div class="row-actions">
 diff --git a/static/index.html b/static/index.html
-index bb6661f..5b57406 100644
+index bb6661f..1567c91 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -7,7 +7,7 @@
@@ -1374,7 +1484,7 @@ index bb6661f..5b57406 100644
  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
 -<link rel="stylesheet" href="/static/style.css?v=5">
-+<link rel="stylesheet" href="/static/style.css?v=7">
++<link rel="stylesheet" href="/static/style.css?v=8">
  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
  </head>
  <body>
@@ -1399,16 +1509,16 @@ index bb6661f..5b57406 100644
  <button id="fbBtn" onclick="feedbackModal()" title="Something wrong or annoying here? File it — your last steps get attached automatically" style="position:fixed;right:18px;bottom:18px;z-index:900;width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(20,20,32,.85);color:var(--text-dim);font-size:17px;cursor:pointer;backdrop-filter:blur(6px)">🐞</button>
  <script src="/static/nexus3d.js?v=1" type="module"></script>
 -<script src="/static/app.js?v=28"></script>
-+<script src="/static/memory3d.js?v=3" type="module"></script>
++<script src="/static/memory3d.js?v=4" type="module"></script>
 +<script src="/static/jarvis3d.js?v=1" type="module"></script>
-+<script src="/static/app.js?v=32"></script>
++<script src="/static/app.js?v=33"></script>
  </body>
  </html>
 diff --git a/static/style.css b/static/style.css
-index e17c46d..8d54b9e 100644
+index e17c46d..f4c2b29 100644
 --- a/static/style.css
 +++ b/static/style.css
-@@ -1229,3 +1229,101 @@ code, pre, .mono { font-family: var(--font-mono); }
+@@ -1229,3 +1229,103 @@ code, pre, .mono { font-family: var(--font-mono); }
    .spec-grid { grid-template-columns:1fr; }
    .drawer { width:100vw; }
  }
@@ -1510,6 +1620,8 @@ index e17c46d..8d54b9e 100644
 +  padding:10px 14px; border-radius:0 10px 10px 0; margin:10px 0; font-size:12.5px;
 +  color:var(--text-dim); line-height:1.6;
 +}
++.modal { position:relative; }
++.modal-help { position:absolute; top:14px; right:14px; z-index:5; }
 diff --git a/templates.json b/templates.json
 index e4a0612..baec6b0 100644
 --- a/templates.json

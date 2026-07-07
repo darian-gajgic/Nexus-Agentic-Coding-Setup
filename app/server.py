@@ -3496,8 +3496,9 @@ async def memory3d(force: bool = False):
         # PCA via SVD — the 3 principal semantic axes of the whole memory
         _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
         coords = centered @ vt[:3].T
-        # normalize into a comfortable room size (~[-60, 60])
-        coords = coords / (np.abs(coords).max() + 1e-9) * 60.0
+        # normalize into a spacious room (~[-120, 120]) — operator asked for
+        # 2x the spread between stars
+        coords = coords / (np.abs(coords).max() + 1e-9) * 120.0
 
         # top-k similarity links (real cosine, deduped pairs)
         sims = vecs @ vecs.T
