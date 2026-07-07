@@ -3082,6 +3082,7 @@ async def task_wizard(body: dict):
                     db.log_activity("info", "system",
                                     f"Task wizard asked {len(qs)} clarifying question(s)")
                     return {"type": "questions", "questions": qs,
+                            "repo_path": valid_repo or None,
                             "preamble": str(data.get("preamble") or "").strip()[:300]}
             # Answers were already given (or no valid question survived): force a plan.
             data = await _call(allow_questions=False)

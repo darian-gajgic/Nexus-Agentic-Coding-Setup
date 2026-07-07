@@ -327,7 +327,7 @@ index 1efde5b..42fdf7b 100755
  
  echo -e "${YELLOW}═══ 5. JARVIS FUNCTION INTEGRITY ═══${NC}"
 diff --git a/server.py b/server.py
-index 2bd943c..deec16b 100644
+index 2bd943c..e605294 100644
 --- a/server.py
 +++ b/server.py
 @@ -127,6 +127,24 @@ class TaskCreate(BaseModel):
@@ -515,7 +515,15 @@ index 2bd943c..deec16b 100644
          "Reply now with the required JSON object only."
      )
  
-@@ -3058,6 +3135,8 @@ async def task_wizard(body: dict):
+@@ -3005,6 +3082,7 @@ async def task_wizard(body: dict):
+                     db.log_activity("info", "system",
+                                     f"Task wizard asked {len(qs)} clarifying question(s)")
+                     return {"type": "questions", "questions": qs,
++                            "repo_path": valid_repo or None,
+                             "preamble": str(data.get("preamble") or "").strip()[:300]}
+             # Answers were already given (or no valid question survived): force a plan.
+             data = await _call(allow_questions=False)
+@@ -3058,6 +3136,8 @@ async def task_wizard(body: dict):
          t = _clamp_wizard_task(data.get("task") or data, repairs, _specialist_names())
          t["description"] = _with_assumptions(t["description"])
          out = {"type": "task", "task": t, "assumptions": assumptions, "repairs": repairs}
@@ -524,7 +532,7 @@ index 2bd943c..deec16b 100644
      db.log_activity("info", "system", "Task wizard drafted a "
                      + ("project" if out["type"] == "workflow" else "task"))
      return out
-@@ -3097,10 +3176,12 @@ async def create_workflow(body: dict):
+@@ -3097,10 +3177,12 @@ async def create_workflow(body: dict):
      wid = f"wf-{uuid.uuid4().hex[:8]}"
      now = time.time()
      lc = body.get("loop_config")
@@ -540,7 +548,7 @@ index 2bd943c..deec16b 100644
      db.log_activity("info", "system", f"Workflow created: '{name}'")
      w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
      await mgr.broadcast({"type": "workflow_created", "data": w})
-@@ -3144,6 +3225,25 @@ async def update_workflow(wf_id: str, body: dict):
+@@ -3144,6 +3226,25 @@ async def update_workflow(wf_id: str, body: dict):
          lc = body["loop_config"]
          db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
                     (json.dumps(lc) if isinstance(lc, dict) else None, time.time(), wf_id))
@@ -566,7 +574,7 @@ index 2bd943c..deec16b 100644
      return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
  
  
-@@ -3445,6 +3545,388 @@ async def agent_config_update(agent_id: str, body: dict):
+@@ -3445,6 +3546,388 @@ async def agent_config_update(agent_id: str, body: dict):
  import tools_hub
  
  
