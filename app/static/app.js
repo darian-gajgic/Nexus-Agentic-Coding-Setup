@@ -361,7 +361,7 @@ let quotaTickCounter = 0;
 const VIEW_META = {
   dashboard: ['Dashboard', 'Mission control — live overview of your agent OS'],
   kanban: ['Kanban Board', 'Plan, assign and track work across the fleet'],
-  workflows: ['Projects', 'Connect tasks into campaigns — dependencies run in order, outputs feed forward'],
+  workflows: ['Pipelines', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
   deliverables: ['Deliverables', 'Every agent output in one place — read, download, chain'],
   agents: ['Agent Fleet', 'Click any agent for memory, messages & cost'],
   agentic: ['Agentic Capabilities', 'Approvals · verification · scheduling · self-healing · cost control'],
@@ -1160,8 +1160,8 @@ function viewManual() {
   </div>
 
   <div class="manual-sec" id="m-projects">
-    <h2>🧩 Projects</h2>
-    <div class="m-sub">Pipelines where one step feeds the next</div>
+    <h2>🧩 Pipelines</h2>
+    <div class="m-sub">Rounds of work where one step feeds the next — they visit your durable projects</div>
     <p>A project chains tasks with <b>dependencies</b>. Each stage starts automatically once its predecessors finish, and receives their outputs as input. This is how big jobs stay organized:</p>
     <div class="m-visual">  SPEC &amp; PLAN ──▶ IMPLEMENT ──▶ CODE REVIEW ──▶ FIX FINDINGS ──▶ FINAL VERIFICATION
    (architect)    (builder)     (critic)        (builder)        (independent tester)</div>
@@ -1193,7 +1193,7 @@ function viewManual() {
   <div class="manual-sec" id="m-coding">
     <h2>🧬 Coding on your own repositories</h2>
     <div class="m-sub">Repo-native tasks: the diff is the deliverable</div>
-    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Repositories tab or the wizard's repo dropdown) — never in a loose workspace. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
+    <div class="m-tip">💡 <b>The model:</b> the repository is the client project — it lives for years under <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code>. Kanban pipelines are work ROUNDS visiting it: build v1, then "implement the demo feedback", then "fix the checkout bug"… each round is a new wizard pipeline targeting the same repo. <b>Repo-first rule:</b> start client work with "➕ New client project" (Repositories tab or the wizard's repo dropdown) — never in a loose workspace. Personal long-lived work (uni projects, own experiments) gets the same treatment via 🏠 personal projects (~/Projects, no client, personal memory). Small iterative jobs (diagnose → try → feedback, like fixing a car) don't need a project at all: one task + Reject-with-feedback rounds. If an app already grew inside a task, use <b>📦 Promote to repository</b> on that task to lift it out; the client scope (memory isolation) is derived from the folder automatically.</div>
     <div class="m-steps">
       <div class="m-step"><div>Once per repository: run the <b>"🧬 Onboard a code repository"</b> template. It studies your repo (read-only) and writes an AGENTS.md — the house rules every agent will follow there.</div></div>
       <div class="m-step"><div>On any coding task or project, pick your repo under <b>"Existing code repository"</b>.</div></div>
@@ -1300,7 +1300,7 @@ const TOURS = {
     { sel: '.kanban-card', title: 'A task card', body: 'Click any card to open its full record: description, budget, the agent working on it, attachments, its improvement loop, and every file it produced. The ⚑ flag shows which agent claimed it.' },
   ],
   workflows: [
-    { sel: '#content', title: 'Projects = task pipelines', body: 'A project chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when the stages it depends on are done, and their outputs are handed over as input.' },
+    { sel: '#content', title: 'Pipelines = rounds of work', body: 'A pipeline chains tasks with dependencies: research feeds writing, code feeds review, review feeds fixes. Each stage starts automatically when its inputs are ready. Pipelines VISIT your durable projects (Repositories tab): build v1, fix a bug, iterate a campaign — the project accumulates the results, pipelines come and go.' },
     { sel: '.btn-primary', title: 'Describe a goal', body: 'Click "✨ Describe a goal" and say what you want in plain words — e.g. "an online shop for GPUs". The AI asks smart questions, then proposes a full pipeline (plan → build → review → fix → verify) which you can trim before approving. Coding projects always get quality gates.' },
     { sel: '.agentic-row, .wf-card', title: 'A project', body: 'Click one to see its stages, their status, the improvement loop (🔁), and attached files. Green stages are done; the diagram shows what feeds what.' },
   ],
@@ -3396,7 +3396,7 @@ function viewProjects() {
       p.is_repo ? '<span style="color:var(--green)">● clean</span>' :
         '<span class="muted">○ no git</span>';
     html += `<tr class="proj-row" data-path="${esc(p.path)}">
-      <td><div class="proj-name">${esc(p.name)} ${p.client ? `<span class="chip c-cyan" title="client project — memory isolated">🏢 ${esc(p.client)}</span>` : ''}</div><div class="proj-desc muted">${esc(p.description || '')}</div></td>
+      <td><div class="proj-name">${esc(p.name)} ${p.client ? `<span class="chip c-cyan" title="client project — memory isolated">🏢 ${esc(p.client)}</span>` : (p.personal ? '<span class="chip" title="personal project">🏠 personal</span>' : '')}</div><div class="proj-desc muted">${esc(p.description || '')}</div></td>
       <td>${langs}</td>
       <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
       <td>${status}</td>
@@ -3422,6 +3422,8 @@ function bindProjects() {
           <div class="kv-row"><span class="kv-key">Size</span><span class="kv-val">${(p.size_bytes / 1e6).toFixed(1)} MB</span></div>
           <div class="kv-row"><span class="kv-key">venv</span><span class="kv-val">${p.has_venv ? 'yes' : 'no'}</span></div>
           <h4 style="margin-top:12px">Languages</h4>${langs}
+          ${p.is_repo ? `<h4 style="margin-top:14px">Work history</h4>
+          <div id="repoHistory" class="muted" style="font-size:12px">loading…</div>` : ''}
           ${p.is_repo ? `
           <h4 style="margin-top:14px">Git workflow</h4>
           <div class="form-hint" style="margin-bottom:8px">${p.git_remote
@@ -3433,6 +3435,7 @@ function bindProjects() {
             <button class="btn-ghost" onclick="tagRepoUI('${esc(p.path)}','${esc(p.name)}')">🏷 Tag release</button>`}
           </div>` : ''}
         </div>`);
+      if (p.is_repo) loadRepoHistory(p.path);
     };
   });
 }
@@ -3475,6 +3478,9 @@ function newClientProjectUI() {
   showModal(`
     <h2>➕ New client project</h2>
     <div class="view-intro" style="margin-bottom:10px">Creates <code>~/Client-Projects/&lt;client&gt;/&lt;project&gt;</code> as a proper git repository (README, .gitignore, first commit) — the repo-first rule: client code is versioned and backable from minute one. Every work round then targets this repo via the wizard.</div>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <input type="checkbox" id="ncp-personal" onchange="const c=$('#ncp-client'); if(c){c.disabled=this.checked; c.value=this.checked?'':c.value;}">
+      🏠 Personal project (no client — uni work, own experiments; stored under ~/Projects, memory stays personal)</label>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Client</label>
         <input class="form-input" id="ncp-client" placeholder="acme"></div>
@@ -3488,9 +3494,10 @@ function newClientProjectUI() {
       <button class="btn-primary" id="ncp-create">Create repository</button>
     </div>`);
   $('#ncp-create').onclick = async () => {
-    const client = slugify($('#ncp-client').value);
+    const personal = !!($('#ncp-personal') && $('#ncp-personal').checked);
+    const client = personal ? '' : slugify($('#ncp-client').value);
     const name = slugify($('#ncp-name').value);
-    if (!client || !name) { toast('Client and project name required', 'err'); return; }
+    if (!name || (!personal && !client)) { toast(personal ? 'Project name required' : 'Client and project name required', 'err'); return; }
     $('#ncp-create').disabled = true; $('#ncp-create').textContent = 'Creating…';
     try {
       const r = await api('POST', '/api/projects/create-client',
@@ -3537,6 +3544,29 @@ async function promoteTaskUI(taskId, title) {
       $('#pr-go').disabled = false; $('#pr-go').textContent = 'Promote';
     }
   };
+}
+
+async function loadRepoHistory(path) {
+  const el = () => document.getElementById('repoHistory');
+  try {
+    const h = await api('GET', `/api/projects/history?path=${encodeURIComponent(path)}`);
+    if (!el()) return;
+    if (!h.total_tasks) {
+      el().innerHTML = 'No pipelines have visited this project yet — target it via ✨ Describe a goal.';
+      return;
+    }
+    const chip = s => `<span class="chip ${s === 'done' ? 'c-green' : s === 'in_progress' ? 'c-cyan' : ''}">${esc(s)}</span>`;
+    el().innerHTML =
+      (h.pipelines || []).map(w => `
+        <div style="padding:6px 0;border-bottom:1px dashed rgba(148,148,190,.12)">
+          <strong>⚑ ${esc(w.name)}</strong> <span class="muted">${new Date((w.created_at || 0) * 1000).toLocaleDateString()}</span><br>
+          ${(w.tasks || []).map(t => `<span style="font-size:11.5px">· ${esc(t.title.slice(0, 48))} ${chip(t.status)}</span>`).join('<br>')}
+        </div>`).join('') +
+      (h.loose_tasks || []).map(t => `
+        <div style="padding:4px 0">· ${esc(t.title.slice(0, 55))} ${chip(t.status)}</div>`).join('');
+  } catch (e) {
+    if (el()) el().textContent = 'history unavailable: ' + e.message;
+  }
 }
 
 async function publishRepoUI(path, name) {
@@ -5925,18 +5955,34 @@ function describeTaskUI() {
     <h2>✨ Describe what you want done</h2>
     <div class="view-intro" style="margin-bottom:10px">Plain words, German or English. The AI may ask up to 5 clarifying questions first (every one skippable), then plans: specialist, domain, model, priority, high-stakes flag and the full brief — you review before anything is created. Coding goals become the full pipeline (spec → implement → review → fix → verify) automatically.</div>
     <textarea class="form-textarea" id="twAsk" style="height:120px" placeholder="e.g. We have to develop our application. It has to be a webshop for clothing with a basket and payment…"></textarea>
+    <div class="form-group" style="margin-top:8px">
+      <label class="form-label">📂 About an existing project? (optional)</label>
+      <select class="form-select" id="twRepo"><option value="">— No: something new —</option></select>
+      <div class="form-hint">Pick the project and the AI plans an <strong>improvement round on the real thing</strong>: it reads the project's contents, skips questions the project already answers, and writes briefs that reference the existing work. Bug fixes and new features on client projects always go through here.</div>
+    </div>
     <div class="form-hint" style="margin-top:6px">💡 This wizard only <strong>plans</strong> — the actual work happens later, inside the task it creates. Describe the goal and desired outcome (e.g. "a summary of what is on a picture"); if the work needs files, 📎 attach them to the created task afterwards.</div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
       <button class="btn-primary" id="twGo">✨ Plan it</button>
     </div>`);
+  const twSel = $('#twRepo');
+  if (twSel) {
+    api('GET', '/api/projects').then(d => {
+      const ps = (d.projects || d || []).filter(x => x.is_repo);
+      ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
+      if (twSel.isConnected) twSel.innerHTML += ps.map(x =>
+        `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
+    }).catch(() => { });
+  }
   const b = $('#twGo');
   if (b) b.onclick = async () => {
     const instruction = ($('#twAsk') || {}).value || '';
     if (!instruction.trim()) { toast('Describe it first', 'err'); return; }
+    wizardCtx.repo_path = ($('#twRepo') || {}).value || null;
     b.disabled = true; b.textContent = '✨ Planning… (up to ~3 min under load)';
     try {
-      const r = await api('POST', '/api/tasks/wizard', { instruction: instruction.trim() });
+      const r = await api('POST', '/api/tasks/wizard',
+        { instruction: instruction.trim(), repo_path: wizardCtx.repo_path });
       handleWizardPlan(instruction.trim(), r);
     } catch (e) {
       toast('Wizard failed: ' + e.message, 'err');
@@ -5944,6 +5990,8 @@ function describeTaskUI() {
     }
   };
 }
+
+const wizardCtx = { repo_path: null };
 
 // Route a wizard response: one question round, or straight to the plan preview.
 function handleWizardPlan(instruction, r) {
@@ -5989,7 +6037,7 @@ function wizardQuestionsModal(instruction, r) {
   const submit = async (answers, btn) => {
     btn.disabled = true; btn.textContent = '✨ Planning… (up to ~3 min under load)';
     try {
-      const r2 = await api('POST', '/api/tasks/wizard', { instruction, answers });
+      const r2 = await api('POST', '/api/tasks/wizard', { instruction, answers, repo_path: wizardCtx.repo_path });
       handleWizardPlan(instruction, r2);
     } catch (e) {
       toast('Wizard failed: ' + e.message, 'err');
@@ -6027,6 +6075,13 @@ function applyWizardTask(t, meta) {
     if ($('#m-task-priority')) $('#m-task-priority').value = String(t.priority ?? 2);
     if ($('#m-task-budget') && t.budget_tokens) $('#m-task-budget').value = t.budget_tokens;
     if ($('#m-task-tags')) $('#m-task-tags').value = (t.tags || []).join(', ');
+    if ($('#m-task-repo') && (meta && meta.repo_path)) {
+      const rs = $('#m-task-repo');
+      if (![...rs.options].some(o => o.value === meta.repo_path)) {
+        rs.insertAdjacentHTML('beforeend', `<option value="${esc(meta.repo_path)}">${esc(meta.repo_path.split('/').slice(-2).join('/'))}</option>`);
+      }
+      rs.value = meta.repo_path;
+    }
     const ssel = $('#m-task-specialist');
     if (ssel && t.specialist) {
       if (![...ssel.options].some(o => o.value === t.specialist)) {
@@ -6124,9 +6179,14 @@ function proposeWorkflowModal(wf, meta) {
       ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0)); // client repos first
       if (!repoSel.isConnected) return;
       repoSel.innerHTML += ps.map(p =>
-        `<option value="${esc(p.path)}" data-client="${esc(p.client || '')}">${p.client ? '🏢 ' + esc(p.client) + ' / ' : ''}${esc(p.name)}</option>`).join('') +
+        `<option value="${esc(p.path)}" data-client="${esc(p.client || '')}">${p.client ? '🏢 ' + esc(p.client) + ' / ' : (p.personal ? '🏠 ' : '')}${esc(p.name)}</option>`).join('') +
         '<option value="__new__">➕ New client repository…</option>';
       repoSel.onchange = () => wfRepoChanged(repoSel);
+      const pre = (meta && meta.repo_path) || wizardCtx.repo_path;
+      if (pre && [...repoSel.options].some(o => o.value === pre)) {
+        repoSel.value = pre;
+        wfRepoChanged(repoSel); // autofills the client field
+      }
     }).catch(() => { });
   }
   const keeps = () => tasks.map((_, i) => {

@@ -378,6 +378,7 @@ def _is_project(path: Path) -> bool:
 
 
 CLIENT_PROJECTS_ROOT = HOME / "Client-Projects"
+PERSONAL_PROJECTS_ROOT = HOME / "Projects"
 
 
 def _project_entry(d, client=None):
@@ -411,13 +412,21 @@ def get_projects() -> list:
     for d in sorted(scan_root.iterdir()):
         if not d.is_dir() or d.name.startswith(".") or d.name in EXCLUDE_DIRS:
             continue
-        if d == CLIENT_PROJECTS_ROOT:
-            continue  # handled below, nested per client
+        if d in (CLIENT_PROJECTS_ROOT, PERSONAL_PROJECTS_ROOT):
+            continue  # handled below (nested / personal)
         if not _is_project(d):
             continue
         e = _project_entry(d)
         if e:
             projects.append(e)
+    if PERSONAL_PROJECTS_ROOT.is_dir():
+        for d in sorted(PERSONAL_PROJECTS_ROOT.iterdir()):
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            e = _project_entry(d)
+            if e:
+                e["personal"] = True
+                projects.append(e)
     if CLIENT_PROJECTS_ROOT.is_dir():
         for cdir in sorted(CLIENT_PROJECTS_ROOT.iterdir()):
             if not cdir.is_dir() or cdir.name.startswith("."):

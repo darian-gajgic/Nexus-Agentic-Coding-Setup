@@ -355,6 +355,21 @@ def _publish_client_scope(session_id: str, client: str | None):
         db.log_activity("warn", "system", f"client-scope publish failed: {str(e)[:80]}")
 
 
+def _repo_is_code(path: str) -> bool:
+    """Code project vs content/campaign/thesis project — decides which
+    repo-mode contract the agent gets."""
+    markers = ("package.json", "pyproject.toml", "requirements.txt", "Cargo.toml",
+               "go.mod", "src", "app", "lib")
+    try:
+        names = set(os.listdir(path))
+    except Exception:
+        return True
+    if any(m in names for m in markers):
+        return True
+    code_exts = (".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cpp", ".sh")
+    return any(n.endswith(code_exts) for n in names)
+
+
 def _repo_slug(task: dict) -> str:
     """Pipeline tasks share one branch (stages build on each other); loose
     tasks get their own."""
@@ -404,25 +419,38 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
         "for the Nexus Agent OS control plane. Work the task to completion in this turn.",
     ]
     if repo_ctx:
-        parts.append(
-            f"REPO-NATIVE TASK: you operate on the EXISTING repository checked out at "
+        is_code = _repo_is_code(repo_ctx["worktree"])
+        common_head = (
+            f"PROJECT-NATIVE TASK: you operate on the EXISTING project checked out at "
             f"{repo_ctx['worktree']} — an isolated git worktree on branch "
             f"{repo_ctx['branch']} (baseline: {repo_ctx['base']}; the operator's main "
             "checkout is untouched). Rules:\n"
-            f"- Work INSIDE {repo_ctx['worktree']} — change the real code there, do NOT "
-            "scaffold a fresh project in the task workspace.\n"
-            "- Follow the repository's own conventions and commands (see the conventions "
-            "file below if present). Its test/build/lint gates are YOUR gates — run them "
-            "and paste real output.\n"
-            "- Navigate by symbol (mcp-serena) and check every touched symbol's other "
-            "usages before calling the work done.\n"
+            f"- Work INSIDE {repo_ctx['worktree']} — build on what exists there, do NOT "
+            "start fresh in the task workspace.\n")
+        if is_code:
+            body = (
+                "- Follow the repository's own conventions and commands (see the conventions "
+                "file below if present). Its test/build/lint gates are YOUR gates — run them "
+                "and paste real output.\n"
+                "- Navigate by symbol (mcp-serena) and check every touched symbol's other "
+                "usages before calling the work done.\n")
+        else:
+            body = (
+                "- This is a CONTENT project (campaign/document/thesis materials). READ the "
+                "existing materials first — new work must be consistent with them (voice, "
+                "branding, decisions already made). Place deliverable files in sensible "
+                "folders inside the project.\n"
+                "- Do not modify previously delivered material unless the goal says so — "
+                "add new versions alongside.\n")
+        common_tail = (
             "- COMMIT your work on the branch in clear, scoped commits (git add/commit in "
             "the worktree). Never push, never merge, never switch branches.\n"
-            f"- Write {workspace}/deliverable.md as a CHANGE REPORT: what changed and why, "
-            "files touched, commands run with real output, follow-ups. The DIFF on the "
-            "branch is the real deliverable — the operator reviews and merges it manually."
-            + (f"\n\nREPOSITORY CONVENTIONS {repo_ctx['conventions'][:6200]}"
+            f"- Write {workspace}/deliverable.md as a CHANGE REPORT: what you added/changed "
+            "and why, files touched, and follow-ups. The DIFF on the branch is the real "
+            "deliverable — the operator reviews and merges it manually."
+            + (f"\n\nPROJECT CONVENTIONS {repo_ctx['conventions'][:6200]}"
                if repo_ctx.get("conventions") else ""))
+        parts.append(common_head + body + common_tail)
     else:
         parts.append(
             f"Write your final deliverable to the file {workspace}/deliverable.md using your file "
