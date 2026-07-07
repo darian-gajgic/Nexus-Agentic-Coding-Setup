@@ -7,12 +7,15 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
-<link rel="stylesheet" href="/static/style.css?v=10">
+<link rel="stylesheet" href="/static/style.css?v=12">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <div class="bg-aurora" aria-hidden="true"></div>
 <div id="app">
+  <!-- MOBILE NAV SCRIM (inside #app: it must stack under the sidebar, and
+       #app is a stacking context — a body-level scrim would cover the nav) -->
+  <div class="sidebar-scrim" id="sidebarScrim"></div>
   <!-- SIDEBAR -->
   <nav class="sidebar">
     <div class="logo">
@@ -63,6 +66,7 @@
   <main class="main">
     <!-- TOPBAR -->
     <header class="topbar">
+      <button class="menu-btn" id="menuBtn" title="Menu" aria-label="Open navigation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="17" height="17"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg></button>
       <div class="topbar-title">
         <h1 id="pageTitle">Dashboard</h1>
         <span class="page-sub" id="pageSub">Mission control</span>
@@ -98,6 +102,6 @@
 <script src="/static/nexus3d.js?v=1" type="module"></script>
 <script src="/static/memory3d.js?v=5" type="module"></script>
 <script src="/static/jarvis3d.js?v=1" type="module"></script>
-<script src="/static/app.js?v=45"></script>
+<script src="/static/app.js?v=49"></script>
 </body>
 </html>

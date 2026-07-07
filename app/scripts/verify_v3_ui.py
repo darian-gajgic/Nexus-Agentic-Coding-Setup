@@ -40,7 +40,13 @@ async def main():
         await page.goto(BASE, wait_until="networkidle")
 
         # ── Dashboard: hero + now-strip ──
-        ok("hero canvas present", await page.locator("#nexus3d").count() == 1)
+        # (the hero is the memory galaxy since the 2026-07-08 dashboard
+        # redesign — #nexus3d was the OLD constellation mount)
+        try:
+            await page.wait_for_selector("#dashGalaxy", timeout=5000, state="attached")
+            ok("hero canvas present", True)
+        except Exception:
+            ok("hero canvas present", False, "#dashGalaxy never attached")
         ok("now-running strip present", await page.locator("#nowStrip").count() == 1)
 
         # ── Agent drawer ──
@@ -92,9 +98,14 @@ async def main():
         await page.fill("#m-task-title", "v3-ui-test task")
         await page.fill("#m-task-tags", "e2e")
         await page.click('#modal button:has-text("Create")')
-        await page.wait_for_timeout(900)
+        try:
+            # wait-based, not a fixed sleep: create is two sequential fetches
+            # (POST + board refetch) and lands right around the old 900ms
+            await page.wait_for_selector('.task-card:has-text("v3-ui-test task")', timeout=6000)
+            ok("task created from modal", True)
+        except Exception:
+            ok("task created from modal", False, "card never rendered")
         card = page.locator('.task-card:has-text("v3-ui-test task")')
-        ok("task created from modal", await card.count() == 1)
 
         await card.first.click()
         await page.wait_for_selector("#td-title", timeout=3000)

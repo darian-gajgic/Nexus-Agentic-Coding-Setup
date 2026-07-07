@@ -202,8 +202,8 @@
     {
       "path": "~/.hermes/plugins/mem0-client/__init__.py",
       "golden": "mem0_client__init__.py",
-      "sha256": "b0d2a29c230123f3c4f77105264440a1d4e7db6a8d76bdbb8e3e2ab1eb5a06c0",
-      "note": "M3 client-isolated mem0 provider (activated via memory.provider: mem0-client)"
+      "sha256": "9ecd4e6394e8be27070874e4eab03dfe22124fa7e4766c70cd3b231408de328e",
+      "note": "M3 client-isolated + Block-1 user-isolated mem0 provider (activated via memory.provider: mem0-client)"
     }
   ],
   "packages": [

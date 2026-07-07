@@ -162,10 +162,33 @@ Context-aware help: `TOURS` registry + spotlight engine (`startTour`),
   the reproducible install lives in the **Nexus-Agentic-Coding-Setup** repo
   (full source, patches, installer, docs — secrets excluded by design).
 
+## 7b. Multi-user (Block 1, 2026-07-07 — docs/SPEC-MULTIUSER.md)
+Household multi-tenancy on one instance. Every row and query is user-scoped
+(a seeded `u_owner` owns all pre-multiuser data), so there is no unscoped
+code path. With 0/1 users configured there is NO login — the single-operator
+machine behaves exactly as before. Adding user #2 (Settings → Users & access)
+turns the login screen on for everyone; each user then gets their own task
+board, workflows/projects, deliverables, known issues, activity, focus
+context, JARVIS conversation, and mem0 memory scope (the M3 client-isolation
+provider generalized: sessions are user-tagged via `~/.hermes/
+client-scopes.json` `"users"` map; reads post-filter other users' rows).
+Cookie sessions (scrypt passwords, hashed tokens, HttpOnly + SameSite=Lax,
+sliding 30-day expiry, login rate-limit); WS handshakes authenticate the
+cookie and task/workflow events broadcast only to the owner's sockets.
+Shared by design: agents fleet, scheduler, approvals, watchdog, settings
+(admin-write), specialists/lessons/skills, shared-context. Emergency:
+`scripts/auth_reset.py` (local) returns the box to single-user.
+Proof: `scripts/verify_multiuser_e2e.py` (55 checks) — HTTP/WS/JARVIS/mem0
+isolation probed E2E against the live server + qdrant, self-cleaning.
+Remote access: **Tailscale only, never public** — see docs/TAILSCALE.md
+(`tailscale serve` on the tailnet; nexus stays loopback-bound).
+
 ## 8. Security posture
 - HTTPS-only UI; localhost binding everywhere; API keys only in
   `~/.hermes/.env` (guardrail-protected, never in git; template + credential
   scanner in the setup repo).
+- Multi-user auth + per-user data isolation (see 7b); remote access is
+  tailnet-only via `tailscale serve` — never port-forwarded, never funneled.
 - No command allowlist auto-approval (removed — guardian-enforced absence);
   approval gates for sensitive actions; tirith pre-exec security hook
   fail-closed.

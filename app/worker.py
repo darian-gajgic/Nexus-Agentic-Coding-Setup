@@ -66,7 +66,7 @@ def _slot_ok(task: dict, agent_id: str) -> bool:
         _slot_wait_logged[task["id"]] = now
         db.log_activity("info", agent_id,
                         f"Task {task['id']} waiting for a free {task.get('model') or hd.DEFAULT_MODEL} "
-                        f"slot (in flight: {hd.slots_in_use()})")
+                        f"slot (in flight: {hd.slots_in_use()})", user_id=task.get("user_id"))
     return False
 
 
@@ -88,7 +88,8 @@ def _find_work(agent_id: str, auto_claim: bool, dispatch_on: bool):
             if _slot_ok(t, agent_id):
                 db.log_activity("warn", agent_id,
                                 f"Task {t['id']}: claim had no dispatch (lane died "
-                                "mid-claim?) — starting dispatch now")
+                                "mid-claim?) — starting dispatch now",
+                                user_id=t.get("user_id"))
                 return t, "claimed"
             continue
         if st == "queued":
@@ -121,7 +122,8 @@ def _find_work(agent_id: str, auto_claim: bool, dispatch_on: bool):
         if not _slot_ok(t, agent_id):
             continue  # don't even claim without a free slot for its model
         if db.claim_task_cas(t["id"], agent_id):
-            db.log_activity("info", agent_id, f"Claimed task '{t['title']}'")
+            db.log_activity("info", agent_id, f"Claimed task '{t['title']}'",
+                            user_id=t.get("user_id"))
             return db.query_one("SELECT * FROM tasks WHERE id=?", (t["id"],)), "claimed"
     return None, None
 
@@ -144,7 +146,8 @@ def _execute(task: dict, mode: str, agent_id: str):
             "WHERE task_id=? AND state IN ('queued','dispatching','streaming')",
             (time.time(), tid))
         db.log_activity("warn", agent_id,
-                        f"Task {tid}: previous executor died — resuming session")
+                        f"Task {tid}: previous executor died — resuming session",
+                        user_id=task.get("user_id"))
         did = hd.start_dispatch(tid, agent_id)
         hd.run_task_dispatch(did, tid, agent_id, resume=True)
     else:  # "retry" (block cleared) or freshly "claimed"
