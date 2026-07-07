@@ -57,14 +57,31 @@ instruction — this repo is the canonical record):
 - **Non-breaking:** a task without `repo_path` behaves byte-identically to
   before; verified by the full 109-check gate.
 
+## Repo layout
+- `patches/` — the changes as reviewable git patches.
+  `nexus-repo-native-tasks.patch` applies on nexus-agent-os @ **01d7138**.
+- `files/` — FULL copies of every changed file (nexus + the five Hermes
+  specialist definitions) as an apply fallback if the patch base has moved,
+  and as the readable source of truth.
+- `docs/` — the research plan this implements.
+
 ## Apply / verify / rollback
 - Nexus: `git -C ~/nexus-agent-os apply patches/nexus-repo-native-tasks.patch`
-  (already live on this machine), then `bash scripts/verify.sh` and restart
+  (already live on this machine; base commit 01d7138 — if the base has moved,
+  copy from `files/nexus/` instead), then `bash scripts/verify.sh` and restart
   the `nexus` unit.
 - Hermes specialists: `git -C ~/.hermes/agents cherry-pick e14fc20` on a fresh
-  machine (or apply the patch).
+  machine (or copy `files/hermes-agents/*.md` into `~/.hermes/agents/`).
 - Rollback: `git -C ~/nexus-agent-os checkout -- .` (nexus) and
   `git -C ~/.hermes/agents revert e14fc20` (specialists).
+
+## E2E verification (2026-07-07, live pipeline run)
+Probe task on a scratch repo: agent worked in the isolated worktree, followed
+AGENTS.md conventions, committed `Add farewell() to greeter`, repo test suite
+green, 39-line junk-free changes.diff captured, main checkout untouched.
+The run also surfaced and fixed: a per-model slot deadlock (truthy "0"
+default), snapshot pollution by __pycache__, and a git pathspec quirk
+(':(exclude)' long form required).
 
 ## Usage
 1. (Once per client repo) Create a task from the "🧬 Onboard a code
