@@ -7,7 +7,7 @@ import asyncio
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -15,8 +15,73 @@ from typing import Optional
 
 import database as db
 import agent_manager as am
+import auth
 
 app = FastAPI(title="NEXUS Agent OS", version="1.0.0")
+
+
+# --- Auth middleware (Block 1 multi-user — docs/SPEC-MULTIUSER.md) ---
+# Pure ASGI (NOT BaseHTTPMiddleware): keeps SSE/StreamingResponse untouched.
+# Resolves cookie -> user into a contextvar; 401s /api/* when login is
+# required and no valid session is presented. /ws authenticates separately
+# at the websocket handshake.
+class AuthMiddleware:
+    def __init__(self, asgi_app):
+        self.asgi_app = asgi_app
+
+    @staticmethod
+    def _cookie_token(scope) -> str:
+        for name, value in scope.get("headers") or []:
+            if name == b"cookie":
+                for part in value.decode("latin-1").split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k == auth.COOKIE_NAME:
+                        return v
+        return ""
+
+    @staticmethod
+    def _header(scope, name: bytes) -> str:
+        for k, v in scope.get("headers") or []:
+            if k == name:
+                return v.decode("latin-1")
+        return ""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.asgi_app(scope, receive, send)
+        path = scope.get("path", "")
+        user = auth.resolve_session(self._cookie_token(scope))
+        if user is None and auth.internal_token_valid(
+                self._header(scope, auth.INTERNAL_HEADER.encode())):
+            # In-process engine (loop engine) acting AS a task's owner —
+            # scoped like that user, no isolation bypass.
+            user = auth.get_user(self._header(scope, auth.INTERNAL_USER_HEADER.encode()))
+        if user is None and not auth.auth_required():
+            user = auth.sole_user()
+        auth.set_request_user(user)
+        scope.setdefault("state", {})["user"] = user
+
+        public = (path in auth.PUBLIC_PATHS or path in auth.PUBLIC_EXACT
+                  or any(path.startswith(p) for p in auth.PUBLIC_PREFIXES))
+        if user is None and not public:
+            resp = JSONResponse(status_code=401, content={"error": "auth_required"})
+            return await resp(scope, receive, send)
+
+        # CSRF belt-and-braces on top of SameSite=Lax + JSON-only bodies:
+        # a state-changing request that DOES carry an Origin must match Host.
+        if scope.get("method") in ("POST", "PATCH", "PUT", "DELETE"):
+            origin = self._header(scope, b"origin")
+            host = self._header(scope, b"host")
+            if origin and host:
+                from urllib.parse import urlsplit
+                if urlsplit(origin).netloc not in (host, ""):
+                    resp = JSONResponse(status_code=403, content={"error": "cross-origin request rejected"})
+                    return await resp(scope, receive, send)
+
+        return await self.asgi_app(scope, receive, send)
+
+
+app.add_middleware(AuthMiddleware)
 
 # --- Startup ---
 @app.on_event("startup")
@@ -77,20 +142,25 @@ def startup():
 
 # --- WebSocket for real-time updates ---
 class ConnectionManager:
-    def __init__(self):
-        self.active: list[WebSocket] = []
+    """Sockets are tagged with their authenticated user; user-scoped events
+    (tasks/workflows) are delivered ONLY to the owner's sockets. user_id=None
+    on broadcast = system-wide event, goes to everyone."""
 
-    async def connect(self, ws: WebSocket):
+    def __init__(self):
+        self.active: dict[WebSocket, str | None] = {}
+
+    async def connect(self, ws: WebSocket, user_id: str | None = None):
         await ws.accept()
-        self.active.append(ws)
+        self.active[ws] = user_id
 
     def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
+        self.active.pop(ws, None)
 
-    async def broadcast(self, data: dict):
+    async def broadcast(self, data: dict, user_id: str | None = None):
         dead = []
-        for ws in self.active:
+        for ws, owner in list(self.active.items()):
+            if user_id is not None and owner != user_id:
+                continue
             try:
                 await ws.send_json(data)
             except Exception:
@@ -180,6 +250,136 @@ async def health():
     return {"status": "ok", "ts": time.time()}
 
 
+# --- Auth & users (Block 1 multi-user — docs/SPEC-MULTIUSER.md) ---
+
+def _set_session_cookie(resp: JSONResponse, token: str, request: Request):
+    resp.set_cookie(
+        auth.COOKIE_NAME, token, max_age=auth.SESSION_TTL, httponly=True,
+        samesite="lax", secure=(request.url.scheme == "https"), path="/")
+
+
+@app.get("/api/auth/state")
+async def auth_state(request: Request):
+    """Public. Tells the SPA whether to show the login screen and who we are."""
+    user = getattr(request.state, "user", None)
+    return {"auth_required": auth.auth_required(),
+            "user": auth.public_user(user)}
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request, body: dict):
+    username = str(body.get("username") or "")
+    password = str(body.get("password") or "")
+    ip = request.client.host if request.client else ""
+    user = auth.try_login(username, password, ip)
+    if not user:
+        db.log_activity("warn", "auth", f"Failed login for '{username[:32]}' from {ip}")
+        return JSONResponse(status_code=401, content={"error": "invalid credentials"})
+    auth.prune_sessions()
+    token = auth.create_session(user["id"], request.headers.get("user-agent", ""))
+    db.log_activity("info", "auth", f"{user['username']} logged in", user_id=user["id"])
+    resp = JSONResponse(content={"ok": True, "user": auth.public_user(user)})
+    _set_session_cookie(resp, token, request)
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    auth.destroy_session(request.cookies.get(auth.COOKIE_NAME, ""))
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(auth.COOKIE_NAME, path="/")
+    return resp
+
+
+@app.post("/api/auth/password")
+async def auth_change_password(request: Request, body: dict):
+    """Change your OWN password. Requires the current one once set."""
+    user = auth.current_user()
+    if not user:
+        return JSONResponse(status_code=401, content={"error": "auth_required"})
+    row = db.query_one("SELECT * FROM users WHERE id=?", (user["id"],))
+    if row.get("password_hash") and not auth.verify_password(
+            str(body.get("current") or ""), row["password_hash"]):
+        return JSONResponse(status_code=403, content={"error": "current password is wrong"})
+    new = str(body.get("password") or "")
+    if len(new) < 8:
+        return JSONResponse(status_code=400, content={"error": "password must be at least 8 characters"})
+    db.execute("UPDATE users SET password_hash=? WHERE id=?",
+               (auth.hash_password(new), user["id"]))
+    db.log_activity("info", "auth", f"{user['username']} changed their password", user_id=user["id"])
+    resp = JSONResponse(content={"ok": True})
+    if not auth.resolve_session(request.cookies.get(auth.COOKIE_NAME, "")):
+        # The single-user auto-identity just set their password (the step
+        # right before adding user #2 flips login on). Mint their session NOW
+        # so the flip doesn't log the operator out mid-setup.
+        token = auth.create_session(user["id"], request.headers.get("user-agent", ""))
+        _set_session_cookie(resp, token, request)
+    return resp
+
+
+@app.get("/api/users")
+async def list_users():
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    return [auth.public_user(u) for u in
+            db.query_all("SELECT * FROM users ORDER BY created_at")]
+
+
+@app.post("/api/users")
+async def create_user_ep(body: dict):
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    me = auth.current_user()
+    me_row = db.query_one("SELECT * FROM users WHERE id=?", (me["id"],))
+    # No-lockout rule: the moment a 2nd user exists, login turns on for
+    # everyone — so the acting admin must have a password BEFORE that flip.
+    if not me_row.get("password_hash"):
+        return JSONResponse(status_code=400, content={
+            "error": "set your own password first (adding a user turns login on for everyone)"})
+    user, err = auth.create_user(str(body.get("username") or ""),
+                                 str(body.get("display_name") or ""),
+                                 str(body.get("password") or ""),
+                                 str(body.get("role") or "member"))
+    if not user:
+        return JSONResponse(status_code=400, content={"error": err})
+    db.log_activity("info", "auth", f"User '{user['username']}' created", user_id=None)
+    return auth.public_user(user)
+
+
+@app.patch("/api/users/{user_id}")
+async def update_user_ep(user_id: str, body: dict):
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    row = db.query_one("SELECT * FROM users WHERE id=?", (user_id,))
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    me = auth.current_user()
+    if "display_name" in body:
+        db.execute("UPDATE users SET display_name=? WHERE id=?",
+                   (str(body["display_name"]).strip()[:60], user_id))
+    if "password" in body:
+        pw = str(body["password"] or "")
+        if pw and len(pw) < 8:
+            return JSONResponse(status_code=400, content={"error": "password must be at least 8 characters"})
+        db.execute("UPDATE users SET password_hash=? WHERE id=?",
+                   (auth.hash_password(pw) if pw else "", user_id))
+        db.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
+    if "active" in body:
+        if user_id == me["id"] and not body["active"]:
+            return JSONResponse(status_code=400, content={"error": "cannot deactivate yourself"})
+        db.execute("UPDATE users SET active=? WHERE id=?",
+                   (1 if body["active"] else 0, user_id))
+        if not body["active"]:
+            db.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
+    if "role" in body:
+        if user_id == me["id"] and body["role"] != "admin":
+            return JSONResponse(status_code=400, content={"error": "cannot demote yourself"})
+        if body["role"] in ("admin", "member"):
+            db.execute("UPDATE users SET role=? WHERE id=?", (body["role"], user_id))
+    auth.invalidate_auth_cache()
+    return auth.public_user(db.query_one("SELECT * FROM users WHERE id=?", (user_id,)))
+
+
 # --- Agents ---
 @app.get("/api/agents")
 async def get_agents():
@@ -240,33 +440,69 @@ async def restart_agent(agent_id: str):
 
 
 # --- Tasks / Kanban ---
+
+def _owned_task(task_id: str):
+    """Fetch a task ONLY if the current user owns it. Cross-user access is a
+    404 (no existence disclosure). Every by-id task endpoint goes through
+    this — it is the isolation chokepoint for the whole task surface."""
+    return db.query_one("SELECT * FROM tasks WHERE id=? AND user_id=?",
+                        (task_id, auth.current_user_id()))
+
+
+def _owned_workflow(wf_id: str):
+    return db.query_one("SELECT * FROM workflows WHERE id=? AND user_id=?",
+                        (wf_id, auth.current_user_id()))
+
+
 @app.get("/api/tasks")
 async def get_tasks():
-    return db.query_all("SELECT * FROM tasks ORDER BY position, created_at")
+    return db.query_all("SELECT * FROM tasks WHERE user_id=? ORDER BY position, created_at",
+                        (auth.current_user_id(),))
+
+
+def _foreign_refs_error(workflow_id, depends_on):
+    """Cross-user reference guard: linking into someone else's workflow or
+    depending on their task would leak their deliverables into dispatch
+    framing / project views."""
+    if workflow_id and not _owned_workflow(workflow_id):
+        return "workflow not found"
+    for dep in depends_on or []:
+        if not _owned_task(dep):
+            return f"dependency task not found: {dep}"
+    return None
 
 
 @app.post("/api/tasks")
 async def create_task(body: TaskCreate):
+    err = _foreign_refs_error(body.workflow_id, body.depends_on)
+    if err:
+        return JSONResponse(status_code=404, content={"error": err})
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
+    uid = auth.current_user_id()
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
-         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tid, body.title, body.description, body.status, body.priority,
          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
          body.domain, body.specialist, 1 if body.high_stakes else 0, body.budget_tokens, body.model,
          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
          json.dumps(body.loop_config) if body.loop_config else None,
-         (body.repo_path or None), (_derive_client(body.client, body.repo_path))))
-    db.log_activity("info", "system", f"Task created: '{body.title}'")
+         (body.repo_path or None), (_derive_client(body.client, body.repo_path)), uid))
+    db.log_activity("info", "system", f"Task created: '{body.title}'", user_id=uid)
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
-    await mgr.broadcast({"type": "task_created", "data": task})
+    await mgr.broadcast({"type": "task_created", "data": task}, user_id=uid)
     return task
 
 
 @app.patch("/api/tasks/{task_id}")
 async def update_task(task_id: str, body: TaskUpdate):
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    err = _foreign_refs_error(body.workflow_id, body.depends_on)
+    if err:
+        return JSONResponse(status_code=404, content={"error": err})
     updates = {}
     if body.status is not None:
         updates["status"] = body.status
@@ -318,7 +554,7 @@ async def update_task(task_id: str, body: TaskUpdate):
     db.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
 
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    await mgr.broadcast({"type": "task_updated", "data": task})
+    await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return task
 
 
@@ -343,6 +579,9 @@ def _deps_would_cycle(task_id: str, dep_ids: list) -> bool:
 
 @app.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: str):
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "not found"})
     db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     # Drop the deleted id from other tasks' depends_on so successors don't
     # silently run without the input this predecessor was meant to produce
@@ -355,7 +594,8 @@ async def delete_task(task_id: str):
                        (json.dumps(deps), t["id"]))
         except Exception:
             pass
-    await mgr.broadcast({"type": "task_deleted", "data": {"id": task_id}})
+    await mgr.broadcast({"type": "task_deleted", "data": {"id": task_id}},
+                        user_id=task.get("user_id"))
     return {"ok": True}
 
 
@@ -391,7 +631,7 @@ async def create_program(body: ProgramCreate):
 async def get_stats():
     sys_stats = am.get_system_stats()
     agents = db.query_all("SELECT * FROM agents")
-    tasks = db.query_all("SELECT * FROM tasks")
+    tasks = db.query_all("SELECT * FROM tasks WHERE user_id=?", (auth.current_user_id(),))
     programs = db.query_all("SELECT * FROM programs")
 
     agent_status = {}
@@ -1013,8 +1253,14 @@ def get_memory():
         with urllib.request.urlopen(req, timeout=10) as r:
             pts = (json.loads(r.read()).get("result") or {}).get("points", [])
         mems = []
+        me = auth.current_user_id()
         for p in pts:
             pl = p.get("payload") or {}
+            # Block-1 user isolation: rows stamped with another nexus user's
+            # tag are invisible (untagged = shared/global; same rule as the
+            # mem0-client provider read filter).
+            if pl.get("user") and pl.get("user") != me:
+                continue
             mems.append({
                 "id": p.get("id"),
                 "memory": pl.get("data") or pl.get("memory"),
@@ -1038,8 +1284,11 @@ def get_memory():
 
 @app.get("/api/activity")
 async def get_activity(limit: int = 50):
+    # Own rows + system-wide rows (user_id IS NULL). Other users' task
+    # lifecycle events are invisible.
     return db.query_all(
-        "SELECT * FROM activity ORDER BY ts DESC LIMIT ?", (limit,)
+        "SELECT * FROM activity WHERE user_id IS NULL OR user_id=? "
+        "ORDER BY ts DESC LIMIT ?", (auth.current_user_id(), limit)
     )
 
 
@@ -1051,7 +1300,16 @@ async def agent_metrics(agent_id: str, limit: int = 60):
 # --- WebSocket ---
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    await mgr.connect(ws)
+    # Same auth as HTTP: cookie at handshake. Reject when login is required
+    # and the cookie is absent/invalid — otherwise an anonymous socket would
+    # receive system broadcasts.
+    user = auth.resolve_session(ws.cookies.get(auth.COOKIE_NAME, ""))
+    if user is None:
+        if auth.auth_required():
+            await ws.close(code=4401)
+            return
+        user = auth.sole_user()
+    await mgr.connect(ws, user_id=user["id"] if user else None)
     try:
         while True:
             await ws.receive_text()
@@ -1088,20 +1346,34 @@ def _hermes_headers() -> dict:
 
 
 def _load_jarvis_session() -> dict:
+    """Per-user JARVIS store: {"sessions": {user_id: hermes_session_id}}.
+    Legacy single-session shape {"session_id": ...} migrates to u_owner."""
     try:
-        return json.loads(JARVIS_SESSION_FILE.read_text())
+        data = json.loads(JARVIS_SESSION_FILE.read_text())
     except Exception:
-        return {}
+        data = {}
+    if "sessions" not in data:
+        data = {"sessions": ({auth.DEFAULT_USER_ID: data["session_id"]}
+                             if data.get("session_id") else {})}
+    return data
 
 
 def _save_jarvis_session(data: dict):
     JARVIS_SESSION_FILE.write_text(json.dumps(data))
 
 
+def _jarvis_sid_for(user_id: str) -> str | None:
+    return (_load_jarvis_session().get("sessions") or {}).get(user_id)
+
+
 async def _get_or_create_jarvis_session() -> str:
-    """Get persistent JARVIS session ID, create if missing."""
+    """Get the CURRENT USER's persistent JARVIS session ID, create if missing.
+    Each user has their own conversation; the session is user-scope-published
+    so mem0 memories extracted from it are stamped with this user."""
+    user = auth.current_user()
+    uid = user["id"] if user else auth.DEFAULT_USER_ID
     state = _load_jarvis_session()
-    sid = state.get("session_id")
+    sid = (state.get("sessions") or {}).get(uid)
     if sid:
         # Verify session still exists
         async with httpx.AsyncClient() as client:
@@ -1111,22 +1383,43 @@ async def _get_or_create_jarvis_session() -> str:
                     headers=_hermes_headers(), timeout=5,
                 )
                 if r.status_code == 200:
+                    _publish_jarvis_user_scope(sid, uid)
                     return sid
             except Exception:
                 pass
-    # Create new session
+    # Create new session. Hermes session titles are UNIQUE — retry with a
+    # hex suffix on collision (same pattern as hermes_dispatch.create_session).
+    title = f"JARVIS — {(user or {}).get('display_name') or uid}"
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{HERMES_API_BASE}/api/sessions",
             headers=_hermes_headers(),
-            json={"title": "JARVIS"}, timeout=10,
+            json={"title": title}, timeout=10,
         )
+        if r.status_code >= 400:
+            r = await client.post(
+                f"{HERMES_API_BASE}/api/sessions",
+                headers=_hermes_headers(),
+                json={"title": f"{title} ~{uuid.uuid4().hex[:6]}"}, timeout=10,
+            )
         r.raise_for_status()
         data = r.json()
         sid = (data.get("session") or data).get("id")
-    _save_jarvis_session({"session_id": sid})
-    db.log_activity("info", "jarvis", f"JARVIS session created: {sid}")
+    state.setdefault("sessions", {})[uid] = sid
+    _save_jarvis_session(state)
+    _publish_jarvis_user_scope(sid, uid)
+    db.log_activity("info", "jarvis", f"JARVIS session created: {sid}", user_id=uid)
     return sid
+
+
+def _publish_jarvis_user_scope(sid: str, uid: str):
+    """Tag the JARVIS session with its owner in the mem0 scopes bridge file
+    (idempotent) so extracted memories are user-isolated."""
+    try:
+        import hermes_dispatch as _hd
+        _hd.publish_session_scope(sid, user=uid)
+    except Exception:
+        pass
 
 
 @app.get("/api/jarvis/status")
@@ -1143,11 +1436,10 @@ async def jarvis_status():
     except Exception:
         connected = False
         data = {}
-    state = _load_jarvis_session()
     return {
         "connected": connected,
         "hermes_version": data.get("version", "—"),
-        "session_id": state.get("session_id"),
+        "session_id": _jarvis_sid_for(auth.current_user_id()),
         "api_base": HERMES_API_BASE,
     }
 
@@ -1186,7 +1478,10 @@ async def jarvis_skills():
 
 @app.get("/api/jarvis/sessions")
 async def jarvis_list_sessions(limit: int = 10):
-    """List recent Hermes sessions."""
+    """List recent Hermes sessions. Admin-only: the gateway's session list
+    spans EVERY user's JARVIS + task sessions (titles leak content)."""
+    if not auth.is_admin():
+        return {"sessions": []}
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
@@ -1205,7 +1500,10 @@ async def jarvis_list_sessions(limit: int = 10):
 
 @app.get("/api/jarvis/messages/{session_id}")
 async def jarvis_messages(session_id: str, limit: int = 50):
-    """Get message history for a session."""
+    """Get message history — ONLY for the caller's own JARVIS session.
+    (Arbitrary session ids would read other users' conversations.)"""
+    if session_id != _jarvis_sid_for(auth.current_user_id()):
+        return JSONResponse(status_code=404, content={"error": "not found"})
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
@@ -1389,6 +1687,8 @@ async def jarvis_talk(body: dict):
 @app.post("/api/tasks/{task_id}/claim")
 async def claim_task(task_id: str, body: dict):
     """Atomically claim a task via SQLite CAS (compare-and-swap)."""
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
     agent_id = body.get("agent_id")
     if not agent_id:
         return JSONResponse(status_code=400, content={"error": "agent_id required"})
@@ -1410,14 +1710,17 @@ async def claim_task(task_id: str, body: dict):
             "status": task.get("status"),
         })
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    db.log_activity("info", agent_id, f"Claimed task '{task['title']}'")
-    await mgr.broadcast({"type": "task_updated", "data": task})
+    db.log_activity("info", agent_id, f"Claimed task '{task['title']}'",
+                    user_id=task.get("user_id"))
+    await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return {"ok": True, "task": task}
 
 
 @app.post("/api/tasks/{task_id}/release")
 async def release_task(task_id: str, body: dict):
     """Release a task claim back to 'todo' so another agent may pick it up."""
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
     agent_id = body.get("agent_id")
     now = time.time()
     db.execute(
@@ -1428,7 +1731,7 @@ async def release_task(task_id: str, body: dict):
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
-    await mgr.broadcast({"type": "task_updated", "data": task})
+    await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return {"ok": True, "task": task}
 
 
@@ -1806,7 +2109,7 @@ async def dispatch_task(task_id: str, body: dict):
         return JSONResponse(status_code=404, content={"error": "agent not found"})
     if agent.get("status") in ("retired", "cost_capped"):
         return JSONResponse(status_code=409, content={"error": f"agent is {agent['status']}"})
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     if task.get("dispatch_state") in _ACTIVE_DISPATCH_STATES:
@@ -1841,14 +2144,14 @@ async def dispatch_task(task_id: str, body: dict):
     # server-thread execution — that race is designed out).
     did = hd.start_dispatch(task_id, agent_id)
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
-    await mgr.broadcast({"type": "task_updated", "data": task})
+    await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return {"ok": True, "dispatch_id": did, "task": task}
 
 
 @app.get("/api/tasks/{task_id}/transcript")
 async def task_transcript(task_id: str, limit: int = 100):
     """The REAL log: the task's Hermes session transcript (proxied from state.db)."""
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     sid = task.get("session_id")
@@ -1868,11 +2171,14 @@ async def task_transcript(task_id: str, limit: int = 100):
 
 @app.get("/api/dispatches")
 async def list_dispatches(limit: int = 50, task_id: Optional[str] = None):
-    q = "SELECT * FROM dispatches WHERE 1=1"
-    params = []
+    # Scoped through the owning task (dispatch rows carry session ids +
+    # errors — user data).
+    q = ("SELECT d.* FROM dispatches d JOIN tasks t ON t.id = d.task_id "
+         "WHERE t.user_id = ?")
+    params = [auth.current_user_id()]
     if task_id:
-        q += " AND task_id = ?"; params.append(task_id)
-    q += " ORDER BY started_at DESC LIMIT ?"
+        q += " AND d.task_id = ?"; params.append(task_id)
+    q += " ORDER BY d.started_at DESC LIMIT ?"
     params.append(limit)
     return {"dispatches": db.query_all(q, tuple(params))}
 
@@ -1920,7 +2226,7 @@ def _workspace_files(ws: str) -> tuple[list, bool]:
 @app.get("/api/tasks/{task_id}/files")
 async def task_files(task_id: str):
     """List the task workspace RECURSIVELY (deliverables are FILES — R6)."""
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     ws = task.get("workspace_path")
@@ -1934,7 +2240,7 @@ async def task_files(task_id: str):
 async def task_file_download(task_id: str, name: str):
     """Download/view one workspace file (incl. attachments/ subpaths).
     Path-traversal-safe: the resolved path must stay inside the task workspace."""
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task or not task.get("workspace_path"):
         return JSONResponse(status_code=404, content={"error": "no workspace"})
     ws = Path(task["workspace_path"]).resolve()
@@ -1958,7 +2264,9 @@ async def task_file_download(task_id: str, name: str):
 # ── App preview: ▶ Test a task's program output live (v3.3) ──
 
 def _task_workspace(task_id: str) -> str | None:
-    task = db.query_one("SELECT workspace_path FROM tasks WHERE id=?", (task_id,))
+    # Ownership-scoped: every app-preview endpoint funnels through here.
+    task = db.query_one("SELECT workspace_path FROM tasks WHERE id=? AND user_id=?",
+                        (task_id, auth.current_user_id()))
     ws = (task or {}).get("workspace_path")
     return ws if ws and os.path.isdir(ws) else None
 
@@ -1987,6 +2295,8 @@ async def task_app_start(task_id: str):
 @app.post("/api/tasks/{task_id}/app/stop")
 async def task_app_stop(task_id: str):
     import app_runner as _apps
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "not found"})
     return _apps.stop_app(task_id)
 
 
@@ -2019,14 +2329,14 @@ def _attachments_dir(kind: str, oid: str, create: bool = False) -> Path | None:
     """attachments/ folder inside the object's workspace. For a task this also
     pins workspace_path so the files are dispatch-visible before first run."""
     if kind == "task":
-        task = db.query_one("SELECT * FROM tasks WHERE id=?", (oid,))
+        task = _owned_task(oid)  # ownership chokepoint for all task attachments
         if not task:
             return None
         ws = Path(task.get("workspace_path") or (Path(__file__).parent / "workspaces" / oid))
         if create and not task.get("workspace_path"):
             db.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), oid))
     elif kind == "workflow":
-        if not db.query_one("SELECT id FROM workflows WHERE id=?", (oid,)):
+        if not _owned_workflow(oid):  # ownership chokepoint for workflow attachments
             return None
         ws = Path(__file__).parent / "workspaces" / f"workflow-{oid}"
     else:
@@ -2183,7 +2493,7 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
 @app.post("/api/tasks/{task_id}/judge")
 async def run_judge(task_id: str):
     """R4.2: 'Run frontier judge' — async; poll GET /api/tasks/{id}/judge."""
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     domain = (task.get("domain") or "").strip()
@@ -2207,8 +2517,9 @@ async def run_judge(task_id: str):
 
 @app.get("/api/tasks/{task_id}/judge")
 async def judge_status(task_id: str):
-    task = db.query_one("SELECT judge_verdict, judge_output, judge_ts FROM tasks WHERE id=?",
-                        (task_id,))
+    task = db.query_one(
+        "SELECT judge_verdict, judge_output, judge_ts FROM tasks WHERE id=? AND user_id=?",
+        (task_id, auth.current_user_id()))
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     return {"verdict": task.get("judge_verdict"), "output": task.get("judge_output"),
@@ -2219,7 +2530,7 @@ async def judge_status(task_id: str):
 async def log_task_feedback(task_id: str, body: dict):
     """R6.3: Log as WIN / LESSON — appends a properly-formatted entry to the
     Business Brain feedback files. Numbers are REQUIRED for wins, never invented."""
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     kind = body.get("kind")
@@ -2325,10 +2636,12 @@ def _retry_task(task_id: str, feedback: str | None):
 
 @app.post("/api/tasks/{task_id}/retry")
 async def retry_task(task_id: str, body: dict):
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
     task = _retry_task(task_id, (body or {}).get("feedback"))
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
-    await mgr.broadcast({"type": "task_updated", "data": task})
+    await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return {"ok": True, "task": task}
 
 
@@ -2935,13 +3248,13 @@ async def loop_design(body: dict):
     # When designing for an EXISTING object, pull its real shape from the DB.
     oid = body.get("id")
     if oid and kind == "task":
-        t = db.query_one("SELECT * FROM tasks WHERE id=?", (oid,))
+        t = _owned_task(oid)
         if t:
             meta = {"title": t.get("title"), "domain": t.get("domain"),
                     "high_stakes": bool(t.get("high_stakes")),
                     "specialist": t.get("specialist"), **meta}
     elif oid and kind == "workflow":
-        w = db.query_one("SELECT * FROM workflows WHERE id=?", (oid,))
+        w = _owned_workflow(oid)
         if w:
             specs = [r.get("specialist") for r in db.query_all(
                 "SELECT specialist FROM tasks WHERE workflow_id=?", (oid,)) if r.get("specialist")]
@@ -3173,7 +3486,8 @@ def _workflow_rollup(w: dict) -> dict:
 async def list_workflows():
     return {"workflows": [
         _workflow_rollup(w) for w in
-        db.query_all("SELECT * FROM workflows ORDER BY created_at DESC")]}
+        db.query_all("SELECT * FROM workflows WHERE user_id=? ORDER BY created_at DESC",
+                     (auth.current_user_id(),))]}
 
 
 @app.post("/api/workflows")
@@ -3183,23 +3497,24 @@ async def create_workflow(body: dict):
         return JSONResponse(status_code=400, content={"error": "name required"})
     wid = f"wf-{uuid.uuid4().hex[:8]}"
     now = time.time()
+    uid = auth.current_user_id()
     lc = body.get("loop_config")
-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path, user_id) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
                 json.dumps(lc) if isinstance(lc, dict) else None,
                 1 if body.get("high_stakes") else 0,
                 _derive_client(body.get("client"), body.get("project_path")),
-                ((body.get("project_path") or "").strip() or None)))
-    db.log_activity("info", "system", f"Workflow created: '{name}'")
+                ((body.get("project_path") or "").strip() or None), uid))
+    db.log_activity("info", "system", f"Workflow created: '{name}'", user_id=uid)
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
-    await mgr.broadcast({"type": "workflow_created", "data": w})
+    await mgr.broadcast({"type": "workflow_created", "data": w}, user_id=uid)
     return w
 
 
 @app.get("/api/workflows/{wf_id}")
 async def get_workflow(wf_id: str):
-    w = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
+    w = _owned_workflow(wf_id)
     if not w:
         return JSONResponse(status_code=404, content={"error": "workflow not found"})
     tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? ORDER BY created_at", (wf_id,))
@@ -3223,7 +3538,7 @@ async def get_workflow(wf_id: str):
 
 @app.patch("/api/workflows/{wf_id}")
 async def update_workflow(wf_id: str, body: dict):
-    w = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
+    w = _owned_workflow(wf_id)
     if not w:
         return JSONResponse(status_code=404, content={"error": "workflow not found"})
     for k in ("name", "goal", "domain", "status", "project_path"):
@@ -3264,6 +3579,8 @@ async def update_workflow(wf_id: str, body: dict):
 @app.delete("/api/workflows/{wf_id}")
 async def delete_workflow(wf_id: str):
     """Delete the workflow container; its tasks stay on the board (unlinked)."""
+    if not _owned_workflow(wf_id):
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
     db.execute("UPDATE tasks SET workflow_id=NULL WHERE workflow_id=?", (wf_id,))
     db.execute("DELETE FROM workflows WHERE id=?", (wf_id,))
     return {"ok": True}
@@ -3275,8 +3592,9 @@ async def delete_workflow(wf_id: str):
 async def list_deliverables(limit: int = 100):
     """All tasks that produced output, newest first, with their workspace files."""
     tasks = db.query_all(
-        "SELECT * FROM tasks WHERE workspace_path IS NOT NULL "
-        "ORDER BY COALESCE(completed_at, updated_at) DESC LIMIT ?", (limit,))
+        "SELECT * FROM tasks WHERE workspace_path IS NOT NULL AND user_id=? "
+        "ORDER BY COALESCE(completed_at, updated_at) DESC LIMIT ?",
+        (auth.current_user_id(), limit))
     out = []
     import app_runner as _apps
     for t in tasks:
@@ -3480,6 +3798,9 @@ async def get_settings(prefix: str = "dispatch."):
 
 @app.patch("/api/settings")
 async def patch_settings(body: dict):
+    # Global knobs (budgets, caps, judge cmd) — admin-only once multi-user.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     bad = [k for k in body if not k.startswith(_SETTINGS_PREFIXES)]
     if bad:
         return JSONResponse(status_code=400, content={
@@ -3496,7 +3817,9 @@ async def patch_settings(body: dict):
 
 @app.get("/api/known-issues")
 async def known_issues_list():
-    rows = db.query_all("SELECT * FROM known_issues ORDER BY ts DESC LIMIT 200")
+    rows = db.query_all(
+        "SELECT * FROM known_issues WHERE user_id=? ORDER BY ts DESC LIMIT 200",
+        (auth.current_user_id(),))
     return {"issues": rows}
 
 
@@ -3507,24 +3830,27 @@ async def known_issues_add(body: dict):
         return JSONResponse(status_code=400, content={"error": "feedback text required"})
     iid = f"ki-{uuid.uuid4().hex[:10]}"
     ctx = body.get("context")
+    uid = auth.current_user_id()
     db.execute(
-        "INSERT INTO known_issues (id, ts, view, feedback, context, status) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO known_issues (id, ts, view, feedback, context, status, user_id) VALUES (?,?,?,?,?,?,?)",
         (iid, time.time(), str(body.get("view") or "")[:40], feedback[:4000],
-         json.dumps(ctx)[:20000] if ctx is not None else None, "new"))
-    db.log_activity("info", "feedback", f"Known issue filed: {feedback[:80]}")
+         json.dumps(ctx)[:20000] if ctx is not None else None, "new", uid))
+    db.log_activity("info", "feedback", f"Known issue filed: {feedback[:80]}", user_id=uid)
     return {"ok": True, "id": iid}
 
 
 @app.patch("/api/known-issues/{iid}")
 async def known_issues_update(iid: str, body: dict):
     if body.get("status") in ("new", "in_progress", "resolved"):
-        db.execute("UPDATE known_issues SET status=? WHERE id=?", (body["status"], iid))
+        db.execute("UPDATE known_issues SET status=? WHERE id=? AND user_id=?",
+                   (body["status"], iid, auth.current_user_id()))
     return {"ok": True}
 
 
 @app.delete("/api/known-issues/{iid}")
 async def known_issues_delete(iid: str):
-    db.execute("DELETE FROM known_issues WHERE id=?", (iid,))
+    db.execute("DELETE FROM known_issues WHERE id=? AND user_id=?",
+               (iid, auth.current_user_id()))
     return {"ok": True}
 
 
@@ -3560,7 +3886,9 @@ import tools_hub
 
 
 # ── Memory 3D map: real mem0 vectors (qdrant) → PCA 3D + similarity links ──
-_MEM3D_CACHE: dict = {"ts": 0.0, "data": None}
+# Cache keyed per user: the galaxy is user-filtered (Block 1), so one user's
+# cached map must never be served to another.
+_MEM3D_CACHE: dict = {}
 
 
 @app.get("/api/memory3d")
@@ -3568,8 +3896,10 @@ async def memory3d(force: bool = False):
     """Nodes = mem0 memories at their REAL vector positions (768-dim qdrant
     embeddings PCA-projected to 3D); links = strongest cosine similarities.
     Nothing is invented — distance on screen is semantic distance in mem0."""
-    if not force and _MEM3D_CACHE["data"] and time.time() - _MEM3D_CACHE["ts"] < 120:
-        return _MEM3D_CACHE["data"]
+    me = auth.current_user_id()
+    cached = _MEM3D_CACHE.get(me)
+    if not force and cached and cached["data"] and time.time() - cached["ts"] < 120:
+        return cached["data"]
     try:
         import numpy as np
         import requests as _rq
@@ -3591,7 +3921,10 @@ async def memory3d(force: bool = False):
             if isinstance(v, dict):
                 v = v.get("") or v.get("dense")
             return v if isinstance(v, list) else None
-        pts = [p for p in pts if _dense(p)]
+        # Block-1 user isolation: another user's tagged rows are invisible
+        # (untagged = shared/global — same rule as the mem0-client provider).
+        pts = [p for p in pts if _dense(p)
+               and (p.get("payload") or {}).get("user", me) in (me, None, "")]
         if len(pts) < 3:
             return {"nodes": [], "links": [], "note": "not enough memories yet"}
 
@@ -3734,7 +4067,7 @@ async def memory3d(force: bool = False):
         data = {"nodes": nodes, "links": links, "clusters": clusters,
                 "groups": groups,
                 "count": len(nodes), "dims": 768, "generated_at": time.time()}
-        _MEM3D_CACHE.update(ts=time.time(), data=data)
+        _MEM3D_CACHE[me] = {"ts": time.time(), "data": data}
         return data
     except Exception as e:
         return JSONResponse(status_code=503, content={
@@ -3747,7 +4080,7 @@ import review as review_engine
 
 @app.get("/api/tasks/{task_id}/review")
 async def task_review(task_id: str):
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task or not task.get("workspace_path"):
         return JSONResponse(status_code=404, content={"error": "task or workspace not found"})
     try:
@@ -3759,6 +4092,8 @@ async def task_review(task_id: str):
 @app.get("/api/workflows/{wf_id}/review")
 async def workflow_review(wf_id: str):
     """Aggregated change review across all member tasks (newest first)."""
+    if not _owned_workflow(wf_id):
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
     tasks = db.query_all(
         "SELECT * FROM tasks WHERE workflow_id=? AND workspace_path IS NOT NULL "
         "ORDER BY COALESCE(completed_at, updated_at) DESC LIMIT 12", (wf_id,))
@@ -3853,7 +4188,7 @@ async def task_promote(task_id: str, body: dict):
     client repository. Copies the code (junk excluded), seeds the repo, and
     commits 'imported from task'. All future rounds then run repo-native."""
     import shutil
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = _owned_task(task_id)
     if not task or not task.get("workspace_path"):
         return JSONResponse(status_code=404, content={"error": "task or workspace not found"})
     ws = Path(task["workspace_path"])
@@ -3909,8 +4244,9 @@ async def project_history(path: str):
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
     tasks = db.query_all(
         "SELECT id, title, status, workflow_id, created_at, completed_at, client "
-        "FROM tasks WHERE repo_path = ? OR repo_path LIKE ? ORDER BY created_at DESC LIMIT 200",
-        (p, p + "/%"))
+        "FROM tasks WHERE (repo_path = ? OR repo_path LIKE ?) AND user_id = ? "
+        "ORDER BY created_at DESC LIMIT 200",
+        (p, p + "/%", auth.current_user_id()))
     wf_ids = sorted({t["workflow_id"] for t in tasks if t.get("workflow_id")})
     wfs = []
     for wid in wf_ids:
@@ -4040,8 +4376,9 @@ async def api_tasks_cleanup():
     import time as _t
     now = _t.time()
     moved = []
+    uid = auth.current_user_id()
     rows = db.query_all("SELECT id, title, status, claimed_by, claimed_at FROM tasks "
-                        "WHERE status IN ('in_progress','review')")
+                        "WHERE status IN ('in_progress','review') AND user_id=?", (uid,))
     for r in rows:
         stale = False
         reason = ""
@@ -4058,8 +4395,9 @@ async def api_tasks_cleanup():
             moved.append({"id": r["id"], "title": r["title"],
                           "from": r["status"], "to": new_status, "reason": reason})
     if moved:
-        db.log_activity("info", "system", f"Kanban cleanup: moved {len(moved)} stale tasks")
-        await mgr.broadcast({"type": "tasks", "ts": now})
+        db.log_activity("info", "system", f"Kanban cleanup: moved {len(moved)} stale tasks",
+                        user_id=uid)
+        await mgr.broadcast({"type": "tasks", "ts": now}, user_id=uid)
     return {"moved": moved, "count": len(moved)}
 
 

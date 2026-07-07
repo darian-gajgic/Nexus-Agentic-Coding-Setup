@@ -185,6 +185,27 @@ def init_db():
         error TEXT,
         heartbeat_at REAL
     );
+
+    -- ===== Multi-user tables (Block 1, additive — docs/SPEC-MULTIUSER.md) =====
+
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        display_name TEXT DEFAULT '',
+        password_hash TEXT DEFAULT '',
+        role TEXT DEFAULT 'member',
+        active INTEGER DEFAULT 1,
+        created_at REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at REAL,
+        expires_at REAL,
+        last_seen REAL,
+        ua TEXT DEFAULT ''
+    );
     """)
 
     # Migrate: add columns if they don't exist (for existing DBs)
@@ -231,6 +252,7 @@ def init_db():
         ("loop_config", "TEXT"),
         ("repo_path", "TEXT"),
         ("client", "TEXT"),
+        ("user_id", "TEXT"),
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -246,6 +268,8 @@ def init_db():
         conn.execute("ALTER TABLE workflows ADD COLUMN client TEXT")
     if "project_path" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN project_path TEXT")
+    if "user_id" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN user_id TEXT")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (
@@ -261,6 +285,24 @@ def init_db():
     existing_disp_cols = {r[1] for r in conn.execute("PRAGMA table_info(dispatches)").fetchall()}
     if "heartbeat_at" not in existing_disp_cols:
         conn.execute("ALTER TABLE dispatches ADD COLUMN heartbeat_at REAL")
+
+    # ===== Multi-user migration (Block 1, additive — docs/SPEC-MULTIUSER.md) =====
+    # user_id on the per-user tables; NULL on activity = system-wide row.
+    for tbl in ("known_issues", "activity"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
+        if "user_id" not in cols:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN user_id TEXT")
+    # Seed the default owner ONCE, then hand every pre-multiuser row to it so
+    # ALL queries are uniformly user-scoped (no unscoped legacy path). With
+    # only this one user configured, login stays off and nothing changes for
+    # the single-operator machine.
+    if not conn.execute("SELECT 1 FROM users WHERE id='u_owner'").fetchone():
+        conn.execute(
+            "INSERT INTO users (id, username, display_name, password_hash, role, "
+            "active, created_at) VALUES ('u_owner','owner','Operator','','admin',1,?)",
+            (time.time(),))
+    for tbl in ("tasks", "workflows", "known_issues"):
+        conn.execute(f"UPDATE {tbl} SET user_id='u_owner' WHERE user_id IS NULL")
 
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
@@ -287,6 +329,9 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_dispatches_state ON dispatches(state, heartbeat_at)",
         "CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity(ts)",
         "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at)",
     ):
         conn.execute(ddl)
     conn.commit()
@@ -312,9 +357,11 @@ def execute(sql, params=()):
     return cur
 
 
-def log_activity(level, source, message):
-    execute("INSERT INTO activity (ts, level, source, message) VALUES (?,?,?,?)",
-            (time.time(), level, source, message))
+def log_activity(level, source, message, user_id=None):
+    """user_id=None = system-wide row (visible to every user); pass the owning
+    task's user_id when the event is about one user's work."""
+    execute("INSERT INTO activity (ts, level, source, message, user_id) VALUES (?,?,?,?,?)",
+            (time.time(), level, source, message, user_id))
 
 
 # --- Settings helpers (shared by server, worker, watchdog) ---
