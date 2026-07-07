@@ -386,10 +386,10 @@ index e4a0612..baec6b0 100644
 +]
 \ No newline at end of file
 diff --git a/worktree.py b/worktree.py
-index d1fcbbe..3159478 100644
+index d1fcbbe..b561540 100644
 --- a/worktree.py
 +++ b/worktree.py
-@@ -62,3 +62,63 @@ def remove_worktree(repo_path: str, wt_path: str) -> bool:
+@@ -62,3 +62,78 @@ def remove_worktree(repo_path: str, wt_path: str) -> bool:
      if code != 0 and os.path.isdir(wt_path):
          shutil.rmtree(wt_path, ignore_errors=True)
      return True
@@ -434,12 +434,24 @@ index d1fcbbe..3159478 100644
 +            "base_branch": base}
 +
 +
++# Build/runtime junk that must never pollute a task branch or its review diff
++# (the E2E probe's snapshot once committed test-run __pycache__).
++_JUNK_PATHSPECS = tuple(
++    f":(exclude){p}" for p in (
++        "__pycache__", "*.pyc", "node_modules", ".venv", "venv", "dist",
++        "build", ".pytest_cache", "*.egg-info", ".next", "coverage"))
++
++
 +def snapshot_commit(wt_path: str, message: str) -> bool:
 +    """Safety net: commit anything the agent left uncommitted, so the diff
-+    capture never loses work. No-op on a clean tree."""
++    capture never loses work. No-op on a clean tree; never adds junk."""
 +    if not worktree_has_changes(wt_path):
 +        return False
-+    _run_git(wt_path, "add", "-A")
++    _run_git(wt_path, "add", "-A", "--", ".", *_JUNK_PATHSPECS)
++    # anything staged?
++    code, staged = _run_git(wt_path, "diff", "--cached", "--name-only")
++    if code != 0 or not staged.strip():
++        return False
 +    code, _ = _run_git(wt_path, "-c", "user.name=nexus", "-c",
 +                       "user.email=nexus@local", "commit", "-m", message)
 +    return code == 0
@@ -447,9 +459,12 @@ index d1fcbbe..3159478 100644
 +
 +def capture_diff(wt_path: str, base: str) -> str:
 +    """The pipeline's real deliverable: everything the branch changed vs the
-+    baseline (three-dot = since the merge-base, immune to base moving on)."""
-+    code, out = _run_git(wt_path, "diff", f"{base}...HEAD")
++    baseline (three-dot = since the merge-base, immune to base moving on).
++    Junk paths are excluded so reviews see only real changes."""
++    code, out = _run_git(wt_path, "diff", f"{base}...HEAD", "--",
++                         ".", *_JUNK_PATHSPECS)
 +    if code != 0:
 +        return ""
-+    code2, stat = _run_git(wt_path, "diff", "--stat", f"{base}...HEAD")
++    code2, stat = _run_git(wt_path, "diff", "--stat", f"{base}...HEAD", "--",
++                           ".", *_JUNK_PATHSPECS)
 +    return (stat + "\n\n" + out) if code2 == 0 and stat else out
