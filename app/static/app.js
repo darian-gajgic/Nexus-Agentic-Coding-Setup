@@ -1415,8 +1415,21 @@ function showTourStep() {
       ${i > 0 ? '<button class="btn-ghost" onclick="nextTourStep(-1)">← Back</button>' : ''}
       <button class="btn-primary" onclick="nextTourStep(1)">${i === steps.length - 1 ? 'Done ✓' : 'Next →'}</button>
     </div>`;
-  card.style.left = Math.max(12, Math.min(innerWidth - 380, r.left)) + 'px';
-  card.style.top = (below ? r.bottom + 14 : Math.max(12, r.top - card.offsetHeight - 180)) + 'px';
+  // measure the REAL card, then pick the side with room and clamp fully
+  // into the viewport — fixed guesses ran off-screen on tall/edge targets
+  const cw = card.offsetWidth || 360, ch = card.offsetHeight || 180;
+  const pad = 12, gap = 14;
+  let top;
+  if (r.bottom + gap + ch <= innerHeight - pad) top = r.bottom + gap;          // below
+  else if (r.top - gap - ch >= pad) top = r.top - gap - ch;                    // above
+  else top = Math.max(pad, Math.min(innerHeight - ch - pad,                    // beside
+                                    r.top + r.height / 2 - ch / 2));
+  let left = r.left;
+  if (top > r.top - gap - ch && top < r.bottom + gap) {                        // beside: dodge the target
+    left = (r.right + gap + cw <= innerWidth - pad) ? r.right + gap : r.left - gap - cw;
+  }
+  card.style.left = Math.max(pad, Math.min(innerWidth - cw - pad, left)) + 'px';
+  card.style.top = Math.max(pad, Math.min(innerHeight - ch - pad, top)) + 'px';
 }
 
 function nextTourStep(dir) {

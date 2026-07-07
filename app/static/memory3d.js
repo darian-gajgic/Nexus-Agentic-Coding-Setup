@@ -84,22 +84,45 @@ function textSprite(text, sub, hex) {
   return s;
 }
 
-// Region palette — each semantic cluster gets its own vivid hue, like the
-// brain-region maps this view is modeled on. CYAN is first: it goes to the
-// LARGEST region (operator's request), then hues by descending region size.
-const REGION_HUES = [0x22d3ee, 0xa3e635, 0xf43f5e, 0xf59e0b,
-                     0x8b5cf6, 0xec4899, 0x60a5fa, 0x2dd4bf];
+// Color = IDENTITY. Each color group is one memory owner (a specialist, or
+// one semantic slice of hermes's own mind — the server splits any identity
+// holding >50% of the map). Cyan family first and extended across the top
+// groups until it covers >=20% of all nodes; then maximally distinct hues.
+const CYAN_FAMILY = [0x22d3ee, 0x67e8f9, 0x0ea5b7];
+const DISTINCT_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6, 0xec4899,
+                       0x60a5fa, 0x2dd4bf, 0xfb7185, 0xfacc15, 0x34d399,
+                       0xc084fc, 0xf97316];
 
-function buildHueMap(clusters) {
-  // biggest region → cyan, second → lime, …
+function buildHueMap(data) {
+  // groups arrive ranked by size desc; node.group is the rank index
+  const groups = data.groups || [];
+  const total = groups.reduce((s, g) => s + g.size, 0) || 1;
+  M.hueByGroup = [];
+  let cyanShare = 0, ci = 0, di = 0;
+  groups.forEach((g, rank) => {
+    if (cyanShare < 0.20 && ci < CYAN_FAMILY.length) {
+      M.hueByGroup[rank] = CYAN_FAMILY[ci++];
+      cyanShare += g.size / total;
+    } else {
+      M.hueByGroup[rank] = DISTINCT_HUES[di++ % DISTINCT_HUES.length];
+    }
+  });
+  // region callouts inherit the hue of the group most of their nodes wear
   M.hueByCluster = {};
-  [...(clusters || [])].sort((a, b) => b.size - a.size).forEach((cl, rank) => {
-    M.hueByCluster[cl.id] = REGION_HUES[rank % REGION_HUES.length];
+  const tally = {};
+  (data.nodes || []).forEach((n) => {
+    if (n.cluster == null) return;
+    (tally[n.cluster] = tally[n.cluster] || {})[n.group] =
+      (tally[n.cluster]?.[n.group] || 0) + 1;
+  });
+  Object.entries(tally).forEach(([cid, byGroup]) => {
+    const top = Object.entries(byGroup).sort((a, b) => b[1] - a[1])[0];
+    M.hueByCluster[cid] = M.hueByGroup[+top[0]] ?? CYAN_FAMILY[0];
   });
 }
 
 function nodeColor(n) {
-  return (M.hueByCluster && M.hueByCluster[n.cluster]) ?? REGION_HUES[0];
+  return (M.hueByGroup && M.hueByGroup[n.group]) ?? CYAN_FAMILY[0];
 }
 
 function lerp3(a, b, t) {
@@ -108,7 +131,7 @@ function lerp3(a, b, t) {
 
 function buildScene(data) {
   const { nodes, links } = data;
-  buildHueMap(data.clusters);
+  buildHueMap(data);
   M.group = new THREE.Group();
   M.scene.add(M.group);
 
@@ -162,7 +185,7 @@ function buildScene(data) {
 
   // ── semantic region callouts in their region's color ──
   (data.clusters || []).forEach((cl) => {
-    const hue = (M.hueByCluster && M.hueByCluster[cl.id]) ?? REGION_HUES[0];
+    const hue = (M.hueByCluster && M.hueByCluster[cl.id]) ?? CYAN_FAMILY[0];
     const s = textSprite(cl.label, `${cl.size} memories`, hue);
     s.position.set(cl.x, cl.y + 7, cl.z);
     M.group.add(s);
@@ -383,9 +406,9 @@ async function mount(container, data) {
   legend.style.cssText =
     'position:absolute;left:18px;bottom:16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;' +
     'font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);pointer-events:none;z-index:5;max-width:75%';
-  const regionChips = (data.clusters || []).map((cl) => {
-    const col = '#' + (((M.hueByCluster && M.hueByCluster[cl.id]) ?? REGION_HUES[0])).toString(16).padStart(6, '0');
-    const word = esc(String(cl.label).split(' · ')[0]);
+  const regionChips = (data.groups || []).slice(0, 9).map((g, rank) => {
+    const col = '#' + ((M.hueByGroup && M.hueByGroup[rank]) ?? CYAN_FAMILY[0]).toString(16).padStart(6, '0');
+    const word = esc(String(g.label).replace('hermes · ', '').slice(0, 18));
     return `<span><i style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col};margin-right:5px"></i>${word}</span>`;
   }).join('');
   legend.innerHTML = regionChips +
