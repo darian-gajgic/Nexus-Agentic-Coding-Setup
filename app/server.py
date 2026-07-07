@@ -3580,10 +3580,14 @@ async def memory3d(force: bool = False):
                                 reverse=True)[:3]
                 cx = coords[idxs].mean(axis=0)
                 clusters.append({
+                    "id": c,
                     "label": " · ".join(w for w, _ in scored) or f"region {c+1}",
                     "x": round(float(cx[0]), 2), "y": round(float(cx[1]), 2),
                     "z": round(float(cx[2]), 2), "size": len(idxs),
                 })
+            # per-node region → the frontend colors the galaxy by cluster
+            for i, node in enumerate(nodes):
+                node["cluster"] = int(assign[i])
         except Exception:
             clusters = []
 

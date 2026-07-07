@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
-<link rel="stylesheet" href="/static/style.css?v=6">
+<link rel="stylesheet" href="/static/style.css?v=7">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -45,6 +45,7 @@
       <a class="nav-item" data-view="observability"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></svg></span>Observability</a>
       <a class="nav-item" data-view="issues"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="5.5"/><line x1="12" y1="10.5" x2="12" y2="14"/><circle cx="12" cy="16" r=".4" fill="currentColor"/><line x1="7" y1="6.5" x2="9.2" y2="8.7"/><line x1="17" y1="6.5" x2="14.8" y2="8.7"/></svg></span>Known Issues <span class="badge" id="kiBadge" style="display:none">0</span></a>
       <a class="nav-item" data-view="settings"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>Settings</a>
+      <a class="nav-item" data-view="manual"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><line x1="9" y1="7" x2="15" y2="7"/><line x1="9" y1="11" x2="13" y2="11"/></svg></span>User Manual</a>
     </div>
     <div class="jarvis-nav-wrap">
       <a class="nav-item nav-jarvis" data-view="jarvis"><span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.2" stroke-dasharray="3 2.5"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/></svg></span>J.A.R.V.I.S<span class="jarvis-live">◉</span></a>
@@ -68,6 +69,7 @@
       </div>
       <div class="topbar-right">
         <div class="model-strip" id="modelStrip" title="Live Hermes sessions per model (running / cap) — caps editable in Settings" style="display:flex;gap:8px;align-items:center;font-family:var(--font-mono);font-size:11px;color:var(--text-dim)"></div>
+        <button class="help-btn" id="helpBtn" onclick="startTour(currentView)" title="Guided walkthrough of this tab — explains everything on screen">?</button>
         <div class="conn-pill" id="connPill"><span class="status-dot online" id="wsDot"></span><span id="wsLabel">LIVE</span></div>
         <span class="live-text" id="liveClock">--:--:--</span>
         <button class="btn-primary" id="spawnBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" width="13" height="13"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Spawn Agent</button>
@@ -93,8 +95,8 @@
 
 <button id="fbBtn" onclick="feedbackModal()" title="Something wrong or annoying here? File it — your last steps get attached automatically" style="position:fixed;right:18px;bottom:18px;z-index:900;width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,.15);background:rgba(20,20,32,.85);color:var(--text-dim);font-size:17px;cursor:pointer;backdrop-filter:blur(6px)">🐞</button>
 <script src="/static/nexus3d.js?v=1" type="module"></script>
-<script src="/static/memory3d.js?v=2" type="module"></script>
+<script src="/static/memory3d.js?v=3" type="module"></script>
 <script src="/static/jarvis3d.js?v=1" type="module"></script>
-<script src="/static/app.js?v=31"></script>
+<script src="/static/app.js?v=32"></script>
 </body>
 </html>
