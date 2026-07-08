@@ -141,11 +141,12 @@ SECTIONS = [
                 "doesn't block other models.",
         "items": [
             {"key": "vision.vlm_keep_alive", "label": "VLM keep-alive after use", "type": "str",
-             "default": "30s",
-             "help": "How long ollama holds the vision LLM (qwen3-vl, ~6-8GB) after JARVIS looks "
-                     "at something. Short (e.g. 30s or 0) frees the card for other models fast; "
-                     "the chat turn also evicts it explicitly when the turn ends. Longer (e.g. 5m) "
-                     "keeps repeated 'look at this' turns warm at the cost of held VRAM."},
+             "default": "60s",
+             "help": "How long ollama keeps the vision LLM (qwen3-vl, ~8GB) warm after JARVIS "
+                     "looks at something — the timer resets on each look, so it frees the card "
+                     "this long after the LAST look. 60s keeps an active webcam Q&A responsive "
+                     "while still freeing VRAM once you're done; 0 unloads immediately (cold "
+                     "reload on every look); 5m holds it longer for heavy vision sessions."},
         ],
     },
     {
