@@ -6540,6 +6540,10 @@ async function jarvisHandleSSE(event, data, liveMsg) {
       jarvisAddMessage('tool',
         `⚡ ${parsed.from || 'The usual model'} is overloaded right now — answering on ${parsed.to || 'the fallback model'} instead.`);
       break;
+    case 'status':
+      // server-side progress note (e.g. local vision analyzing an image)
+      if (parsed.text) jarvisAddMessage('tool', parsed.text);
+      break;
     case 'run.completed':
     case 'message_complete':
     case 'done':

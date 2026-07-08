@@ -1967,48 +1967,58 @@ async def jarvis_chat_stream(body: dict):
     # when the user references an image, the LOCAL VLM (the same eyes as the
     # live-frame path) describes files from the exchange and the description
     # rides along, so "analyze nexus-ad.png" just works instead of "I can't".
-    img_notes = []
+    # Target selection is cheap and happens here; the DESCRIBE itself runs
+    # INSIDE the SSE stream (a cold VLM can take a minute — a byte-less
+    # pending request dies as "Error in input stream" in the browser).
+    img_targets = []
     try:
         import re as _re
-        import vision as _vision_mod
         fdir = _jarvis_files_dir(uid)
         exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
         imgs = ([f for f in fdir.iterdir() if f.is_file() and f.suffix.lower() in exts]
                 if fdir.is_dir() else [])
         low = user_input.lower()
-        named = [f for f in imgs if f.name.lower() in low]
-        targets = named[:2]
-        if (not targets and imgs and not frame_b64
+        img_targets = [f for f in imgs if f.name.lower() in low][:2]
+        if (not img_targets and imgs and not frame_b64
                 and _re.search(r"\b(image|picture|photo|screenshot|graphic|logo|analy[sz]e)\b", low)):
             # unnamed "analyze the image" → the newest image in the exchange
-            targets = sorted(imgs, key=lambda f: f.stat().st_mtime, reverse=True)[:1]
+            img_targets = sorted(imgs, key=lambda f: f.stat().st_mtime, reverse=True)[:1]
+    except Exception:
+        img_targets = []
+
+    async def _describe_files(targets: list) -> list:
+        import vision as _vision_mod
+        notes = []
         for f in targets:
             try:
                 raw = f.read_bytes()
-                if len(raw) > 1_500_000:
-                    # multi-MB camera rolls choke the VLM — downscale first
+                try:
+                    # ALWAYS normalize for the VLM: vision-token prefill
+                    # dominates latency, and the card is usually shared
                     import io as _io
                     from PIL import Image as _Im
                     im = _Im.open(_io.BytesIO(raw)).convert("RGB")
-                    im.thumbnail((1280, 1280))
+                    if max(im.size) > 1024:
+                        im.thumbnail((1024, 1024))
                     buf = _io.BytesIO()
                     im.save(buf, "JPEG", quality=88)
                     raw = buf.getvalue()
-                desc = await _vision_mod.describe_image(raw, user_input[:300])
-                img_notes.append(f"[JARVIS EYES — image file '{f.name}' from the file "
-                                 f"exchange, seen through your own local vision: {desc}]")
+                except Exception:
+                    pass    # unreadable by PIL → let the VLM try the original
+                desc = await asyncio.wait_for(
+                    _vision_mod.describe_image(raw, user_input[:300]), timeout=185)
+                notes.append(f"[JARVIS EYES — image file '{f.name}' from the file "
+                             f"exchange, seen through your own local vision: {desc}]")
             except Exception as e:
-                img_notes.append(f"[JARVIS EYES — image '{f.name}' could not be analyzed "
-                                 f"locally right now: {str(e)[:100]}]")
-    except Exception:
-        pass
+                notes.append(f"[JARVIS EYES — image '{f.name}' could not be analyzed "
+                             f"locally right now ({type(e).__name__}: {str(e)[:80]}) — "
+                             f"tell the user vision hiccuped and to try again]")
+        return notes
 
     hermes_input = user_input
     if frame_note:
         hermes_input = (f"[JARVIS EYES — what your camera/screen sees right now: "
                         f"{frame_note}]\n\n{hermes_input}")
-    if img_notes:
-        hermes_input = "\n".join(img_notes) + "\n\n" + hermes_input
 
     async def event_generator():
         """Stream SSE events from Hermes, re-emit as SSE for the browser.
@@ -2022,7 +2032,17 @@ async def jarvis_chat_stream(body: dict):
         and non-quota errors keep the old behavior. Test knob:
         jarvis.force_429=1 treats the primary pass as shed without sending it
         (the fallback pass still runs for real)."""
+        nonlocal hermes_input
         import hermes_dispatch as _hd
+        # local vision runs INSIDE the stream: the browser gets an immediate
+        # status bubble instead of a silent request that dies on a hiccup
+        if img_targets:
+            names = ", ".join(f.name for f in img_targets)
+            yield ("event: status\n"
+                   f"data: {json.dumps({'text': '👁 Analyzing ' + names + ' with local vision…'})}\n\n")
+            notes = await _describe_files(img_targets)
+            if notes:
+                hermes_input = "\n".join(notes) + "\n\n" + hermes_input
         url = f"{HERMES_API_BASE}/api/sessions/{session_id}/chat/stream"
         payload = {"input": hermes_input, "system_message": _jarvis_framing(uid)}
         primary_model = db.default_task_model(uid) or _hd.DEFAULT_MODEL
@@ -2247,6 +2267,11 @@ async def jarvis_file_upload(file: UploadFile = File(...)):
     if len(data) > 50 * 1024 * 1024:
         return JSONResponse(status_code=413, content={"error": "max 50 MB"})
     (_jarvis_files_dir(auth.current_user_id()) / name).write_bytes(data)
+    if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
+        # an image just landed — the user will likely ask about it. Load the
+        # local VLM NOW so the analysis doesn't pay the cold start.
+        import vision as _vision_mod
+        asyncio.create_task(_vision_mod.warm_vlm())
     return {"ok": True, "name": name, "size": len(data)}
 
 

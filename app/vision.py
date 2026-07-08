@@ -250,17 +250,31 @@ async def forget_all(user_id: str) -> int:
 
 # ── understanding: local VLM via ollama ─────────────────────────────────────
 
+async def warm_vlm() -> None:
+    """Preload the VLM into ollama (fired when an image lands in the file
+    exchange) so a following 'analyze this' doesn't pay the cold start."""
+    try:
+        async with httpx.AsyncClient(timeout=240) as client:
+            await client.post(f"{OLLAMA_URL}/api/generate",
+                              json={"model": VLM_MODEL, "keep_alive": "10m"})
+    except Exception:
+        pass
+
+
 async def describe_image(jpeg: bytes, prompt: str = "") -> str:
     """Ask the local VLM what's in the image. Used for 'look at this' turns."""
     q = prompt.strip() or (
         "Describe what you see, concisely but completely: objects, people, "
         "text (transcribe it), UI elements, anything notable.")
-    async with httpx.AsyncClient(timeout=120) as client:
+    # 12GB card shared with the user's dictation tool (~3.3GB resident): the
+    # VLM often runs partially CPU-offloaded, so keep the generation short
+    # and allow the slow path to finish instead of ReadTimeout-ing at 120s
+    async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(f"{OLLAMA_URL}/api/chat", json={
             "model": VLM_MODEL, "stream": False,
             "messages": [{"role": "user", "content": q,
                           "images": [base64.b64encode(jpeg).decode()]}],
-            "options": {"num_predict": 500},
+            "options": {"num_predict": 256},
         })
         r.raise_for_status()
         return (r.json().get("message") or {}).get("content", "").strip()
