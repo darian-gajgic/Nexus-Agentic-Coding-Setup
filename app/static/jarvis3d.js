@@ -216,6 +216,47 @@ function shade(n, opts = {}) {
   return 0.10 + 0.58 * Math.pow(lam, 1.2) + fill + rim;
 }
 
+/* primary: prebuilt bust from a real male head scan (Lee Perry-Smith /
+   Infinite-Realities, CC-BY 3.0 — built by scripts/build_avatar_from_glb.py
+   into static/avatar/head_points.json, incl. occluder meshes). */
+function buildFromPrebuilt(cloud) {
+  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
+  const P = cloud.pos, B = cloud.bri;
+  const [my0, my1, mxh] = cloud.mouth || [0, 1, 6];
+  const [ey0, ey1, exh] = cloud.eyes || [0, 1, 8];
+  for (let i = 0; i < B.length; i++) {
+    const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+    const b = B[i];
+    const n = pos.length / 3;
+    pos.push(x + (Math.random() - .5) * .3,
+             y + (Math.random() - .5) * .3,
+             z + (Math.random() - .5) * .3);
+    const w = b > 0.9 ? Math.min(1, (b - 0.9) / 0.25) * 0.4 : 0;
+    bri.push(b); wmi.push(w);
+    col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
+             b * (MODE_TINT.idle[1] * (1 - w) + w),
+             b * (MODE_TINT.idle[2] * (1 - w) + w));
+    if (z > 2 && y > my0 && y < my1 && Math.abs(x) < mxh) mouthIdx.push(n);
+    if (z > 2 && y > ey0 && y < ey1 && Math.abs(x) > 1.5 && Math.abs(x) < exh) eyeIdx.push(n);
+  }
+  return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY: [my0, my1] };
+}
+
+function buildPrebuiltOccluders(cloud) {
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x060913, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
+  });
+  return (cloud.occ || []).map((o) => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(o.v), 3));
+    geo.setIndex(o.i);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.scale.setScalar(0.985);
+    mesh.renderOrder = 0;
+    return mesh;
+  });
+}
+
 function buildSculpt() {
   const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
   const push = (p, n, b) => {
@@ -516,7 +557,18 @@ async function mount(container) {
   };
   container.addEventListener('pointermove', J.pointerHandler);
 
-  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = buildSculpt();
+  // primary: the prebuilt real-scan bust; fallback: the procedural sculpt
+  let prebuilt = null;
+  try {
+    const r = await fetch('/static/avatar/head_points.json');
+    if (r.ok) {
+      const c = await r.json();
+      if (c && c.occ && c.pos && c.pos.length > 9000) prebuilt = c;
+    }
+  } catch { }
+  if (J.disposed) return;
+  const built = prebuilt ? buildFromPrebuilt(prebuilt) : buildSculpt();
+  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = built;
   if (J.disposed) return;
   J.mouthY = mouthY;
   J.basePos = Float32Array.from(pos);
@@ -536,12 +588,15 @@ async function mount(container) {
 
   J.headGroup = new THREE.Group();
   J.headGroup.add(J.head);
-  J.occluders = buildOccluders();
+  J.occluders = prebuilt ? buildPrebuiltOccluders(prebuilt) : buildOccluders();
   for (const m of J.occluders) J.headGroup.add(m);
 
   // eye glints: two soft sparks in the sockets — the "alive" cue
+  const eyeY = prebuilt ? (prebuilt.eyes[0] + prebuilt.eyes[1]) / 2 : null;
   for (const side of [-1, 1]) {
-    const gp = headPoint(58 * D2R, side * 13 * D2R);
+    const gp = prebuilt
+      ? { x: side * 3.6, y: eyeY, z: 9.6 }
+      : headPoint(58 * D2R, side * 13 * D2R);
     const sp = new THREE.Sprite(new THREE.SpriteMaterial({
       map: glowTexture(), color: 0x9df5ff, transparent: true, opacity: 0.85,
       blending: THREE.AdditiveBlending, depthWrite: false,
