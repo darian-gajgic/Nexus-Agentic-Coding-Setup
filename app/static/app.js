@@ -5954,6 +5954,8 @@ let jarvisState = {
   conversationMode: false,
   voiceOn: localStorage.getItem('jvVoiceOn') !== '0',
   fxOn: localStorage.getItem('jvFxOn') !== '0',
+  deckOpen: localStorage.getItem('jvDeckOpen') === '1',
+  domain: null,
   abortController: null,
   ttsAnimating: false,  // true while the WS audio pipeline is speaking
   statusGen: 0,
@@ -6154,7 +6156,9 @@ function renderJarvisView() {
           <span class="jv2-chip"><span class="j-dot" id="jDotHermes"></span> Hermes</span>
           <span class="jv2-chip"><span class="j-dot" id="jDotVoice"></span> Voice</span>
           <span class="jv2-chip" id="jVisionChip" title="frames in visual memory">👁 —</span>
+          <span class="jv2-chip jv2-domain" id="jDomainChip" title="craft domain JARVIS is drawing on (Business Brain)" style="display:none"></span>
           <span style="flex:1"></span>
+          <button class="jv2-btn${jarvisState.deckOpen ? ' active' : ''}" id="jDeckBtn" title="Command deck — board, deliverables, approvals, Test app">⚡ Deck</button>
           <button class="jv2-btn" id="jCamBtn" title="Share webcam — JARVIS sees and remembers frames">🎥 Cam</button>
           <button class="jv2-btn" id="jScreenBtn" title="Share screen — JARVIS sees and remembers frames">🖥 Screen</button>
           <button class="jv2-btn" id="jVisMemBtn" title="Search everything JARVIS has seen">👁 Memory</button>
@@ -6180,9 +6184,15 @@ function renderJarvisView() {
         </div>
         <video id="jCapPreview" class="jv2-cap-preview" style="display:none" muted playsinline></video>
       </div>
+      <aside class="jv2-deck" id="jDeck" style="display:${jarvisState.deckOpen ? 'flex' : 'none'}">
+        <div class="jv2-panel-title" style="margin-top:0">⚡ Command deck
+          <button class="jv2-mini-btn" id="jDeckRefresh" title="refresh">⟳</button></div>
+        <div class="jv2-deck-body" id="jDeckBody"><div class="muted" style="font-size:11.5px">—</div></div>
+      </aside>
     </div>
   `;
   jarvisBindControls();
+  if (jarvisState.deckOpen) jarvisLoadDeck();
   jarvisState.statusGen++;
   jarvisLoadStatus(jarvisState.statusGen);
   jarvisState.eventsGen++;
@@ -6263,6 +6273,8 @@ function jarvisBindControls() {
     if (q) jarvisImagine(q);
   });
   $('#jBriefBtn').addEventListener('click', () => jarvisBrief(true));
+  $('#jDeckBtn').addEventListener('click', () => jarvisToggleDeck());
+  $('#jDeckRefresh').addEventListener('click', () => jarvisLoadDeck());
   $('#jVoiceBtn').addEventListener('click', () => {
     jarvisState.voiceOn = !jarvisState.voiceOn;
     localStorage.setItem('jvVoiceOn', jarvisState.voiceOn ? '1' : '0');
@@ -6432,6 +6444,99 @@ function jarvisAddMessage(role, text, extra) {
   jarvisRenderFeed();
 }
 
+// ── domain chip (Business Brain) ──
+function jarvisSetDomain(domain, label) {
+  jarvisState.domain = domain || null;
+  const chip = $('#jDomainChip');
+  if (!chip) return;
+  if (domain) {
+    chip.textContent = '📚 ' + (label || domain);
+    chip.style.display = '';
+  } else {
+    chip.style.display = 'none';
+  }
+}
+
+// ── command deck: board · deliverables (▶ Test app) · approvals, without
+//    leaving the conversation. Data mirrors the dedicated tabs; actions reuse
+//    their handlers (testAppUI, decideApproval, describeTaskUI). ──
+function jarvisToggleDeck() {
+  jarvisState.deckOpen = !jarvisState.deckOpen;
+  localStorage.setItem('jvDeckOpen', jarvisState.deckOpen ? '1' : '0');
+  const deck = $('#jDeck'), btn = $('#jDeckBtn');
+  if (deck) deck.style.display = jarvisState.deckOpen ? 'flex' : 'none';
+  if (btn) btn.classList.toggle('active', jarvisState.deckOpen);
+  if (jarvisState.deckOpen) jarvisLoadDeck();
+}
+
+async function jarvisLoadDeck() {
+  const body = $('#jDeckBody');
+  if (!body) return;
+  let tasks = [], delivs = [], approvals = [];
+  try {
+    const [tr, dr, ar] = await Promise.all([
+      api('GET', '/api/tasks').catch(() => ({ tasks: [] })),
+      api('GET', '/api/deliverables?limit=8').catch(() => ({ deliverables: [] })),
+      api('GET', '/api/approvals?status=pending').catch(() => ({ approvals: [] })),
+    ]);
+    tasks = tr.tasks || [];
+    delivs = dr.deliverables || [];
+    approvals = ar.approvals || ar.pending || [];
+  } catch { /* deck is best-effort */ }
+  if ($('#jDeckBody') !== body) return;  // view changed mid-fetch
+
+  // board glance
+  const live = tasks.filter(t => t.status !== 'archived');
+  const col = (s) => live.filter(t => t.status === s).length;
+  const running = live.filter(t => ['queued', 'dispatching', 'streaming', 'finalizing']
+    .includes(t.dispatch_state)).length;
+  const board = `
+    <div class="jv2-deck-sec">
+      <div class="jv2-deck-h">Board</div>
+      <div class="jv2-deck-board" onclick="switchView('kanban')" title="Open the kanban">
+        ${[['Backlog', col('backlog')], ['To do', col('todo')], ['Doing', col('in_progress')], ['Done', col('done')]]
+      .map(([l, n]) => `<div class="jv2-deck-stat"><b>${n}</b><span>${l}</span></div>`).join('')}
+      </div>
+      ${running ? `<div class="jv2-deck-running">▶ ${running} running now</div>` : ''}
+    </div>`;
+
+  // deliverables with ▶ Test app when a runnable was detected
+  const vBadge = (v) => v ? `<span class="jv2-deck-badge ${/APPROVE|PASS/i.test(v) ? 'ok' : /REVISE|REWRITE|FAIL/i.test(v) ? 'warn' : ''}">${esc(v)}</span>` : '';
+  const delRows = delivs.length ? delivs.slice(0, 8).map(d => {
+    const test = d.app ? `<button class="jv2-mini-btn" title="Run the produced app/site live" onclick="testAppUI('${esc(d.task_id)}', ${JSON.stringify(esc(d.title))})">▶ Test</button>` : '';
+    const open = (d.files && d.files.length)
+      ? `<a class="jv2-mini-btn" href="/api/tasks/${esc(d.task_id)}/files/${encodeURIComponent(d.files[0].name || d.files[0])}" target="_blank" title="open first output file">📄</a>` : '';
+    return `<div class="jv2-deck-row">
+      <div class="jv2-deck-row-t" title="${esc(d.title)}">${esc(d.title)} ${vBadge(d.judge_verdict)}</div>
+      <div class="jv2-deck-row-a">${test}${open}</div>
+    </div>`;
+  }).join('') : '<div class="muted" style="font-size:11px">No output yet.</div>';
+  const deliverables = `
+    <div class="jv2-deck-sec">
+      <div class="jv2-deck-h">Deliverables <button class="jv2-mini-btn" onclick="switchView('deliverables')" title="open Deliverables tab">all</button></div>
+      ${delRows}
+    </div>`;
+
+  // pending approvals
+  const apRows = approvals.length ? approvals.slice(0, 6).map(a => `
+    <div class="jv2-deck-row">
+      <div class="jv2-deck-row-t" title="${esc(a.reason || a.action || '')}">${esc(a.action || a.reason || 'request')}</div>
+      <div class="jv2-deck-row-a">
+        <button class="jv2-mini-btn ok" title="approve" onclick="decideApproval('${esc(a.id)}','approved').then(jarvisLoadDeck)">✓</button>
+        <button class="jv2-mini-btn warn" title="reject" onclick="decideApproval('${esc(a.id)}','rejected').then(jarvisLoadDeck)">✕</button>
+      </div>
+    </div>`).join('') : '';
+  const approvalsSec = approvals.length ? `
+    <div class="jv2-deck-sec">
+      <div class="jv2-deck-h">Approvals · ${approvals.length}</div>
+      ${apRows}
+    </div>` : '';
+
+  body.innerHTML = board + deliverables + approvalsSec + `
+    <button class="btn-ghost" style="width:100%;margin-top:4px" onclick="describeTaskUI()"
+      title="Describe a goal in plain words — the fleet plans and builds it">✨ Hand a task to the fleet</button>`;
+}
+
 function jarvisRenderFeed() {
   const feed = $('#jFeed');
   if (!feed) return;
@@ -6484,6 +6589,7 @@ function jarvisSendText(forced) {
 //    is still streaming — clause-level latency, not whole-reply latency) ──
 async function jarvisStreamChat(text) {
   jarvisState.streaming = true;
+  jarvisSetDomain(null);  // cleared; the server's 'domain' event re-sets it if detected
   jarvisSetMode('thinking');
   const sendBtn = $('#jSendBtn'), stopBtn = $('#jStopBtn');
   if (sendBtn) sendBtn.disabled = true;
@@ -6633,6 +6739,7 @@ async function jarvisHandleSSE(event, data, liveMsg) {
         jarvisAddMessage('tool', `📦 JARVIS produced ${parsed.files.length} file${parsed.files.length > 1 ? 's' : ''}:`,
           { files: parsed.files.map(f => f.name) });
         jarvisLoadFiles();
+        if (jarvisState.deckOpen) jarvisLoadDeck();
       }
       break;
     case 'fallback':
@@ -6643,6 +6750,10 @@ async function jarvisHandleSSE(event, data, liveMsg) {
     case 'status':
       // server-side progress note (e.g. local vision analyzing an image)
       if (parsed.text) jarvisAddMessage('tool', parsed.text);
+      break;
+    case 'domain':
+      // the Business Brain detected which craft domain this turn draws on
+      jarvisSetDomain(parsed.domain, parsed.label);
       break;
     case 'run.completed':
     case 'message_complete':

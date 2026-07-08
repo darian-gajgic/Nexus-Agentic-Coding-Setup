@@ -5,6 +5,31 @@
 
 ---
 
+## 0.0 v2.1 CAPABILITY + ROBUSTNESS PASS (2026-07-08)
+
+Additive; the pipeline below is unchanged. New:
+
+- **STT self-heals** (voice.py): a CUDA failure under VRAM contention used to be a silent 500.
+  Now it logs a traceback → reloads → retries once → CPU int8 fallback + a 600s GPU cooldown.
+  Model/device/language are settings (`voice.stt_model` [medium.en; try large-v3-turbo],
+  `voice.stt_device` auto|cuda|cpu, `voice.stt_language`).
+- **Graceful shutdown bounded** (server.py + watchdog.py + the unit): `timeout_graceful_shutdown=8`
+  + a `handle_exit` that trips `watchdog.SHUTTING_DOWN` before shutting down (no worker respawn
+  mid-stop) + `TimeoutStopSec=25`. Ends the 90s-SIGKILL-on-every-restart problem (was ~1s now).
+- **Business Brain** (jarvis_brain.py): per-turn domain detection (9 domains) folds ~/knowledge
+  (BUSINESS-CONTEXT facts + STYLE-VOICE kill-list always; the matched domain's RUBRIC gates +
+  PLAYBOOK menu + paths on deliverable turns) into the framing. `_jarvis_framing` returns
+  (framing, domain); the stream emits an SSE `domain` event → topbar 📚 chip.
+- **Fuller control surface**: the framing now documents the whole OS API (wizard, projects,
+  deliverables, ▶ Test-app, judge/verify/review, approvals/scheduler/quota), told to plan-then-build
+  or hand work to the fleet.
+- **Command deck** (app.js): topbar ⚡ Deck → right rail with board glance, deliverables (each
+  with ▶ Test app), pending approvals, and "Hand a task to the fleet". `jarvisLoadDeck`.
+- Gates: `verify.sh` (static) + `verify_jarvis_e2e.py` (page_errors:[] with the new topbar) both
+  green; deck+domain-chip proven live via Playwright.
+
+---
+
 ## 0. ARCHITECTURE v2 (2026-07-08) — READ THIS FIRST
 
 The Wav2Lip talking-head is **RETIRED from the pipeline** (endpoints `/talk`

@@ -146,7 +146,8 @@ def startup():
     at = threading.Thread(target=_apps.reaper_thread, args=(apps_stop,), daemon=True)
     at.start()
     app.state.apps_stop = apps_stop
-    # Start idle model unloader (frees GPU VRAM after 60s of voice inactivity)
+    # Start idle model unloader (frees GPU VRAM after voice.IDLE_TIMEOUT (300s)
+    # of voice inactivity; the vision worker dies after 10min idle)
     def _idle_unloader_loop():
         import time as _t
         while True:
@@ -1900,8 +1901,9 @@ def _jarvis_overload_signature(event_name: str, data_text: str) -> str | None:
     return None
 
 
-def _jarvis_framing(uid: str) -> str:
-    """Ephemeral per-turn system message: persona + the levers JARVIS may pull.
+def _jarvis_framing(uid: str, user_input: str = "") -> tuple[str, str | None]:
+    """Ephemeral per-turn system message: persona + the levers JARVIS may pull +
+    domain-aware Business-Brain craft context. Returns (framing, detected_domain).
     The internal token is per-boot random and never persisted — a server
     restart invalidates whatever older turns saw."""
     files_dir = _jarvis_files_dir(uid)
@@ -1916,19 +1918,34 @@ def _jarvis_framing(uid: str) -> str:
         running_s = "; ".join(r["title"] for r in running) or "none"
     except Exception:
         board, running_s = "unknown", "unknown"
-    return f"""You are JARVIS, the spoken+written operator interface of this user's Nexus Agent OS (a local dashboard managing a fleet of real AI agents on a kanban). Voice replies are read aloud — default to tight, natural sentences; no markdown tables or code fences unless the user is clearly reading.
+
+    brain_block, domain = "", None
+    try:
+        import jarvis_brain as _jb
+        brain_block, domain = _jb.brain_framing(user_input)
+    except Exception:
+        brain_block, domain = "", None
+    brain_section = ("\n\n" + brain_block) if brain_block else ""
+
+    framing = f"""You are JARVIS, the spoken+written operator interface of this user's Nexus Agent OS (a local dashboard managing a fleet of real AI agents on a kanban). Voice replies are read aloud — default to tight, natural sentences; no markdown tables or code fences unless the user is clearly reading. You are their capable partner across software, SaaS, consulting, research, marketing, content, brand, e-commerce and music — when a request needs real, sustained work (build a feature, write a campaign, research a topic), you can DO it yourself in this conversation OR hand it to the agent fleet as a task; offer the choice when it isn't obvious.
 
 FILE EXCHANGE: the operator's shared folder with you is {files_dir} — files they upload land there; ANY file you create for them MUST be written there (use your file tools). Mention created files by name.
 
-SYSTEM CONTROL — you can manage the user's Nexus board over its local REST API:
+SYSTEM CONTROL — you can drive the user's whole Nexus OS over its local REST API (curl, always -sk):
   curl -sk -H "x-nexus-internal: {auth.INTERNAL_TOKEN}" -H "x-nexus-user: {uid}" https://127.0.0.1:8777/api/...
-  GET /api/tasks (their board) · POST /api/tasks {{"title","description","status":"todo"}} · PATCH /api/tasks/ID {{"status":...}} · POST /api/tasks/ID/dispatch (run it NOW with a real agent) · GET /api/workflows (projects) · GET /api/approvals?status=pending · PATCH /api/approvals/ID {{"decision":"approved"}} · GET/POST /api/scheduler (cron jobs: {{"name","cron","action"}})
+  BOARD: GET /api/tasks · POST /api/tasks {{"title","description","status":"todo"}} · PATCH /api/tasks/ID {{"status"|"title"|...}} · DELETE /api/tasks/ID · POST /api/tasks/ID/dispatch (run it NOW on a real agent lane) · GET /api/tasks/ID/transcript (live agent output)
+  PLAN WELL: for anything non-trivial prefer POST /api/tasks/wizard {{"instruction":"…"}} — it returns a best-practice multi-stage plan (spec→build→review→verify for code; research→create for content) with the right specialist, model and quality gates; then create the returned tasks. This beats a bare one-line task.
+  PROJECTS: GET /api/workflows · POST /api/workflows {{"name","goal"}} · GET /api/workflows/ID · GET /api/deliverables (finished output files across all tasks)
+  TEST OUTPUT: POST /api/tasks/ID/app/start then GET /api/tasks/ID/app/log — runs the task's produced app/site on a local port so the user can try it live (the UI's ▶ Test app).
+  QUALITY: POST /api/tasks/ID/judge (frontier-judge a deliverable) · POST /api/verify {{"task_id","command"}} (run a check) · GET /api/tasks/ID/review (diff review)
+  OPS: GET /api/approvals?status=pending · PATCH /api/approvals/ID {{"decision":"approved"}} · GET/POST /api/scheduler (cron: {{"name","cron","action"}}) · GET /api/agents · GET /api/quota
   Board now: {board}. Running: {running_s}.
-  RULES: read back and get an explicit yes BEFORE dispatching, deleting, approving, or scheduling anything. Never invent task IDs — list first. After acting, state plainly what changed.
+  RULES: read back and get an explicit yes BEFORE dispatching, deleting, approving, scheduling, or spending real tokens. Never invent IDs — GET the list first. After acting, state plainly what changed. curl failures: report them, don't pretend success.
 
-VISION: the UI indexes what the camera/screen share sees into your visual memory; when the user asks what you saw or when they showed you something, the UI searches it — you may reference "[JARVIS EYES]" context blocks in the conversation as things you personally saw. Image FILES in the exchange are auto-described into [JARVIS EYES] blocks by your own local vision whenever the user references one — you CAN see and analyze images; never claim you lack vision. If an image the user means has no [JARVIS EYES] block yet, ask them to name the file.
+VISION: the UI indexes what the camera/screen share sees into your visual memory; when the user asks what you saw or when they showed you something, the UI searches it — you may reference "[JARVIS EYES]" context blocks in the conversation as things you personally saw. Image FILES in the exchange are auto-described into [JARVIS EYES] blocks by your own local vision whenever the user references one — you CAN see and analyze images; never claim you lack vision. If an image the user means has no [JARVIS EYES] block yet, ask them to name the file.{brain_section}
 
 Current date/time: {time.strftime('%A %Y-%m-%d %H:%M')}."""
+    return framing, domain
 
 
 @app.post("/api/jarvis/chat/stream")
@@ -2044,7 +2061,12 @@ async def jarvis_chat_stream(body: dict):
             if notes:
                 hermes_input = "\n".join(notes) + "\n\n" + hermes_input
         url = f"{HERMES_API_BASE}/api/sessions/{session_id}/chat/stream"
-        payload = {"input": hermes_input, "system_message": _jarvis_framing(uid)}
+        _framing, _domain = _jarvis_framing(uid, user_input)
+        if _domain:
+            import jarvis_brain as _jb
+            yield ("event: domain\n"
+                   f"data: {json.dumps({'domain': _domain, 'label': _jb.domain_label(_domain)})}\n\n")
+        payload = {"input": hermes_input, "system_message": _framing}
         primary_model = db.default_task_model(uid) or _hd.DEFAULT_MODEL
         fb_model = _hd.fallback_model_for(primary_model)
 
@@ -2120,6 +2142,15 @@ async def jarvis_chat_stream(body: dict):
                 yield f"event: files\ndata: {json.dumps({'files': fresh})}\n\n"
         except Exception:
             pass
+        # The turn is done; if it used JARVIS's eyes (local VLM), free that VRAM
+        # now instead of letting ollama camp the 6-8GB model for its keep_alive —
+        # the chat model is cloud, so nothing local is needed until the next look.
+        if (frame_b64 or img_targets) and _vision_ok:
+            try:
+                import vision as _vision_mod
+                await _vision_mod.unload_vlm()
+            except Exception:
+                pass
 
     return StreamingResponse(
         event_generator(),
@@ -2152,6 +2183,9 @@ async def jarvis_stt(file: UploadFile = File(...)):
     except Exception as e:
         # unguarded, a GPU error here surfaced as a NON-JSON 500 (seen live:
         # cudaErrorInvalidDevice 2026-07-05) and broke the frontend's .json()
+        # voice.py logs the traceback + self-heals (reload → CPU fallback);
+        # reaching here means even the CPU pass failed — make it visible.
+        db.log_activity("error", "jarvis", f"STT failed after fallback: {str(e)[:300]}")
         return JSONResponse(status_code=500, content={"error": f"transcription failed: {str(e)[:200]}"})
     return {"text": text}
 
@@ -2330,6 +2364,9 @@ async def jarvis_vision_frame(file: UploadFile = File(...), kind: str = "webcam"
     try:
         r = await _vision.ingest_frame(auth.current_user_id(), jpeg, kind)
     except Exception as e:
+        # was a silent 500 — a VRAM-contended SigLIP OOM is now the worker's CPU
+        # fallback, but log whatever still slips through so it isn't invisible
+        db.log_activity("error", "jarvis", f"vision frame ({kind}) failed: {str(e)[:300]}")
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
     return r
 
@@ -6425,11 +6462,26 @@ def main():
     if use_https:
         print("  (HTTPS active — mic works from any address; accept the self-signed cert)")
     print("=" * 55 + "\n")
-    uvicorn.run(
+    # Graceful-shutdown discipline (2026-07-08): the dashboard always holds an
+    # open /ws websocket + SSE streams, so an unbounded graceful shutdown hangs
+    # until systemd's 90s TimeoutStopSec SIGKILLs the whole cgroup. Bound it,
+    # and flag the watchdog FIRST so it stops resurrecting SIGTERM'd workers
+    # mid-shutdown (fresh workers spawned after systemd's SIGTERM broadcast
+    # would otherwise keep the cgroup alive into the timeout).
+    import watchdog as _wd
+
+    class _Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            _wd.SHUTTING_DOWN.set()
+            super().handle_exit(sig, frame)
+
+    config = uvicorn.Config(
         app, host="127.0.0.1", port=8777, log_level="info",
         ssl_certfile=str(cert) if use_https else None,
         ssl_keyfile=str(key) if use_https else None,
+        timeout_graceful_shutdown=8,
     )
+    _Server(config).run()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,10 @@ import psutil
 import database as db
 import agent_manager as am
 
+# Set by the uvicorn server's exit handler the moment SIGTERM/SIGINT lands:
+# a stopping service must never resurrect its own SIGTERM'd workers.
+SHUTTING_DOWN = threading.Event()
+
 # Defaults (overridable via settings table at runtime)
 # stale_threshold_s must exceed the dispatch stream's worst tolerated silence
 # (SSE keepalives ~30s, read timeout 120s in hermes_dispatch) — killing a
@@ -90,6 +94,8 @@ def _recent_actions(limit=20) -> list[dict]:
 
 def _once(cfg: dict) -> list[dict]:
     """Run one watchdog sweep. Returns the list of actions taken this sweep."""
+    if SHUTTING_DOWN.is_set():
+        return []  # never respawn workers while the service is stopping
     actions = []
     now = time.time()
     # Include 'crashed' so agents marked dead by the metrics loop get healed.

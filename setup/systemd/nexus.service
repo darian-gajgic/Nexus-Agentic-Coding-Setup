@@ -11,6 +11,9 @@ Type=simple
 WorkingDirectory=/home/sinep/nexus-agent-os
 ExecStart=/home/sinep/nexus-agent-os/start.sh
 Restart=on-failure
+# Graceful shutdown is bounded app-side (uvicorn timeout_graceful_shutdown=8);
+# 25s here is the belt-and-braces ceiling instead of the 90s default.
+TimeoutStopSec=25
 RestartSec=5
 
 [Install]

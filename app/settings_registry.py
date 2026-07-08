@@ -111,6 +111,44 @@ SECTIONS = [
         ],
     },
     {
+        "id": "voice", "title": "JARVIS voice",
+        "desc": "Local speech models. STT falls back to CPU automatically when the GPU is contended.",
+        "items": [
+            {"key": "voice.tts_voice", "label": "TTS voice (Piper)", "type": "str", "default": "",
+             "help": "Path to a Piper .onnx voice (relative to the app dir), or empty for the base "
+                     "voice. Downloaded US-male options in models/voices/: "
+                     "models/voices/en_US-ryan-high.onnx (confident, clear — recommended), "
+                     "en_US-lessac-high.onnx (professional, neutral), en_US-joe-medium.onnx (calmer, "
+                     "deeper). Must be 22050 Hz; a missing/broken file falls back to the base voice."},
+            {"key": "voice.tts_speed", "label": "TTS speaking speed", "type": "float",
+             "default": "1.0", "min": 0.5, "max": 2.0,
+             "help": "Playback pace multiplier — 1.0 is the voice's native speed, 1.25 is 25% "
+                     "faster, 0.9 slower. Applies to the next spoken sentence (no restart)."},
+            {"key": "voice.stt_model", "label": "STT model (faster-whisper)", "type": "str",
+             "default": "medium.en",
+             "help": "Any faster-whisper checkpoint, e.g. medium.en or large-v3-turbo "
+                     "(multilingual, better accuracy, similar VRAM). Downloads on first use."},
+            {"key": "voice.stt_device", "label": "STT device", "type": "str", "default": "auto",
+             "help": "auto = CUDA with automatic CPU fallback on GPU errors; or force cuda / cpu."},
+            {"key": "voice.stt_language", "label": "STT language", "type": "str", "default": "en",
+             "help": "ISO code spoken to JARVIS (en, de, …). Empty = autodetect per utterance. "
+                     "Ignored by english-only (*.en) checkpoints."},
+        ],
+    },
+    {
+        "id": "vision", "title": "JARVIS vision",
+        "desc": "Local visual models on the shared 12GB GPU. The VLM frees VRAM promptly so it "
+                "doesn't block other models.",
+        "items": [
+            {"key": "vision.vlm_keep_alive", "label": "VLM keep-alive after use", "type": "str",
+             "default": "30s",
+             "help": "How long ollama holds the vision LLM (qwen3-vl, ~6-8GB) after JARVIS looks "
+                     "at something. Short (e.g. 30s or 0) frees the card for other models fast; "
+                     "the chat turn also evicts it explicitly when the turn ends. Longer (e.g. 5m) "
+                     "keeps repeated 'look at this' turns warm at the cost of held VRAM."},
+        ],
+    },
+    {
         "id": "watchdog", "title": "Watchdog",
         "desc": "Self-healing for worker lanes.",
         "items": [

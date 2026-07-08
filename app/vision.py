@@ -45,6 +45,23 @@ VISION_IDLE_TIMEOUT = 600.0     # kill the worker after 10 min without use
 DUP_COSINE = 0.985              # frames this similar to the previous one are skipped
 FRAME_KEEP = 4000               # per-user cap; oldest frames beyond it are pruned
 
+
+def _conf(key: str, default: str) -> str:
+    """Settings-registry lookup that degrades to the default if unavailable."""
+    try:
+        import settings_registry as sreg
+        v = sreg.conf(key)
+        return v if v not in (None, "") else default
+    except Exception:
+        return default
+
+
+def _vlm_keep_alive() -> str:
+    """How long ollama holds the VLM after a describe. Short by default so the
+    6-8GB model frees VRAM for other models once JARVIS is done looking; long
+    enough that back-to-back describes within one turn reuse the warm model."""
+    return _conf("vision.vlm_keep_alive", "30s")
+
 _worker: subprocess.Popen | None = None
 _worker_lock = asyncio.Lock()
 _last_use = 0.0
@@ -252,11 +269,25 @@ async def forget_all(user_id: str) -> int:
 
 async def warm_vlm() -> None:
     """Preload the VLM into ollama (fired when an image lands in the file
-    exchange) so a following 'analyze this' doesn't pay the cold start."""
+    exchange) so a following 'analyze this' doesn't pay the cold start. Uses the
+    same short keep_alive as describe — so a dropped-but-never-asked image can't
+    camp 6-8GB of VRAM."""
     try:
         async with httpx.AsyncClient(timeout=240) as client:
             await client.post(f"{OLLAMA_URL}/api/generate",
-                              json={"model": VLM_MODEL, "keep_alive": "10m"})
+                              json={"model": VLM_MODEL, "keep_alive": _vlm_keep_alive()})
+    except Exception:
+        pass
+
+
+async def unload_vlm() -> None:
+    """Evict the VLM from VRAM NOW (keep_alive:0). Called when JARVIS finishes a
+    turn that used its eyes — the local model shouldn't hold the card once the
+    task is done and the (cloud) chat model has taken over. no-op if not loaded."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(f"{OLLAMA_URL}/api/generate",
+                              json={"model": VLM_MODEL, "keep_alive": 0})
     except Exception:
         pass
 
@@ -268,10 +299,13 @@ async def describe_image(jpeg: bytes, prompt: str = "") -> str:
         "text (transcribe it), UI elements, anything notable.")
     # 12GB card shared with the user's dictation tool (~3.3GB resident): the
     # VLM often runs partially CPU-offloaded, so keep the generation short
-    # and allow the slow path to finish instead of ReadTimeout-ing at 120s
+    # and allow the slow path to finish instead of ReadTimeout-ing at 120s.
+    # keep_alive is short so the model frees VRAM soon after the turn; the chat
+    # endpoint also evicts it explicitly once the turn ends (unload_vlm).
     async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(f"{OLLAMA_URL}/api/chat", json={
             "model": VLM_MODEL, "stream": False,
+            "keep_alive": _vlm_keep_alive(),
             "messages": [{"role": "user", "content": q,
                           "images": [base64.b64encode(jpeg).decode()]}],
             "options": {"num_predict": 256},

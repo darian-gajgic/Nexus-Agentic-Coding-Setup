@@ -49,7 +49,12 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   mode, 2.1s manual) and auto-sends; CONV mode adds a barge-in monitor during playback
   (echoCancellation'd mic — sustained speech stops TTS and listens).
 - **Vision memory**: `vision.py` + `vision_worker.py` (persistent ml-env subprocess, killed
-  after 10min idle): SigLIP so400m + RapidOCR per frame → qdrant `jarvis_vision`
+  after 10min idle): SigLIP so400m + RapidOCR per frame → qdrant `jarvis_vision`.
+  **VRAM robustness (2026-07-08)**: the 12GB card is shared with ollama + the user's dictation
+  tool; when SigLIP OOMs on CUDA, `vision_worker._siglip_op_with_fallback` drops it to CPU
+  (float32) for the worker's life and reruns — "seeing" degrades to slower-but-working instead
+  of a 500 (a worker respawn after idle retries CUDA). The embed ops report `device`; frame
+  failures are logged to the activity feed. Mirrors the STT self-heal.
   (per-user, deduped). Webcam/screen share buttons index frames every 4-5s; hybrid search
   (`/api/jarvis/vision/search`) opens a scroll/select/copy popup; "look at this" turns ride
   a frame described by ollama `qwen3-vl:8b` into the chat as [JARVIS EYES] context.
@@ -60,6 +65,21 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   points Hermes there; post-turn folder diff → SSE `files` event → chips in chat.
 - **System control**: per-turn `system_message` gives Hermes curl access to the Nexus API via
   the per-boot `auth.INTERNAL_TOKEN` + `x-nexus-user` (user-scoped; readback-confirm rule).
+  The framing documents the FULL OS surface (board+wizard, projects, deliverables, ▶ Test-app,
+  judge/verify/review, approvals/scheduler/agents/quota) so JARVIS can plan-then-build or hand
+  work to the fleet — not just move cards.
+- **Business Brain (2026-07-08)**: `jarvis_brain.py` makes JARVIS domain-aware. Per turn it
+  detects the craft domain (9 domains, keyword-scored) and folds ~/knowledge into the framing:
+  always the BUSINESS-CONTEXT facts + STYLE-VOICE AI-slop kill-list (voice guardrail); on a
+  deliverable-looking turn it adds the matched domain's RUBRIC must-pass gates + PLAYBOOK task
+  menu + file paths (compact — full playbooks are read on demand via file tools). Files are
+  mtime-cached (edits apply live). `_jarvis_framing(uid, user_input)` returns (framing, domain);
+  the stream emits an SSE `domain {domain,label}` event → the topbar 📚 domain chip.
+- **Command deck (2026-07-08)**: topbar ⚡ Deck toggles a right rail (`jarvisLoadDeck`) with a
+  board glance (column counts + running, click→kanban), recent Deliverables each with **▶ Test**
+  (reuses `testAppUI` → per-task app preview) + open-file, pending Approvals (✓/✗), and a
+  "✨ Hand a task to the fleet" (→`describeTaskUI`). Persisted open state (`jvDeckOpen`); refreshes
+  on open, on the `files` SSE event, and after approval decisions.
 - **Sessions**: multiple per user (`jarvis_session.json` history) — sidebar switch/forget/title.
 - **Overload fallback (2026-07-08)**: Z.AI load-sheds the chat model at peak → server emits
   `event: fallback {from,to}` + retries the turn ONCE on `dispatch.fallback_model`
@@ -67,11 +87,35 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   ⚡ note. Details in docs/JARVIS-VOICE.md §5 + the Real Dispatch quota bullet below.
 - **Extras**: daily spoken briefing, spoken task completion/failure callbacks (12s polling),
   `/find` + `/imagine` intents (typed or spoken), per-message copy buttons.
+- **STT robustness (2026-07-08)**: `voice.py` STT self-heals — a CUDA hiccup under VRAM
+  contention (was a silent 500, e.g. cudaErrorInvalidDevice) now logs a traceback, reloads the
+  model and retries once, then falls back to a CPU int8 model and blocks the GPU for 600s
+  (`voice.stt_gpu_block_until`). Model/device/language are settings (`voice.stt_model` default
+  medium.en — set `large-v3-turbo` for multilingual+accuracy; `voice.stt_device` auto|cuda|cpu;
+  `voice.stt_language`). A CPU-only fallback still failing is logged to the activity feed.
 - **Idle model unloading:** Piper+Whisper unload after `voice.py IDLE_TIMEOUT` (300s) idle;
-  the vision worker is killed after 10min idle — both via the server's 15s unloader thread.
+  the vision worker (SigLIP/SDXL) is killed after 10min idle — both via the server's 15s
+  unloader thread. **The ollama VLM (qwen3-vl, ~6-8GB) frees promptly (2026-07-08):** describe
+  calls use a short keep_alive (setting `vision.vlm_keep_alive`, default 30s — was ollama's 5min
+  default) and the chat turn calls `vision.unload_vlm()` (keep_alive:0) the moment a look-turn
+  ends, so the local model doesn't camp the shared 12GB card once JARVIS is done seeing (the
+  chat model is cloud). SDXL imagine already evicts the VLM first.
+- **Graceful shutdown (2026-07-08)**: the dashboard always holds a `/ws` socket + SSE streams,
+  so uvicorn's default unbounded graceful shutdown hung until systemd's 90s SIGKILL (every
+  restart lost in-flight state + spammed the journal). Fixed: `uvicorn.Config(timeout_graceful_
+  shutdown=8)` + a `handle_exit` that sets `watchdog.SHUTTING_DOWN` FIRST (so the watchdog stops
+  respawning SIGTERM'd workers mid-stop) + `TimeoutStopSec=25` in the unit. Restart is now ~1s.
 - **Cache-busting:** when editing `app.js`, `style.css`, `jarvis3d.js` etc., bump `?v=N` in
   `index.html` or the browser serves stale cached code.
-- TTS voice: Piper "ryan" (male). Backup of old female voice at `models/piper_voice_female_backup.onnx`.
+- TTS voice: swappable via setting `voice.tts_voice` (path to a 22050 Hz Piper .onnx; empty =
+  base `models/piper_voice.onnx` = ryan-medium, the always-present fallback). Higher-quality
+  US-male voices downloaded to `models/voices/` (gitignored — re-downloadable): **en_US-joe-medium**
+  (currently active — calm, deeper), en_US-ryan-high (confident, clear), en_US-lessac-high
+  (professional/neutral). `voice._get_tts` reloads on change
+  and falls back to the base voice if the file is missing/broken/non-22050. Comparison samples:
+  `~/.hermes/cache/voice-samples/*.wav`. Backup of old female voice at
+  `models/piper_voice_female_backup.onnx`. SOTA upgrade path (Kokoro-82M, more natural) is a
+  separate python3.11 worker — blocked on the 3.14 venv; see `jarvis-tts-kokoro-py314-blocker`.
 
 ## Python Environment
 - Venv at `.venv/` (Python 3.14) — the nexus server + Playwright for tests
