@@ -72,7 +72,7 @@ async function buildHead() {
     i.onerror = () => res(null);
     i.src = '/static/avatar/reference.jpg';
   });
-  const S = 110;                       // sample grid
+  const S = 150;                       // sample grid
   const cv = document.createElement('canvas');
   cv.width = cv.height = S;
   const g = cv.getContext('2d');
@@ -84,45 +84,86 @@ async function buildHead() {
   }
   const px = g.getImageData(0, 0, S, S).data;
 
-  // luminance map with contrast stretch — a photo's face is tonally flat, so
-  // raw luminance carves no features; stretching + edge boost makes eyes,
-  // nose, mouth and hair POP as denser/brighter particles (the inspiration
-  // look). Edges via simple gradient magnitude.
+  // The reference is a portrait on a BRIGHT wall — luminance alone renders
+  // the wall, not the person (the "egg" bug). So: (1) background removal by
+  // color distance from the top-corner average → the SUBJECT silhouette is
+  // the head shape, hair and shoulders included; (2) density is uniform-ish
+  // inside the subject (additive blending flattens density anyway);
+  // (3) photo luminance drives per-point BRIGHTNESS (with contrast stretch),
+  // edges (eyes/brows/nose/lips) always pop. Tuned offline 2026-07-08.
+  const rgbAt = (i) => [px[i * 4] / 255, px[i * 4 + 1] / 255, px[i * 4 + 2] / 255];
   const lumAt = new Float32Array(S * S);
-  let lmin = 1, lmax = 0;
   for (let i = 0; i < S * S; i++) {
-    const l = (px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114) / 255;
-    lumAt[i] = l;
-    if (l < lmin) lmin = l;
-    if (l > lmax) lmax = l;
+    lumAt[i] = (px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114) / 255;
   }
-  const stretch = (l) => Math.min(1, Math.max(0, (l - lmin) / Math.max(0.01, lmax - lmin)));
+  // background color ≈ mean of the two top corners
+  let br = 0, bgc = 0, bb = 0, bn = 0;
+  for (let y = 0; y < 12; y++) {
+    for (const x0 of [0, S - 12]) {
+      for (let x = x0; x < x0 + 12; x++) {
+        const c = rgbAt(y * S + x);
+        br += c[0]; bgc += c[1]; bb += c[2]; bn++;
+      }
+    }
+  }
+  br /= bn; bgc /= bn; bb /= bn;
+  const isSubjectRaw = new Uint8Array(S * S);
+  for (let i = 0; i < S * S; i++) {
+    const c = rgbAt(i);
+    const d = Math.hypot(c[0] - br, c[1] - bgc, c[2] - bb);
+    isSubjectRaw[i] = d > 0.16 ? 1 : 0;
+  }
+  // despeckle: a subject pixel needs ≥3 subject neighbors
+  const isSubject = new Uint8Array(S * S);
+  for (let y = 1; y < S - 1; y++) {
+    for (let x = 1; x < S - 1; x++) {
+      const i = y * S + x;
+      if (!isSubjectRaw[i]) continue;
+      let nb = 0;
+      for (const o of [-S - 1, -S, -S + 1, -1, 1, S - 1, S, S + 1]) nb += isSubjectRaw[i + o];
+      isSubject[i] = nb >= 3 ? 1 : 0;
+    }
+  }
+  // contrast stretch from the subject's own tonal range (approx. quantiles)
+  const tones = [];
+  for (let i = 0; i < S * S; i++) if (isSubject[i]) tones.push(lumAt[i]);
+  tones.sort((a, b) => a - b);
+  const lo = tones[Math.floor(tones.length * 0.04)] ?? 0;
+  const hi = tones[Math.floor(tones.length * 0.97)] ?? 1;
+  const stretch = (l) => Math.min(1, Math.max(0, (l - lo) / Math.max(0.01, hi - lo)));
 
-  const pos = [], col = [], mouthIdx = [], eyeIdx = [];
+  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
   const W = 34, H = 44, DEPTH = 16;    // head proportions (world units)
   for (let y = 1; y < S - 1; y++) {
     for (let x = 1; x < S - 1; x++) {
       const i = y * S + x;
+      if (!isSubject[i]) continue;
       const lum = stretch(lumAt[i]);
       const edge = Math.min(1, (Math.abs(lumAt[i + 1] - lumAt[i - 1])
-        + Math.abs(lumAt[i + S] - lumAt[i - S])) * 3.4);
+        + Math.abs(lumAt[i + S] - lumAt[i - S])) * 4.0);
       const u = x / S - 0.5, v = 0.5 - y / S;      // -0.5..0.5
-      const rr = (u * u) / 0.23 + (v * v) / 0.245; // ellipse mask (head-shaped)
-      if (rr > 1.0) continue;
-      // density: features (edges) always sample; flat areas by tone
-      const density = Math.min(1, Math.pow(lum, 1.7) * 0.75 + edge * 0.9 + 0.05);
+      let density = 0.72 + edge * 0.28;
+      if (v < -0.30) density *= 0.25;              // shirt/shoulders fade out
       if (Math.random() > density) continue;
+      // brightness: glowing skin, popping features, dim-but-visible hair
+      let b = Math.max(Math.pow(lum, 1.1), edge, 0.18);
+      if (v < -0.30) b *= 0.5;
+      const rr = (u * u) / 0.23 + (v * v) / 0.245; // dome only shapes depth now
       const wx = u * W, wy = v * H;
-      const wz = Math.sqrt(Math.max(0, 1 - rr)) * DEPTH + lum * 4.2 + edge * 1.5;
+      const wz = Math.sqrt(Math.max(0, 1 - rr)) * DEPTH + lum * 4.0 + edge * 1.5;
       const n = pos.length / 3;
       pos.push(wx + (Math.random() - .5) * .45,
                wy + (Math.random() - .5) * .45,
                wz + (Math.random() - .5) * .45);
-      const b = 0.28 + lum * 0.62 + edge * 0.5;
-      col.push(b * MODE_TINT.idle[0], b * MODE_TINT.idle[1], b * MODE_TINT.idle[2]);
-      // regions (in image space): mouth = lower-center, eyes = upper band
-      if (v < -0.10 && v > -0.30 && Math.abs(u) < 0.16) mouthIdx.push(n);
-      if (v > 0.02 && v < 0.14 && Math.abs(u) > 0.05 && Math.abs(u) < 0.26) eyeIdx.push(n);
+      // brightest points tint toward white (lit-skin look from the inspiration)
+      const wmix = b > 0.72 ? (b - 0.72) / 0.28 * 0.45 : 0;
+      bri.push(b); wmi.push(wmix);
+      col.push(b * (MODE_TINT.idle[0] * (1 - wmix) + wmix),
+               b * (MODE_TINT.idle[1] * (1 - wmix) + wmix),
+               b * (MODE_TINT.idle[2] * (1 - wmix) + wmix));
+      // regions measured on THIS reference photo: eyes v≈0.14, mouth v≈-0.05
+      if (v < -0.005 && v > -0.11 && Math.abs(u) < 0.13) mouthIdx.push(n);
+      if (v > 0.09 && v < 0.17 && Math.abs(u) > 0.04 && Math.abs(u) < 0.20) eyeIdx.push(n);
     }
   }
   // sparse back-of-skull shell so the head reads as a volume from the side
@@ -133,7 +174,7 @@ async function buildHead() {
     if (sz > 0.15) continue;                       // front stays the face
     back.push(sx * W * 0.52, sy * H * 0.5, sz * DEPTH * 1.35);
   }
-  return { pos, col, mouthIdx, eyeIdx, back };
+  return { pos, col, bri, wmi, mouthIdx, eyeIdx, back };
 }
 
 /* ── Galaxy backdrop from the user's REAL memory map ── */
@@ -253,15 +294,15 @@ function tick() {
     }
 
     // mouth: native-timing lip-sync — displace mouth points by audio level
+    // (band center wy≈-2.5, half-height≈2.3 — measured on the reference)
     const posAttr = J.headGeo.attributes.position;
     const open = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.15);
     for (let k = 0; k < J.mouthIdx.length; k++) {
       const n = J.mouthIdx[k];
       const by = J.basePos[n * 3 + 1];
-      const depth = (by + 13.2) / 8.8;             // deeper rows open more
-      posAttr.array[n * 3 + 1] = by - open * 3.4 * Math.max(0, 1 - Math.abs(depth))
-        - open * 0.7 * Math.random();
-      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] - open * 1.1;
+      const center = Math.max(0, 1 - Math.abs((by + 2.5) / 2.3));
+      posAttr.array[n * 3 + 1] = by - open * 3.0 * center - open * 0.5 * Math.random();
+      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] - open * 1.0;
     }
     if (J.mouthIdx.length) posAttr.needsUpdate = true;
 
@@ -272,10 +313,10 @@ function tick() {
     if ((Math.round(t * 60) & 3) === 0) {
       const mix = 0.14;
       for (let n = 0; n < colAttr.count; n++) {
-        const b = J.baseCol[n * 3] / MODE_TINT.idle[0];   // stored brightness
-        colAttr.array[n * 3]     += (b * tint[0] - colAttr.array[n * 3]) * mix;
-        colAttr.array[n * 3 + 1] += (b * tint[1] - colAttr.array[n * 3 + 1]) * mix;
-        colAttr.array[n * 3 + 2] += (b * tint[2] - colAttr.array[n * 3 + 2]) * mix;
+        const b = J.baseB[n], w = J.baseW[n];   // true brightness + white-mix
+        colAttr.array[n * 3]     += (b * (tint[0] * (1 - w) + w) - colAttr.array[n * 3]) * mix;
+        colAttr.array[n * 3 + 1] += (b * (tint[1] * (1 - w) + w) - colAttr.array[n * 3 + 1]) * mix;
+        colAttr.array[n * 3 + 2] += (b * (tint[2] * (1 - w) + w) - colAttr.array[n * 3 + 2]) * mix;
       }
       for (const n of J.eyeIdx) {
         colAttr.array[n * 3] *= blink; colAttr.array[n * 3 + 1] *= blink; colAttr.array[n * 3 + 2] *= blink;
@@ -321,10 +362,12 @@ async function mount(container) {
   J.renderer.domElement.className = 'jarvis3d-canvas';
   container.prepend(J.renderer.domElement);
 
-  const { pos, col, mouthIdx, eyeIdx, back } = await buildHead();
+  const { pos, col, bri, wmi, mouthIdx, eyeIdx, back } = await buildHead();
   if (J.disposed) return;
   J.basePos = Float32Array.from(pos);
   J.baseCol = Float32Array.from(col);
+  J.baseB = Float32Array.from(bri);
+  J.baseW = Float32Array.from(wmi);
   J.mouthIdx = mouthIdx;
   J.eyeIdx = eyeIdx;
   J.headGeo = new THREE.BufferGeometry();
@@ -380,6 +423,7 @@ function dispose() {
   }
   J.streams = []; J.pulses = []; J.renderer = null; J.scene = null;
   J.headGeo = null; J.basePos = null; J.baseCol = null;
+  J.baseB = null; J.baseW = null;
 }
 
 function setMode(mode) { J.mode = mode; }
