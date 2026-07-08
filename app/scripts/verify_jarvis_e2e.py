@@ -55,7 +55,7 @@ with sync_playwright() as p:
         time.sleep(1.5)
         s = pg.evaluate("""()=>({
             st: (document.querySelector('#jStateChip')||{}).textContent,
-            tts: (typeof jarvisState !== 'undefined' && jarvisState.ttsAnimating) || false,
+            tts: (typeof jarvisState !== 'undefined' && (jarvisState.ttsAnimating || jarvisState.ttsEngagedEver)) || false,
             reply: [...document.querySelectorAll('#jFeed .j-msg.jarvis')]
                      .map(e => e.innerText.trim()).filter(t => !t.startsWith('📋')).pop() || '',
             err: [...document.querySelectorAll('#jFeed .j-msg.error')]

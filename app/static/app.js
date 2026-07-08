@@ -5925,6 +5925,8 @@ function jarvisTTSWs() {
       };
       if (!jarvisState.ttsAnimating) {
         jarvisState.ttsAnimating = true;
+        jarvisState.ttsEngagedEver = true;   // latch for the e2e gate — a short
+        // reply can start AND finish speaking between two 1.5s gate polls
         jarvisSetMode('talking');
         jarvisTtsLevelLoop();
         jarvisBargeMonitorStart();
@@ -6018,7 +6020,15 @@ function jarvisTtsLevelLoop() {
   let sum = 0;
   for (let i = 0; i < jTTS.data.length; i++) { const d = (jTTS.data[i] - 128) / 128; sum += d * d; }
   const rms = Math.sqrt(sum / jTTS.data.length);
-  if (window.Jarvis3D) window.Jarvis3D.setLevel(rms * 6);
+  // spectral hint for the mouth: sibilance share (high band vs vowel band) —
+  // jarvis3d narrows the aperture on s/sh/f instead of dropping the jaw
+  if (!jTTS.freq) jTTS.freq = new Uint8Array(jTTS.analyser.frequencyBinCount);
+  jTTS.analyser.getByteFrequencyData(jTTS.freq);
+  let lo = 0, hi = 0;
+  for (let i = 1; i <= 6; i++) lo += jTTS.freq[i];
+  for (let i = 24; i <= 60; i++) hi += jTTS.freq[i];
+  lo /= 6 * 255; hi /= 37 * 255;
+  if (window.Jarvis3D) window.Jarvis3D.setLevel(rms * 6, hi / (lo + hi + 1e-4));
   requestAnimationFrame(jarvisTtsLevelLoop);
 }
 
