@@ -1926,7 +1926,7 @@ SYSTEM CONTROL — you can manage the user's Nexus board over its local REST API
   Board now: {board}. Running: {running_s}.
   RULES: read back and get an explicit yes BEFORE dispatching, deleting, approving, or scheduling anything. Never invent task IDs — list first. After acting, state plainly what changed.
 
-VISION: the UI indexes what the camera/screen share sees into your visual memory; when the user asks what you saw or when they showed you something, the UI searches it — you may reference "[JARVIS EYES]" context blocks in the conversation as things you personally saw.
+VISION: the UI indexes what the camera/screen share sees into your visual memory; when the user asks what you saw or when they showed you something, the UI searches it — you may reference "[JARVIS EYES]" context blocks in the conversation as things you personally saw. Image FILES in the exchange are auto-described into [JARVIS EYES] blocks by your own local vision whenever the user references one — you CAN see and analyze images; never claim you lack vision. If an image the user means has no [JARVIS EYES] block yet, ask them to name the file.
 
 Current date/time: {time.strftime('%A %Y-%m-%d %H:%M')}."""
 
@@ -1963,10 +1963,42 @@ async def jarvis_chat_stream(body: dict):
         except Exception as e:
             frame_note = f"(vision unavailable: {str(e)[:120]})"
 
+    # Image-file analysis (2026-07-08): the chat models (GLM) have NO vision —
+    # when the user references an image, the LOCAL VLM (the same eyes as the
+    # live-frame path) describes files from the exchange and the description
+    # rides along, so "analyze nexus-ad.png" just works instead of "I can't".
+    img_notes = []
+    try:
+        import re as _re
+        import vision as _vision_mod
+        fdir = _jarvis_files_dir(uid)
+        exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+        imgs = ([f for f in fdir.iterdir() if f.is_file() and f.suffix.lower() in exts]
+                if fdir.is_dir() else [])
+        low = user_input.lower()
+        named = [f for f in imgs if f.name.lower() in low]
+        targets = named[:2]
+        if (not targets and imgs and not frame_b64
+                and _re.search(r"\b(image|picture|photo|screenshot|graphic|logo|analy[sz]e)\b", low)):
+            # unnamed "analyze the image" → the newest image in the exchange
+            targets = sorted(imgs, key=lambda f: f.stat().st_mtime, reverse=True)[:1]
+        for f in targets:
+            try:
+                desc = await _vision_mod.describe_image(f.read_bytes(), user_input[:300])
+                img_notes.append(f"[JARVIS EYES — image file '{f.name}' from the file "
+                                 f"exchange, seen through your own local vision: {desc}]")
+            except Exception as e:
+                img_notes.append(f"[JARVIS EYES — image '{f.name}' could not be analyzed "
+                                 f"locally right now: {str(e)[:100]}]")
+    except Exception:
+        pass
+
     hermes_input = user_input
     if frame_note:
         hermes_input = (f"[JARVIS EYES — what your camera/screen sees right now: "
-                        f"{frame_note}]\n\n{user_input}")
+                        f"{frame_note}]\n\n{hermes_input}")
+    if img_notes:
+        hermes_input = "\n".join(img_notes) + "\n\n" + hermes_input
 
     async def event_generator():
         """Stream SSE events from Hermes, re-emit as SSE for the browser.
