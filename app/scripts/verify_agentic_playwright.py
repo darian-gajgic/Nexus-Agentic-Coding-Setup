@@ -58,8 +58,14 @@ async def main():
         approve_btn = page.locator(f'div.agentic-row:has-text("deploy v3") button:has-text("Approve")')
         if await approve_btn.count() > 0:
             await approve_btn.first.click()
-            await page.wait_for_timeout(800)
-            ok("approval approved from UI", await page.locator(f'text=deploy v3 to staging').count() == 0)
+            # decideApproval() awaits PATCH + GET /api/tasks + loadAgenticData()
+            # (6 parallel fetches) before render() removes the row — a fixed
+            # sleep races that async chain. Wait for the DOM mutation instead.
+            try:
+                await page.wait_for_selector(f'text=deploy v3 to staging', state='detached', timeout=5000)
+                ok("approval approved from UI", True)
+            except Exception:
+                ok("approval approved from UI", False, "approval row not removed after click")
         else:
             ok("approval approve button found", False, "no approve button")
 

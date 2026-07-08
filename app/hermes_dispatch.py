@@ -686,6 +686,15 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     """Common tail of every dispatch: token accounting, deliverable file, task/
     dispatch state. Raises QuotaError for rate-limit failures (caller backs off)."""
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if task is None:
+        # The row vanished mid-run (deleted while dispatching — e.g. an e2e
+        # suite's cleanup sweeping by title). Close the dispatch cleanly and
+        # discard the result instead of crashing on a ghost.
+        _set_dispatch(dispatch_id, state="failed", ended_at=time.time(),
+                      error="task row deleted mid-run — result discarded")
+        db.log_activity("warn", agent_id,
+                        f"Task {task_id} was deleted while its dispatch ran — result discarded")
+        return
     if err_text and is_quota_error(err_text):
         raise QuotaError(err_text)
 
