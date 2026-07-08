@@ -408,6 +408,11 @@ async def get_agents():
 
 @app.post("/api/agents")
 async def create_agent(body: AgentCreate):
+    # Admin-only (H3): agent lanes are the SHARED executor pool (no user_id; the
+    # worker claims every user's tasks). Managing the fleet is an operator action;
+    # members get their work done by creating tasks, not lanes.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     agent = am.spawn_agent(body.name, body.role, body.program_id, auto_claim=body.auto_claim)
     await mgr.broadcast({"type": "agent_created", "data": agent})
     return agent
@@ -417,6 +422,8 @@ async def create_agent(body: AgentCreate):
 async def retire_agent(agent_id: str):
     """Terminal lifecycle state (R3.1): worker killed, tasks released, and the
     watchdog never restarts a retired lane — this is how zombies end."""
+    if not auth.is_admin():  # H3: shared fleet control
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     agent = am.retire_agent(agent_id)
     if not agent:
         return JSONResponse(status_code=404, content={"error": "agent not found"})
@@ -435,6 +442,8 @@ async def get_agent(agent_id: str):
 
 @app.delete("/api/agents/{agent_id}")
 async def delete_agent(agent_id: str):
+    if not auth.is_admin():  # H3: shared fleet control
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     am.stop_agent(agent_id)
     # Release this lane's claimed work first — deleting the row without this
     # strands in_progress tasks on a nonexistent agent forever (no lane will
@@ -453,6 +462,8 @@ async def delete_agent(agent_id: str):
 
 @app.post("/api/agents/{agent_id}/restart")
 async def restart_agent(agent_id: str):
+    if not auth.is_admin():  # H3: shared fleet control (watchdog self-heal uses am.* directly)
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     agent = am.restart_agent(agent_id)
     if agent:
         await mgr.broadcast({"type": "agent_updated", "data": agent})
@@ -844,7 +855,11 @@ def get_coremods():
 @app.post("/api/coremods/decide")
 async def decide_coremod(body: dict):
     """Human decision on a tracked core modification: keep_ours | accept_upstream | reenable.
-    Writes the decision into the guardian's state and triggers a guardian run to act on it."""
+    Writes the decision into the guardian's state and triggers a guardian run to act on it.
+    Admin-only (H2): runs guardian.py as the operator (may git-apply patches + restart
+    the shared Hermes gateway every user depends on) — global operator control."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import subprocess
     name = body.get("name"); decision = body.get("decision")
     if decision not in ("keep_ours", "accept_upstream", "reenable"):
@@ -961,8 +976,13 @@ def get_specialists():
             offset = res.get("next_page_offset")
             if offset is None:
                 break
+        me = auth.current_user_id()
         for p in pts:
             pl = p.get("payload") or {}
+            # H4: same user-tag filter as /api/memory — a point stamped with
+            # another user's tag is invisible; untagged = shared/global (kept).
+            if pl.get("user") and pl.get("user") != me:
+                continue
             aid = pl.get("agent_id")
             if aid:
                 mems.setdefault(aid, []).append({
@@ -1006,7 +1026,11 @@ def _run_curate(*cli_args):
 
 @app.post("/api/specialists/{name}/memory")
 async def add_specialist_memory(name: str, body: dict):
-    """Teach a specialist a curated lesson (stored under its memory scope)."""
+    """Teach a specialist a curated lesson (stored under its memory scope).
+    Admin-only (H1): specialist memory is SHARED operator craft-knowledge that
+    every dispatched task + JARVIS recalls — a member write is stored injection."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import re
     text = (body.get("text") or "").strip()
     if not re.match(r"^[a-z0-9-]+$", name):
@@ -1025,7 +1049,10 @@ async def add_specialist_memory(name: str, body: dict):
 
 @app.delete("/api/specialists/{name}/memory/{mem_id}")
 async def delete_specialist_memory(name: str, mem_id: str):
-    """Forget a specialist's lesson by id."""
+    """Forget a specialist's lesson by id. Admin-only (H1): deletes a shared
+    specialist memory by raw id — irreversible destruction of operator knowledge."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     return _run_curate("delete", "--id", mem_id)
 
 
@@ -1053,7 +1080,11 @@ def get_archived_lessons(name: str):
 
 @app.post("/api/specialists/{name}/archived/{mem_id}/restore")
 async def restore_lesson(name: str, mem_id: str):
-    """Restore an archived lesson back into the specialist's active memory."""
+    """Restore an archived lesson back into the specialist's active memory.
+    Admin-only (H1): relabels a shared point's agent_id (raw qdrant write) —
+    a member could move any point between specialist scopes."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import urllib.request
     try:
         qurl = sreg.conf("qdrant.url")
@@ -1103,7 +1134,11 @@ def get_pending_lessons():
 @app.post("/api/lessons/{lid}/decide")
 async def decide_lesson(lid: str, body: dict):
     """Approve (optionally edited), or reject, a proposed lesson. Approve writes it to
-    the specialist's PRIVATE memory with human-approved provenance; nothing else does."""
+    the specialist's PRIVATE memory with human-approved provenance; nothing else does.
+    Admin-only (H1): this IS the human-review gate of the reflection pipeline —
+    approving writes shared specialist memory that every dispatched task consumes."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     action = body.get("action")
     try:
         q = json.loads(open(_pending_path()).read()) if os.path.exists(_pending_path()) else []
@@ -1276,6 +1311,10 @@ def get_shared_context():
 
 @app.post("/api/shared-context")
 async def add_shared_context(body: dict):
+    # Admin-only (H1): writes the `team-shared` scope that EVERY specialist
+    # recalls — a member write is a global stored prompt-injection vector.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     text = (body.get("text") or "").strip()
     if not text:
         return JSONResponse(status_code=400, content={"error": "empty"})
@@ -1284,6 +1323,9 @@ async def add_shared_context(body: dict):
 
 @app.delete("/api/shared-context/{mem_id}")
 async def delete_shared_context(mem_id: str):
+    # Admin-only (H1): deletes any shared/global memory point by raw id.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     return _run_curate("delete", "--id", mem_id)
 
 
@@ -2104,6 +2146,10 @@ async def watchdog_status():
 
 @app.patch("/api/watchdog/config")
 async def watchdog_config(body: dict):
+    # Admin-only (H2): watchdog config is fleet-wide self-healing — disabling it
+    # (restart_on_dead/stuck=false) strands dead lanes on EVERY user's work.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     for k, v in body.items():
         db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                    (f"watchdog.{k}", "1" if isinstance(v, bool) else str(v)))
@@ -2116,6 +2162,8 @@ async def watchdog_config(body: dict):
 @app.post("/api/agents/{agent_id}/worktree")
 async def agent_worktree(agent_id: str, body: dict):
     """Create an isolated git worktree for an agent against a repo path."""
+    if not auth.is_admin():  # H3: mutates a shared lane + touches the operator's repo
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import worktree as _wt
     repo = body.get("repo_path")
     if not repo:
@@ -4810,6 +4858,8 @@ async def known_issues_delete(iid: str):
 async def agent_config_update(agent_id: str, body: dict):
     """Edit a lane's config after creation (auto_claim, max_tokens cap).
     The worker re-reads its config every tick, so changes apply live."""
+    if not auth.is_admin():  # H3: shared fleet control (cost caps affect everyone's work)
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     agent = db.query_one("SELECT * FROM agents WHERE id=?", (agent_id,))
     if not agent:
         return JSONResponse(status_code=404, content={"error": "agent not found"})
@@ -5602,6 +5652,8 @@ async def api_tasks_cleanup():
 @app.patch("/api/agents/{agent_id}/rename")
 async def api_agent_rename(agent_id: str, body: dict):
     """Rename an agent by id."""
+    if not auth.is_admin():  # H3: shared fleet control
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     new_name = (body.get("name") or "").strip()
     if not new_name:
         return JSONResponse(status_code=422, content={"error": "name required"})
@@ -5617,6 +5669,8 @@ async def api_agent_rename(agent_id: str, body: dict):
 @app.post("/api/agents/cleanup-test-agents")
 async def api_agents_cleanup_test():
     """Bulk-delete stopped test-artifact agents (e.g. leftover SelfHealTest spawns)."""
+    if not auth.is_admin():  # H3: shared fleet control
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     targets = db.query_all("SELECT id, name FROM agents WHERE status='stopped'")
     deleted = []
     for a in targets:
