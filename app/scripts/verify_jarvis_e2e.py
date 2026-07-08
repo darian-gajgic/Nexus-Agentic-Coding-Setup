@@ -44,6 +44,11 @@ with sync_playwright() as p:
     pg.screenshot(path=f"{SCREENSHOTS}/01-idle.png")
 
     # --- Check 2 + 3 + 4: send message, watch the full flow ---
+    # Fresh conversation first: the operator's live session may have a long
+    # multi-step turn in flight, and jarvisSendText() no-ops while streaming
+    # (two false check5 fails on 2026-07-08 were exactly this).
+    pg.click('#jNewChat')
+    time.sleep(1.5)
     pg.fill('#jInput', "Say hi in one short sentence, nothing more.")
     pg.press('#jInput', 'Enter')
 
@@ -71,6 +76,16 @@ with sync_playwright() as p:
             reply_text = s['reply']
         if reply_text and s.get('st') == 'IDLE' and i > 3:
             break
+
+    # cold Piper can deliver the first audio chunk AFTER the text reply is
+    # done (mode already back to IDLE) — give the latch a grace window
+    if not saw_speaking and not overloaded:
+        for _ in range(10):
+            time.sleep(1.5)
+            if pg.evaluate("()=> (typeof jarvisState !== 'undefined' && "
+                           "(jarvisState.ttsAnimating || jarvisState.ttsEngagedEver)) || false"):
+                saw_speaking = True
+                break
 
     results['check2_reply_rendered'] = bool(reply_text) or overloaded
     results['check3_ws_tts_engaged'] = saw_speaking or overloaded

@@ -35,7 +35,9 @@ GLB = ROOT / "static" / "avatar" / "male_head.glb"
 OUT = ROOT / "static" / "avatar" / "head_points.json"
 PREVIEW = Path("/tmp/claude-1000/-home-sinep-Nexus-Agentic-Coding-Setup/de8d5241-8032-42ce-9546-2f5dd08ad5b7/scratchpad/avatar-preview")
 
-N_HEAD = 46000
+# v13: the bust renders as DISCRETE memory-node dots (GPU shader points with
+# core+halo), not a dense fuzz — far fewer, bigger, individually visible
+N_HEAD = 7000
 KEY = np.array([-0.45, 0.55, 0.8]); KEY = KEY / np.linalg.norm(KEY)
 # dim counter-key from the right so the shadow side keeps its form
 KEY2 = np.array([0.65, 0.05, 0.60]); KEY2 = KEY2 / np.linalg.norm(KEY2)

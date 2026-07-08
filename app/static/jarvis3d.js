@@ -252,9 +252,9 @@ function buildFromPrebuilt(cloud) {
     const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
     const b = B[i];
     const n = pos.length / 3;
-    pos.push(x + (Math.random() - .5) * .3,
-             y + (Math.random() - .5) * .3,
-             z + (Math.random() - .5) * .3);
+    pos.push(x + (Math.random() - .5) * .12,
+             y + (Math.random() - .5) * .12,
+             z + (Math.random() - .5) * .12);
     const w = b > 0.9 ? Math.min(1, (b - 0.9) / 0.25) * 0.4 : 0;
     bri.push(b); wmi.push(w);
     col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
@@ -811,38 +811,20 @@ function tick() {
     J.headGroup.rotation.x = Math.sin(t * 0.11) * 0.035;
     J.headGroup.scale.y = 1 + Math.sin(t * 1.1) * 0.005;
 
-    // ── mouth: audio-driven jaw, per real-time lip-sync practice — a fast
-    // attack / slow release envelope (the mouth must never lag the audio,
-    // and it settles through pauses instead of snapping shut), the LOWER
-    // lip/jaw does the work while the upper lip barely moves, the corners
-    // stay sealed, sibilant (high-band) energy narrows the aperture, and
-    // per-point jitter is a STABLE seed (frame-random made the lips boil) ──
-    const posAttr = J.headGeo.attributes.position;
+    // ── ALL head animation is uniforms-only; the shader displaces the dots.
+    // Mouth: fast attack / slow release envelope (never lags the audio,
+    // settles through pauses), sibilance narrows the aperture. Blink:
+    // measured human dynamics (Trutoiu et al., Disney Research / ACM TAP
+    // 2011) — ~80ms accelerating close, brief closure, ~220ms asymptotic
+    // reopen, randomized 2–6s apart with occasional double blinks. ──
+    const u = J.head.material.uniforms;
+    u.uTime.value = t;
+
     const target = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12)
       * (1 - 0.35 * J.levelHF);
     J.env += (target - J.env) * (target > J.env ? 0.55 : 0.10);
-    const open = J.env;
-    const mc = (J.mouthY[0] + J.mouthY[1]) / 2;
-    const mh = Math.max(0.7, (J.mouthY[1] - J.mouthY[0]) / 2);
-    for (let k = 0; k < J.mouthIdx.length; k++) {
-      const n = J.mouthIdx[k];
-      const bx = J.basePos[n * 3], by = J.basePos[n * 3 + 1];
-      const rel = (by - mc) / mh;                                  // −1 chin … +1 upper lip
-      const jaw = Math.max(0, Math.min(1.1, 0.55 - 0.55 * rel));   // jaw drop grows downward
-      const corner = 0.3 + 0.7 * Math.max(0, 1 - Math.abs(bx) / J.mouthXh);
-      const jit = open * 0.22 * J.jit[k];
-      posAttr.array[n * 3 + 1] = by - (open * jaw * corner * mh * 1.5) - jit;
-      // the lip line parts slightly FORWARD (stays in front of the occluder)
-      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2]
-        + open * corner * Math.max(0, 1 - Math.abs(rel)) * 0.7;
-    }
+    u.uOpen.value = J.env;
 
-    // ── blink: measured human dynamics (Trutoiu et al., Disney Research /
-    // ACM TAP 2011): the close is short with high acceleration (~80ms), the
-    // reopen lasts longer and decelerates asymptotically (~220ms) — a
-    // symmetric blink reads sleepy/robotic. Randomized 2–6s apart with
-    // occasional double blinks. The lid is GEOMETRIC: the upper points of
-    // the eye band sweep DOWN over the eye (lids close, not lights dim) ──
     if (J.blinkT < 0 && t >= J.blinkAt) J.blinkT = t;
     let lid = 0;
     if (J.blinkT >= 0) {
@@ -855,42 +837,20 @@ function tick() {
         J.blinkAt = t + (Math.random() < 0.12 ? 0.25 : 2 + Math.random() * 4);
       }
     }
-    if (lid > 0 || J.lidPrev > 0) {
-      const ey0 = J.eyesY[0], eh = Math.max(0.5, J.eyesY[1] - J.eyesY[0]);
-      for (const n of J.eyeIdx) {
-        const by = J.basePos[n * 3 + 1];
-        const relE = (by - ey0) / eh;                              // 0 low … 1 top of band
-        posAttr.array[n * 3 + 1] = by - lid * relE * eh * 0.85;
-      }
-    }
-    J.lidPrev = lid;
-    posAttr.needsUpdate = true;
+    u.uLid.value = lid;
 
-    const colAttr = J.headGeo.attributes.color;
-    if ((Math.round(t * 60) & 3) === 0) {
-      const mix = 0.14;
-      for (let n = 0; n < colAttr.count; n++) {
-        const b = J.baseB[n], w = J.baseW[n];
-        colAttr.array[n * 3]     += (b * (tint[0] * (1 - w) + w) - colAttr.array[n * 3]) * mix;
-        colAttr.array[n * 3 + 1] += (b * (tint[1] * (1 - w) + w) - colAttr.array[n * 3 + 1]) * mix;
-        colAttr.array[n * 3 + 2] += (b * (tint[2] * (1 - w) + w) - colAttr.array[n * 3 + 2]) * mix;
-      }
-      colAttr.needsUpdate = true;
-    }
-    // eyes are written ABSOLUTELY every frame; the closing lid shadows them
-    const shadow = 1 - 0.45 * lid;
-    for (const n of J.eyeIdx) {
-      const b = J.baseB[n], we = J.baseW[n];
-      colAttr.array[n * 3]     = b * (tint[0] * (1 - we) + we) * shadow;
-      colAttr.array[n * 3 + 1] = b * (tint[1] * (1 - we) + we) * shadow;
-      colAttr.array[n * 3 + 2] = b * (tint[2] * (1 - we) + we) * shadow;
-    }
-    if (J.eyeIdx.length) colAttr.needsUpdate = true;
+    // mode tint eases over (thinking = lit-up electric cyan)
+    const tc = u.uTint.value;
+    tc.x += (tint[0] - tc.x) * 0.05;
+    tc.y += (tint[1] - tc.y) * 0.05;
+    tc.z += (tint[2] - tc.z) * 0.05;
+
+    u.uSize.value = 1.05 + Math.min(0.35, J.level * 0.25)
+      + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.07 : 0);
+
     // the glints slip under the closing lid
     const gvis = (1 - lid) * (1 - lid);
     for (const g of J.glints) g.material.opacity = 0.85 * gvis;
-    J.head.material.size = 0.62 + Math.min(0.3, J.level * 0.22)
-      + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.05 : 0);
   }
 
   if (J.matrix) J.matrix.rotation.y = Math.sin(t * 0.02) * 0.03;
@@ -1135,15 +1095,97 @@ async function mount(container, opts) {
   J.env = 0; J.levelHF = 0;
   J.blinkAt = J.t + 1.5 + Math.random() * 3;
   J.blinkT = -1; J.lidPrev = 0;
+  // ── the bust as DISCRETE memory-node dots, animated ON THE GPU ──
+  // Per-particle data (base position, brightness, mouth/lid displacement
+  // vectors, seeds) is uploaded ONCE as attributes; per frame only uniforms
+  // change (uOpen/uLid/uTint/uTime). Per-frame JS attribute writes — the old
+  // approach — are the documented anti-pattern for particle morph animation.
+  const N = bri.length;
+  const aB = new Float32Array(N), aWm = new Float32Array(N);
+  const aSeed = new Float32Array(N), aSize = new Float32Array(N);
+  const aMouthVec = new Float32Array(N * 3);
+  const aLid = new Float32Array(N), aEye = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    aB[i] = bri[i]; aWm[i] = wmi[i];
+    aSeed[i] = Math.random();
+    aSize[i] = 0.8 + Math.random() * 0.5 + Math.min(0.25, Math.max(0, bri[i] - 0.9));
+  }
+  // bake the research-grounded displacements at open=1 / lid=1: jaw drop
+  // grows toward the chin (corners sealed, upper lip near-static); the lid
+  // sweep pulls upper eye-band dots down over the eye
+  {
+    const mc = (mouthY[0] + mouthY[1]) / 2;
+    const mh = Math.max(0.7, (mouthY[1] - mouthY[0]) / 2);
+    for (const n of mouthIdx) {
+      const bx = pos[n * 3], by = pos[n * 3 + 1];
+      const rel = (by - mc) / mh;
+      const jaw = Math.max(0, Math.min(1.1, 0.55 - 0.55 * rel));
+      const corner = 0.3 + 0.7 * Math.max(0, 1 - Math.abs(bx) / J.mouthXh);
+      aMouthVec[n * 3 + 1] = -(jaw * corner * mh * 1.5) - 0.22 * (Math.random() * 2 - 1);
+      aMouthVec[n * 3 + 2] = corner * Math.max(0, 1 - Math.abs(rel)) * 0.7;
+    }
+    const ey0 = J.eyesY[0], eh = Math.max(0.5, J.eyesY[1] - J.eyesY[0]);
+    for (const n of eyeIdx) {
+      aLid[n] = -(pos[n * 3 + 1] - ey0) * 0.85;
+      aEye[n] = 1;
+    }
+  }
   J.headGeo = new THREE.BufferGeometry();
   J.headGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
-  J.headGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(col), 3));
-  J.head = new THREE.Points(J.headGeo, new THREE.PointsMaterial({
-    size: 0.55, map: glowTexture(), vertexColors: true, transparent: true,
-    opacity: 0.62, depthWrite: false, blending: THREE.AdditiveBlending,
-    sizeAttenuation: true,
+  J.headGeo.setAttribute('aB', new THREE.BufferAttribute(aB, 1));
+  J.headGeo.setAttribute('aW', new THREE.BufferAttribute(aWm, 1));
+  J.headGeo.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 1));
+  J.headGeo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
+  J.headGeo.setAttribute('aMouthVec', new THREE.BufferAttribute(aMouthVec, 3));
+  J.headGeo.setAttribute('aLid', new THREE.BufferAttribute(aLid, 1));
+  J.headGeo.setAttribute('aEye', new THREE.BufferAttribute(aEye, 1));
+  J.head = new THREE.Points(J.headGeo, new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    uniforms: {
+      uTime: { value: 0 }, uOpen: { value: 0 }, uLid: { value: 0 },
+      uSize: { value: 1.05 }, uScale: { value: 1000 }, uOpacity: { value: 0.9 },
+      uTint: { value: new THREE.Vector3(MODE_TINT.idle[0], MODE_TINT.idle[1], MODE_TINT.idle[2]) },
+    },
+    vertexShader: `
+      attribute float aB; attribute float aW; attribute float aSeed;
+      attribute float aSize; attribute vec3 aMouthVec;
+      attribute float aLid; attribute float aEye;
+      uniform float uTime, uOpen, uLid, uSize, uScale;
+      uniform vec3 uTint;
+      varying vec3 vColor;
+      void main() {
+        vec3 p = position + aMouthVec * uOpen;
+        p.y += aLid * uLid;
+        // organic micro-drift: each dot breathes on its own seed
+        p += 0.06 * vec3(sin(uTime * 1.1 + aSeed * 17.0),
+                         sin(uTime * 1.4 + aSeed * 29.0),
+                         sin(uTime * 0.9 + aSeed * 41.0));
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        float shade = 1.0 - 0.45 * uLid * aEye;   // closing lid shadows the eye
+        vColor = aB * shade * mix(uTint, vec3(1.0), aW);
+        gl_PointSize = uSize * aSize * (uScale / -mv.z);   // manual attenuation
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform float uOpacity;
+      varying vec3 vColor;
+      void main() {
+        float r = length(gl_PointCoord - 0.5) * 2.0;
+        if (r > 1.0) discard;
+        float core = smoothstep(0.45, 0.0, r);              // bright node core
+        float halo = pow(max(0.0, 1.0 - r), 2.4) * 0.5;     // soft glow skirt
+        gl_FragColor = vec4(vColor * (core + halo), (core + halo) * uOpacity);
+      }`,
   }));
   J.head.renderOrder = 1;
+  // manual size attenuation (ShaderMaterial loses sizeAttenuation): points
+  // are sized in device pixels from the drawing-buffer height and the fov
+  J.setPtScale = () => {
+    if (!J.head || !J.renderer) return;
+    J.head.material.uniforms.uScale.value =
+      J.renderer.domElement.height / (2 * Math.tan(23 * D2R));
+  };
+  J.setPtScale();
 
   J.headGroup = new THREE.Group();
   J.headGroup.add(J.head);
@@ -1181,6 +1223,7 @@ async function mount(container, opts) {
     J.camera.aspect = W / H;
     J.camera.updateProjectionMatrix();
     J.renderer.setSize(W, H);
+    if (J.setPtScale) J.setPtScale();
   });
   J.resizeObs.observe(container);
 
