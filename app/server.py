@@ -3201,6 +3201,93 @@ async def task_app_log(task_id: str):
     return {"log": _apps.log_tail(ws) if ws else ""}
 
 
+# ── Project app preview (v3.6): ▶ run the WHOLE assembled project, at the
+# current state or any earlier one — old and new side by side on their own
+# ports. Materialization is always into a disposable copy (project_preview.py);
+# the live worktree / task workspaces are never run in place. ──
+
+def _wf_member_tasks(wf_id: str) -> list[dict]:
+    return db.query_all("SELECT * FROM tasks WHERE workflow_id=? ORDER BY created_at",
+                        (wf_id,))
+
+
+def _wf_running_states(wf_id: str) -> list[dict]:
+    import app_runner as _apps
+    import project_preview as pp
+    return [{**a, "version": a["key"].split(":", 2)[2]}
+            for a in _apps.instances(pp.app_key(wf_id, ""))]
+
+
+@app.get("/api/workflows/{wf_id}/app")
+async def workflow_app_status(wf_id: str):
+    """The project's runnable history (git commits / stage checkpoints) plus
+    every running preview instance of it."""
+    import project_preview as pp
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    info = pp.list_states(dict(w), _wf_member_tasks(wf_id))
+    info.pop("repo", None)  # UI needs mode/states/latest/note only
+    return {**info, "running": _wf_running_states(wf_id)}
+
+
+@app.post("/api/workflows/{wf_id}/app/start")
+async def workflow_app_start(wf_id: str, body: dict):
+    import app_runner as _apps
+    import project_preview as pp
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    version = (body.get("version") or "").strip()
+    running = _wf_running_states(wf_id)
+    for a in running:
+        if version and a["version"] == version:
+            return {"ok": True, **a}  # already up — never rebuild under a live server
+    loop_ = asyncio.get_running_loop()
+    mat = await loop_.run_in_executor(
+        None, pp.materialize, dict(w), _wf_member_tasks(wf_id), version or None)
+    if mat.get("error"):
+        return JSONResponse(status_code=409, content={"ok": False, "error": mat["error"]})
+    for a in running:  # empty version resolved to a state that is already up
+        if a["version"] == mat["key"]:
+            return {"ok": True, **a}
+    pp.gc(wf_id, {a["version"] for a in running} | {mat["key"]})
+    res = await loop_.run_in_executor(
+        None, _apps.start_app, pp.app_key(wf_id, mat["key"]), mat["dir"])
+    res["version"] = mat["key"]
+    return res if res.get("ok") else JSONResponse(status_code=409, content=res)
+
+
+@app.post("/api/workflows/{wf_id}/app/stop")
+async def workflow_app_stop(wf_id: str, body: dict):
+    """Stop one project preview state ({version}) or all of them (empty body)."""
+    import app_runner as _apps
+    import project_preview as pp
+    if not _owned_workflow(wf_id):
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    version = (body.get("version") or "").strip()
+    if version:
+        return _apps.stop_app(pp.app_key(wf_id, version))
+    for a in _wf_running_states(wf_id):
+        _apps.stop_app(a["key"])
+    return {"ok": True}
+
+
+@app.get("/api/workflows/{wf_id}/app/log")
+async def workflow_app_log(wf_id: str, version: str = ""):
+    import app_runner as _apps
+    import project_preview as pp
+    if not _owned_workflow(wf_id):
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    v = version.strip()
+    # state keys are v<N> or short git shas — reject anything that could walk
+    # out of the preview root (the raw value becomes a path component below)
+    if not v or not _re.fullmatch(r"[A-Za-z0-9._-]+", v):
+        return {"log": ""}
+    d = pp.state_dir(wf_id, v)
+    return {"log": _apps.log_tail(str(d)) if d.is_dir() else ""}
+
+
 # ── Attachments: operator-supplied input files on tasks & projects ──
 
 _ATTACH_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf",

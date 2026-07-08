@@ -289,6 +289,18 @@ chk "cache-buster bumped (55)"       "grep -oP 'app.js\?v=\\K[0-9]+' static/inde
 chk "settings v2 spec + gate"        "[ -f docs/SPEC-SETTINGS-V2.md ] && [ -f scripts/verify_settings_e2e.py ]"
 
 echo ""
+echo -e "${YELLOW}═══ 16. PROJECT APP PREVIEW (v3.6 — run the whole project, any state) ═══${NC}"
+chk "project_preview module"         "[ -f project_preview.py ]"
+chk "pp list_states + materialize"   "grep -q 'def list_states' project_preview.py && grep -q 'def materialize' project_preview.py && grep -q 'def app_key' project_preview.py"
+chk "pp git + workspace modes"       "grep -q '\"mode\": \"git\"' project_preview.py && grep -q '\"mode\": \"workspace\"' project_preview.py"
+chk "pp git archive (read-only)"     "grep -q 'git.*archive' project_preview.py"
+chk "pp membership injection gate"   "grep -q 'any(s\\[.key.\\] == key for s in info' project_preview.py"
+chk "app_runner instances() helper"  "grep -q 'def instances' app_runner.py"
+chk "workflow app endpoints"         "grep -q '/api/workflows/{wf_id}/app/start' server.py && grep -q '/api/workflows/{wf_id}/app/stop' server.py && grep -q '/api/workflows/{wf_id}/app/log' server.py"
+chk "project preview UI"             "grep -q 'function projectAppUI' static/app.js && grep -q 'function projectAppModal' static/app.js && grep -q 'function projAppStart' static/app.js"
+chk "Test project button wired"      "grep -q 'Test project' static/app.js"
+
+echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then
   echo -e "  ${GREEN}ALL CHECKS PASSED: $PASS/$PASS${NC}"
