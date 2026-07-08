@@ -41,7 +41,7 @@ KEY = np.array([-0.45, 0.55, 0.8]); KEY = KEY / np.linalg.norm(KEY)
 # the full model is scaled to 42 units to get a ~24-unit head.
 MODEL_H = 42.0
 CROWN_Y = 28.0
-SHO_TOP = -11.0      # torso starts under the scan's own shoulder stump
+# torso top is measured from the scan stump at build time (sho_top)
 
 
 def parse_glb(path):
@@ -102,25 +102,40 @@ def main():
     N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-6)
     B = shade(N)
 
+    # ── measure the stump's bottom cross-section so the torso continues it
+    #    EXACTLY (the v8.0 torso started lower and wider → a visible shelf) ──
+    stump_y0 = pos[:, 1].min()
+    sel = pos[:, 1] < stump_y0 + 2.0
+    stump_hw = float(np.quantile(np.abs(pos[sel, 0]), 0.98))
+    stump_dp = float(np.quantile(np.abs(pos[sel, 2]), 0.98))
+    stump_cz = float(np.median(pos[sel, 2]))
+    sho_top = stump_y0 + 1.2          # torso tucks UP inside the stump
+
+    # fade the scan's open bottom edge into the torso (the boundary rim
+    # otherwise catches rim light as a bright seam line)
+    fade = np.clip((P[:, 1] - stump_y0) / 2.0, 0, 1)
+    B = B * (0.45 + 0.55 * fade)
+
     pts = [P]
     bri = [B]
 
-    # ── procedural torso under the scan's stump (superellipse slab; the scan
-    #    provides its own neck + shoulder start) ──
+    # ── procedural torso: starts at the measured stump section, flares out ──
     k = 14000
     u = rng.random(k) * 2 * np.pi
     v = rng.random(k)
-    slope = np.clip(v / 0.5, 0, 1); slope = slope * slope * (3 - 2 * slope)
-    halfw = 11 + 12.5 * slope
-    depth = 7.5 + 2.5 * slope
+    slope = np.clip(v / 0.55, 0, 1); slope = slope * slope * (3 - 2 * slope)
+    halfw = stump_hw * 0.98 + (23.5 - stump_hw) * slope
+    depth = stump_dp * 0.98 + 2.5 * slope
     c, sn = np.cos(u), np.sin(u)
     kk = 3
     denom = np.power(np.power(np.abs(sn / halfw), kk) + np.power(np.abs(c / depth), kk), 1 / kk)
     r = 1 / np.maximum(denom, 1e-4)
-    ps = np.stack([sn * r, SHO_TOP - v * 19, c * r * 0.92], axis=1)
+    ps = np.stack([sn * r, sho_top - v * 20, c * r + stump_cz], axis=1)
     nsh = np.stack([sn, np.zeros(k), c], axis=1)
     cloth = 0.42 + 0.1 * np.abs(np.sin(v * 6) * np.sin(u * 12))
-    pts.append(ps); bri.append(shade(nsh, 0.42) * cloth)
+    # soft top: torso brightens in over its first stretch (joint melts away)
+    joint = 0.5 + 0.5 * np.clip(v / 0.12, 0, 1)
+    pts.append(ps); bri.append(shade(nsh, 0.42) * cloth * joint)
 
     P = np.concatenate(pts)
     B = np.clip(np.concatenate(bri), 0.03, 1.35)
@@ -150,13 +165,14 @@ def main():
                 idxs += [a, b, cq, b, d, cq]
         return {"v": verts, "i": idxs}
     def sho(a, b):
-        sl = min(1, max(0, b / 0.5)); sl = sl * sl * (3 - 2 * sl)
-        hw, dp = 11 + 12.5 * sl, 7.5 + 2.5 * sl
+        sl = min(1, max(0, b / 0.55)); sl = sl * sl * (3 - 2 * sl)
+        hw = stump_hw * 0.98 + (23.5 - stump_hw) * sl
+        dp = stump_dp * 0.98 + 2.5 * sl
         ang = a * 2 * math.pi
         c2, s2 = math.cos(ang), math.sin(ang)
         dn = (abs(s2 / hw) ** 3 + abs(c2 / dp) ** 3) ** (1 / 3)
         r2 = 1 / max(1e-4, dn)
-        return (s2 * r2, SHO_TOP - b * 19, c2 * r2 * 0.92)
+        return (s2 * r2, sho_top - b * 20, c2 * r2 + stump_cz)
     occ.append(grid_occ(sho, 40, 18))
 
     out = {
