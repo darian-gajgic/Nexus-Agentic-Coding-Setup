@@ -37,15 +37,20 @@ PREVIEW = Path("/tmp/claude-1000/-home-sinep-Nexus-Agentic-Coding-Setup/de8d5241
 
 N_HEAD = 46000
 KEY = np.array([-0.45, 0.55, 0.8]); KEY = KEY / np.linalg.norm(KEY)
+# dim counter-key from the right so the shadow side keeps its form
+KEY2 = np.array([0.65, 0.05, 0.60]); KEY2 = KEY2 / np.linalg.norm(KEY2)
 
 # world placement (matches jarvis3d.js camera/framing).
-# The GLB spans crown→shoulder stump; the cranium is ~57% of that span, so
-# the full model is scaled to 42 units to get a ~24-unit head.
-MODEL_H = 42.0
+# The GLB spans crown→shoulder stump; the cranium is ~57% of that span.
+# v11: the bust is 1.5× bigger (63 units, ~36-unit head) so the face fills
+# the frame; SAME 46k particles = finer relative detail, crisper features.
+MODEL_H = 63.0
 # The bust anchors to the BOTTOM of the frame: the camera (fov 46°, z=88,
 # y drifting −2.5…10.5) puts the lowest visible bottom edge at y≈−39.9, so
-# a crown at 1.5 keeps the scan's open cut (1.5−42 = −40.5) always off-frame.
-CROWN_Y = 1.5
+# a crown at 22.5 keeps the scan's open cut (22.5−63 = −40.5) always off-frame.
+CROWN_Y = 22.5
+HEAD_H = 24.0 * MODEL_H / 42.0   # cranium height in world units (36)
+SC = MODEL_H / 42.0              # scale factor vs the v9 placement (1.5)
 
 
 def parse_glb(path):
@@ -72,10 +77,15 @@ def parse_glb(path):
 
 
 def shade(n, rim_k=0.32):
+    # sculpted portrait light: sharp key falloff + dim counter-key + gentle
+    # fill/sky. (The old flat 0.24 frontal fill washed out every feature —
+    # brow, nose, lips read only if their shadows survive.)
     lam = np.clip(n @ KEY, 0, None)
-    fill = np.clip(n[:, 2], 0, None) * 0.24    # frontal fill: the face must read
-    rim = np.power(1 - np.abs(n[:, 2]), 2.0) * rim_k
-    return 0.12 + 0.55 * np.power(lam, 1.2) + fill + rim
+    lam2 = np.clip(n @ KEY2, 0, None)
+    fill = np.clip(n[:, 2], 0, None) * 0.15
+    rim = np.power(1 - np.abs(n[:, 2]), 2.6) * rim_k
+    up = np.clip(n[:, 1], 0, None) * 0.06
+    return 0.07 + 0.78 * np.power(lam, 1.4) + 0.20 * np.power(lam2, 1.3) + fill + rim + up
 
 
 def main():
@@ -91,11 +101,16 @@ def main():
     pos *= s
     pos[:, 1] += CROWN_Y - pos[:, 1].max()
 
-    # ── area-weighted surface sampling ──
+    # ── area-weighted surface sampling, biased toward the FACE: front
+    # triangles get up to 2.6× density so the same 46k points carry more
+    # feature detail where it counts (occiput/neck give it up) ──
     v0, v1, v2 = pos[tri[:, 0]], pos[tri[:, 1]], pos[tri[:, 2]]
     n0, n1, n2 = nrm[tri[:, 0]], nrm[tri[:, 1]], nrm[tri[:, 2]]
     area = np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1) / 2
-    prob = area / area.sum()
+    cent_z = (v0[:, 2] + v1[:, 2] + v2[:, 2]) / 3
+    facew = 1 + 1.6 * np.clip(cent_z / (cent_z.max() + 1e-9), 0, 1)
+    prob = area * facew
+    prob = prob / prob.sum()
     rng = np.random.default_rng(7)
     t = rng.choice(len(tri), N_HEAD, p=prob)
     r1, r2 = rng.random(N_HEAD), rng.random(N_HEAD)
@@ -113,13 +128,28 @@ def main():
     B = B * (0.45 + 0.55 * fade)
     B = np.clip(B, 0.03, 1.35)
 
-    # ── animation bands (fractions of the ~24-unit head, verified on previews) ──
-    eyes_y = CROWN_Y - 0.475 * 24
-    mouth_y = CROWN_Y - 0.775 * 24
+    # ── animation bands (fractions of the head height, verified on previews) ──
+    eyes_y = CROWN_Y - 0.475 * HEAD_H
+    mouth_y = CROWN_Y - 0.775 * HEAD_H
     meta = {
-        "mouth": [round(mouth_y - 1.9, 2), round(mouth_y + 1.9, 2), 5.5],
-        "eyes": [round(eyes_y - 1.6, 2), round(eyes_y + 1.6, 2), 8.0],
+        "mouth": [round(mouth_y - 1.9 * SC, 2), round(mouth_y + 1.9 * SC, 2), round(5.5 * SC, 2)],
+        "eyes": [round(eyes_y - 1.6 * SC, 2), round(eyes_y + 1.6 * SC, 2), round(8.0 * SC, 2)],
     }
+
+    # ── eye glints measured from the sampled surface, so the sparks sit ON
+    # the eyes (the old hardcoded x±3.6/z9.6 floated in front of the face) ──
+    glints = []
+    for side in (-1.0, 1.0):
+        sel_g = ((np.abs(P[:, 1] - eyes_y) < 1.6 * SC)
+                 & (P[:, 0] * side > 2.0 * SC) & (P[:, 0] * side < 7.0 * SC)
+                 & (P[:, 2] > 0))
+        if sel_g.sum() < 10:
+            glints.append([round(side * 3.6 * SC, 2), round(eyes_y, 2), round(9.6 * SC, 2)])
+        else:
+            gx = float(np.median(P[sel_g, 0]))
+            gz = float(np.quantile(P[sel_g, 2], 0.9))
+            glints.append([round(gx, 2), round(eyes_y, 2), round(gz, 2)])
+    meta["glints"] = glints
 
     # ── occluder: the full head mesh (hides the far-side particles) ──
     occ = [{
@@ -145,8 +175,8 @@ def main():
         x2 = P[:, 0] * c2 + P[:, 2] * s2
         Wp = Hp = 900
         canvas = np.zeros((Hp, Wp), np.float32)
-        px = ((x2 + 30) / 60 * Wp).astype(int)
-        py = ((CROWN_Y + 6 - P[:, 1]) / 60 * Hp).astype(int)
+        px = ((x2 + 42) / 84 * Wp).astype(int)
+        py = ((CROWN_Y + 10 - P[:, 1]) / 84 * Hp).astype(int)
         ok = (px > 1) & (px < Wp - 2) & (py > 1) & (py < Hp - 2)
         for i in np.where(ok)[0]:
             canvas[py[i] - 1:py[i] + 2, px[i] - 1:px[i] + 2] += B[i] * 0.5
