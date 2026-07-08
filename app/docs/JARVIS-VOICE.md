@@ -18,10 +18,22 @@ dormant). The v2 stack:
   into static/avatar/head_points.json incl. the opaque head-occluder mesh;
   jarvis3d.js loads that (procedural sculpt = fallback). The v8 procedural
   torso is GONE: the bust is anchored at the frame BOTTOM so the scan's open
-  neck/shoulder cut stays below the visible edge. v12: MODEL_H 44.1 (30%
-  down from the v11 1.5×; crown y=3.6, cut −40.5 — still off-frame), SAME
-  46k points (face-weighted sampling + sculpted two-key shading), eye-glint
-  positions MEASURED from the scan and baked into the JSON ("glints").
+  neck/shoulder cut stays below the visible edge. v12: MODEL_H 44.1 (crown
+  y=3.6, cut −40.5 — off-frame), face-weighted sampling + sculpted two-key
+  shading, eye-glint positions MEASURED from the scan ("glints" in the JSON).
+  **v13 (2026-07-08): the bust is 7,000 DISCRETE memory-node dots animated
+  100% ON THE GPU.** A custom ShaderMaterial Points renders each dot as a
+  bright core + soft halo from gl_PointCoord with MANUAL size attenuation
+  (gl_PointSize = uSize·aSize·uScale/−mv.z; uScale from drawing-buffer
+  height + fov, updated on resize). Per-particle data is uploaded ONCE as
+  attributes (aB brightness, aW white-mix, aSeed, aSize, aMouthVec = baked
+  jaw-drop displacement at open=1, aLid = baked lid sweep at lid=1, aEye);
+  per frame ONLY uniforms change (uOpen/uLid/uTint/uTime/uSize) — per-frame
+  JS attribute writes (the old approach) are the documented anti-pattern
+  for particle morphing. Organic per-dot micro-drift runs in the vertex
+  shader off aSeed. The blink/lip-sync CURVES (Disney blink dynamics,
+  attack/release envelope, sibilance narrowing) are unchanged — they just
+  drive uniforms now.
   **Animations are research-grounded (2026-07-08):** blink follows measured
   human dynamics (Trutoiu et al., Disney Research, ACM TAP 2011 — fast
   accelerating ~80ms close, brief closure, slow asymptotic ~220ms reopen;

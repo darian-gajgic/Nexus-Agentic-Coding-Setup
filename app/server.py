@@ -1984,7 +1984,17 @@ async def jarvis_chat_stream(body: dict):
             targets = sorted(imgs, key=lambda f: f.stat().st_mtime, reverse=True)[:1]
         for f in targets:
             try:
-                desc = await _vision_mod.describe_image(f.read_bytes(), user_input[:300])
+                raw = f.read_bytes()
+                if len(raw) > 1_500_000:
+                    # multi-MB camera rolls choke the VLM — downscale first
+                    import io as _io
+                    from PIL import Image as _Im
+                    im = _Im.open(_io.BytesIO(raw)).convert("RGB")
+                    im.thumbnail((1280, 1280))
+                    buf = _io.BytesIO()
+                    im.save(buf, "JPEG", quality=88)
+                    raw = buf.getvalue()
+                desc = await _vision_mod.describe_image(raw, user_input[:300])
                 img_notes.append(f"[JARVIS EYES — image file '{f.name}' from the file "
                                  f"exchange, seen through your own local vision: {desc}]")
             except Exception as e:
