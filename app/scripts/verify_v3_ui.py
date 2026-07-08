@@ -87,8 +87,11 @@ async def main():
         ok("messages tab renders", await page.locator("#msgInput").count() == 1)
 
         await page.click('.dtab:has-text("Cost")')
-        await page.wait_for_timeout(700)
-        ok("cost tab renders", await page.locator('.drawer-sec h4:has-text("Token spend")').count() == 1)
+        try:  # wait-based, not fixed-sleep: the cost fetch is slow under load
+            await page.wait_for_selector('.drawer-sec h4:has-text("Token spend")', timeout=8000)
+            ok("cost tab renders", True)
+        except Exception:
+            ok("cost tab renders", False, "Token spend section never rendered")
         await page.screenshot(path=f"{SHOTS}/v3_drawer.png")
         await page.click('.drawer .btn-icon[title="Close"]')
         await page.wait_for_timeout(400)

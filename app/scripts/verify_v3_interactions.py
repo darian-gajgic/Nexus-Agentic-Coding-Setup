@@ -78,13 +78,18 @@ async def main():
         await page.wait_for_timeout(700)
         await page.fill("#memAddInput", "e2e drawer memory test")
         await page.click('#drawerBody button:has-text("Add")')
-        await page.wait_for_timeout(900)
-        ok("memory added via drawer", await page.locator('#drawerBody:has-text("e2e drawer memory test")').count() > 0)
-        # delete it again
+        try:  # wait-based, not fixed-sleep (the add re-render is an async fetch)
+            await page.wait_for_selector('.mem-item:has-text("e2e drawer memory test")', timeout=6000)
+            ok("memory added via drawer", True)
+        except Exception:
+            ok("memory added via drawer", False, "item never rendered")
+        # delete ALL matching rows — an earlier aborted run may have left one behind
         row = page.locator('.mem-item:has-text("e2e drawer memory test") button[title="Forget"]')
-        if await row.count():
+        for _ in range(5):
+            if not await row.count():
+                break
             await row.first.click()
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(600)
         ok("memory deleted via drawer", await page.locator('#drawerBody:has-text("e2e drawer memory test")').count() == 0)
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(400)
@@ -123,8 +128,11 @@ async def main():
         await page.wait_for_timeout(500)
         ok("watchdog modal opens", await page.locator("#wd-interval").count() == 1)
         await page.click('button:has-text("Save")')
-        await page.wait_for_timeout(900)
-        ok("watchdog config saved (toast)", await page.locator('.toast:has-text("Watchdog config saved")').count() > 0)
+        try:  # wait-based: the save round-trip outlives a fixed sleep under load
+            await page.wait_for_selector('.toast:has-text("Watchdog config saved")', timeout=6000)
+            ok("watchdog config saved (toast)", True)
+        except Exception:
+            ok("watchdog config saved (toast)", False, "toast never appeared")
 
         # 6. JARVIS still boots (no voice interaction)
         await page.click('a.nav-item[data-view="jarvis"]')

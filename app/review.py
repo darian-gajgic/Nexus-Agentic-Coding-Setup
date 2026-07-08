@@ -67,10 +67,14 @@ def list_versions(ws: str) -> list[str]:
 # ── unified diff parsing (git diff text AND difflib output) ──
 
 def parse_unified(text: str) -> list[dict]:
-    """Unified diff → [{path, status, additions, deletions, hunks}]."""
+    """Unified diff → [{path, status, additions, deletions, hunks}].
+    Every hunk line carries its real file position (`o` = old line no,
+    `n` = new line no) so the UI can anchor per-line comments and build
+    the side-by-side view."""
     files: list[dict] = []
     cur: dict | None = None
     hunk: dict | None = None
+    old_no = new_no = 0
     for raw in (text or "").splitlines():
         if raw.startswith("diff --git "):
             m = re.match(r'diff --git a/(.*?) b/(.*)$', raw)
@@ -100,18 +104,85 @@ def parse_unified(text: str) -> list[dict]:
                 files.append(cur)
             hunk = {"header": raw[:120], "lines": []}
             cur["hunks"].append(hunk)
+            m = re.match(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', raw)
+            old_no = int(m.group(1)) if m else 1
+            new_no = int(m.group(2)) if m else 1
         elif hunk is not None and cur is not None:
             if sum(len(h["lines"]) for h in cur["hunks"]) > MAX_HUNK_LINES:
                 continue
             if raw.startswith("+"):
                 cur["additions"] += 1
-                hunk["lines"].append({"t": "+", "s": raw[1:][:500]})
+                hunk["lines"].append({"t": "+", "s": raw[1:][:500], "n": new_no})
+                new_no += 1
             elif raw.startswith("-"):
                 cur["deletions"] += 1
-                hunk["lines"].append({"t": "-", "s": raw[1:][:500]})
+                hunk["lines"].append({"t": "-", "s": raw[1:][:500], "o": old_no})
+                old_no += 1
             elif raw.startswith(" ") or raw == "":
-                hunk["lines"].append({"t": " ", "s": raw[1:][:500]})
+                hunk["lines"].append({"t": " ", "s": raw[1:][:500],
+                                      "o": old_no, "n": new_no})
+                old_no += 1
+                new_no += 1
     return files
+
+
+# ── syntax highlighting (Pygments — server-side, no build step) ──
+# The `h` field is Pygments-generated HTML whose text content is fully
+# escaped by Pygments itself; it is the ONLY server HTML the frontend may
+# inject raw. Anything without `h` renders through esc() as before.
+
+def _lexer_for(path: str):
+    try:
+        from pygments.lexers import get_lexer_for_filename
+        return get_lexer_for_filename(path, stripnl=False, ensurenl=False)
+    except Exception:
+        return None
+
+
+def highlight_file(f: dict) -> None:
+    """Attach `h` (highlighted HTML) to each hunk line of a text-y file entry.
+    Each hunk is highlighted per side (old = context+deletions, new =
+    context+additions) so multi-line constructs survive within the hunk.
+    Any mismatch falls back to plain rendering for that side."""
+    if f.get("binary") or f.get("kind") in ("image", "binary", "pdf") or not f.get("hunks"):
+        return
+    lexer = _lexer_for(f.get("path") or "")
+    if lexer is None:
+        return
+    try:
+        from pygments import highlight as _pyg_highlight
+        from pygments.formatters import HtmlFormatter
+    except Exception:
+        return
+    fmt = HtmlFormatter(nowrap=True)
+    for hunk in f["hunks"]:
+        lines = hunk.get("lines") or []
+        # new side last so context lines keep the new-side highlight
+        for types in ((" ", "-"), (" ", "+")):
+            idxs = [i for i, ln in enumerate(lines) if ln["t"] in types]
+            if not idxs:
+                continue
+            try:
+                out = _pyg_highlight("\n".join(lines[i]["s"] for i in idxs),
+                                     lexer, fmt)
+            except Exception:
+                continue
+            out_lines = out.split("\n")
+            while out_lines and out_lines[-1] == "":
+                out_lines.pop()
+            if len(out_lines) != len(idxs):
+                continue
+            for i, html in zip(idxs, out_lines):
+                lines[i]["h"] = html
+
+
+def highlight_files(files: list[dict]) -> None:
+    total = 0
+    for f in files:
+        total += sum(len(h.get("lines") or []) for h in (f.get("hunks") or []))
+        if total > MAX_HUNK_LINES * 3:  # highlighting is decoration, not worth stalling huge reviews
+            return
+        highlight_file(f)
 
 
 def _difflib_files(old_text: str, new_text: str, path: str) -> dict:
@@ -229,6 +300,7 @@ def build_task_review(task: dict) -> dict:
         diff_file = Path(ws) / "changes.diff"
         if diff_file.is_file():
             files = parse_unified(diff_file.read_text(errors="replace"))
+            highlight_files(files)
             return {"mode": "git", "source": "branch diff vs base",
                     "files": files,
                     "additions": sum(f["additions"] for f in files),
@@ -238,6 +310,7 @@ def build_task_review(task: dict) -> dict:
     versions = list_versions(ws)
     prev = str(Path(ws) / "_history" / versions[-1]) if versions else None
     files = compare_dirs(prev, ws, f"/api/tasks/{tid}/files")
+    highlight_files(files)
     return {"mode": "workspace",
             "source": f"current output vs {versions[-1] if versions else 'nothing (first version — everything is new)'}",
             "versions": versions,
