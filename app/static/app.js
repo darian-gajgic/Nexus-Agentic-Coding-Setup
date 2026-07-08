@@ -6607,9 +6607,11 @@ async function jarvisStreamChat(text) {
       .then(() => jarvisLoadSessions()).catch(() => { });
   }
 
-  // eyes: if a share is live and the words reference seeing, ride the frame along
+  // eyes: if a share is live and the words reference seeing, ride the frame along.
+  // Broad on purpose — a miss leaves JARVIS blind and he may improvise (e.g. try
+  // to shell into the frames dir), so cover common perception phrasings too.
   let frame = null, frameKind = null;
-  const wantsEyes = /\b(see|look|watch|read|this|screen|camera|showing|show you|front of)\b/i.test(text);
+  const wantsEyes = /\b(see|look|looking|watch|read(ing)?|this|screen|camera|webcam|showing|show you|holding|wearing|colou?r|describe|what am i|what'?s this|what is this|in front|behind me|point(ing)? (at|to)|front of)\b/i.test(text);
   if (wantsEyes) {
     const cap = jarvisState.capture.webcam || jarvisState.capture.screen;
     if (cap) {
