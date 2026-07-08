@@ -6,6 +6,7 @@ Saves to ~/.hermes/cache/screenshots/nexus-<suffix>/<view>.png
 """
 import asyncio, sys, os
 from playwright.async_api import async_playwright
+from _gate_auth import playwright_cookies
 
 BASE = "https://127.0.0.1:8777"
 SUFFIX = sys.argv[1] if len(sys.argv) > 1 else "current"
@@ -23,6 +24,7 @@ async def main():
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1600, "height": 1000},
                                       ignore_https_errors=True)
+        await page.context.add_cookies(playwright_cookies(BASE))
         current_view = ["boot"]
         page.on("console", lambda m: errors.setdefault(current_view[0], []).append(m.text)
                 if m.type == "error" else None)

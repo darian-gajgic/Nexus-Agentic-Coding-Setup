@@ -9,8 +9,10 @@ import requests
 from playwright.async_api import async_playwright
 import urllib3
 urllib3.disable_warnings()
+from _gate_auth import owner_cookie, playwright_cookies
 
 BASE = "https://127.0.0.1:8777"
+CK = owner_cookie()  # {} while login is off; owner session when multi-user is live
 SHOTS = os.path.expanduser("~/.hermes/cache/screenshots")
 P, F = 0, 0
 console_errors = []
@@ -18,9 +20,9 @@ console_errors = []
 # Self-sufficiency: the board starts EMPTY since the real-agents migration —
 # ensure at least one lane exists so agent-card checks have something to click.
 _spawned_lane = None
-if not [a for a in requests.get(BASE + "/api/agents", verify=False, timeout=10).json()
+if not [a for a in requests.get(BASE + "/api/agents", verify=False, timeout=10, cookies=CK).json()
         if a.get("status") != "retired"]:
-    _spawned_lane = requests.post(BASE + "/api/agents", verify=False, timeout=15,
+    _spawned_lane = requests.post(BASE + "/api/agents", verify=False, timeout=15, cookies=CK,
                                   json={"name": "UI-Gate-Lane", "auto_claim": False}).json()["id"]
 
 def ok(name, cond, extra=""):
@@ -34,13 +36,20 @@ async def main():
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1600, "height": 1000},
                                       ignore_https_errors=True)
+        await page.context.add_cookies(playwright_cookies(BASE))
         page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         page.on("pageerror", lambda e: console_errors.append(f"PAGEERROR: {e}"))
 
         await page.goto(BASE, wait_until="networkidle")
 
         # ── Dashboard: hero + now-strip ──
-        ok("hero canvas present", await page.locator("#nexus3d").count() == 1)
+        # (the hero is the memory galaxy since the 2026-07-08 dashboard
+        # redesign — #nexus3d was the OLD constellation mount)
+        try:
+            await page.wait_for_selector("#dashGalaxy", timeout=5000, state="attached")
+            ok("hero canvas present", True)
+        except Exception:
+            ok("hero canvas present", False, "#dashGalaxy never attached")
         ok("now-running strip present", await page.locator("#nowStrip").count() == 1)
 
         # ── Agent drawer ──
@@ -92,9 +101,14 @@ async def main():
         await page.fill("#m-task-title", "v3-ui-test task")
         await page.fill("#m-task-tags", "e2e")
         await page.click('#modal button:has-text("Create")')
-        await page.wait_for_timeout(900)
+        try:
+            # wait-based, not a fixed sleep: create is two sequential fetches
+            # (POST + board refetch) and lands right around the old 900ms
+            await page.wait_for_selector('.task-card:has-text("v3-ui-test task")', timeout=6000)
+            ok("task created from modal", True)
+        except Exception:
+            ok("task created from modal", False, "card never rendered")
         card = page.locator('.task-card:has-text("v3-ui-test task")')
-        ok("task created from modal", await card.count() == 1)
 
         await card.first.click()
         await page.wait_for_selector("#td-title", timeout=3000)
@@ -157,7 +171,7 @@ async def main():
 
 asyncio.run(main())
 if _spawned_lane:
-    requests.post(f"{BASE}/api/agents/{_spawned_lane}/retire", verify=False, timeout=10)
-    requests.delete(f"{BASE}/api/agents/{_spawned_lane}", verify=False, timeout=10)
+    requests.post(f"{BASE}/api/agents/{_spawned_lane}/retire", verify=False, timeout=10, cookies=CK)
+    requests.delete(f"{BASE}/api/agents/{_spawned_lane}", verify=False, timeout=10, cookies=CK)
 print(f"\n=== V3 UI RESULT: {P} passed, {F} failed ===")
 sys.exit(1 if F else 0)
