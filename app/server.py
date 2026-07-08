@@ -2948,24 +2948,82 @@ async def delete_template(tpl_id: str):
     return {"ok": True}
 
 
+# ── In-app Business-Brain onboarding (docs/SPEC-ONBOARDING.md) ─────────────
+import onboarding as ob
+
+
 @app.get("/api/onboarding-status")
 async def onboarding_status():
-    """X4: unfilled {{FILL: ...}} slots in the Business Brain — until 0, outputs
-    use generic placeholder context and the dashboard shows a call-to-action."""
-    out = {"files": [], "total": 0}
-    for name in ("BUSINESS-CONTEXT.md", "STYLE-VOICE.md"):
-        fp = os.path.join(KNOWLEDGE_DIR, name)
-        n = 0
-        try:
-            n = open(fp).read().count("{{FILL:")
-        except Exception:
-            pass
-        out["files"].append({"file": name, "unfilled": n})
-        out["total"] += n
-    out["done"] = out["total"] == 0
-    out["cta"] = None if out["done"] else \
-        "Run the onboarding: open a terminal → cd ~/knowledge && claude → say 'run the onboarding'"
-    return out
+    """X4 (reworked per SPEC-ONBOARDING): unfilled Business-Brain slots for
+    the CALLING user — the dashboard call-to-action now opens the in-app
+    guided wizard instead of pointing at a terminal."""
+    return ob.status_for(auth.current_user_id())
+
+
+@app.get("/api/onboarding")
+async def onboarding_schema():
+    """The wizard: sections with impact explanations + the caller's saved
+    answers (resumable — partial saves are the norm)."""
+    me = auth.current_user_id()
+    sections = ob.schema()
+    rows = db.query_all("SELECT * FROM onboarding_answers WHERE user_id=?", (me,))
+    answers = {r["slot_id"]: {"text": r["answer"] or "", "na": bool(r["na"])}
+               for r in rows}
+    answered = sum(1 for a in answers.values() if a["na"] or a["text"].strip())
+    st = db.query_one("SELECT * FROM onboarding_state WHERE user_id=?", (me,))
+    total = sum(len(s["questions"]) for s in sections)
+    return {"sections": sections, "answers": answers, "total": total,
+            "answered": answered, "applied_at": st["applied_at"] if st else None,
+            "target_dir": ob.target_dir(me),
+            "is_owner": me == auth.DEFAULT_USER_ID}
+
+
+@app.post("/api/onboarding/answers")
+async def onboarding_save(body: dict):
+    """Partial upsert of the caller's answers. Empty text + na=false
+    un-answers the slot. Unknown slot ids are rejected."""
+    me = auth.current_user_id()
+    answers = (body or {}).get("answers") or {}
+    if not isinstance(answers, dict) or not answers:
+        return JSONResponse(status_code=400, content={"error": "answers object is required"})
+    valid = ob.all_slot_ids()
+    unknown = [k for k in answers if k not in valid]
+    if unknown:
+        return JSONResponse(status_code=400,
+                            content={"error": f"unknown slot ids: {unknown[:5]}"})
+    now = time.time()
+    saved = removed = 0
+    for sid, a in answers.items():
+        text = str((a or {}).get("text") or "").strip()[:2000]
+        na = bool((a or {}).get("na"))
+        if not text and not na:
+            db.execute("DELETE FROM onboarding_answers WHERE user_id=? AND slot_id=?",
+                       (me, sid))
+            removed += 1
+        else:
+            db.execute("INSERT OR REPLACE INTO onboarding_answers "
+                       "(user_id, slot_id, answer, na, updated_at) VALUES (?,?,?,?,?)",
+                       (me, sid, text or None, 1 if na else 0, now))
+            saved += 1
+    n = db.query_one("SELECT COUNT(*) AS n FROM onboarding_answers WHERE user_id=? "
+                     "AND (na=1 OR TRIM(COALESCE(answer,'')) != '')", (me,))["n"]
+    return {"ok": True, "saved": saved, "removed": removed, "answered": n}
+
+
+@app.post("/api/onboarding/apply")
+async def onboarding_apply():
+    """Write the caller's Business Brain (u_owner -> canonical ~/knowledge,
+    everyone else -> their personal overlay). Confirm-gated in the UI."""
+    me = auth.current_user_id()
+    u = auth.current_user() or {}
+    try:
+        res = ob.apply_for(me, u.get("username") or me)
+    except FileNotFoundError as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"template missing: {e}"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+    return {"ok": True, **res}
 
 
 # ── Task wizard: describe the goal, AI sets every parameter (v2.2) ──
