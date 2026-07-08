@@ -330,6 +330,16 @@ async function handleWSMessage(msg) {
 
 // Re-render the active view unless the user is mid-interaction.
 function softRender() {
+  if (currentView === 'jarvis') {
+    // JARVIS manages its own live updates (SSE stream, status/event pollers).
+    // A blind render() here rebuilds #content, which DETACHES the 3D canvas;
+    // mount() then early-returns because the renderer still exists, leaving the
+    // avatar + memory galaxy blank until a full teardown/re-enter. tick() already
+    // skips jarvis for the same reason — mirror it here for the WS path. Only
+    // nudge the command deck (the one genuinely-live panel) if it's open.
+    if (jarvisState.deckOpen) jarvisLoadDeck();
+    return;
+  }
   if (uiLocked()) { pendingRender = true; return; }
   render();
 }
@@ -5970,7 +5980,7 @@ let jarvisState = {
 // ── WS TTS pipeline: server streams raw PCM (16-bit mono 22050) per sentence;
 //    chunks are scheduled gaplessly on an AudioContext; an AnalyserNode on the
 //    SAME graph feeds the avatar's mouth = native-timing lip-sync. ──
-const jTTS = { ws: null, nextTime: 0, sources: [], pending: 0, analyser: null, data: null };
+const jTTS = { ws: null, connecting: null, nextTime: 0, sources: [], pending: 0, analyser: null, data: null };
 
 function jarvisAudioCtx() {
   if (!jarvisState.audioContext) {
@@ -5994,10 +6004,16 @@ function jarvisTTSGraph() {
 }
 
 function jarvisTTSWs() {
-  return new Promise((resolve) => {
-    if (jTTS.ws && jTTS.ws.readyState === 1) return resolve(jTTS.ws);
-    const ws = new WebSocket(`wss://${location.host}/ws/jarvis/tts`);
+  if (jTTS.ws && jTTS.ws.readyState === 1) return Promise.resolve(jTTS.ws);
+  if (jTTS.connecting) return jTTS.connecting;   // F130: one socket only — await the in-flight connect
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';   // derive scheme like the main /ws socket
+  const p = new Promise((resolve) => {
+    const ws = new WebSocket(`${proto}://${location.host}/ws/jarvis/tts`);
     ws.binaryType = 'arraybuffer';
+    // Only THIS attempt may clear the shared connect marker — a stale socket's
+    // late open/error/close must not wipe a NEWER connect's promise, or a second
+    // socket could open and break the one-socket invariant (F130).
+    const clearConnecting = () => { if (jTTS.connecting === p) jTTS.connecting = null; };
     ws.onmessage = (e) => {
       if (typeof e.data === 'string') {
         let d = {};
@@ -6006,6 +6022,10 @@ function jarvisTTSWs() {
         if (d.error) { jTTS.pending = Math.max(0, jTTS.pending - 1); jarvisTTSMaybeFinish(); }
         return;
       }
+      // A chunk with no outstanding utterance is a straggler from a stopped /
+      // barged-in reply — drop it so it can't re-wake the avatar into "talking"
+      // and play audio past the interrupt (F063).
+      if (jTTS.pending <= 0) return;
       // binary PCM chunk → schedule right after whatever is already queued
       const ctx = jarvisAudioCtx();
       const i16 = new Int16Array(e.data);
@@ -6034,10 +6054,17 @@ function jarvisTTSWs() {
         jarvisBargeMonitorStart();
       }
     };
-    ws.onopen = () => { jTTS.ws = ws; resolve(ws); };
-    ws.onerror = () => resolve(null);
-    ws.onclose = () => { if (jTTS.ws === ws) jTTS.ws = null; };
+    ws.onopen = () => { jTTS.ws = ws; clearConnecting(); resolve(ws); };
+    ws.onerror = () => { clearConnecting(); if (jTTS.ws === ws) jarvisTTSReset(); resolve(null); };
+    ws.onclose = () => {
+      clearConnecting();
+      // socket dropped mid-utterance → force the pipeline back to idle so the
+      // avatar can't stay wedged in "talking" forever (F063)
+      if (jTTS.ws === ws) { jTTS.ws = null; jarvisTTSReset(); }
+    };
   });
+  jTTS.connecting = p;
+  return p;
 }
 
 function jarvisTTSMaybeFinish() {
@@ -6051,6 +6078,21 @@ function jarvisTTSMaybeFinish() {
     if (window.Jarvis3D) window.Jarvis3D.setLevel(0);
     jarvisMaybeAutoListen();
   }
+}
+
+// Force the WS TTS pipeline back to a quiet idle state and drop any queued /
+// scheduled audio. Used when the socket drops or errors mid-utterance (there is
+// no {done} coming, so jarvisTTSMaybeFinish would never fire) so the avatar can
+// never get stuck "talking" (F063).
+function jarvisTTSReset() {
+  for (const s of jTTS.sources) { try { s.stop(); } catch { } }
+  jTTS.sources = [];
+  jTTS.pending = 0;
+  jTTS.nextTime = 0;
+  jarvisState.ttsAnimating = false;
+  jarvisBargeMonitorStop();
+  if (window.Jarvis3D) window.Jarvis3D.setLevel(0);
+  if (jarvisState.mode === 'talking') jarvisSetMode('idle');
 }
 
 // gate-contract name: speak a reply (sentence-split, streamed over the WS)

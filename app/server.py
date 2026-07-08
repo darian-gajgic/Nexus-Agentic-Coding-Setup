@@ -1958,7 +1958,7 @@ Current date/time: {time.strftime('%A %Y-%m-%d %H:%M')}."""
 
 
 @app.post("/api/jarvis/chat/stream")
-async def jarvis_chat_stream(body: dict):
+async def jarvis_chat_stream(request: Request, body: dict):
     """Proxy SSE stream from Hermes Agent API.
     The browser reads this as EventSource-style text/event-stream.
     Extras over plain proxying: per-turn system framing (persona, file
@@ -2049,7 +2049,7 @@ async def jarvis_chat_stream(body: dict):
                         f"(this text IS your vision; answer from it, do NOT call any "
                         f"vision/image tool): {frame_note}]\n\n{hermes_input}")
 
-    async def event_generator():
+    async def _stream_body():
         """Stream SSE events from Hermes, re-emit as SSE for the browser.
 
         Peak-overload fallback (2026-07-08): when the turn dies with a Z.AI
@@ -2161,6 +2161,27 @@ async def jarvis_chat_stream(body: dict):
         # describe is what pushes the chat model to fall back to the broken
         # vision_analyze tool). keep_alive frees the card ~30s after the LAST look
         # — i.e. once it is genuinely no longer needed.
+
+    async def event_generator():
+        # Stop pulling from Hermes the moment the browser goes away (tab closed
+        # mid-stream): check disconnect at every yield boundary so we don't keep
+        # generating (and billing) to a dead client, and emit a terminal [DONE]
+        # once the turn finishes on its own. (F011 SSE)
+        normal_end = False
+        try:
+            async for _ev in _stream_body():
+                if await request.is_disconnected():
+                    return
+                yield _ev
+            normal_end = True
+        finally:
+            # Only send the sentinel on a clean finish. Yielding while the
+            # generator is being torn down (client disconnect → GeneratorExit /
+            # task cancellation) raises "async generator ignored GeneratorExit"
+            # and swallows the cancellation — the exact shutdown-noise class this
+            # patch set removes elsewhere.
+            if normal_end:
+                yield "event: done\ndata: [DONE]\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -2544,9 +2565,22 @@ async def jarvis_tts_ws(ws: WebSocket):
 
     q: asyncio.Queue = asyncio.Queue()
     watcher = asyncio.create_task(watch_incoming(q))
+    get_task = None
     try:
         while True:
-            text = await q.get()
+            # Race the next utterance against the socket reader: an idle client
+            # that disconnects (navigates away, closes the tab) with nothing
+            # queued raises WebSocketDisconnect inside the WATCHER, not here — so
+            # a bare `await q.get()` would park this coroutine forever (leaking a
+            # coroutine + websocket on every idle JARVIS visit, and blowing
+            # uvicorn's graceful-shutdown timeout with a crash-looking traceback).
+            # When the watcher finishes, we stop instead of parking. (F011)
+            get_task = asyncio.ensure_future(q.get())
+            done, _pending = await asyncio.wait(
+                {get_task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done:
+                break
+            text = get_task.result()
             try:
                 async for chunk in _voice.synthesize_stream(text):
                     if stop_flag["stop"]:
@@ -2554,15 +2588,26 @@ async def jarvis_tts_ws(ws: WebSocket):
                     await ws.send_bytes(chunk)
                 await ws.send_json({"done": True, "stopped": stop_flag["stop"]})
             except Exception as e:
-                await ws.send_json({"error": str(e)[:200]})
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        pass  # CancelledError = server shutting down (bounded graceful stop):
-              # a clean close, not an error — don't let it surface as an ASGI
-              # traceback that reads like a crash in the journal on every restart
+                try:
+                    await ws.send_json({"error": str(e)[:200]})
+                except Exception:
+                    break  # socket is gone — stop the loop, let finally clean up
+    except asyncio.CancelledError:
+        # Server shutting down (bounded graceful stop): clean up in the finally,
+        # then RE-RAISE. Swallowing CancelledError is what let the parked q.get()
+        # survive the graceful-shutdown window and blow the timeout every restart.
+        raise
+    except WebSocketDisconnect:
+        pass  # normal: client navigated away / closed the tab
     except Exception:
-        pass
+        pass  # any synth/send error — close the socket cleanly
     finally:
         watcher.cancel()
+        if get_task is not None:
+            get_task.cancel()  # the last (possibly still-pending) q.get()
+        await asyncio.gather(
+            *(t for t in (watcher, get_task) if t is not None),
+            return_exceptions=True)
 
 
 # ===== AGENTIC OS CAPABILITIES (v1) =====
