@@ -245,7 +245,12 @@ def stop_app(task_id: str) -> dict:
 def log_tail(workspace: str, lines: int = 80) -> str:
     p = Path(workspace) / "_preview.log"
     try:
-        data = p.read_bytes()[-16000:]
+        # seek-read only the tail — a chatty dev server's log grows unbounded
+        # and this is polled every few seconds while the preview modal is open
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16000))
+            data = f.read()
         return "\n".join(data.decode(errors="replace").splitlines()[-lines:])
     except Exception:
         return ""
