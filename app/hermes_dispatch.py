@@ -784,6 +784,18 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
         remove_session_key(task["session_id"])
     if err_text and is_quota_error(err_text):
         raise QuotaError(err_text)
+    # Real 429 storms don't always raise: on sessions WITH history (e.g. a
+    # resume continue-turn) the run completes CLEANLY with either empty
+    # content or the raw error string AS the reply ("API call failed after
+    # 3 retries: HTTP 429: …") — no error event, no exception (both shapes
+    # verified 2026-07-08 against the live gateway; fresh first turns raise
+    # instead). Neither is a success when no deliverable file exists either —
+    # route them into the quota machinery (fallback retry, then backoff)
+    # instead of completing the task with nothing / with an error string.
+    stripped = (content or "").strip()
+    if not err_text and not harvested and not (workspace / "deliverable.md").exists() \
+            and (not stripped or (len(stripped) < 300 and is_quota_error(stripped))):
+        raise QuotaError(stripped or "empty run result — upstream produced no content (load-shed)")
 
     tin = int(usage.get("input_tokens") or 0)
     tout = int(usage.get("output_tokens") or 0)
