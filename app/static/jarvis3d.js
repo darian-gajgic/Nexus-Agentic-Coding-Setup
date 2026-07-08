@@ -437,8 +437,9 @@ function mountStreams(clusterCenters) {
   for (let i = 0; i < N; i++) {
     const tgt = targets[i % targets.length];
     const a = (i / N) * Math.PI * 2;
-    const start = new THREE.Vector3(Math.cos(a) * 8, 14 + Math.sin(a * 2) * 7, -9 - Math.random() * 4);
-    const mid1 = new THREE.Vector3(start.x * 3.2, start.y * 1.4 + 6, -46 - Math.random() * 22);
+    // starts hug the bust, which is anchored at the frame bottom (crown y≈1.5)
+    const start = new THREE.Vector3(Math.cos(a) * 8, -10 + Math.sin(a * 2) * 7, -9 - Math.random() * 4);
+    const mid1 = new THREE.Vector3(start.x * 3.2, start.y * 0.5 + 10, -46 - Math.random() * 22);
     const mid2 = new THREE.Vector3(tgt.x * 0.55 + (Math.random() - .5) * 24,
                                    tgt.y * 0.7 + (Math.random() - .5) * 18, -110);
     const curve = new THREE.CatmullRomCurve3([start, mid1, mid2, tgt]);
