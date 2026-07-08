@@ -1868,12 +1868,18 @@ def _jarvis_files_list(uid: str) -> list[dict]:
 def _jarvis_overload_signature(event_name: str, data_text: str) -> str | None:
     """Quota/load-shed signature in one Hermes SSE event, or None.
 
-    A shed turn surfaces two ways: an 'error'/'run.failed' event when the run
-    raised, or — the common case — the assistant 'reply' IS the raw provider
-    error string ("HTTP 429: The service may be temporarily overloaded…"),
-    because Hermes' conversation loop returns exhausted-retry errors as final
-    content. The content check is deliberately narrow (short, starts with
-    "HTTP ") so a real answer that merely mentions 429s never matches."""
+    A shed turn surfaces three ways, all verified against the live gateway
+    (2026-07-08): an 'error'/'run.failed' event when the run raised (fresh
+    sessions); a clean assistant.completed whose content is EMPTY (sessions
+    with history sometimes swallow the exhausted-retry RateLimitError and
+    return nothing — no error event at all); or the assistant 'reply' BEING
+    the raw error string, whose prefix VARIES ("HTTP 400: Unknown Model…",
+    "API call failed after 3 retries: HTTP 429: …") — so the content check
+    is any SHORT completion carrying a quota signature. A false positive
+    (a genuine <300-char answer that mentions rate limits) merely retries
+    the turn on the fallback model — benign; a false negative is a dead
+    turn. interrupted/partial turns are never overload — that's the user
+    stopping it, not the provider."""
     import hermes_dispatch as _hd
     if event_name not in ("error", "run.failed", "assistant.completed"):
         return None
@@ -1884,8 +1890,12 @@ def _jarvis_overload_signature(event_name: str, data_text: str) -> str | None:
     if event_name in ("error", "run.failed"):
         msg = str(data.get("message") or data.get("error") or data)[:300]
         return msg if _hd.is_quota_error(msg) else None
+    if data.get("partial") or data.get("interrupted"):
+        return None
     content = str(data.get("content") or "")
-    if content.startswith("HTTP ") and len(content) < 300 and _hd.is_quota_error(content):
+    if not content.strip():
+        return "empty reply — upstream returned no content (load-shed)"
+    if len(content) < 300 and _hd.is_quota_error(content):
         return content[:300]
     return None
 
