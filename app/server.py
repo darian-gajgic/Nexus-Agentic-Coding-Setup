@@ -601,6 +601,18 @@ async def delete_task(task_id: str):
     task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "not found"})
+    # Deleting a task whose dispatch is LIVE creates a zombie: the worker keeps
+    # executing against a row that no longer exists (observed 2026-07-09 —
+    # crashed finalize, wasted tokens). Refuse until it is stopped/parked.
+    live = db.query_one(
+        "SELECT id FROM dispatches WHERE task_id=? AND heartbeat_at > ? "
+        "AND state IN ('dispatching','streaming','finalizing')",
+        (task_id, time.time() - 120))
+    if live:
+        return JSONResponse(status_code=409, content={
+            "error": "this task is EXECUTING right now — wait for it to finish "
+                     "or fail before deleting (its agent would keep running "
+                     "against a ghost row)"})
     db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     # Drop the deleted id from other tasks' depends_on — deps_satisfied is
     # fail-closed (a dangling id parks the dependent forever), so this scrub
