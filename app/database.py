@@ -259,6 +259,25 @@ def init_db():
         if col not in existing_task_cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
 
+    # In-app onboarding (docs/SPEC-ONBOARDING.md): per-user Business-Brain
+    # answers (partial saves are the norm — the wizard is resumable) and the
+    # last-applied marker. Answers NEVER cross users.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS onboarding_answers (
+        user_id TEXT NOT NULL,
+        slot_id TEXT NOT NULL,
+        answer TEXT,
+        na INTEGER DEFAULT 0,
+        updated_at REAL,
+        PRIMARY KEY (user_id, slot_id)
+    )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS onboarding_state (
+        user_id TEXT PRIMARY KEY,
+        applied_at REAL,
+        target_dir TEXT
+    )""")
+
     # Review v2 (docs/SPEC-BLOCK2.md R1.4): per-line comments on a task's
     # change review. status: open (feeds the NEXT retry) | consumed (attached
     # to a retry — kept for audit). Fail-closed per user like approvals.

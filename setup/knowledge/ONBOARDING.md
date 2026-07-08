@@ -1,6 +1,16 @@
 # ONBOARDING — personalize the Business Brain (run once, ~20 min)
 
-**How to run:** open a terminal and type:
+**Primary path — the Nexus wizard (recommended):** open the Nexus dashboard →
+click **🚀 Start the guided onboarding** on the dashboard banner (or Settings →
+Business Brain). It walks you through every blank section by section, explains
+what each answer changes in the system, saves as you go (stop and resume
+anytime), and is **per-user**: the owner's answers become these canonical
+files; every other Nexus user gets their own personal context under
+`users/<id>/` that their tasks use automatically. The pristine questionnaires
+live in `templates/` — the wizard reads those, so it can be re-run to revise
+answers even after these files are filled.
+
+**Alternative — terminal interview** (if you prefer talking it through):
 
 ```bash
 cd ~/knowledge && claude

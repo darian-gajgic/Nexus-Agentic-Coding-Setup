@@ -611,7 +611,7 @@ function bindHeroExpand() {
   }, { passive: true });
 }
 
-// X4: "run the onboarding" call-to-action until the Business Brain is personalized
+// X4 → SPEC-ONBOARDING: call-to-action opens the IN-APP guided onboarding
 async function loadOnboardingCta() {
   const box = $('#onboardingCta');
   if (!box) return;
@@ -620,14 +620,216 @@ async function loadOnboardingCta() {
     if (s.done || !box.isConnected) { box.innerHTML = ''; return; }
     box.innerHTML = `
       <div style="margin:14px 0;padding:12px 16px;border:1px solid rgba(251,146,60,.4);
-                  background:rgba(251,146,60,.08);border-radius:12px;display:flex;gap:12px;align-items:center">
-        <span style="font-size:20px">📝</span>
-        <div style="flex:1">
-          <div style="font-weight:700;font-size:13.5px">Business Brain not personalized yet — ${s.total} blanks to fill</div>
-          <div style="font-size:12px;color:var(--text-dim)">Agents work with placeholder context until then. ${esc(s.cta || '')}</div>
+                  background:rgba(251,146,60,.08);border-radius:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:20px">🧭</span>
+        <div style="flex:1;min-width:240px">
+          <div style="font-weight:700;font-size:13.5px">Your Business Brain isn't personalized yet — ${s.total} blanks to fill</div>
+          <div style="font-size:12px;color:var(--text-dim)">Agents work from placeholder context until then. ${esc(s.cta || '')} Answers save as you go — pause anytime.</div>
         </div>
+        <button class="btn-primary" onclick="openOnboardingWizard()">🚀 Start the guided onboarding</button>
       </div>`;
   } catch { /* optional widget */ }
+}
+
+// ═══════ Business-Brain onboarding wizard (SPEC-ONBOARDING R4) ═══════
+// step 0 = welcome · 1..S = sections · S+1 = review · after apply = success
+let _onb = null;
+
+async function openOnboardingWizard() {
+  showModal(`<h2>🧭 Business Brain onboarding</h2>
+    <div class="loading" style="padding:40px;text-align:center">Loading your questionnaire…</div>`);
+  try {
+    const d = await api('GET', '/api/onboarding');
+    _onb = { d, step: 0 };
+    renderOnbWizard();
+  } catch (e) {
+    showModal(`<h2>🧭 Onboarding</h2><div class="empty">${esc(e.message)}</div>
+      <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+  }
+}
+
+function onbAnsweredCount() {
+  return Object.values(_onb.d.answers).filter(a => a.na || (a.text || '').trim()).length;
+}
+
+function onbHeaderHTML() {
+  const { d, step } = _onb;
+  const S = d.sections.length;
+  const answered = onbAnsweredCount();
+  const where = step === 0 ? 'Welcome' : step > S ? 'Review & apply'
+    : `Section ${step}/${S}`;
+  return `
+    <h2 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">🧭 Business Brain onboarding
+      <span class="chip">${esc(where)}</span>
+      <span class="chip c-accent">${answered}/${d.total} answered</span></h2>
+    <div class="onb-progress" style="margin:4px 0 14px"><i style="width:${Math.round(100 * answered / d.total)}%"></i></div>`;
+}
+
+function onbWelcomeHTML() {
+  const { d } = _onb;
+  const landing = d.is_owner
+    ? `Because you are the <b>owner</b>, your answers become the <b>canonical business identity</b> —
+       written to <code>${esc(d.target_dir)}</code> (git-versioned; nothing is ever lost), read by every
+       agent, the frontier judge and the eval runner.`
+    : `Your answers become <b>your personal business context</b> — written to
+       <code>${esc(d.target_dir)}</code>. Tasks <b>you</b> create use <i>your</i> answers; the owner's
+       canonical files stay untouched. Each user onboards for themselves.`;
+  return `
+    <div class="view-intro" style="font-size:13px;line-height:1.6">
+      👋 Nexus agents can draft marketing, shop copy, proposals, release plans and more — but they are only
+      as sharp as what they know about <b>your</b> business. That knowledge is the <b>Business Brain</b>:
+      two files every agent reads before business work.
+    </div>
+    <div class="onb-q"><b>1 · BUSINESS-CONTEXT.md</b> — who you are, what you sell, to whom.
+      <div class="onb-hint">Agents ground every claim, plan and price on these lines. While a line is blank they must
+      work from clearly-marked generic assumptions.</div></div>
+    <div class="onb-q"><b>2 · STYLE-VOICE.md</b> — how everything you publish sounds.
+      <div class="onb-hint">Every outward-facing text is written against this voice, and the frontier judge scores
+      deliverables on it.</div></div>
+    <div class="onb-explain">📍 <b>Where your answers land:</b> ${landing}</div>
+    <div class="onb-explain" style="border-color:rgba(124,92,255,.3);background:rgba(124,92,255,.07)">
+      ⏱ <b>How it works:</b> one short section at a time (~15 min total). Every section explains what the answers
+      change in the system. Answers <b>save every time you hit Next</b> — close this window whenever you like and
+      resume later from the same spot. Short and true beats polished and vague; mark anything that doesn't apply
+      as “not applicable” and skip what you don't know yet.</div>`;
+}
+
+function onbSectionHTML(sec, prevSec) {
+  const { d } = _onb;
+  const fileIntro = (!prevSec || prevSec.file !== sec.file)
+    ? `<div class="onb-explain" style="border-color:rgba(124,92,255,.3);background:rgba(124,92,255,.07)">📘 <b>${esc(sec.file_name)}</b> — ${esc(sec.file_intro)}</div>` : '';
+  const qs = sec.questions.map(q => {
+    const a = d.answers[q.slot_id] || { text: '', na: false };
+    return `
+      <div class="onb-q ${a.na ? 'na' : ''}" id="onbq-${esc(q.slot_id.replace(':', '-'))}">
+        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <b style="font-size:12.5px;flex:1">${esc(q.label)}</b>
+          <label style="font-size:11px;color:var(--text-dim);display:flex;gap:5px;align-items:center;cursor:pointer">
+            <input type="checkbox" class="onb-na" data-sid="${esc(q.slot_id)}" ${a.na ? 'checked' : ''}
+              onchange="this.closest('.onb-q').classList.toggle('na', this.checked)"> not applicable</label>
+        </div>
+        ${q.hint ? `<div class="onb-hint">e.g. ${esc(q.hint)}</div>` : ''}
+        <textarea class="onb-input" data-sid="${esc(q.slot_id)}" rows="2"
+          placeholder="${esc(q.hint || 'Your answer…')}">${esc(a.text || '')}</textarea>
+      </div>`;
+  }).join('');
+  return `
+    ${fileIntro}
+    <h3 class="section-title" style="margin-top:2px">${esc(sec.title)} <span class="chip" style="margin-left:6px">${esc(sec.file_name)}</span></h3>
+    <div class="onb-explain">💡 <b>What these answers change:</b> ${esc(sec.explain)}</div>
+    ${qs}`;
+}
+
+function onbReviewHTML() {
+  const { d } = _onb;
+  const rows = d.sections.map((sec, i) => {
+    let ans = 0, na = 0, open = 0;
+    const missing = [];
+    sec.questions.forEach(q => {
+      const a = d.answers[q.slot_id];
+      if (a && a.na) na++;
+      else if (a && (a.text || '').trim()) ans++;
+      else { open++; missing.push(q.label); }
+    });
+    return `
+      <div class="agentic-row" style="cursor:pointer" onclick="onbGoto(${i + 1})">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <strong style="flex:1">${esc(sec.title)}</strong>
+          ${ans ? `<span class="chip c-green">${ans} answered</span>` : ''}
+          ${na ? `<span class="chip">${na} n/a</span>` : ''}
+          ${open ? `<span class="chip c-orange">${open} open</span>` : '<span class="chip c-green">✓ complete</span>'}
+        </div>
+        ${open ? `<div class="onb-hint" style="margin-top:3px">open: ${esc(missing.slice(0, 3).join(' · '))}${missing.length > 3 ? ' …' : ''}</div>` : ''}
+      </div>`;
+  }).join('');
+  const answered = onbAnsweredCount();
+  return `
+    <div class="view-intro">Review before writing. Click a section to jump back and change answers — nothing is
+    written until you hit Apply.</div>
+    <div style="display:flex;flex-direction:column;gap:6px;max-height:44vh;overflow-y:auto;margin-bottom:12px">${rows}</div>
+    <div class="onb-explain">📍 Apply writes <b>${answered}/${d.total}</b> answers into
+      <code>${esc(d.target_dir)}</code> ${_onb.d.is_owner ? '(the canonical Business Brain, git-committed)' : '(your personal context, git-committed)'} —
+      open slots simply stay open; you can return anytime. From the moment you apply,
+      ${_onb.d.is_owner ? 'every agent' : 'every task you own'} works with this context.</div>`;
+}
+
+function onbSuccessHTML(res) {
+  return `
+    <div class="empty" style="padding:18px"><span class="e-ico">🎉</span>
+      <b>Your Business Brain is live.</b></div>
+    <div class="onb-q"><b>${res.replaced}</b> answers written · <b>${res.remaining}</b> slots still open
+      <div class="onb-hint">${(res.written || []).map(esc).join('<br>')}${res.git_committed ? '<br>✓ git-committed (nothing is ever lost)' : ''}</div></div>
+    <div class="onb-explain">🚀 <b>What improves right now:</b> business deliverables
+      ${_onb.d.is_owner ? '' : 'on your tasks '}are grounded on your real ventures, audience and constraints;
+      outward-facing text follows your voice and brand overrides; the judge scores against <i>your</i> quarter goals.</div>
+    <div class="onb-explain" style="border-color:rgba(124,92,255,.3);background:rgba(124,92,255,.07)">
+      💡 <b>Feel the difference:</b> create a task in a business domain (Kanban → “✨ Describe a task”, e.g.
+      “write a product page for our best seller”) and compare it with what you got before. Revise answers anytime
+      via Settings → Business Brain.</div>`;
+}
+
+function renderOnbWizard() {
+  const { d, step } = _onb;
+  const S = d.sections.length;
+  let body, buttons;
+  if (_onb.success) {
+    body = onbSuccessHTML(_onb.success);
+    buttons = `<button class="btn-primary" onclick="closeModal();loadOnboardingCta()">Done</button>`;
+  } else if (step === 0) {
+    body = onbWelcomeHTML();
+    buttons = `<button class="btn-ghost" onclick="closeModal()">Later</button>
+      <button class="btn-primary" onclick="onbNext()">Let's go →</button>`;
+  } else if (step > S) {
+    body = onbReviewHTML();
+    buttons = `<button class="btn-ghost" onclick="onbBack()">← Back</button>
+      <button class="btn-ghost" onclick="closeModal()">Save & close</button>
+      <button class="btn-primary" onclick="onbApply()">✅ Apply to the Business Brain</button>`;
+  } else {
+    body = onbSectionHTML(d.sections[step - 1], d.sections[step - 2]);
+    buttons = `<button class="btn-ghost" onclick="onbBack()">← Back</button>
+      <button class="btn-ghost" onclick="onbSaveClose()">Save & close</button>
+      <button class="btn-primary" onclick="onbNext()">${step === S ? 'Review →' : 'Next →'}</button>`;
+  }
+  showModal(`${onbHeaderHTML()}
+    <div style="max-height:58vh;overflow-y:auto;padding-right:4px">${body}</div>
+    <div class="modal-actions">${buttons}</div>`);
+  const first = document.querySelector('.onb-input');
+  if (first && step > 0 && step <= S) first.focus();
+}
+
+async function onbCollectSave() {
+  const inputs = [...document.querySelectorAll('.onb-input')];
+  if (!inputs.length) return true;
+  const answers = {};
+  inputs.forEach(t => {
+    const sid = t.dataset.sid;
+    const na = document.querySelector(`.onb-na[data-sid="${CSS.escape(sid)}"]`)?.checked || false;
+    answers[sid] = { text: t.value.trim(), na };
+    if (!answers[sid].text && !na) _onb.d.answers[sid] ? delete _onb.d.answers[sid] : null;
+    else _onb.d.answers[sid] = { text: answers[sid].text, na };
+  });
+  try {
+    await api('POST', '/api/onboarding/answers', { answers });
+    return true;
+  } catch (e) { toast('Could not save: ' + e.message, 'err'); return false; }
+}
+
+async function onbNext() { if (await onbCollectSave()) { _onb.step++; renderOnbWizard(); } }
+async function onbBack() { if (await onbCollectSave()) { _onb.step = Math.max(0, _onb.step - 1); renderOnbWizard(); } }
+async function onbGoto(i) { _onb.step = i; renderOnbWizard(); }
+async function onbSaveClose() {
+  if (await onbCollectSave()) { toast('Progress saved — resume anytime from the dashboard banner or Settings → Business Brain', 'ok'); closeModal(); }
+}
+
+async function onbApply() {
+  const target = _onb.d.is_owner ? 'the CANONICAL Business Brain (all agents)' : 'YOUR personal business context';
+  if (!confirm(`Write ${onbAnsweredCount()} answers to ${target}?\n\nOpen slots stay open, the previous state is git-committed first — nothing is lost.`)) return;
+  try {
+    const res = await api('POST', '/api/onboarding/apply');
+    _onb.success = res;
+    renderOnbWizard();
+    loadOnboardingCta();
+  } catch (e) { toast('Apply failed: ' + e.message, 'err'); }
 }
 
 function mountNexus3D(tries) {
@@ -1756,6 +1958,12 @@ function viewSettings() {
     </div></div>
     <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>👥 Users & access</h3></div><div class="card-body" id="usersPanel">
       <div class="muted" style="font-size:12px">Loading users…</div>
+    </div></div>
+    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🧭 Business Brain</h3></div><div class="card-body">
+      <div class="form-hint" style="margin-bottom:8px">The business context + voice every agent reads before business deliverables.
+        <strong>Each user fills their own</strong> — the owner's answers are the canonical identity, every other user gets a personal
+        context that their tasks use. Answers save as you go; revise them here anytime.</div>
+      <button class="btn-ghost" onclick="openOnboardingWizard()">🧭 Open the guided onboarding</button>
     </div></div>
     <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🛡 Related</h3></div><div class="card-body" style="display:flex;gap:10px;flex-wrap:wrap">
       <button class="btn-ghost" onclick="showWatchdogModal()">Watchdog configuration</button>
