@@ -147,6 +147,34 @@ async function loadPhotoModel() {
   return { S, mask, dist, lumRaw: lum, stretch };
 }
 
+/* ── bust from the 3D SCAN (built offline from the operator's 360° head-turn
+   video by scripts/build_avatar_pointcloud.py — Depth-Anything per frame +
+   turntable fusion, lighting baked). This is the primary path; the photo
+   inflation below is the fallback when no scan file exists. ── */
+function buildFromScan(cloud) {
+  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
+  const P = cloud.pos, B = cloud.bri;
+  const [my0, my1, mxh] = cloud.mouth || [0, 1, 6];
+  const [ey0, ey1, exh] = cloud.eyes || [0, 1, 8];
+  for (let i = 0; i < B.length; i++) {
+    const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+    const b = B[i];
+    const n = pos.length / 3;
+    // jitter breaks the voxel-lattice moiré
+    pos.push(x + (Math.random() - .5) * .55,
+             y + (Math.random() - .5) * .55,
+             z + (Math.random() - .5) * .55);
+    const w = b > 0.88 ? Math.min(1, (b - 0.88) / 0.25) * 0.45 : 0;
+    bri.push(b); wmi.push(w);
+    col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
+             b * (MODE_TINT.idle[1] * (1 - w) + w),
+             b * (MODE_TINT.idle[2] * (1 - w) + w));
+    if (z > 2 && y > my0 && y < my1 && Math.abs(x) < mxh) mouthIdx.push(n);
+    if (z > 2 && y > ey0 && y < ey1 && Math.abs(x) > 1.5 && Math.abs(x) < exh) eyeIdx.push(n);
+  }
+  return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY: [my0, my1] };
+}
+
 /* ── bust from the photo: inflated silhouette, HIS actual shape ── */
 function buildBust(pm) {
   const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
@@ -451,9 +479,21 @@ async function mount(container) {
   };
   container.addEventListener('pointermove', J.pointerHandler);
 
-  const photoModel = await loadPhotoModel();
+  // primary: the offline 3D scan of the operator; fallback: photo inflation
+  let scan = null;
+  try {
+    const r = await fetch('/static/avatar/head_points.json');
+    if (r.ok) scan = await r.json();
+  } catch { }
   if (J.disposed) return;
-  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = buildBust(photoModel);
+  let built;
+  if (scan && scan.pos && scan.pos.length > 9000) {
+    built = buildFromScan(scan);
+  } else {
+    built = buildBust(await loadPhotoModel());
+  }
+  if (J.disposed) return;
+  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = built;
   J.mouthY = mouthY;
   J.basePos = Float32Array.from(pos);
   J.baseB = Float32Array.from(bri);
