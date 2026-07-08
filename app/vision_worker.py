@@ -19,6 +19,7 @@ the old Wav2Lip subprocess.
 Errors never kill the loop: each request gets {"error": "..."} and the worker
 keeps serving.
 """
+import gc
 import json
 import sys
 import traceback
@@ -31,18 +32,58 @@ SIGLIP_ID = "google/siglip-so400m-patch14-384"
 SDXL_ID = "stabilityai/sdxl-turbo"
 
 _siglip = None       # (model, processor)
+_siglip_device = DEVICE  # flips to "cpu" after a CUDA OOM (this box's 12GB card
+                         # is shared with ollama + the user's dictation tool, so
+                         # SigLIP must still embed when the GPU is full)
 _ocr = None          # RapidOCR engine
 _sdxl = None         # diffusers pipeline (cpu-offloaded)
+
+
+def _siglip_dtype():
+    # float16 is a GPU win but slow/patchy on CPU — use float32 there
+    return torch.float16 if _siglip_device == "cuda" else torch.float32
 
 
 def _get_siglip():
     global _siglip
     if _siglip is None:
         from transformers import AutoModel, AutoProcessor
-        model = AutoModel.from_pretrained(SIGLIP_ID, torch_dtype=torch.float16).to(DEVICE).eval()
+        model = AutoModel.from_pretrained(
+            SIGLIP_ID, torch_dtype=_siglip_dtype()).to(_siglip_device).eval()
         processor = AutoProcessor.from_pretrained(SIGLIP_ID)
         _siglip = (model, processor)
     return _siglip
+
+
+def _drop_siglip():
+    global _siglip
+    _siglip = None
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _is_oom(e: Exception) -> bool:
+    return isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ())) \
+        or "out of memory" in str(e).lower()
+
+
+def _siglip_op_with_fallback(fn, req):
+    """Run a SigLIP op; on a CUDA OOM, permanently drop to CPU (for the life of
+    this worker — a respawn after idle retries CUDA) and rerun. Mirrors the STT
+    self-heal so a contended GPU degrades 'seeing' instead of breaking it."""
+    global _siglip_device
+    try:
+        return fn(req)
+    except Exception as e:
+        if _siglip_device == "cuda" and _is_oom(e):
+            _siglip_device = "cpu"
+            _drop_siglip()  # free the (partially) resident CUDA model, reload on CPU
+            return fn(req)
+        raise
 
 
 def _get_ocr():
@@ -69,16 +110,21 @@ def _get_sdxl():
     return _sdxl
 
 
-def op_embed_image(req):
+def _embed_image(req):
     # transformers 5.x: get_*_features returns token-level states for SigLIP —
     # the pooled embedding lives on the tower's pooler_output (verified: 1152-d)
     model, processor = _get_siglip()
     img = Image.open(req["path"]).convert("RGB")
-    inputs = processor(images=img, return_tensors="pt").to(DEVICE)
+    inputs = processor(images=img, return_tensors="pt").to(_siglip_device)
+    pv = inputs["pixel_values"].to(_siglip_dtype())
     with torch.no_grad():
-        feat = model.vision_model(pixel_values=inputs["pixel_values"].half()).pooler_output
-    vec = torch.nn.functional.normalize(feat[0].float(), dim=-1).cpu().tolist()
-    out = {"vec": vec}
+        feat = model.vision_model(pixel_values=pv).pooler_output
+    return torch.nn.functional.normalize(feat[0].float(), dim=-1).cpu().tolist()
+
+
+def op_embed_image(req):
+    vec = _siglip_op_with_fallback(_embed_image, req)
+    out = {"vec": vec, "device": _siglip_device}
     if req.get("ocr"):
         try:
             result, _ = _get_ocr()(req["path"])
@@ -88,13 +134,17 @@ def op_embed_image(req):
     return out
 
 
-def op_embed_text(req):
+def _embed_text(req):
     model, processor = _get_siglip()
     inputs = processor(text=[req["text"]], return_tensors="pt",
-                       padding="max_length", truncation=True).to(DEVICE)
+                       padding="max_length", truncation=True).to(_siglip_device)
     with torch.no_grad():
         feat = model.text_model(**inputs).pooler_output
-    return {"vec": torch.nn.functional.normalize(feat[0].float(), dim=-1).cpu().tolist()}
+    return torch.nn.functional.normalize(feat[0].float(), dim=-1).cpu().tolist()
+
+
+def op_embed_text(req):
+    return {"vec": _siglip_op_with_fallback(_embed_text, req), "device": _siglip_device}
 
 
 def op_generate(req):
@@ -109,7 +159,7 @@ def op_generate(req):
 
 
 OPS = {
-    "ping": lambda req: {"ok": True, "device": DEVICE},
+    "ping": lambda req: {"ok": True, "device": _siglip_device},
     "embed_image": op_embed_image,
     "embed_text": op_embed_text,
     "generate": op_generate,
