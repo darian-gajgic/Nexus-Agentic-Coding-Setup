@@ -1440,14 +1440,8 @@ async function attachUploadFiles(elId, files) {
   const { kind, id } = t.getTarget();
   let done = 0;
   for (const f of files) {
-    const fd = new FormData();
-    fd.append('file', f);
-    try {
-      const r = await fetch(`${attachApiBase(kind, id)}/attachments`, { method: 'POST', body: fd });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || r.status);
-      done++;
-    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+    try { await attachPostFile(kind, id, f); done++; }
+    catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
   }
   if (done) toast(`Attached ${done} file${done > 1 ? 's' : ''} ${kind === 'task' ? 'to the task' : 'project-wide'}`, 'ok');
   t.reload();
@@ -1518,6 +1512,73 @@ async function deleteAttachment(kind, id, name, elId) {
     const t = attachTargets[elId];
     if (t) t.reload(); else loadAttachmentsInto(kind, id, elId);
   } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+async function attachPostFile(kind, id, f) {
+  const fd = new FormData();
+  fd.append('file', f);
+  const r = await fetch(`${attachApiBase(kind, id)}/attachments`, { method: 'POST', body: fd });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+// ── Attach at CREATION time: the object doesn't exist yet, so files are staged
+//    in memory while the form is open and uploaded right after Create. The
+//    HTML helper resets the stage, so a cancelled form never leaks files into
+//    the next one. ──
+const attachStaged = {}; // elId → File[]
+function attachStageHTML(elId) {
+  attachStaged[elId] = [];
+  return `
+    <div id="${elId}-pending"></div>
+    <div class="attach-dz" id="${elId}-dz">
+      <input type="file" id="${elId}-file" accept="${ATTACH_ACCEPT}" multiple style="font-size:11.5px;max-width:260px"
+        onchange="attachStageAdd('${elId}', [...this.files]); this.value='';">
+      <div class="muted" style="font-size:10.5px;margin-top:4px">…or drag &amp; drop files here · pdf, office, images, text · max 25 MB each · uploaded when you press Create</div>
+    </div>`;
+}
+function attachStageWire(elId) {
+  const z = document.getElementById(`${elId}-dz`);
+  if (!z) return;
+  ['dragenter', 'dragover'].forEach(ev => z.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); z.classList.add('dz-hover');
+  }));
+  z.addEventListener('dragleave', e => { e.preventDefault(); z.classList.remove('dz-hover'); });
+  z.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation(); z.classList.remove('dz-hover');
+    attachStageAdd(elId, [...((e.dataTransfer || {}).files || [])]);
+  });
+}
+function attachStageAdd(elId, files) {
+  const cur = attachStaged[elId] || (attachStaged[elId] = []);
+  for (const f of files) {
+    if (!cur.some(x => x.name === f.name && x.size === f.size)) cur.push(f);
+  }
+  attachStageRender(elId);
+}
+function attachStageRemove(elId, i) {
+  (attachStaged[elId] || []).splice(i, 1);
+  attachStageRender(elId);
+}
+function attachStageRender(elId) {
+  const el = document.getElementById(`${elId}-pending`);
+  if (!el) return;
+  el.innerHTML = (attachStaged[elId] || []).map((f, i) => `
+    <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:2px">
+      📎 ${esc(f.name)} <span class="muted" style="font-size:10.5px">${(f.size / 1024).toFixed(0)} KB · pending</span>
+      <button class="btn-sm danger" title="remove" onclick="attachStageRemove('${elId}',${i})">✕</button>
+    </div>`).join('');
+}
+async function attachStageUploadAll(elId, kind, id) {
+  const files = attachStaged[elId] || [];
+  delete attachStaged[elId];
+  let done = 0;
+  for (const f of files) {
+    try { await attachPostFile(kind, id, f); done++; }
+    catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+  }
+  return done;
 }
 
 // ═══════════════════ GLOBAL FOCUS CONTEXT (Projects › Workflows › Tasks) ═══════════════════
@@ -4234,6 +4295,10 @@ function showTaskModal(status) {
         <div class="form-hint" style="margin-top:4px">The loop itself is designed automatically for this exact task when you press Create — you can view, understand and change it afterwards via the task's 🔁 Loop settings.</div>
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label">📎 Attachments (input files the agent reads before working)</label>
+      ${attachStageHTML('tc-attach')}
+    </div>
     <div class="modal-actions" style="justify-content:space-between">
       <button class="btn-ghost" title="Save these form values as a reusable template" onclick="saveAsTemplateUI()">⭐ Save as template</button>
       <div style="display:flex;gap:10px">
@@ -4243,6 +4308,7 @@ function showTaskModal(status) {
     </div>
   `;
   $('#modal').style.display = 'flex';
+  attachStageWire('tc-attach');
   // fill the specialist + template pickers async (cached)
   (async () => {
     try {
@@ -4334,7 +4400,7 @@ async function submitTask() {
     } catch (e) { toast('Loop design failed (task created without loop): ' + e.message, 'err'); }
   }
   closeModal();
-  await api('POST', '/api/tasks', {
+  const created = await api('POST', '/api/tasks', {
     loop_config: loopCfg,
     repo_path: $('#m-task-repo') ? ($('#m-task-repo').value || null) : null,
     workflow_id: focusCtx.workflow ? focusCtx.workflow.id : null,
@@ -4355,9 +4421,10 @@ async function submitTask() {
       ? taskCreateContext.depends_on : null,
   });
   taskCreateContext = null;
+  const nAtt = await attachStageUploadAll('tc-attach', 'task', created.id);
   wfState.fetched = false;
   state.tasks = await api('GET', '/api/tasks');
-  toast('Task created', 'ok');
+  toast(`Task created${nAtt ? ` with ${nAtt} attachment${nAtt > 1 ? 's' : ''}` : ''}`, 'ok');
   render();
 }
 
@@ -8161,12 +8228,17 @@ function proposeWorkflowModal(wf, meta) {
         <div class="form-hint" style="margin-top:4px">The loop is designed automatically for this exact project when you press Create — inspect and change it later via the project's 🔁 Loop settings.</div>
       </div>
     </div>
+    <div class="form-group" style="margin-top:8px">
+      <label class="form-label">📎 Attachments — project-wide input files (every task reads them)</label>
+      ${attachStageHTML('wz-attach')}
+    </div>
     <div class="form-hint" style="margin-top:8px">Tasks are created in <strong>Backlog</strong> so you can fill any [brackets] first. Move task 1 to Todo to start the chain.</div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
       <button class="btn-primary" id="wfCreateBtn">Create project (${tasks.length} tasks)</button>
     </div>`);
   planEdRender();
+  attachStageWire('wz-attach');
   const addBtn = $('#wfAddTask');
   if (addBtn) addBtn.onclick = () => planEdAddTask();
   const b = $('#wfCreateBtn');
@@ -8259,11 +8331,12 @@ function proposeWorkflowModal(wf, meta) {
         });
         ids.push(created.id);
       }
+      const nAtt = await attachStageUploadAll('wz-attach', 'workflow', w.id);
       wfState.fetched = false;
       state.tasks = await api('GET', '/api/tasks');
       planEd = null;
       closeModal();
-      toast(`Project "${wf.name}" created — fill the [brackets], then move task 1 to Todo`, 'ok');
+      toast(`Project "${wf.name}" created${nAtt ? ` with ${nAtt} project-wide file${nAtt > 1 ? 's' : ''}` : ''} — fill the [brackets], then move task 1 to Todo`, 'ok');
       switchView('workflows');
     } catch (e) {
       toast('Create failed: ' + e.message, 'err');

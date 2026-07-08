@@ -224,7 +224,10 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   project modal has an "Attach to" target picker (project-wide vs ONE member task) with
   per-task placement groups, every upload spot takes multi-file + drag & drop
   (`attachWire`/`attachUploadFiles` in app.js), and the task modal shows inherited
-  project-wide files read-only.
+  project-wide files read-only. Files can also be staged at CREATION time (task-create
+  modal incl. single-task wizard output → the new task; wizard project proposal →
+  project-wide): `attachStage*` helpers hold File objects in memory and upload right
+  after Create returns the new id — a cancelled form never leaks its staged files.
 - **Task wizard** (v3): `POST /api/tasks/wizard {instruction, answers?}` — two-phase.
   Phase 1 may return `{type:"questions"}` (ONE round, ≤6 — ask-when-in-doubt; each option carries pros/cons + a ★ recommended best-practice pick; unknowns that change the
   plan's SHAPE — stack/platform, acceptance criteria, real-money blast radius; every
