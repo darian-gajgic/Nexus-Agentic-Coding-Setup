@@ -143,6 +143,7 @@ async function bootAuth() {
   if (authState.required && !authState.user) { renderLoginScreen(); return; }
   loadFocus();
   renderUserChip();
+  ensureModels(); // Settings v2: model registry feeds every task-model dropdown
   init();
 }
 
@@ -1300,11 +1301,7 @@ function openTaskDetail(id) {
     </div>
     <div class="form-group">
       <label class="form-label">AI model</label>
-      <select class="form-select" id="td-model">
-        <option value="" ${!t.model ? 'selected' : ''}>glm-5.2 — smartest (default)</option>
-        <option value="glm-5.1" ${t.model === 'glm-5.1' ? 'selected' : ''}>glm-5.1 — lighter/faster (own concurrency pool)</option>
-        <option value="glm-4.5-air" ${t.model === 'glm-4.5-air' ? 'selected' : ''}>glm-4.5-air — cheapest (mechanical work)</option>
-      </select>
+      <select class="form-select" id="td-model">${taskModelOptions(t.model)}</select>
     </div>
     ${(() => {
       const curDeps = (() => { try { return JSON.parse(t.depends_on || '[]'); } catch { return []; } })();
@@ -1586,7 +1583,7 @@ function viewManual() {
     <h4>Attachments — give agents your material</h4>
     <p>Open any task and add files: PDFs, Word, Excel, PowerPoint, pictures. The agent is <b>required</b> to read them before working. Results can also come back in those formats — just ask for "a Word document" or "an Excel sheet" in the description.</p>
     <h4>Choosing a model (optional)</h4>
-    <p>Each task can run on a different AI model: <b>glm-5.2</b> (the smart default), <b>glm-5.1</b>, or <b>glm-4.5-air</b> (fast and cheap — fine for simple mechanical work). If you don't choose, the system does.</p>
+    <p>Each task can run on a different AI model from your registry (Settings → Models & routing) — a hard-thinking default, a lighter/faster tier, and a cheap mechanical tier. If you don't choose, your 'complicated tasks' model applies.</p>
     <div class="m-tip">💡 A good task description says: what you want, for whom, and what "done" looks like. One sentence of each is enough — the wizard fills in the rest and always shows you its assumptions.</div>
   </div>
 
@@ -1793,7 +1790,7 @@ const TOURS = {
 Object.assign(TOURS, {
   'task-detail-modal': [
     { sel: '#td-status, .modal-content', title: 'Status & priority', body: 'Status is the kanban column this task sits in — moving it here is the same as dragging the card. Priority orders it against other waiting tasks (1 is most urgent).' },
-    { sel: '#td-model', title: 'Which AI model works on it', body: 'glm-5.2 is the smart default for real work. glm-4.5-air is faster and cheaper — fine for simple mechanical jobs. Each model has its own traffic lane, so light tasks never queue behind heavy ones.' },
+    { sel: '#td-model', title: 'Which AI model works on it', body: 'The default is your registry\'s "complicated tasks" model — right for real work. Lighter registry models are faster and cheaper, fine for simple mechanical jobs. Each model has its own traffic lane, so light tasks never queue behind heavy ones.' },
     { sel: '#td-budget', title: 'The spending fence', body: 'The maximum tokens (AI fuel) this task may consume. Empty = the default from Settings. If it runs out, the task pauses as "blocked: budget" — retrying grants exactly one more slice, so nothing ever runs away.' },
     { sel: '#td-depends', title: 'Dependencies', body: 'Tasks selected here must finish first; their results are handed to this task as input automatically. This is how pipelines pass work along.' },
     { sel: '[id^="attachRow"], .attach-list, #td-attachments', title: 'Attachments', body: 'Give the agent your material: PDFs, Office files, images. It is REQUIRED to read them before working. Results can come back in these formats too — just ask in the description.' },
@@ -1905,57 +1902,192 @@ function endTour() {
   ['tourDim', 'tourSpot', 'tourCard'].forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
 }
 
-// ═══════════════════ SETTINGS TAB (budgets · concurrency · per-model efforts) ═══════════════════
-const KNOWN_MODELS = ['glm-5.2', 'glm-5.1', 'glm-4.5-air'];
-const settingsState = { fetched: false, dispatch: {}, model: {} };
+// ═══════════════════ SETTINGS TAB (Settings v2 — registry · models · credentials) ═══════════════════
+const settingsState = { fetched: false, dispatch: {}, model: {}, schema: null, credentials: [] };
+// Model registry (Settings v2): global + own rows, purpose routing, task-model list.
+const modelState = {
+  fetched: false, models: [], assignments: {}, sources: {},
+  taskModels: ['glm-5.2', 'glm-5.1', 'glm-4.5-air'], purposes: {}, isAdmin: false,
+};
+
+async function ensureModels(force) {
+  if (modelState.fetched && !force) return;
+  try {
+    const r = await api('GET', '/api/models');
+    modelState.models = r.models || [];
+    modelState.assignments = r.assignments || {};
+    modelState.sources = r.assignment_sources || {};
+    modelState.taskModels = (r.task_models && r.task_models.length) ? r.task_models : modelState.taskModels;
+    modelState.purposes = r.purposes || {};
+    modelState.isAdmin = !!r.is_admin;
+    modelState.fetched = true;
+  } catch { }
+}
+
+function modelById(id) { return modelState.models.find(m => m.id === id) || null; }
+function hermesModels() { return modelState.models.filter(m => m.route === 'hermes' && m.enabled); }
+function defaultTaskModelId() {
+  const m = modelById(modelState.assignments.complicated);
+  return m ? m.model_id : 'glm-5.2';
+}
+// Options for every per-task model <select> — built from the caller's registry.
+function taskModelOptions(cur) {
+  const def = defaultTaskModelId();
+  const opts = [`<option value="" ${!cur ? 'selected' : ''}>${esc(def)} — default (your 'complicated tasks' model)</option>`];
+  for (const mid of modelState.taskModels) {
+    if (mid === def) continue;
+    const row = modelState.models.find(m => m.model_id === mid && m.route === 'hermes');
+    const label = row && row.label ? ` — ${row.label}` : '';
+    opts.push(`<option value="${esc(mid)}" ${cur === mid ? 'selected' : ''}>${esc(mid)}${esc(label)}</option>`);
+  }
+  return opts.join('');
+}
 
 async function loadSettingsData() {
   try {
-    const [d, m] = await Promise.all([
+    const [d, m, sch, mods, creds] = await Promise.all([
       api('GET', '/api/settings?prefix=dispatch.'),
       api('GET', '/api/settings?prefix=model.'),
+      api('GET', '/api/settings/schema'),
+      api('GET', '/api/models'),
+      api('GET', '/api/credentials'),
     ]);
     settingsState.dispatch = d.settings || {};
     settingsState.model = m.settings || {};
+    settingsState.schema = sch;
+    settingsState.credentials = creds.credentials || [];
+    modelState.models = mods.models || [];
+    modelState.assignments = mods.assignments || {};
+    modelState.sources = mods.assignment_sources || {};
+    modelState.taskModels = (mods.task_models && mods.task_models.length) ? mods.task_models : modelState.taskModels;
+    modelState.purposes = mods.purposes || {};
+    modelState.isAdmin = !!mods.is_admin;
+    modelState.fetched = true;
     settingsState.fetched = true;
     if (currentView === 'settings') render();
   } catch (e) { toast('Settings load failed: ' + e.message, 'err'); }
 }
 
-function viewSettings() {
-  if (!settingsState.fetched) { loadSettingsData(); return skeletonView(); }
-  const d = settingsState.dispatch, m = settingsState.model;
+// One registry item → one labeled input (generic renderer; docs/SPEC-SETTINGS-V2.md R1).
+function settingItemHTML(it) {
+  const id = 'sr-' + it.key.replace(/\./g, '-');
+  const eff = it.effective !== undefined && it.effective !== '' ? it.effective : (it.default || '');
+  let input;
+  if (it.type === 'bool') {
+    const opts = [['', `(default: ${eff === '1' ? 'on' : 'off'})`], ['1', 'on'], ['0', 'off']]
+      .map(([v, t]) => `<option value="${v}" ${it.value === v ? 'selected' : ''}>${t}</option>`).join('');
+    input = `<select class="form-select sr-item" id="${id}" data-key="${esc(it.key)}">${opts}</select>`;
+  } else if (it.type === 'int' || it.type === 'float') {
+    input = `<input class="form-input sr-item" id="${id}" data-key="${esc(it.key)}" type="number"
+      ${it.min !== undefined ? `min="${it.min}"` : ''} ${it.max !== undefined ? `max="${it.max}"` : ''}
+      ${it.type === 'float' ? 'step="any"' : ''} value="${esc(it.value || '')}" placeholder="${esc(eff)}">`;
+  } else {
+    input = `<input class="form-input sr-item" id="${id}" data-key="${esc(it.key)}"
+      value="${esc(it.value || '')}" placeholder="${esc(eff)}" spellcheck="false">`;
+  }
+  const badges = (it.restart ? ' <span class="muted" title="Applies after a service restart">↻ restart</span>' : '')
+    + (it.env ? ` <span class="muted" title="Falls back to the ${esc(it.env)} environment variable when unset">env</span>` : '');
+  return `<div class="form-group" style="min-width:220px">
+    <label class="form-label">${esc(it.label)}${badges}</label>${input}
+    ${it.help ? `<div class="form-hint">${esc(it.help)}</div>` : ''}
+  </div>`;
+}
+
+function settingsRegistryHTML() {
+  const sch = settingsState.schema;
+  if (!sch || !sch.is_admin) return '';
+  return sch.sections.map(sec => `
+    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>⚙ ${esc(sec.title)}</h3></div>
+    <div class="card-body">
+      <div class="form-hint" style="margin-bottom:8px">${esc(sec.desc)}. Empty field = default.</div>
+      <div class="form-row" style="flex-wrap:wrap">${sec.items.map(settingItemHTML).join('')}</div>
+    </div></div>`).join('');
+}
+
+const PURPOSE_ROUTES = { complicated: 'hermes', easy: 'hermes', mechanical: 'hermes', frontier_judge: 'cli' };
+
+function modelsCardHTML() {
   const effOpts = (cur) => ['', 'minimal', 'low', 'medium', 'high', 'max'].map(v =>
     `<option value="${v}" ${cur === v ? 'selected' : ''}>${v || '(automatic)'}</option>`).join('');
-  const modelRows = KNOWN_MODELS.map(mo => `
-    <tr><td><code>${esc(mo)}</code></td>
-      <td><input class="form-input" id="st-cap-${esc(mo)}" type="number" min="1" max="10" style="width:80px"
-        value="${esc(d['dispatch.max_concurrent.' + mo] || '')}" placeholder="${esc(d['dispatch.max_concurrent_per_model'] || '8')}"></td>
-      <td><select class="form-select" id="st-eff-${esc(mo)}" style="width:150px">${effOpts(m['model.effort.' + mo] || '')}</select></td>
-      <td class="muted" style="font-size:11px">${mo === 'glm-4.5-air' ? 'automatic = capped at medium (cheap tier)' : 'automatic = MAX (via global xhigh)'}</td></tr>`).join('');
+  const d = settingsState.dispatch, mset = settingsState.model;
+  const rows = modelState.models.map(mo => {
+    const isHermes = mo.route === 'hermes';
+    const mid = mo.model_id;
+    const cred = settingsState.credentials.find(c => c.id === mo.credential_id);
+    return `<tr ${mo.enabled ? '' : 'style="opacity:.45"'}>
+      <td><code>${esc(mid)}</code>${mo.label ? `<div class="muted" style="font-size:11px">${esc(mo.label)}</div>` : ''}</td>
+      <td>${esc(mo.provider)}${mo.user_id ? '' : ' <span class="muted" title="Global default model (admin-managed)">🌐</span>'}</td>
+      <td>${mo.route === 'cli' ? 'CLI (judge)' : 'Hermes session'}</td>
+      <td class="muted" style="font-size:11px">${cred ? `🔑 ••••${esc(cred.hint)}` : 'default key'}</td>
+      <td>${isHermes ? `<input class="form-input" id="st-cap-${esc(mid)}" type="number" min="1" max="10" style="width:70px"
+        value="${esc(d['dispatch.max_concurrent.' + mid] || '')}" placeholder="${esc(d['dispatch.max_concurrent_per_model'] || '8')}">` : '<span class="muted">—</span>'}</td>
+      <td>${isHermes ? `<select class="form-select" id="st-eff-${esc(mid)}" style="width:130px">${effOpts(mset['model.effort.' + mid] || '')}</select>` : '<span class="muted">—</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn-ghost btn-sm" onclick="showModelModal('${esc(mo.id)}')">Edit</button>
+        <button class="btn-ghost btn-sm" onclick="deleteModelRow('${esc(mo.id)}','${esc(mid)}')">✕</button>
+      </td></tr>`;
+  }).join('');
+  const assignRows = Object.entries(modelState.purposes).map(([p, desc]) => {
+    const wantRoute = PURPOSE_ROUTES[p] || 'hermes';
+    const eligible = modelState.models.filter(m => m.enabled && m.route === wantRoute);
+    const cur = modelState.assignments[p] || '';
+    const opts = eligible.map(m =>
+      `<option value="${esc(m.id)}" ${cur === m.id ? 'selected' : ''}>${esc(m.model_id)}${m.user_id ? '' : ' 🌐'}</option>`).join('');
+    const src = modelState.sources[p] === 'user'
+      ? `<button class="btn-ghost btn-sm" title="Back to the global default" onclick="clearAssignment('${esc(p)}')">↩ default</button>`
+      : '<span class="muted" style="font-size:11px">global default</span>';
+    return `<tr><td style="max-width:340px"><b>${esc(p.replace('_', ' '))}</b>
+        <div class="muted" style="font-size:11px">${esc(desc)}</div></td>
+      <td><select class="form-select st-assign" data-purpose="${esc(p)}" style="min-width:200px">
+        <option value="">(none)</option>${opts}</select></td>
+      <td>${src}</td></tr>`;
+  }).join('');
   return `
-    <div class="agentic-card"><div class="card-head"><h3>⚙ Dispatch & budgets</h3></div><div class="card-body">
-      <div class="form-hint" style="margin-bottom:8px">Budgets count <strong>input + output tokens per turn</strong> — agentic sessions resend their growing context every tool call, so real coding tasks use millions. Every retry automatically grants one more budget-slice.</div>
-      <div class="form-row">
-        <div class="form-group"><label class="form-label">Default per-task budget (tokens)</label>
-          <input class="form-input" id="st-taskbudget" type="number" min="100000" step="100000" value="${esc(d['dispatch.default_task_budget'] || '5000000')}"></div>
-        <div class="form-group"><label class="form-label">Daily cap (tokens, all tasks together)</label>
-          <input class="form-input" id="st-dailycap" type="number" min="1000000" step="1000000" value="${esc(d['dispatch.daily_cap'] || '9900000000')}"></div>
+    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🧠 Models & routing</h3>
+      <button class="btn-ghost btn-sm" onclick="showModelModal()">+ Add model</button></div><div class="card-body">
+      <div class="form-hint" style="margin-bottom:8px">Your model registry: 🌐 rows are the machine defaults every user inherits; rows you add apply to <b>you only</b>. Hermes-session models run your tasks; CLI models power the frontier judge. Effort = how hard a GLM model thinks per call. Assign below <b>which model serves which purpose</b> — the wizard, dispatch, dev-pipeline floor and judge all follow these assignments.</div>
+      <div style="overflow-x:auto"><table class="data-table">
+        <thead><tr><th>Model</th><th>Provider</th><th>Runs via</th><th>API key</th><th>Max parallel</th><th>Default effort</th><th></th></tr></thead>
+        <tbody id="modelRegistryRows">${rows || '<tr><td colspan="7" class="muted">No models yet — add one.</td></tr>'}</tbody></table></div>
+      <h4 style="margin:14px 0 6px">Purpose routing${modelState.isAdmin ? ' <label style="font-weight:400;font-size:11.5px;margin-left:8px"><input type="checkbox" id="assignGlobal"> edit the global defaults (all users)</label>' : ''}</h4>
+      <div style="overflow-x:auto"><table class="data-table">
+        <thead><tr><th>Purpose</th><th>Model</th><th>Source</th></tr></thead>
+        <tbody>${assignRows}</tbody></table></div>
+      <div style="margin-top:10px"><button class="btn-ghost" onclick="saveAssignments()">Apply purpose routing</button></div>
+    </div></div>`;
+}
+
+function credentialsCardHTML() {
+  const rows = settingsState.credentials.map(c => `
+    <tr><td><code>${esc(c.provider)}</code>${c.global ? ' <span class="muted" title="Machine-wide default override (admin-managed)">🌐</span>' : ''}</td>
+      <td>••••••••${esc(c.hint)}</td>
+      <td class="muted">${esc(c.label || '')}</td>
+      <td><button class="btn-ghost btn-sm" onclick="deleteCredential('${esc(c.id)}','${esc(c.provider)}')">Remove</button></td></tr>`).join('');
+  return `
+    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🔑 Providers & credentials</h3></div><div class="card-body">
+      <div class="form-hint" style="margin-bottom:8px">Personal API keys — they apply to <b>your</b> tasks/judge runs only and are stored <b>encrypted</b>; saved keys are never shown again (last 4 characters only). No key here = the machine's default key keeps working. Provider slugs: <code>zai</code> (GLM tasks), <code>anthropic</code> (frontier judge)${modelState.isAdmin ? ', <code>langfuse_public</code>/<code>langfuse_secret</code> (observability, global)' : ''}.</div>
+      ${rows ? `<div style="overflow-x:auto"><table class="data-table">
+        <thead><tr><th>Provider</th><th>Key</th><th>Label</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : '<div class="muted" style="font-size:12px;margin-bottom:6px">No keys saved — the machine defaults apply.</div>'}
+      <div class="form-row" style="margin-top:10px;flex-wrap:wrap;align-items:flex-end">
+        <div class="form-group"><label class="form-label">Provider</label>
+          <input class="form-input" id="credProvider" placeholder="e.g. zai" autocapitalize="none" style="width:140px"></div>
+        <div class="form-group"><label class="form-label">API key (write-only)</label>
+          <input class="form-input" id="credValue" type="password" autocomplete="off" placeholder="paste key…"></div>
+        <div class="form-group"><label class="form-label">Label (optional)</label>
+          <input class="form-input" id="credLabel" placeholder="e.g. my Z.AI account" style="width:170px"></div>
+        ${modelState.isAdmin ? '<label style="font-size:11.5px;align-self:center;white-space:nowrap"><input type="checkbox" id="credGlobal"> global (all users’ default)</label>' : ''}
+        <button class="btn-primary" onclick="saveCredential()" style="align-self:center">Save key</button>
       </div>
-      <div class="form-row">
-        <div class="form-group"><label class="form-label">Max parallel sessions TOTAL</label>
-          <input class="form-input" id="st-total" type="number" min="1" max="10" value="${esc(d['dispatch.max_concurrent_total'] || '8')}">
-          <div class="form-hint">Hermes caps ~10 concurrent runs; stay below it so JARVIS/wizard always get a slot.</div></div>
-        <div class="form-group"><label class="form-label">Max parallel sessions per model (global default)</label>
-          <input class="form-input" id="st-permodel" type="number" min="1" max="10" value="${esc(d['dispatch.max_concurrent_per_model'] || '8')}">
-          <div class="form-hint">Z.AI allows ~10 concurrent per model. Per-model overrides below.</div></div>
-      </div>
-    </div></div>
-    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🧠 Per-model limits & effort</h3></div><div class="card-body">
-      <div class="form-hint" style="margin-bottom:8px">Effort = how hard the model thinks per call (more effort → better answers, more tokens, slower). The default here is applied to <strong>every call</strong> of that model — it overrides the automatic choice. Claude models (cjudge/cspec/creview) use the Claude CLI's saved default (<code>xhigh</code>) and are not configured here.</div>
-      <table class="data-table"><thead><tr><th>Model</th><th>Max parallel</th><th>Default effort</th><th></th></tr></thead>
-      <tbody>${modelRows}</tbody></table>
-    </div></div>
+    </div></div>`;
+}
+
+function viewSettings() {
+  if (!settingsState.fetched) { loadSettingsData(); return skeletonView(); }
+  return `
+    ${modelsCardHTML()}
+    ${credentialsCardHTML()}
+    ${settingsRegistryHTML()}
     <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>👥 Users & access</h3></div><div class="card-body" id="usersPanel">
       <div class="muted" style="font-size:12px">Loading users…</div>
     </div></div>
@@ -1970,8 +2102,8 @@ function viewSettings() {
       <button class="btn-ghost" onclick="switchView('issues')">Known issues</button>
     </div></div>
     <div style="margin-top:14px;display:flex;gap:10px">
-      <button class="btn-primary" onclick="saveSettingsTab()">Save all settings</button>
-      <span class="muted" style="align-self:center;font-size:11.5px">Applies immediately — workers read settings live, and per-model efforts reach Hermes without a restart.</span>
+      ${settingsState.schema && settingsState.schema.is_admin ? '<button class="btn-primary" onclick="saveSettingsTab()">Save all settings</button>' : ''}
+      <span class="muted" style="align-self:center;font-size:11.5px">Most settings apply immediately — workers read them live, per-model efforts reach Hermes without a restart; ↻-marked values need a service restart.</span>
     </div>`;
 }
 
@@ -2101,24 +2233,140 @@ async function toggleUserActive(uid, active) {
 }
 
 async function saveSettingsTab() {
-  const body = {
-    'dispatch.default_task_budget': String(parseInt($('#st-taskbudget').value) || 5000000),
-    'dispatch.daily_cap': String(parseInt($('#st-dailycap').value) || 9900000000),
-    'dispatch.max_concurrent_total': String(Math.min(10, parseInt($('#st-total').value) || 8)),
-    'dispatch.max_concurrent_per_model': String(Math.min(10, parseInt($('#st-permodel').value) || 8)),
-  };
-  for (const mo of KNOWN_MODELS) {
-    const cap = ($(`#st-cap-${mo}`) || {}).value;
-    if (cap) body[`dispatch.max_concurrent.${mo}`] = String(Math.min(10, parseInt(cap) || 8));
-    else body[`dispatch.max_concurrent.${mo}`] = '';
-    body[`model.effort.${mo}`] = ($(`#st-eff-${mo}`) || {}).value || '';
+  const body = {};
+  // Generic registry inputs (Settings v2) — empty value = clear to default.
+  document.querySelectorAll('.sr-item').forEach(el => { body[el.dataset.key] = el.value; });
+  // Per-model concurrency + effort rows (hermes-route registry models).
+  for (const mo of hermesModels()) {
+    const mid = mo.model_id;
+    const cap = ($(`#st-cap-${CSS.escape(mid)}`) || {}).value;
+    body[`dispatch.max_concurrent.${mid}`] = cap ? String(Math.min(10, parseInt(cap) || 8)) : '';
+    body[`model.effort.${mid}`] = ($(`#st-eff-${CSS.escape(mid)}`) || {}).value || '';
   }
   try {
     await api('PATCH', '/api/settings', body);
     settingsState.fetched = false;
-    toast('Settings saved — active immediately', 'ok');
+    toast('Settings saved', 'ok');
     loadSettingsData();
   } catch (e) { toast('Save failed: ' + e.message, 'err'); }
+}
+
+// ── Settings v2: model registry CRUD + purpose routing + credentials ──
+
+function showModelModal(modelRowId) {
+  const m = modelRowId ? modelById(modelRowId) : null;
+  const creds = settingsState.credentials;
+  const credOpts = ['<option value="">(machine default key)</option>']
+    .concat(creds.map(c =>
+      `<option value="${esc(c.id)}" ${m && m.credential_id === c.id ? 'selected' : ''}>${esc(c.provider)} ••••${esc(c.hint)}${c.global ? ' 🌐' : ''}</option>`))
+    .join('');
+  showModal(`
+    <div class="modal-head"><h3>${m ? 'Edit model' : 'Add model'}</h3></div>
+    <div class="modal-body">
+      <div class="form-hint" style="margin-bottom:10px">Hermes-session models run tasks (currently the Z.AI/GLM provider — more providers become task-routable when Hermes gains them); CLI models power the frontier judge via <code>judge.cmd</code> (e.g. Anthropic's Opus). ${modelState.isAdmin ? 'Global models are inherited by every user.' : 'Models you add apply to you only.'}</div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Provider slug</label>
+          <input class="form-input" id="mm-provider" autocapitalize="none" placeholder="zai / anthropic / openai…" value="${esc(m ? m.provider : '')}"></div>
+        <div class="form-group"><label class="form-label">Model id</label>
+          <input class="form-input" id="mm-model" autocapitalize="none" placeholder="e.g. claude-opus-4-8" value="${esc(m ? m.model_id : '')}"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="form-group"><label class="form-label">Label (optional)</label>
+          <input class="form-input" id="mm-label" placeholder="what it's good at" value="${esc(m ? (m.label || '') : '')}"></div>
+        <div class="form-group"><label class="form-label">Runs via</label>
+          <select class="form-select" id="mm-route">
+            <option value="hermes" ${!m || m.route === 'hermes' ? 'selected' : ''}>Hermes session (tasks)</option>
+            <option value="cli" ${m && m.route === 'cli' ? 'selected' : ''}>CLI (frontier judge)</option>
+          </select></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="form-group"><label class="form-label">API key</label>
+          <select class="form-select" id="mm-cred">${credOpts}</select>
+          <div class="form-hint">Keys are added under Providers & credentials.</div></div>
+        <div class="form-group"><label class="form-label">Enabled</label>
+          <select class="form-select" id="mm-enabled"><option value="1" ${!m || m.enabled ? 'selected' : ''}>yes</option><option value="0" ${m && !m.enabled ? 'selected' : ''}>no</option></select></div>
+      </div>
+      ${!m && modelState.isAdmin ? '<label style="font-size:11.5px;display:block;margin-top:10px"><input type="checkbox" id="mm-global"> global (inherited by every user)</label>' : ''}
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn-primary" onclick="submitModelModal(${m ? `'${esc(m.id)}'` : 'null'})">${m ? 'Save changes' : 'Add model'}</button>
+        <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      </div>
+    </div>`);
+}
+
+async function submitModelModal(modelRowId) {
+  const body = {
+    provider: $('#mm-provider').value.trim().toLowerCase(),
+    model_id: $('#mm-model').value.trim(),
+    label: $('#mm-label').value.trim(),
+    route: $('#mm-route').value,
+    credential_id: $('#mm-cred').value || null,
+    enabled: $('#mm-enabled').value === '1',
+  };
+  if ($('#mm-global') && $('#mm-global').checked) body.global = true;
+  try {
+    if (modelRowId) await api('PATCH', `/api/models/${modelRowId}`, body);
+    else await api('POST', '/api/models', body);
+    toast(modelRowId ? 'Model updated' : 'Model added', 'ok');
+    closeModal();
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Model save failed: ' + e.message, 'err'); }
+}
+
+async function deleteModelRow(modelRowId, modelId) {
+  if (!confirm(`Remove model ${modelId} from the registry? Purpose assignments pointing at it are cleared.`)) return;
+  try {
+    await api('DELETE', `/api/models/${modelRowId}`);
+    toast('Model removed', 'ok');
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+async function saveAssignments() {
+  const body = {};
+  document.querySelectorAll('.st-assign').forEach(el => { body[el.dataset.purpose] = el.value || null; });
+  if ($('#assignGlobal') && $('#assignGlobal').checked) body.global = true;
+  try {
+    await api('PUT', '/api/models/assignments', body);
+    toast('Purpose routing applied — dispatch/wizard/judge follow it immediately', 'ok');
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Routing save failed: ' + e.message, 'err'); }
+}
+
+async function clearAssignment(purpose) {
+  try {
+    await api('PUT', '/api/models/assignments', { [purpose]: null });
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+async function saveCredential() {
+  const provider = $('#credProvider').value.trim().toLowerCase();
+  const value = $('#credValue').value;
+  if (!provider || !value) { toast('Provider and key are required', 'err'); return; }
+  const body = { provider, value, label: $('#credLabel').value.trim() };
+  if ($('#credGlobal') && $('#credGlobal').checked) body.global = true;
+  try {
+    await api('POST', '/api/credentials', body);
+    $('#credValue').value = '';
+    toast('Key saved (encrypted) — it will never be displayed again', 'ok', 5000);
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Key save failed: ' + e.message, 'err'); }
+}
+
+async function deleteCredential(credId, provider) {
+  if (!confirm(`Remove the ${provider} key? Sessions fall back to the machine default key.`)) return;
+  try {
+    await api('DELETE', `/api/credentials/${credId}`);
+    toast('Key removed', 'ok');
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
 // ── Always-visible per-model session strip (topbar) ──
@@ -2128,13 +2376,14 @@ function updateModelStrip() {
   const inflight = state.quota.in_flight || {};
   const d = settingsState.dispatch || {};
   const globalCap = parseInt(d['dispatch.max_concurrent_per_model']) || state.quota.per_model_cap || 8;
-  const parts = KNOWN_MODELS.map(mo => {
+  const stripModels = modelState.taskModels;
+  const parts = stripModels.map(mo => {
     const n = inflight[mo] || 0;
     const cap = parseInt(d['dispatch.max_concurrent.' + mo]) || globalCap;
     const hot = n >= cap;
     return `<span style="${n ? 'color:var(--accent-2)' : ''}${hot ? ';color:var(--red,#f87171)' : ''}" title="${esc(mo)}: ${n} running of max ${cap}">${esc(mo.replace('glm-', ''))} ${n}/${cap}</span>`;
   });
-  const extra = Object.keys(inflight).filter(k => !KNOWN_MODELS.includes(k));
+  const extra = Object.keys(inflight).filter(k => !stripModels.includes(k));
   for (const k of extra) parts.push(`<span style="color:var(--accent-2)">${esc(k)} ${inflight[k]}</span>`);
   el.innerHTML = `<span class="muted">sessions</span> ` + parts.join(' <span class="muted">·</span> ');
 }
@@ -3728,7 +3977,7 @@ function showSpawnModal() {
       <label class="form-label" style="display:flex;align-items:center;gap:8px">
         <input type="checkbox" id="m-agent-autoclaim" checked> Auto-claim: pick up unassigned Todo tasks by itself</label>
     </div>
-    <div class="form-hint" style="margin-bottom:10px">A lane is a worker that executes ONE task at a time. The AI model (glm-5.2 / 5.1 / 4.5-air) is chosen per TASK, not per lane — every lane runs whatever the task specifies.</div>
+    <div class="form-hint" style="margin-bottom:10px">A lane is a worker that executes ONE task at a time. The AI model (from your registry in Settings → Models & routing) is chosen per TASK, not per lane — every lane runs whatever the task specifies.</div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
       <button class="btn-primary" onclick="submitSpawn()">Spawn</button>
@@ -3805,12 +4054,8 @@ function showTaskModal(status) {
     </div>
     <div class="form-group">
       <label class="form-label">AI model</label>
-      <select class="form-select" id="m-task-model">
-        <option value="">glm-5.2 — smartest (default, real deliverables)</option>
-        <option value="glm-5.1">glm-5.1 — lighter/faster (simple tasks; own concurrency pool)</option>
-        <option value="glm-4.5-air">glm-4.5-air — cheapest (mechanical/formatting work)</option>
-      </select>
-      <div class="form-hint">Z.ai's concurrency limit is per model — putting light tasks on glm-5.1 keeps glm-5.2 slots free for the hard ones.</div>
+      <select class="form-select" id="m-task-model">${taskModelOptions('')}</select>
+      <div class="form-hint">The list comes from your model registry (Settings → Models & routing). Concurrency is per model — putting light tasks on a lighter model keeps default-model slots free for the hard ones.</div>
     </div>
     <div class="form-row">
       <div class="form-group">
@@ -7567,11 +7812,7 @@ function planEdEditorHTML(t, i) {
         <select class="form-select" id="pe-domain" style="max-width:190px">
           ${NEXUS_DOMAINS.map(d => `<option value="${d}" ${(t.domain || 'general') === d ? 'selected' : ''}>${d}</option>`).join('')}
         </select>
-        <select class="form-select" id="pe-model" style="max-width:230px">
-          <option value="">glm-5.2 — default (real work)</option>
-          <option value="glm-5.1" ${t.model === 'glm-5.1' ? 'selected' : ''}>glm-5.1 — lighter tasks</option>
-          <option value="glm-4.5-air" ${t.model === 'glm-4.5-air' ? 'selected' : ''}>glm-4.5-air — mechanical work</option>
-        </select>
+        <select class="form-select" id="pe-model" style="max-width:230px">${taskModelOptions(t.model)}</select>
         <input class="form-input" id="pe-budget" type="number" min="0" step="100000" value="${t.budget_tokens || ''}" placeholder="token budget (default)" style="max-width:190px">
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px"><input type="checkbox" id="pe-hs" ${t.high_stakes ? 'checked' : ''}> ⚖ high-stakes</label>
       </div>

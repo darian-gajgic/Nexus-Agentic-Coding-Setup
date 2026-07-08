@@ -10,6 +10,7 @@ node_modules/
 *.log
 cert.pem
 cert.key
+secret.key
 workspaces/
 nexus.db.bak-*
 jarvis_session.json

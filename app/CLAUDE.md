@@ -102,8 +102,37 @@ Key points (current architecture):
 - **Runtime gate — Onboarding UI (Playwright):** `.venv/bin/python scripts/verify_onboarding_ui.py` —
   CTA banner, welcome step, section explanations, auto-save on Next, n/a toggle, review
   counts, confirm-gated apply → success, Settings entry. 12 checks.
+- **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
+  settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
+  never leaves the API, per-user isolation), model registry CRUD + purpose-routing validation,
+  task-model validation, session-keys bridge, judge model/env plumbing via stubbed judge.cmd.
+  50 checks, self-cleaning, multi-user-preserving.
 - **Per-edit gate:** `.claude/check.sh` (auto-run by Claude Code PostToolUse on Write|Edit).
 - Playwright is installed in `.venv`. Screenshots save to `~/.hermes/cache/screenshots/`.
+
+## Settings v2 (2026-07-08, docs/SPEC-SETTINGS-V2.md is source of truth)
+- `settings_registry.py` = declarative registry of every operational setting (defaults =
+  historical behavior; env-backed entries resolve setting → env → default via `sreg.conf`).
+  `GET /api/settings/schema` renders the whole Settings tab generically; `_SETTINGS_PREFIXES`
+  derives from the registry. PATCH with `""` = back-to-default (registry keys pin the default
+  explicitly — code-site fallbacks differ; env-backed/unmanaged keys clear the row).
+- `secrets_store.py` = first at-rest crypto: per-user + global credentials Fernet-encrypted in
+  nexus.db (master key `secret.key`, 0600, gitignored). NO endpoint ever returns a stored
+  secret — metadata + 4-char hint only. Missing credential = the machine's env/CLI default key.
+- **Model registry**: `user_models` (global NULL-user rows + per-user rows) + `model_assignments`
+  (purposes: complicated / easy / mechanical / frontier_judge; 'global' scope = inherited
+  default). Seeded once (empty-table check): the GLM trio + `anthropic/claude-opus-4-8`
+  route=cli as frontier judge. Routing is APPLIED end-to-end: task create/patch validate against
+  `db.task_models_for(uid)`, dispatch/JARVIS/wizard/eval sessions run
+  `resolve_task_model`/`default_task_model`, the wizard's model guidance + dev-stage floor use
+  the owner's assignments, and the judge resolves `evals.judge_model_for(owner)`.
+- **Per-user API keys at execution**: dispatch publishes `~/.hermes/session-keys.json` (0600,
+  same bridge pattern as model-efforts.json); the guardian-tracked zai override plugin turns an
+  entry into a per-request `Authorization` header (absent entry = env `GLM_API_KEY`). Judge gets
+  `JUDGE_MODEL` + `JUDGE_ANTHROPIC_API_KEY` env (cjudge honors both; unset = subscription auth).
+  Caveat: Hermes AUXILIARY calls (title gen, compression) still bill the machine key.
+- Hermes-side files touched (keep guardian + vendored copies in sync — ship-flow step 4):
+  `~/.hermes/plugins/model-providers/zai/__init__.py`, `~/.local/bin/cjudge`.
 
 ## Real Dispatch (v2 — added 2026-07-06, SPEC-REAL-AGENTS.md is source of truth)
 

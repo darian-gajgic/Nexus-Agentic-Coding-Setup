@@ -413,6 +413,68 @@ def init_db():
         ended_at REAL
     )""")
 
+    # ===== Settings v2 (docs/SPEC-SETTINGS-V2.md): encrypted credentials +
+    # per-user model registry. user_id NULL = global (admin-managed) row.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS credentials (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        provider TEXT NOT NULL,
+        label TEXT DEFAULT '',
+        enc_value TEXT NOT NULL,
+        hint TEXT DEFAULT '',
+        created_at REAL,
+        updated_at REAL,
+        created_by TEXT
+    )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_models (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        provider TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        label TEXT DEFAULT '',
+        route TEXT NOT NULL DEFAULT 'hermes',
+        credential_id TEXT,
+        enabled INTEGER DEFAULT 1,
+        config TEXT DEFAULT '{}',
+        created_at REAL,
+        updated_at REAL
+    )""")
+    # Purpose → model routing. user_id 'global' = the default assignment every
+    # user inherits until they set their own override.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS model_assignments (
+        user_id TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        model_row_id TEXT NOT NULL,
+        updated_at REAL,
+        PRIMARY KEY (user_id, purpose)
+    )""")
+    # Seed the registry ONCE (empty table = pre-Settings-v2 install): the same
+    # three GLM tiers the code hardcoded, plus the frontier judge that was
+    # previously invisible (cjudge → Claude CLI default = Opus 4.8). Behavior
+    # with these rows is identical to before the registry existed. Deliberate
+    # deletions stay deleted — this block never re-seeds a non-empty table.
+    if not conn.execute("SELECT 1 FROM user_models LIMIT 1").fetchone():
+        now = time.time()
+        seed_models = [
+            ("mdl-glm52", "zai", "glm-5.2", "GLM 5.2 (hard thinking)", "hermes"),
+            ("mdl-glm51", "zai", "glm-5.1", "GLM 5.1 (light/simple)", "hermes"),
+            ("mdl-glm45air", "zai", "glm-4.5-air", "GLM 4.5 Air (mechanical)", "hermes"),
+            ("mdl-opus48", "anthropic", "claude-opus-4-8", "Claude Opus 4.8 (frontier judge)", "cli"),
+        ]
+        for mid, prov, model_id, label, route in seed_models:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_models (id, user_id, provider, model_id, label, "
+                "route, enabled, created_at, updated_at) VALUES (?,NULL,?,?,?,?,1,?,?)",
+                (mid, prov, model_id, label, route, now, now))
+        for purpose, mid in (("complicated", "mdl-glm52"), ("easy", "mdl-glm51"),
+                             ("mechanical", "mdl-glm45air"), ("frontier_judge", "mdl-opus48")):
+            conn.execute(
+                "INSERT OR IGNORE INTO model_assignments (user_id, purpose, model_row_id, "
+                "updated_at) VALUES ('global',?,?,?)", (purpose, mid, now))
+
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
     dispatch_defaults = [
@@ -443,6 +505,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_eval_runs_user ON eval_runs(user_id, started_at)",
         "CREATE INDEX IF NOT EXISTS idx_eval_results_run ON eval_results(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_credentials_scope ON credentials(user_id, provider)",
+        "CREATE INDEX IF NOT EXISTS idx_user_models_scope ON user_models(user_id, enabled)",
     ):
         conn.execute(ddl)
     conn.commit()
@@ -484,6 +548,50 @@ def get_setting(key, default=None):
 
 def set_setting(key, value):
     execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+
+
+# --- Model registry helpers (Settings v2 — shared by server, dispatch, evals) ---
+
+MODEL_PURPOSES = ("complicated", "easy", "mechanical", "frontier_judge")
+
+
+def visible_models(user_id: str | None, enabled_only: bool = False) -> list:
+    """Global rows + the user's own rows. Foreign users' models never appear."""
+    sql = "SELECT * FROM user_models WHERE (user_id IS NULL OR user_id = ?)"
+    if enabled_only:
+        sql += " AND enabled = 1"
+    return query_all(sql + " ORDER BY user_id IS NULL DESC, provider, model_id", (user_id,))
+
+
+def task_models_for(user_id: str | None) -> list[str]:
+    """Model-id strings a task/eval of this user may run on (hermes-routed).
+    Falls back to the historical trio if the registry is somehow empty."""
+    ids = []
+    for m in visible_models(user_id, enabled_only=True):
+        if m["route"] == "hermes" and m["model_id"] not in ids:
+            ids.append(m["model_id"])
+    return ids or ["glm-5.2", "glm-5.1", "glm-4.5-air"]
+
+
+def resolve_assignment(user_id: str | None, purpose: str) -> dict | None:
+    """The model row a purpose routes to: the user's own assignment beats the
+    global default. Disabled/vanished targets fall through to global, then None
+    (callers keep their pre-registry fallback for that)."""
+    for scope in ([user_id, "global"] if user_id and user_id != "global" else ["global"]):
+        row = query_one(
+            "SELECT m.* FROM model_assignments a JOIN user_models m ON m.id = a.model_row_id "
+            "WHERE a.user_id = ? AND a.purpose = ? AND m.enabled = 1",
+            (scope, purpose))
+        if row and (row["user_id"] is None or row["user_id"] == user_id):
+            return row
+    return None
+
+
+def default_task_model(user_id: str | None) -> str | None:
+    """The 'complicated' purpose model id, or None (= let Hermes' own default
+    apply — identical to pre-registry behavior)."""
+    row = resolve_assignment(user_id, "complicated")
+    return row["model_id"] if row and row["route"] == "hermes" else None
 
 
 # --- Atomic task claiming (single CAS code path — used by the HTTP endpoint
