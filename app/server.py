@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from typing import Optional
 
@@ -53,6 +54,12 @@ class AuthMiddleware:
         if scope["type"] != "http":
             return await self.asgi_app(scope, receive, send)
         path = scope.get("path", "")
+        # Static assets are public and never read the request user — skip the
+        # (blocking) session lookup/write entirely so asset loads don't hit SQLite.
+        if path.startswith("/static/"):
+            auth.set_request_user(None)
+            scope.setdefault("state", {})["user"] = None
+            return await self.asgi_app(scope, receive, send)
         user = auth.resolve_session(self._cookie_token(scope))
         if user is None and auth.internal_token_valid(
                 self._header(scope, auth.INTERNAL_HEADER.encode())):
@@ -3669,10 +3676,12 @@ async def health_full():
     a non-technical operator can copy-paste when the light is red."""
     import subprocess as sp
     checks = []
-    # hermes-gateway (systemd user unit)
+    # hermes-gateway (systemd user unit) — run the blocking subprocess off the
+    # event loop so this handler doesn't freeze every client for its duration.
     try:
-        r = sp.run(["systemctl", "--user", "is-active", "hermes-gateway"],
-                   capture_output=True, text=True, timeout=5)
+        r = await run_in_threadpool(
+            sp.run, ["systemctl", "--user", "is-active", "hermes-gateway"],
+            capture_output=True, text=True, timeout=5)
         gw_ok, gw_detail = r.stdout.strip() == "active", r.stdout.strip() or r.stderr.strip()
     except Exception as e:
         gw_ok, gw_detail = False, str(e)[:80]

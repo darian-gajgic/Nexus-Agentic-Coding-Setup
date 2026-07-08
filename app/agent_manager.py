@@ -225,6 +225,10 @@ def collect_metrics():
 
 def metrics_loop(stop_event: threading.Event):
     """Background thread: collect metrics every few seconds."""
+    # Prime psutil's per-process CPU counter once so the first non-blocking
+    # cpu_percent(interval=None) read (here and in get_system_stats) returns a
+    # real delta instead of 0.0.
+    psutil.cpu_percent(interval=None)
     while not stop_event.is_set():
         try:
             collect_metrics()
@@ -244,7 +248,7 @@ def get_system_stats() -> dict:
 
     net = psutil.net_io_counters()
     return {
-        "cpu_percent": psutil.cpu_percent(interval=0.5),
+        "cpu_percent": psutil.cpu_percent(interval=None),
         "cpu_count": psutil.cpu_count(),
         "load_avg": [round(load1, 2), round(load5, 2), round(load15, 2)],
         "mem_total_gb": round(mem.total / (1024**3), 1),
