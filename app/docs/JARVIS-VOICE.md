@@ -81,7 +81,14 @@ dormant). The v2 stack:
   voice → stop TTS + listen). getUserMedia uses echoCancellation +
   noiseSuppression + autoGainControl.
 - **Eyes** = webcam (`getUserMedia`) / screen (`getDisplayMedia`) share
-  buttons; frames every 4-5s → `POST /api/jarvis/vision/frame` → vision.py:
+  buttons. **Black-frame rescue (2026-07-08):** every grab measures mean
+  luminance; near-black frames (<8/255) are never indexed or sent. On
+  webcam start `jarvisCamAutoFix` probes after ~1.4s — if black (IR/depth
+  sensors enumerate next to the real webcam on face-unlock laptops, and
+  THIS machine has one at /dev/video2), it walks the other cameras and
+  keeps the first that shows light (choice persisted in localStorage
+  `jvCamId`, used as `deviceId: {ideal}` next time). Frames every 4-5s →
+  `POST /api/jarvis/vision/frame` → vision.py:
   SigLIP so400m embeddings + RapidOCR in a persistent ml-env worker
   (`vision_worker.py`, killed after 10min idle), stored in qdrant
   `jarvis_vision` (per-user, deduped, capped 4000). Search =
@@ -90,6 +97,13 @@ dormant). The v2 stack:
   turns mentioning look/see/screen ride the current frame along
   (`frame_b64`) → described locally by ollama `qwen3-vl:8b` → injected as
   `[JARVIS EYES …]` context AND indexed with the user's words as note.
+  **Image-FILE analysis (2026-07-08):** GLM chat models have no vision, so
+  the chat endpoint auto-describes exchange images with the same local VLM:
+  naming an image file in the message analyzes it (up to 2); an unnamed
+  "analyze the image/screenshot/photo…" takes the newest exchange image
+  (only when no live frame rides along). Injected as
+  `[JARVIS EYES — image file '<name>' …]`; the framing tells him he CAN
+  see images and must never claim otherwise.
 - **Image generation** = `POST /api/jarvis/imagine` → SDXL-Turbo in the same
   worker (sequential CPU offload — 12GB card; ollama VLM is evicted first)
   → PNG into the file exchange. Z.AI vision/CogView are NOT available on the

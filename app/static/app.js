@@ -6407,9 +6407,11 @@ async function jarvisStreamChat(text) {
   if (wantsEyes) {
     const cap = jarvisState.capture.webcam || jarvisState.capture.screen;
     if (cap) {
-      frame = jarvisCaptureGrab(cap);
+      const grab = jarvisCaptureGrab(cap);
+      frame = grab && grab.luma >= 8 ? grab.dataUrl : null;  // never show him black
       frameKind = jarvisState.capture.webcam === cap ? 'webcam' : 'screen';
       if (frame) jarvisAddMessage('tool', '👁 Showing JARVIS the current frame…');
+      else if (grab) jarvisAddMessage('tool', '👁 The current camera frame is black — not sending it.');
     }
   }
 
@@ -6759,9 +6761,65 @@ function jarvisCaptureGrab(cap) {
     const scale = Math.min(1, 768 / v.videoWidth);
     cv.width = Math.round(v.videoWidth * scale);
     cv.height = Math.round(v.videoHeight * scale);
-    cv.getContext('2d').drawImage(v, 0, 0, cv.width, cv.height);
-    return cv.toDataURL('image/jpeg', 0.82);
+    const g = cv.getContext('2d');
+    g.drawImage(v, 0, 0, cv.width, cv.height);
+    // mean luminance on a subsample — black-frame detector (IR/depth sensors,
+    // privacy shutters and still-warming cams all deliver ~black)
+    const d = g.getImageData(0, 0, cv.width, cv.height).data;
+    let sum = 0, n = 0;
+    for (let i = 0; i < d.length; i += 160) {
+      sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; n++;
+    }
+    return { dataUrl: cv.toDataURL('image/jpeg', 0.82), luma: sum / Math.max(1, n) };
   } catch { return null; }
+}
+
+function jarvisSavedCam() {
+  // last camera that actually delivered light (ideal: falls back if unplugged)
+  const id = localStorage.getItem('jvCamId');
+  return id ? { deviceId: { ideal: id } } : {};
+}
+
+// IR/depth sensors (face-unlock laptops enumerate them right next to the
+// real webcam) deliver near-black frames. Probe shortly after start — if
+// black, walk the other cameras and keep the first that actually shows light.
+async function jarvisCamAutoFix(cap) {
+  await new Promise(r => setTimeout(r, 1400));
+  if (jarvisState.capture.webcam !== cap) return;
+  const first = jarvisCaptureGrab(cap);
+  if (first && first.luma >= 8) {
+    try { localStorage.setItem('jvCamId', cap.stream.getVideoTracks()[0].getSettings().deviceId || ''); } catch { }
+    return;
+  }
+  let devs = [];
+  try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch { }
+  const curId = (cap.stream.getVideoTracks()[0].getSettings() || {}).deviceId;
+  for (const d of devs) {
+    if (!d.deviceId || d.deviceId === curId) continue;
+    let s = null;
+    try {
+      s = await navigator.mediaDevices.getUserMedia({ video: { width: 960, deviceId: { exact: d.deviceId } } });
+    } catch { continue; }
+    const v = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.srcObject = s;
+    await v.play().catch(() => { });
+    await new Promise(r => setTimeout(r, 1100));
+    const probe = jarvisCaptureGrab({ video: v });
+    v.srcObject = null;
+    if (jarvisState.capture.webcam !== cap) { try { s.getTracks().forEach(t => t.stop()); } catch { } return; }
+    if (probe && probe.luma >= 8) {
+      try { cap.stream.getTracks().forEach(t => t.stop()); } catch { }
+      cap.stream = s;
+      cap.video.srcObject = s;
+      await cap.video.play().catch(() => { });
+      s.getVideoTracks()[0].onended = () => jarvisCaptureStop('webcam');
+      try { localStorage.setItem('jvCamId', d.deviceId); } catch { }
+      jarvisAddMessage('tool', `🎥 The first camera delivered black frames (IR sensor?) — switched to "${(d.label || 'camera 2').slice(0, 48)}".`);
+      return;
+    }
+    try { s.getTracks().forEach(t => t.stop()); } catch { }
+  }
+  toast('The camera only delivers black frames — check the privacy shutter or lighting', 'err');
 }
 
 async function jarvisCaptureToggle(kind) {
@@ -6769,7 +6827,7 @@ async function jarvisCaptureToggle(kind) {
   if (!jarvisState.visionAvailable) { toast('Vision memory is not available', 'err'); return; }
   try {
     const stream = kind === 'webcam'
-      ? await navigator.mediaDevices.getUserMedia({ video: { width: 960 } })
+      ? await navigator.mediaDevices.getUserMedia({ video: { width: 960, ...jarvisSavedCam() } })
       : await navigator.mediaDevices.getDisplayMedia({ video: true });
     const video = $('#jCapPreview');
     video.srcObject = stream;
@@ -6782,8 +6840,15 @@ async function jarvisCaptureToggle(kind) {
     let busy = false;
     cap.timer = setInterval(async () => {
       if (busy || currentView !== 'jarvis') return;
-      const dataUrl = jarvisCaptureGrab(cap);
-      if (!dataUrl) return;
+      const grab = jarvisCaptureGrab(cap);
+      if (!grab) return;
+      if (grab.luma < 8) {              // never index black frames
+        cap.blacks = (cap.blacks || 0) + 1;
+        if (cap.blacks === 3) toast('Camera frames are black — check the privacy shutter/lighting, or toggle the share to let JARVIS try another camera', 'err');
+        return;
+      }
+      cap.blacks = 0;
+      const dataUrl = grab.dataUrl;
       busy = true;
       try {
         const blob = await (await fetch(dataUrl)).blob();
@@ -6801,6 +6866,7 @@ async function jarvisCaptureToggle(kind) {
     }, period);
     const btn = $(kind === 'webcam' ? '#jCamBtn' : '#jScreenBtn');
     if (btn) btn.classList.add('active');
+    if (kind === 'webcam') jarvisCamAutoFix(cap);   // black-frame rescue
     jarvisAddMessage('tool', kind === 'webcam'
       ? '🎥 Webcam ON — JARVIS sees and remembers what you show him (say "look at this").'
       : '🖥 Screen share ON — JARVIS sees and remembers your screen (ask "what am I looking at?").');
