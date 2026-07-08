@@ -42,13 +42,13 @@ KEY2 = np.array([0.65, 0.05, 0.60]); KEY2 = KEY2 / np.linalg.norm(KEY2)
 
 # world placement (matches jarvis3d.js camera/framing).
 # The GLB spans crown→shoulder stump; the cranium is ~57% of that span.
-# v11: the bust is 1.5× bigger (63 units, ~36-unit head) so the face fills
-# the frame; SAME 46k particles = finer relative detail, crisper features.
-MODEL_H = 63.0
+# v12: 30% down from the v11 1.5× (63 → 44.1 units, ~25-unit head); still
+# the SAME 46k particles with face-weighted sampling.
+MODEL_H = 44.1
 # The bust anchors to the BOTTOM of the frame: the camera (fov 46°, z=88,
 # y drifting −2.5…10.5) puts the lowest visible bottom edge at y≈−39.9, so
-# a crown at 22.5 keeps the scan's open cut (22.5−63 = −40.5) always off-frame.
-CROWN_Y = 22.5
+# a crown at 3.6 keeps the scan's open cut (3.6−44.1 = −40.5) always off-frame.
+CROWN_Y = 3.6
 HEAD_H = 24.0 * MODEL_H / 42.0   # cranium height in world units (36)
 SC = MODEL_H / 42.0              # scale factor vs the v9 placement (1.5)
 

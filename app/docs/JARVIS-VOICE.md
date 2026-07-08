@@ -18,22 +18,34 @@ dormant). The v2 stack:
   into static/avatar/head_points.json incl. the opaque head-occluder mesh;
   jarvis3d.js loads that (procedural sculpt = fallback). The v8 procedural
   torso is GONE: the bust is anchored at the frame BOTTOM so the scan's open
-  neck/shoulder cut stays below the visible edge. v11: the bust is 1.5×
-  (MODEL_H 63, crown y=22.5, cut −40.5 — still off-frame), SAME 46k points
-  (face-weighted sampling + sculpted two-key shading = the extra detail),
-  eye-glint positions are MEASURED from the scan and baked into the JSON
-  ("glints"), and the blink writes eye colors absolutely per frame (the old
-  compounding ×= made blinks smear); glints close with the lids.
+  neck/shoulder cut stays below the visible edge. v12: MODEL_H 44.1 (30%
+  down from the v11 1.5×; crown y=3.6, cut −40.5 — still off-frame), SAME
+  46k points (face-weighted sampling + sculpted two-key shading), eye-glint
+  positions MEASURED from the scan and baked into the JSON ("glints").
+  **Animations are research-grounded (2026-07-08):** blink follows measured
+  human dynamics (Trutoiu et al., Disney Research, ACM TAP 2011 — fast
+  accelerating ~80ms close, brief closure, slow asymptotic ~220ms reopen;
+  symmetric blinks read sleepy) with randomized 2–6s intervals + occasional
+  double blinks, and the lid is GEOMETRIC (eye-band points sweep down over
+  the eye; glints slip under the lid). Lip-sync per real-time practice:
+  fast-attack/slow-release amplitude envelope (never lags audio, settles
+  through pauses), jaw-drop weighting (lower lip works, upper barely moves,
+  corners sealed), STABLE per-point jitter seeds (frame-random boiled), and
+  a two-band spectral hint from app.js (sibilance narrows the aperture —
+  Jarvis3D.setLevel(v, hf)). Thinking tint is lit-up electric CYAN (not
+  amber) — MODE_TINT values >1 amplify.
   NOTE: the GLB faces +z as authored — do NOT "fix" its orientation.
 - **Memory galaxy in the JARVIS scene (v10, 2026-07-08)** — the old node
   streams/pulse sprites are GONE. jarvis3d.js now embeds the Memory tab's
   real 3D map (`/api/memory3d`: PCA positions, similarity links, identity
-  hues, region callouts, ambient electric pulses) at **10× node spacing**
-  in a slowly spinning group (the tab's auto-orbit rate) at z≈-7800,
-  y≈1540 (raised so the distant cloud clears the head silhouette) —
-  between the bust and the static memory-matrix backdrop (the same scatter,
-  pushed to z≈-11500). **100 links** run from the back of the skull to the
-  100 most-linked ("most used") nodes, endpoint-tracked every frame.
+  hues, region callouts, ambient electric pulses) at **50× node spacing**
+  (v12: 5× the previous 10×; the ±6000 cloud fills the sky) in a slowly
+  spinning group (the tab's auto-orbit rate) at z≈-7800, y≈1540 — between
+  the bust and the static memory-matrix backdrop (the same scatter, pushed
+  to z≈-16500). **100 links** run from the back of the skull to the 100
+  most-linked ("most used") nodes, endpoint-tracked every frame; each link
+  is a 3-STRAND converging beam (WebGL caps lines at 1px, so 3× thickness
+  = center strand + two dimmer satellites).
   Signals: idle = a thin inbound trickle; **thinking** = rapid amber pulses
   between the avatar-connected nodes; **leaving thinking** (the answer is
   forming) = a 2.4s flood of signals from the galaxy into the head

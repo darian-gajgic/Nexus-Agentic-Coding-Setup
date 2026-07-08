@@ -50,6 +50,9 @@ const J = {
   baseB: null, baseW: null, mouthY: [0, 1], level: 0, mode: 'idle', t: 0,
   animOn: true, disposed: false, resizeObs: null,
   pointer: { x: 0, y: 0 }, pointerHandler: null,
+  // research-grounded animation state (docs/JARVIS-VOICE.md §0)
+  env: 0, levelHF: 0, jit: null, eyesY: [0, 1], mouthXh: 6,
+  blinkAt: 2, blinkT: -1, lidPrev: 0,
   // memory galaxy + static matrix + camera modes
   mem: emptyMem(), matrix: null, galaxyMode: false, fly: null,
   gCam: { theta: Math.PI / 2, phi: 1.35, dist: 700 }, lookCur: null,
@@ -67,7 +70,7 @@ function emptyMem() {
 const MODE_TINT = {
   idle:      [0.30, 0.85, 1.00],
   listening: [0.37, 0.92, 0.83],
-  thinking:  [0.98, 0.75, 0.30],
+  thinking:  [0.50, 1.05, 1.15],   // lit-up electric cyan (>1 amplifies)
   talking:   [0.45, 0.95, 1.00],
 };
 
@@ -402,14 +405,12 @@ const DISTINCT_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6, 0xec4899,
                        0xc084fc, 0xf97316];
 
 // world layout, front to back: bust (z≈0) → memory galaxy → static matrix.
-// The galaxy cloud spans ±1200 (tab ±120 × GALAXY_SCALE), so its center must
-// sit deep enough that the front edge stays FAR behind the bust.
-// y is raised so the (angularly smaller) distant cloud clears the 1.5× head
-// silhouette from the home camera instead of hiding fully eclipsed behind it
+// The galaxy cloud spans ±6000 (tab ±120 × GALAXY_SCALE) around its center;
+// its front edge stays far behind the bust and it fills the sky above.
 const GALAXY_CENTER = { x: 0, y: 1540, z: -7800 };
-const GALAXY_SCALE = 10;     // 10× the memory-tab node spacing (operator ask)
+const GALAXY_SCALE = 50;     // 5× the previous 10× node spacing (operator ask)
 const GALAXY_SPIN = 0.0011;  // rad/frame — the tab's idle auto-orbit rate
-const MATRIX_CENTER = { x: 0, y: 30, z: -11500 };
+const MATRIX_CENTER = { x: 0, y: 30, z: -16500 };
 const TOP_N = 100;           // avatar ↔ the 100 most-linked memory nodes
 
 async function buildGalaxyData() {
@@ -489,7 +490,7 @@ function memLabel(text, sub, hex) {
   const tex = new THREE.CanvasTexture(c);
   const s = new THREE.Sprite(new THREE.SpriteMaterial({
     map: tex, transparent: true, opacity: 0.9, depthWrite: false }));
-  s.scale.set(c.width / 1.6, c.height / 1.6, 1);
+  s.scale.set(c.width / 0.6, c.height / 0.6, 1);   // sized for the 50× spread
   s.center.set(0.06, 0.28);
   return s;
 }
@@ -502,8 +503,8 @@ function buildMatrix(data) {
   const col = new Float32Array(nodes.length * 3);
   const color = new THREE.Color();
   nodes.forEach((n, i) => {
-    pos[i * 3] = (n.x || 0) * 14;
-    pos[i * 3 + 1] = (n.y || 0) * 10;
+    pos[i * 3] = (n.x || 0) * 24;
+    pos[i * 3 + 1] = (n.y || 0) * 16;
     pos[i * 3 + 2] = (n.z || 0) * 8;
     const grp = n.group || 0;
     color.setHex(grp < 2 ? CYAN_FAMILY[grp % CYAN_FAMILY.length]
@@ -583,14 +584,14 @@ function buildMemoryGalaxy(data) {
   (data.clusters || []).forEach((cl) => {
     const s = memLabel(cl.label, `${cl.size} memories`,
                        (hueByCluster && hueByCluster[cl.id]) ?? CYAN_FAMILY[0]);
-    s.position.set(cl.x * S, cl.y * S + 70, cl.z * S);
+    s.position.set(cl.x * S, cl.y * S + 260, cl.z * S);
     mem.group.add(s);
     mem.labels.push(s);
   });
 
   // ambient electrical pulses along the links (the tab's signature motion)
   if (links.length) {
-    const pulseGeo = new THREE.SphereGeometry(10, 8, 8);
+    const pulseGeo = new THREE.SphereGeometry(16, 8, 8);
     const n = Math.min(46, Math.max(10, Math.floor(links.length / 4)));
     for (let i = 0; i < n; i++) {
       const p = new THREE.Mesh(pulseGeo, new THREE.MeshBasicMaterial({
@@ -624,10 +625,10 @@ function buildMemoryGalaxy(data) {
     }
   }
   if (mem.thinkPairs.length) {
-    const thinkGeo = new THREE.SphereGeometry(22, 8, 8);
+    const thinkGeo = new THREE.SphereGeometry(30, 8, 8);
     for (let i = 0; i < 40; i++) {
       const p = new THREE.Mesh(thinkGeo, new THREE.MeshBasicMaterial({
-        color: 0xffd28a, transparent: true, opacity: 0,   // thinking amber
+        color: 0x9df5ff, transparent: true, opacity: 0,   // thinking = cyan
         blending: THREE.AdditiveBlending, depthWrite: false }));
       const link = mem.thinkPairs[Math.floor(Math.random() * mem.thinkPairs.length)];
       p.userData = { link, t: Math.random(), speed: 1.2 + Math.random() * 1.4 };
@@ -645,21 +646,27 @@ function buildMemoryGalaxy(data) {
   mem.marker.visible = false;
   mem.group.add(mem.marker);
 
-  // 100 links: back of the skull → the top nodes (endpoints track per frame)
+  // 100 links: back of the skull → the top nodes (endpoints track per frame).
+  // Each link is THREE strands (center + two offset satellites): WebGL caps
+  // LineBasicMaterial at 1px, so the 3× thickness ask is a 3-strand beam.
   if (mem.top.length) {
     const nT = mem.top.length;
-    const apos = new Float32Array(nT * 6);
-    const acol = new Float32Array(nT * 6);
+    const apos = new Float32Array(nT * 18);
+    const acol = new Float32Array(nT * 18);
     mem.top.forEach((ni, k) => {
       const c = new THREE.Color(mem.nodeColor(nodes[ni])).multiplyScalar(0.85);
-      acol[k * 6] = 0.14; acol[k * 6 + 1] = 0.50; acol[k * 6 + 2] = 0.62; // dim cyan at the head
-      acol[k * 6 + 3] = c.r; acol[k * 6 + 4] = c.g; acol[k * 6 + 5] = c.b;
+      for (let s = 0; s < 3; s++) {
+        const dimS = s === 1 ? 1 : 0.55;         // soft beam edges
+        const o = k * 18 + s * 6;
+        acol[o] = 0.14 * dimS; acol[o + 1] = 0.50 * dimS; acol[o + 2] = 0.62 * dimS;
+        acol[o + 3] = c.r * dimS; acol[o + 4] = c.g * dimS; acol[o + 5] = c.b * dimS;
+      }
     });
     const aGeo = new THREE.BufferGeometry();
     aGeo.setAttribute('position', new THREE.BufferAttribute(apos, 3));
     aGeo.setAttribute('color', new THREE.BufferAttribute(acol, 3));
     mem.avatarLinks = new THREE.LineSegments(aGeo, new THREE.LineBasicMaterial({
-      vertexColors: true, transparent: true, opacity: 0.10,
+      vertexColors: true, transparent: true, opacity: 0.16,
       blending: THREE.AdditiveBlending, depthWrite: false }));
     mem.avatarLinks.frustumCulled = false; // endpoints rewritten every frame
     J.scene.add(mem.avatarLinks);
@@ -682,7 +689,7 @@ function buildMemoryGalaxy(data) {
 function galaxyCamPos(out) {
   const c = J.gCam;
   c.phi = Math.max(0.15, Math.min(Math.PI - 0.15, c.phi));
-  c.dist = Math.max(150, Math.min(4500, c.dist));
+  c.dist = Math.max(500, Math.min(18000, c.dist));
   return out.set(
     GALAXY_CENTER.x + c.dist * Math.sin(c.phi) * Math.cos(c.theta),
     GALAXY_CENTER.y + c.dist * Math.cos(c.phi),
@@ -741,11 +748,14 @@ function toggleGalaxy() {
     toPos.set(0, 4, 88);
     toLook.set(0, 4, 0);
   }
+  const nearHead = new THREE.Vector3(0, -10, -60);
+  const midField = new THREE.Vector3(0, -300, -3500);
   J.fly = {
     t: 0, dur: entering ? 3.0 : 2.0,
     fromPos: J.camera.position.clone(),
     fromLook: (J.lookCur || new THREE.Vector3(0, 4, 0)).clone(),
-    via: new THREE.Vector3(0, -25, -250),   // dip through the bust
+    via1: entering ? nearHead : midField,   // head-side control stays by the bust
+    via2: entering ? midField : nearHead,
     toPos, toLook,
   };
   setMemHover(-1);
@@ -766,17 +776,18 @@ function tick() {
 
   if (J.camera) {
     if (J.fly) {
-      // quadratic bezier dipped through the bust — the camera pierces the
-      // particle head on its way into (or out of) the galaxy
+      // cubic bezier threaded through the bust — the camera pierces the
+      // particle head, dives under the link fan, then climbs to the galaxy
       J.fly.t += dt / J.fly.dur;
       const k = Math.min(1, J.fly.t);
       const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
       const q = 1 - e;
-      const A = J.fly.fromPos, B = J.fly.via, C = J.fly.toPos;
+      const A = J.fly.fromPos, B1 = J.fly.via1, B2 = J.fly.via2, C = J.fly.toPos;
+      const w0 = q * q * q, w1 = 3 * q * q * e, w2 = 3 * q * e * e, w3 = e * e * e;
       J.camera.position.set(
-        q * q * A.x + 2 * q * e * B.x + e * e * C.x,
-        q * q * A.y + 2 * q * e * B.y + e * e * C.y,
-        q * q * A.z + 2 * q * e * B.z + e * e * C.z);
+        w0 * A.x + w1 * B1.x + w2 * B2.x + w3 * C.x,
+        w0 * A.y + w1 * B1.y + w2 * B2.y + w3 * C.y,
+        w0 * A.z + w1 * B1.z + w2 * B2.z + w3 * C.z);
       J.lookCur.lerpVectors(J.fly.fromLook, J.fly.toLook, e);
       J.camera.lookAt(J.lookCur);
       if (k >= 1) J.fly = null;
@@ -800,26 +811,61 @@ function tick() {
     J.headGroup.rotation.x = Math.sin(t * 0.11) * 0.035;
     J.headGroup.scale.y = 1 + Math.sin(t * 1.1) * 0.005;
 
-    // lip-sync: mouth band opens with the real audio level (down + forward
-    // so open lips stay in front of the occluder surface; ×1.5 head scale)
+    // ── mouth: audio-driven jaw, per real-time lip-sync practice — a fast
+    // attack / slow release envelope (the mouth must never lag the audio,
+    // and it settles through pauses instead of snapping shut), the LOWER
+    // lip/jaw does the work while the upper lip barely moves, the corners
+    // stay sealed, sibilant (high-band) energy narrows the aperture, and
+    // per-point jitter is a STABLE seed (frame-random made the lips boil) ──
     const posAttr = J.headGeo.attributes.position;
-    const open = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12);
+    const target = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12)
+      * (1 - 0.35 * J.levelHF);
+    J.env += (target - J.env) * (target > J.env ? 0.55 : 0.10);
+    const open = J.env;
     const mc = (J.mouthY[0] + J.mouthY[1]) / 2;
     const mh = Math.max(0.7, (J.mouthY[1] - J.mouthY[0]) / 2);
     for (let k = 0; k < J.mouthIdx.length; k++) {
       const n = J.mouthIdx[k];
-      const by = J.basePos[n * 3 + 1];
-      const center = Math.max(0, 1 - Math.abs((by - mc) / mh));
-      posAttr.array[n * 3 + 1] = by - open * 3.3 * center - open * 0.45 * Math.random();
-      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] + open * 1.05 * center;
+      const bx = J.basePos[n * 3], by = J.basePos[n * 3 + 1];
+      const rel = (by - mc) / mh;                                  // −1 chin … +1 upper lip
+      const jaw = Math.max(0, Math.min(1.1, 0.55 - 0.55 * rel));   // jaw drop grows downward
+      const corner = 0.3 + 0.7 * Math.max(0, 1 - Math.abs(bx) / J.mouthXh);
+      const jit = open * 0.22 * J.jit[k];
+      posAttr.array[n * 3 + 1] = by - (open * jaw * corner * mh * 1.5) - jit;
+      // the lip line parts slightly FORWARD (stays in front of the occluder)
+      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2]
+        + open * corner * Math.max(0, 1 - Math.abs(rel)) * 0.7;
     }
-    if (J.mouthIdx.length) posAttr.needsUpdate = true;
 
-    // blink: a real eyelid curve every ~4.6s — smooth close+open over 320ms
-    const bph = t % 4.6;
-    const blink = bph > 4.28
-      ? 1 - 0.92 * Math.sin(Math.min(1, (bph - 4.28) / 0.32) * Math.PI)
-      : 1;
+    // ── blink: measured human dynamics (Trutoiu et al., Disney Research /
+    // ACM TAP 2011): the close is short with high acceleration (~80ms), the
+    // reopen lasts longer and decelerates asymptotically (~220ms) — a
+    // symmetric blink reads sleepy/robotic. Randomized 2–6s apart with
+    // occasional double blinks. The lid is GEOMETRIC: the upper points of
+    // the eye band sweep DOWN over the eye (lids close, not lights dim) ──
+    if (J.blinkT < 0 && t >= J.blinkAt) J.blinkT = t;
+    let lid = 0;
+    if (J.blinkT >= 0) {
+      const x = t - J.blinkT;
+      if (x < 0.08) lid = Math.pow(x / 0.08, 1.7);                 // accelerating close
+      else if (x < 0.12) lid = 1;                                  // brief full closure
+      else if (x < 0.34) lid = Math.pow(1 - (x - 0.12) / 0.22, 2.6); // asymptotic reopen
+      else {
+        J.blinkT = -1;
+        J.blinkAt = t + (Math.random() < 0.12 ? 0.25 : 2 + Math.random() * 4);
+      }
+    }
+    if (lid > 0 || J.lidPrev > 0) {
+      const ey0 = J.eyesY[0], eh = Math.max(0.5, J.eyesY[1] - J.eyesY[0]);
+      for (const n of J.eyeIdx) {
+        const by = J.basePos[n * 3 + 1];
+        const relE = (by - ey0) / eh;                              // 0 low … 1 top of band
+        posAttr.array[n * 3 + 1] = by - lid * relE * eh * 0.85;
+      }
+    }
+    J.lidPrev = lid;
+    posAttr.needsUpdate = true;
+
     const colAttr = J.headGeo.attributes.color;
     if ((Math.round(t * 60) & 3) === 0) {
       const mix = 0.14;
@@ -831,17 +877,18 @@ function tick() {
       }
       colAttr.needsUpdate = true;
     }
-    // eyes are written ABSOLUTELY every frame — the old ×= blink inside the
-    // throttled loop compounded to near-black and recovered sluggishly
+    // eyes are written ABSOLUTELY every frame; the closing lid shadows them
+    const shadow = 1 - 0.45 * lid;
     for (const n of J.eyeIdx) {
       const b = J.baseB[n], we = J.baseW[n];
-      colAttr.array[n * 3]     = b * (tint[0] * (1 - we) + we) * blink;
-      colAttr.array[n * 3 + 1] = b * (tint[1] * (1 - we) + we) * blink;
-      colAttr.array[n * 3 + 2] = b * (tint[2] * (1 - we) + we) * blink;
+      colAttr.array[n * 3]     = b * (tint[0] * (1 - we) + we) * shadow;
+      colAttr.array[n * 3 + 1] = b * (tint[1] * (1 - we) + we) * shadow;
+      colAttr.array[n * 3 + 2] = b * (tint[2] * (1 - we) + we) * shadow;
     }
     if (J.eyeIdx.length) colAttr.needsUpdate = true;
-    // the glints close with the lids
-    for (const g of J.glints) g.material.opacity = 0.85 * blink * blink * blink;
+    // the glints slip under the closing lid
+    const gvis = (1 - lid) * (1 - lid);
+    for (const g of J.glints) g.material.opacity = 0.85 * gvis;
     J.head.material.size = 0.62 + Math.min(0.3, J.level * 0.22)
       + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.05 : 0);
   }
@@ -890,7 +937,7 @@ function tick() {
     if (mem.avatarLinks) {
       // the 100 links follow the galaxy spin and the bust sway
       const ry = mem.group.rotation.y, cry = Math.cos(ry), sry = Math.sin(ry);
-      const anchor = _tmpV.set(0, 2, -12);   // inside the (1.5×) skull, at the back
+      const anchor = _tmpV.set(0, -7, -8);   // inside the skull, at the back
       if (J.headGroup) anchor.applyEuler(J.headGroup.rotation);
       const ap = mem.avatarLinks.geometry.attributes.position.array;
       const wOf = (ni, out) => {
@@ -903,12 +950,25 @@ function tick() {
       const w = [0, 0, 0];
       mem.top.forEach((ni, k) => {
         wOf(ni, w);
-        ap[k * 6] = anchor.x; ap[k * 6 + 1] = anchor.y; ap[k * 6 + 2] = anchor.z;
-        ap[k * 6 + 3] = w[0]; ap[k * 6 + 4] = w[1]; ap[k * 6 + 5] = w[2];
+        // side strands spread perpendicular to the link (in xz), narrow at
+        // the head, wide at the node — a converging beam, not 3 loose wires
+        let px = -(w[2] - anchor.z), pz = (w[0] - anchor.x);
+        const pl = Math.hypot(px, pz) || 1;
+        px /= pl; pz /= pl;
+        for (let s = 0; s < 3; s++) {
+          const off = s - 1;                     // −1, 0, +1
+          const o = k * 18 + s * 6;
+          ap[o]     = anchor.x + off * 0.6 * px;
+          ap[o + 1] = anchor.y + off * 0.6;
+          ap[o + 2] = anchor.z + off * 0.6 * pz;
+          ap[o + 3] = w[0] + off * 55 * px;
+          ap[o + 4] = w[1] + off * 55;
+          ap[o + 5] = w[2] + off * 55 * pz;
+        }
       });
       mem.avatarLinks.geometry.attributes.position.needsUpdate = true;
       mem.avatarLinks.material.opacity +=
-        ((thinking ? 0.22 : 0.10) - mem.avatarLinks.material.opacity) * 0.06;
+        ((thinking ? 0.30 : 0.16) - mem.avatarLinks.material.opacity) * 0.06;
 
       // inbound signals: idle trickle → flood while the answer forms
       if (mem.burst > 0) mem.burst -= dt;
@@ -973,8 +1033,8 @@ async function mount(container, opts) {
   J.lookCur = new THREE.Vector3(0, 4, 0);
   J.galaxyMode = false;
   J.fly = null;
-  // dist 1400 vs the ±1200 cloud ≈ the tab's default framing at 10× scale
-  J.gCam = { theta: Math.PI / 2, phi: 1.35, dist: 1400 };
+  // dist 5800 vs the ±6000 cloud ≈ the tab's default framing at 50× scale
+  J.gCam = { theta: Math.PI / 2, phi: 1.35, dist: 5800 };
   _tmpV = new THREE.Vector3();
   const w = container.clientWidth || 800, h = container.clientHeight || 600;
   J.scene = new THREE.Scene();
@@ -1061,6 +1121,20 @@ async function mount(container, opts) {
   J.baseW = Float32Array.from(wmi);
   J.mouthIdx = mouthIdx;
   J.eyeIdx = eyeIdx;
+  J.mouthXh = prebuilt ? prebuilt.mouth[2] : 6;
+  // eye-band vertical extent (drives the geometric lid sweep)
+  let _e0 = 1e9, _e1 = -1e9;
+  for (const n of eyeIdx) {
+    const ny = pos[n * 3 + 1];
+    if (ny < _e0) _e0 = ny;
+    if (ny > _e1) _e1 = ny;
+  }
+  J.eyesY = eyeIdx.length ? [_e0, _e1] : [0, 1];
+  // stable per-point mouth jitter seeds — regenerating per frame boils
+  J.jit = Float32Array.from(mouthIdx, () => Math.random() * 2 - 1);
+  J.env = 0; J.levelHF = 0;
+  J.blinkAt = J.t + 1.5 + Math.random() * 3;
+  J.blinkT = -1; J.lidPrev = 0;
   J.headGeo = new THREE.BufferGeometry();
   J.headGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
   J.headGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(col), 3));
@@ -1157,7 +1231,12 @@ function setMode(mode) {
   if (J.mode === 'thinking' && mode !== 'thinking') J.mem.burst = 2.4;
   J.mode = mode;
 }
-function setLevel(v) { J.level = Math.max(0, v || 0); }
+// v = amplitude; hf (optional 0..1) = sibilance share of the spectrum —
+// high-frequency sounds narrow the mouth instead of dropping the jaw
+function setLevel(v, hf) {
+  J.level = Math.max(0, v || 0);
+  J.levelHF = Math.max(0, Math.min(1, hf || 0));
+}
 function setAnimations(on) {
   J.animOn = !!on;
   if (on && !J.raf && !J.disposed && J.renderer) tick();
