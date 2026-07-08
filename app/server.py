@@ -664,6 +664,10 @@ async def get_programs():
 
 @app.post("/api/programs")
 async def create_program(body: ProgramCreate):
+    # Admin-only (sweep): the programs table is a global catalog (no user_id)
+    # read by every user; members shouldn't write shared operator infra.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     pid = f"prog-{uuid.uuid4().hex[:8]}"
     now = time.time()
     db.execute("""INSERT INTO programs
@@ -2201,6 +2205,10 @@ async def agent_memory(agent_id: str, scope: Optional[str] = None, limit: int = 
 
 @app.post("/api/agents/{agent_id}/memory")
 async def add_memory(agent_id: str, body: MemoryCreate):
+    # Admin-only (sweep): the `memory` table + `agents` fleet carry no user_id
+    # (shared executor pool) — a member must not write shared agent memory.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     mid = f"mem-{uuid.uuid4().hex[:10]}"
     now = time.time()
     db.execute(
@@ -2213,6 +2221,10 @@ async def add_memory(agent_id: str, body: MemoryCreate):
 
 @app.delete("/api/agents/{agent_id}/memory/{mid}")
 async def del_memory(agent_id: str, mid: str):
+    # Admin-only (sweep): shared agent-fleet memory (no user_id) — a member
+    # could enumerate (ungated GET) then wipe any agent's memory.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     db.execute("DELETE FROM memory WHERE id=? AND agent_id=?", (mid, agent_id))
     return {"ok": True}
 
@@ -2248,6 +2260,10 @@ async def scheduler_list():
 
 @app.post("/api/scheduler")
 async def scheduler_create(body: dict):
+    # Admin-only (sweep): scheduled_jobs is a global table (no user_id) driving
+    # the shared cron thread — members shouldn't create fleet-wide jobs.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     name = body.get("name", "").strip()
     cron_expr = body.get("cron_expr", "").strip()
     action = body.get("action", "").strip()
@@ -2274,6 +2290,8 @@ async def scheduler_create(body: dict):
 
 @app.patch("/api/scheduler/{job_id}")
 async def scheduler_update(job_id: str, body: dict):
+    if not auth.is_admin():  # sweep: shared scheduled_jobs (no user_id)
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     if "enabled" in body:
         db.execute("UPDATE scheduled_jobs SET enabled=? WHERE id=?",
                    (1 if body["enabled"] else 0, job_id))
@@ -2286,6 +2304,8 @@ async def scheduler_update(job_id: str, body: dict):
 
 @app.delete("/api/scheduler/{job_id}")
 async def scheduler_delete(job_id: str):
+    if not auth.is_admin():  # sweep: shared scheduled_jobs (no user_id)
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     db.execute("DELETE FROM scheduled_jobs WHERE id=?", (job_id,))
     await mgr.broadcast({"type": "job_deleted", "data": {"id": job_id}})
     return {"ok": True}
@@ -2333,6 +2353,10 @@ class MessageCreate(BaseModel):
 
 @app.post("/api/agents/{agent_id}/message")
 async def send_message(agent_id: str, body: MessageCreate):
+    # Admin-only (sweep): messages is a global table (no user_id) and the
+    # broadcast/activity feed fan out to every user — members shouldn't inject.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     mid = f"msg-{uuid.uuid4().hex[:10]}"
     now = time.time()
     db.execute(
@@ -3014,6 +3038,10 @@ async def task_templates():
 async def create_template(body: dict):
     """Save the current create-form as a reusable template (user-created,
     stored in templates.user.json — the curated set stays in git)."""
+    # Admin-only (sweep): templates.user.json is a single shared file every
+    # user's create-form reads; ungated, a member could overwrite/shadow entries.
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     name = (body.get("name") or "").strip()
     title = (body.get("title") or "").strip()
     if not name or not title:
@@ -3042,6 +3070,8 @@ async def create_template(body: dict):
 @app.delete("/api/templates/{tpl_id}")
 async def delete_template(tpl_id: str):
     """Delete a USER template (curated ones in templates.json are read-only)."""
+    if not auth.is_admin():  # sweep: shared templates.user.json
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     if not tpl_id.startswith("user-"):
         return JSONResponse(status_code=400, content={"error": "only user templates (user-*) can be deleted"})
     try:
@@ -4442,7 +4472,12 @@ async def hermes_skill_get(name: str):
 
 @app.post("/api/hermes-skills/save")
 async def hermes_skill_save(body: dict):
-    """Human approval step: writes SKILL.md after the operator reviewed it."""
+    """Human approval step: writes SKILL.md after the operator reviewed it.
+    Admin-only (sweep, same class as C2 save_specialist): writes the SHARED
+    ~/.hermes/skills/<name>/SKILL.md that the operator's Hermes loads as
+    instructions — a member write is stored prompt-injection running as the operator."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import re
     name = (body.get("name") or "").strip()
     content = body.get("content") or ""
