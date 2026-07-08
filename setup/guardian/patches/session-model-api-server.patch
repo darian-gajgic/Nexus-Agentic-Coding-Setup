@@ -1,0 +1,76 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 3cf11f335..8e5d117e4 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1308,6 +1308,28 @@ class APIServerAdapter(BasePlatformAdapter):
+                 gateway_session_key or session_id,
+             )
+ 
++        # NEXUS CORE-MOD (session-model): honor the per-session stored model.
++        # api_server sessions are created with an explicit ``model`` (Nexus
++        # per-task models, JARVIS sessions, overload-fallback sessions) but
++        # upstream only ever runs the config.yaml default for session turns.
++        # Precedence (highest first): session /model override > per-turn
++        # route/model > stored session model > global config. Sessions created
++        # without an explicit model store the advertised ``_model_name``
++        # placeholder — skip those so they keep following the global default.
++        if session_id and not session_override and not (route and route.get("model")):
++            try:
++                _sdb = self._ensure_session_db()
++                _srow = _sdb.get_session(session_id) if _sdb else None
++                _stored = (_srow or {}).get("model")
++                if _stored and _stored != self._model_name:
++                    model = _stored
++                    logger.debug(
++                        "api_server session stored model applied: session=%s model=%s",
++                        session_id, model,
++                    )
++            except Exception:
++                logger.debug("session stored-model lookup failed", exc_info=True)
++
+         user_config = _load_gateway_config()
+         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+ 
+@@ -1869,6 +1891,13 @@ class APIServerAdapter(BasePlatformAdapter):
+         system_prompt = body.get("system_message") or body.get("instructions")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        # NEXUS CORE-MOD (session-model): optional per-turn model override —
++        # {"model": "…"} runs THIS turn on that model (e.g. peak-overload
++        # fallback) without touching the session's stored model.
++        turn_model = body.get("model")
++        if turn_model is not None and not isinstance(turn_model, str):
++            return web.json_response(_openai_error("model must be a string", code="invalid_model"), status=400)
++        route = self._resolve_route(turn_model) or ({"model": turn_model} if turn_model else None)
+         history = self._conversation_history_for_session(session_id)
+         result, usage = await self._run_agent(
+             user_message=user_message,
+@@ -1876,6 +1905,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             ephemeral_system_prompt=system_prompt,
+             session_id=session_id,
+             gateway_session_key=gateway_session_key,
++            route=route,
+         )
+         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+@@ -1913,6 +1943,12 @@ class APIServerAdapter(BasePlatformAdapter):
+         system_prompt = body.get("system_message") or body.get("instructions")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        # NEXUS CORE-MOD (session-model): per-turn model override, same
++        # contract as the non-streaming session chat handler above.
++        turn_model = body.get("model")
++        if turn_model is not None and not isinstance(turn_model, str):
++            return web.json_response(_openai_error("model must be a string", code="invalid_model"), status=400)
++        route = self._resolve_route(turn_model) or ({"model": turn_model} if turn_model else None)
+ 
+         loop = asyncio.get_running_loop()
+         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
+@@ -1967,6 +2003,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     stream_delta_callback=_delta,
+                     tool_progress_callback=_tool_progress,
+                     gateway_session_key=gateway_session_key,
++                    route=route,
+                 )
+                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id

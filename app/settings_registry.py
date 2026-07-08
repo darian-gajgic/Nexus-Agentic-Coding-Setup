@@ -48,6 +48,15 @@ SECTIONS = [
             {"key": "dispatch.resume_quiet_s", "label": "Resume quiet window (s)", "type": "int",
              "default": "600", "min": 30, "max": 7200,
              "help": "After a worker crash, wait this long for the orphaned Hermes run to finish before re-engaging."},
+            {"key": "dispatch.fallback_enabled", "label": "Overload fallback enabled", "type": "bool",
+             "default": "1",
+             "help": "When a model is overloaded upstream (Z.AI 429 load-shedding at peak hours), "
+                     "retry once on the fallback model instead of failing: task dispatches retry in a "
+                     "fresh session, JARVIS chat retries the turn in the same conversation."},
+            {"key": "dispatch.fallback_model", "label": "Overload fallback model", "type": "str",
+             "default": "glm-5-turbo",
+             "help": "Model that takes over when the primary model (e.g. glm-5.2) is overloaded — "
+                     "used by both task dispatch and JARVIS chat. Turn the switch above off to never fall back."},
         ],
     },
     {

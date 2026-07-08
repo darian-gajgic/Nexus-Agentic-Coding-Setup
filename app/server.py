@@ -1865,6 +1865,31 @@ def _jarvis_files_list(uid: str) -> list[dict]:
     return out
 
 
+def _jarvis_overload_signature(event_name: str, data_text: str) -> str | None:
+    """Quota/load-shed signature in one Hermes SSE event, or None.
+
+    A shed turn surfaces two ways: an 'error'/'run.failed' event when the run
+    raised, or — the common case — the assistant 'reply' IS the raw provider
+    error string ("HTTP 429: The service may be temporarily overloaded…"),
+    because Hermes' conversation loop returns exhausted-retry errors as final
+    content. The content check is deliberately narrow (short, starts with
+    "HTTP ") so a real answer that merely mentions 429s never matches."""
+    import hermes_dispatch as _hd
+    if event_name not in ("error", "run.failed", "assistant.completed"):
+        return None
+    try:
+        data = json.loads(data_text)
+    except Exception:
+        return None
+    if event_name in ("error", "run.failed"):
+        msg = str(data.get("message") or data.get("error") or data)[:300]
+        return msg if _hd.is_quota_error(msg) else None
+    content = str(data.get("content") or "")
+    if content.startswith("HTTP ") and len(content) < 300 and _hd.is_quota_error(content):
+        return content[:300]
+    return None
+
+
 def _jarvis_framing(uid: str) -> str:
     """Ephemeral per-turn system message: persona + the levers JARVIS may pull.
     The internal token is per-boot random and never persisted — a server
@@ -1934,39 +1959,86 @@ async def jarvis_chat_stream(body: dict):
                         f"{frame_note}]\n\n{user_input}")
 
     async def event_generator():
-        """Stream SSE events from Hermes, re-emit as SSE for the browser."""
+        """Stream SSE events from Hermes, re-emit as SSE for the browser.
+
+        Peak-overload fallback (2026-07-08): when the turn dies with a Z.AI
+        429 load-shed signature BEFORE any visible content streamed, retry
+        ONCE on the overload fallback model (settings
+        dispatch.fallback_enabled / dispatch.fallback_model) as a per-turn
+        model override in the SAME session — context kept, and the browser
+        gets a 'fallback' event so the chat can say what happened. Timeouts
+        and non-quota errors keep the old behavior. Test knob:
+        jarvis.force_429=1 treats the primary pass as shed without sending it
+        (the fallback pass still runs for real)."""
+        import hermes_dispatch as _hd
         url = f"{HERMES_API_BASE}/api/sessions/{session_id}/chat/stream"
         payload = {"input": hermes_input, "system_message": _jarvis_framing(uid)}
-        try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST", url,
-                    headers={**_hermes_headers(), "Accept": "text/event-stream"},
-                    json=payload,
-                    timeout=httpx.Timeout(240.0, connect=10.0),
-                ) as resp:
-                    if resp.status_code >= 400:
-                        body_text = ""
-                        async for chunk in resp.aiter_text():
-                            body_text += chunk
-                        yield f"event: error\ndata: {json.dumps({'error': f'HTTP {resp.status_code}', 'detail': body_text[:300]})}\n\n"
-                        return
-                    event_name = ""
-                    buffer = ""
-                    async for line in resp.aiter_lines():
-                        if line.startswith("event: "):
-                            event_name = line[7:].strip()
-                        elif line.startswith("data: "):
-                            data_text = line[6:].strip()
-                            # Forward all events to the browser
-                            yield f"event: {event_name}\ndata: {data_text}\n\n"
-                            event_name = ""
-                        elif line == "":
-                            continue
-        except httpx.ReadTimeout:
-            yield f"event: error\ndata: {json.dumps({'error': 'timeout'})}\n\n"
-        except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
+        primary_model = db.default_task_model(uid) or _hd.DEFAULT_MODEL
+        fb_model = _hd.fallback_model_for(primary_model)
+
+        async def one_pass(extra: dict, watch_for_overload: bool):
+            """Yield ('sse', chunk) events for the browser. When
+            watch_for_overload is set, a load-shed failure before any
+            assistant delta ends the pass with a single ('overload', why)
+            instead of forwarding the error."""
+            streamed = False
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST", url,
+                        headers={**_hermes_headers(), "Accept": "text/event-stream"},
+                        json={**payload, **extra},
+                        timeout=httpx.Timeout(240.0, connect=10.0),
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            body_text = ""
+                            async for chunk in resp.aiter_text():
+                                body_text += chunk
+                            if watch_for_overload and (resp.status_code == 429
+                                                       or _hd.is_quota_error(body_text[:400])):
+                                yield ("overload", f"HTTP {resp.status_code}: {body_text[:200]}")
+                                return
+                            yield ("sse", f"event: error\ndata: {json.dumps({'error': f'HTTP {resp.status_code}', 'detail': body_text[:300]})}\n\n")
+                            return
+                        event_name = ""
+                        async for line in resp.aiter_lines():
+                            if line.startswith("event: "):
+                                event_name = line[7:].strip()
+                            elif line.startswith("data: "):
+                                data_text = line[6:].strip()
+                                if watch_for_overload and not streamed:
+                                    why = _jarvis_overload_signature(event_name, data_text)
+                                    if why:
+                                        yield ("overload", why)
+                                        return
+                                if event_name == "assistant.delta":
+                                    streamed = True
+                                yield ("sse", f"event: {event_name}\ndata: {data_text}\n\n")
+                                event_name = ""
+                            elif line == "":
+                                continue
+            except httpx.ReadTimeout:
+                yield ("sse", f"event: error\ndata: {json.dumps({'error': 'timeout'})}\n\n")
+            except Exception as e:
+                yield ("sse", f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n")
+
+        overloaded = None
+        if fb_model and db.get_setting("jarvis.force_429") == "1":
+            overloaded = "simulated 429 (jarvis.force_429)"
+        else:
+            async for kind, chunk in one_pass({}, watch_for_overload=bool(fb_model)):
+                if kind == "overload":
+                    overloaded = chunk
+                    break
+                yield chunk
+        if overloaded and fb_model:
+            db.log_activity("warn", "jarvis",
+                            f"JARVIS: {primary_model} overloaded ({overloaded[:80]}) "
+                            f"— reply on {fb_model}", user_id=uid)
+            yield ("event: fallback\ndata: "
+                   + json.dumps({"from": primary_model, "to": fb_model}) + "\n\n")
+            async for _kind, chunk in one_pass({"model": fb_model}, watch_for_overload=False):
+                yield chunk
         # Files JARVIS produced (or changed) this turn → chips in the chat
         try:
             fresh = [f for f in _jarvis_files_list(uid)

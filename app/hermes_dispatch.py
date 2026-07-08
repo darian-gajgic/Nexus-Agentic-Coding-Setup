@@ -274,6 +274,19 @@ def check_budgets(task: dict) -> str | None:
     return None
 
 
+def fallback_model_for(model: str | None) -> str | None:
+    """Peak-overload failover target for `model`, or None (disabled / unset /
+    already the fallback). Z.ai load-sheds busy models at peak hours (429
+    error 1305) — instead of parking the task behind the GLOBAL backoff, one
+    retry runs on this model (its own concurrency pool, usually free)."""
+    if sreg.conf("dispatch.fallback_enabled") != "1":
+        return None
+    fb = (sreg.conf("dispatch.fallback_model") or "").strip()
+    if not fb or fb == (model or DEFAULT_MODEL):
+        return None
+    return fb
+
+
 def note_quota_hit():
     """Exponential global backoff: 60s doubling per consecutive STORM, cap 30 min.
     Escalate at most once per backoff window — N lanes hitting the same 429
@@ -910,11 +923,13 @@ def _try_harvest(task: dict) -> dict | None:
 
 
 def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
-                      resume: bool = False) -> dict:
+                      resume: bool = False, fallback_model: str | None = None) -> dict:
     """Execute one claimed task as a real Hermes session. Blocking; call from the
     lane's worker process. resume=True = the previous executor died mid-dispatch:
     harvest the orphaned result if it finished, else send a continue-turn into
-    the SAME session (context kept); fresh re-dispatch only if the session died."""
+    the SAME session (context kept); fresh re-dispatch only if the session died.
+    fallback_model is internal — set by the QuotaError failover retry so the
+    second pass runs on the overload-fallback model (and never falls back again)."""
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     agent = db.query_one("SELECT * FROM agents WHERE id=?", (agent_id,))
     if not task or not agent:
@@ -922,6 +937,7 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                       error="task or agent vanished before dispatch")
         return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
+    run_model = fallback_model or resolve_task_model(task)
     workspace = WORKSPACES / task_id
     workspace.mkdir(parents=True, exist_ok=True)
     db.execute("UPDATE agents SET status='busy', current_task=? WHERE id=?",
@@ -972,7 +988,6 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
         session_id = task.get("session_id")
-        run_model = resolve_task_model(task)
         if not session_id:
             _set_task(task_id, dispatch_state="dispatching")
             session_id = create_session(f"nexus:{task_id}", model=run_model)
@@ -1044,6 +1059,22 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                          content, result.get("usage") or {}, err_text)
 
     except QuotaError as e:
+        # Peak-hours failover: the task's model is being load-shed upstream —
+        # retry ONCE on the configured fallback model (fresh session, its own
+        # concurrency pool) instead of blocking. Only a second strike (the
+        # fallback is overloaded too) declares the storm and starts the backoff.
+        fb = None if fallback_model else fallback_model_for(run_model)
+        if fb:
+            old_sid = task.get("session_id")
+            if old_sid:
+                remove_session_key(old_sid)  # the retry re-publishes for its session
+            _set_task(task_id, session_id=None)
+            db.log_activity("warn", agent_id,
+                            f"Task {task_id}: {run_model or DEFAULT_MODEL} overloaded "
+                            f"({str(e)[:80]}) — falling back to {fb}",
+                            user_id=_task_user(task_id))
+            return run_task_dispatch(dispatch_id, task_id, agent_id,
+                                     resume=False, fallback_model=fb)
         backoff = note_quota_hit()
         _set_task(task_id, dispatch_state="blocked_quota", dispatch_error=str(e)[:300])
         _set_dispatch(dispatch_id, state="blocked_quota", ended_at=time.time(), error=str(e)[:300])

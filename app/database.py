@@ -462,6 +462,7 @@ def init_db():
             ("mdl-glm52", "zai", "glm-5.2", "GLM 5.2 (hard thinking)", "hermes"),
             ("mdl-glm51", "zai", "glm-5.1", "GLM 5.1 (light/simple)", "hermes"),
             ("mdl-glm45air", "zai", "glm-4.5-air", "GLM 4.5 Air (mechanical)", "hermes"),
+            ("mdl-glm5turbo", "zai", "glm-5-turbo", "GLM 5 Turbo (peak-hours fallback)", "hermes"),
             ("mdl-opus48", "anthropic", "claude-opus-4-8", "Claude Opus 4.8 (frontier judge)", "cli"),
         ]
         for mid, prov, model_id, label, route in seed_models:
@@ -474,6 +475,18 @@ def init_db():
             conn.execute(
                 "INSERT OR IGNORE INTO model_assignments (user_id, purpose, model_row_id, "
                 "updated_at) VALUES ('global',?,?,?)", (purpose, mid, now))
+
+    # One-time addition (2026-07-08): glm-5-turbo, the peak-hours overload
+    # fallback (settings dispatch.fallback_model) — pre-existing installs
+    # seeded before it existed get the row here. Marker-guarded so a deliberate
+    # later deletion stays deleted (same contract as the seed block above).
+    if not conn.execute("SELECT 1 FROM settings WHERE key='migrated.glm5turbo'").fetchone():
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO user_models (id, user_id, provider, model_id, label, "
+            "route, enabled, created_at, updated_at) VALUES ('mdl-glm5turbo',NULL,'zai',"
+            "'glm-5-turbo','GLM 5 Turbo (peak-hours fallback)','hermes',1,?,?)", (now, now))
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated.glm5turbo','1')")
 
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.

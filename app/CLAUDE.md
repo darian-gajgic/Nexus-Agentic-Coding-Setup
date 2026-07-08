@@ -61,6 +61,10 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - **System control**: per-turn `system_message` gives Hermes curl access to the Nexus API via
   the per-boot `auth.INTERNAL_TOKEN` + `x-nexus-user` (user-scoped; readback-confirm rule).
 - **Sessions**: multiple per user (`jarvis_session.json` history) — sidebar switch/forget/title.
+- **Overload fallback (2026-07-08)**: Z.AI load-sheds the chat model at peak → server emits
+  `event: fallback {from,to}` + retries the turn ONCE on `dispatch.fallback_model`
+  (default glm-5-turbo) in the SAME session via per-turn model override; the chat shows a
+  ⚡ note. Details in docs/JARVIS-VOICE.md §5 + the Real Dispatch quota bullet below.
 - **Extras**: daily spoken briefing, spoken task completion/failure callbacks (12s polling),
   `/find` + `/imagine` intents (typed or spoken), per-message copy buttons.
 - **Idle model unloading:** Piper+Whisper unload after `voice.py IDLE_TIMEOUT` (300s) idle;
@@ -159,7 +163,9 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   `JUDGE_MODEL` + `JUDGE_ANTHROPIC_API_KEY` env (cjudge honors both; unset = subscription auth).
   Caveat: Hermes AUXILIARY calls (title gen, compression) still bill the machine key.
 - Hermes-side files touched (keep guardian + vendored copies in sync — ship-flow step 4):
-  `~/.hermes/plugins/model-providers/zai/__init__.py`, `~/.local/bin/cjudge`.
+  `~/.hermes/plugins/model-providers/zai/__init__.py`, `~/.local/bin/cjudge`, and the
+  `session-model-api-server` core-mod on
+  `~/.hermes/hermes-agent/gateway/platforms/api_server.py` (guardian patch + sentinel).
 
 ## Real Dispatch (v2 — added 2026-07-06, SPEC-REAL-AGENTS.md is source of truth)
 
@@ -183,13 +189,31 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   Hermes's `~/.hermes/kanban.db` is RETIRED (was empty; its toolset is disabled) — do not
   bridge or revive it.
 - **Quota reality**: Z.ai 429 error 1305 = probabilistic load-shedding at peak, NOT quota
-  exhaustion. blocked_quota + exponential backoff (settings `dispatch.quota_backoff_until`,
-  `dispatch.quota_consecutive`); test injection knob `dispatch.force_429`.
+  exhaustion. First strike on a task's model → **overload fallback** (settings
+  `dispatch.fallback_enabled`/`dispatch.fallback_model`, default glm-5-turbo): the dispatch
+  retries ONCE on the fallback model in a fresh session (`fallback_model_for` /
+  `run_task_dispatch(fallback_model=…)` in hermes_dispatch.py). Only when the fallback is
+  overloaded too: blocked_quota + exponential backoff (settings
+  `dispatch.quota_backoff_until`, `dispatch.quota_consecutive`); test injection knob
+  `dispatch.force_429` (429s BOTH passes, so the gate still sees blocked_quota).
+  **JARVIS chat has the same fallback** (same two settings): a load-shed signature before
+  any streamed content → `event: fallback {from,to}` to the browser + ONE retry in the
+  SAME session as a per-turn model override (server.py `jarvis_chat_stream` /
+  `_jarvis_overload_signature`); test knob `jarvis.force_429=1` sheds the primary pass
+  without sending it (the fallback pass runs for real).
+- **Session models are honored ONLY via our guardian core-mod** (`session-model-api-server`,
+  added 2026-07-08): upstream's api_server platform ignores the per-session `model` for
+  session-chat turns — every turn silently ran config.yaml's default (journal-verified:
+  100% glm-5.2 before the mod, so per-task models/pools were cosmetic until then). The mod
+  makes turns run the session's stored model AND accepts an optional per-turn body
+  `model` override on `/api/sessions/{id}/chat[/stream]` (what JARVIS fallback uses).
+  Gateway restart applies it; guardian re-asserts it after Hermes updates.
 - Hermes API facts (verified against source): sessions persist in `~/.hermes/state.db` and
   survive gateway restarts; `delegate_task` is SYNCHRONOUS on the api_server platform;
   client disconnect does NOT kill a run (it finishes orphaned → harvestable); per-request
   `system_message` = ephemeral framing; **session titles must be UNIQUE** (create_session
-  retries with a `~hex` suffix on collision). NO Hermes-side changes are needed or wanted.
+  retries with a `~hex` suffix on collision). Hermes-side changes ship ONLY as
+  guardian-tracked core-mods/plugins — never loose edits.
 
 ### v2.1 additions (2026-07-06, user-testing round 3)
 - **Workflows (= "Projects" in the UI, nav `data-view="workflows"`)**: `workflows` table +
@@ -204,7 +228,9 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   workers WAIT instead of erroring. Settings: `dispatch.max_concurrent_per_model` (8),
   `dispatch.max_concurrent_total` (8). `/api/quota` exposes `in_flight` per model.
 - **Per-task model** (`tasks.model`): glm-5.2 default / glm-5.1 / glm-4.5-air — session is
-  created with that model; lighter tasks use a separate concurrency pool.
+  created with that model; lighter tasks use a separate concurrency pool. (Actually
+  effective only since the `session-model-api-server` core-mod, 2026-07-08 — before it,
+  upstream ran every session turn on the config default regardless.)
 - **Skill wizard**: `/api/hermes-skills` list/get/save + `/api/hermes-skills/wizard` (AI
   drafts SKILL.md → human reviews → save writes `~/.hermes/skills/<name>/SKILL.md`).
   Specialist wizard: `/api/specialists/wizard` (same pattern; eval gate on save stays).
