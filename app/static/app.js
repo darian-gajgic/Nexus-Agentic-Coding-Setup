@@ -112,6 +112,12 @@ async function api(method, path, body) {
       detail = j.error || j.detail || '';
       if (typeof detail !== 'string') detail = JSON.stringify(detail).slice(0, 200);
     } catch { }
+    if (res.status === 401 && authState.user) {
+      // Session expired mid-use (or login was just turned on) — reboot into
+      // the login screen instead of drowning the user in red toasts.
+      location.reload();
+      throw new Error('session expired');
+    }
     if (method !== 'GET' && Date.now() - _lastErrToast > 2000) {
       _lastErrToast = Date.now();
       toast(detail ? `${detail}` : `${method} ${path} failed (${res.status})`, 'err', 5000);
@@ -119,6 +125,93 @@ async function api(method, path, body) {
     throw new Error(detail || `API ${path}: ${res.status}`);
   }
   return res.json();
+}
+
+// ===== AUTH (Block 1 multi-user) =====
+// Single-user machines never see any of this: /api/auth/state says
+// auth_required=false and boot goes straight to init() as before.
+let authState = { required: false, user: null };
+
+async function bootAuth() {
+  try {
+    const st = await api('GET', '/api/auth/state');
+    authState = { required: !!st.auth_required, user: st.user || null };
+  } catch {
+    // Server unreachable — show the normal app shell; api() toasts errors.
+    authState = { required: false, user: null };
+  }
+  if (authState.required && !authState.user) { renderLoginScreen(); return; }
+  loadFocus();
+  renderUserChip();
+  init();
+}
+
+function renderLoginScreen() {
+  document.title = 'NEXUS — Sign in';
+  const app = $('#app');
+  if (app) app.style.display = 'none';
+  const overlay = document.createElement('div');
+  overlay.id = 'loginScreen';
+  overlay.innerHTML = `
+    <div class="login-card">
+      <div class="logo" style="justify-content:center;margin-bottom:6px">
+        <div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><polygon points="12 2.5 21 7.5 21 16.5 12 21.5 3 16.5 3 7.5"/><polygon points="12 7 16.5 9.5 16.5 14.5 12 17 7.5 14.5 7.5 9.5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg></div>
+        <div class="logo-txt"><span class="logo-text">NEXUS</span><span class="logo-sub">AGENT OS</span></div>
+      </div>
+      <div class="muted" style="text-align:center;margin-bottom:16px;font-size:12.5px">Sign in to your personal workspace</div>
+      <form id="loginForm">
+        <div class="form-group"><label class="form-label">Username</label>
+          <input class="form-input" id="loginUser" autocomplete="username" autocapitalize="none" autofocus></div>
+        <div class="form-group" style="margin-top:10px"><label class="form-label">Password</label>
+          <input class="form-input" id="loginPass" type="password" autocomplete="current-password"></div>
+        <div id="loginErr" class="login-err" style="display:none"></div>
+        <button class="btn-primary" type="submit" style="width:100%;margin-top:14px;justify-content:center">Sign in</button>
+      </form>
+    </div>`;
+  document.body.appendChild(overlay);
+  $('#loginForm').addEventListener('submit', doLogin);
+}
+
+async function doLogin(e) {
+  e.preventDefault();
+  const errEl = $('#loginErr');
+  errEl.style.display = 'none';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('#loginUser').value.trim(), password: $('#loginPass').value }),
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      errEl.textContent = j.error || 'Sign-in failed';
+      errEl.style.display = 'block';
+      return;
+    }
+    location.reload();
+  } catch {
+    errEl.textContent = 'Server unreachable';
+    errEl.style.display = 'block';
+  }
+}
+
+async function doLogout() {
+  try { await api('POST', '/api/auth/logout'); } catch { }
+  location.reload();
+}
+
+function renderUserChip() {
+  // Only shown once login is actually in force — the single-operator
+  // machine keeps its exact pre-multiuser topbar.
+  if (!authState.required || !authState.user) return;
+  const right = $('.topbar-right');
+  if (!right || $('#userChip')) return;
+  const chip = document.createElement('div');
+  chip.id = 'userChip';
+  chip.className = 'user-chip';
+  chip.innerHTML = `<span class="user-avatar">${esc((authState.user.display_name || '?').slice(0, 1).toUpperCase())}</span>` +
+    `<span class="user-name">${esc(authState.user.display_name)}</span>` +
+    `<button class="user-logout" onclick="doLogout()" title="Sign out">⎋</button>`;
+  right.insertBefore(chip, right.firstChild);
 }
 
 // ===== INIT =====
@@ -156,9 +249,25 @@ function bindNav() {
 function bindGlobal() {
   $('#spawnBtn').addEventListener('click', () => showSpawnModal());
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { closeModal(); closeDrawer(); }
+    if (e.key === 'Escape') { closeModal(); closeDrawer(); closeMobileNav(); }
   });
   $('#drawerOverlay').addEventListener('click', () => closeDrawer());
+  // Mobile off-canvas nav (≤900px: the sidebar hides behind the ☰ button)
+  const menuBtn = $('#menuBtn');
+  if (menuBtn) menuBtn.addEventListener('click', () => {
+    $('.sidebar').classList.toggle('open');
+    document.body.classList.toggle('nav-open', $('.sidebar').classList.contains('open'));
+  });
+  const scrim = $('#sidebarScrim');
+  if (scrim) scrim.addEventListener('click', closeMobileNav);
+  // Navigating closes the drawer-style nav on phones
+  $$('.nav-item').forEach(el => el.addEventListener('click', closeMobileNav));
+}
+
+function closeMobileNav() {
+  const sb = $('.sidebar');
+  if (sb) sb.classList.remove('open');
+  document.body.classList.remove('nav-open');
 }
 
 function startClock() {
@@ -1124,12 +1233,48 @@ async function deleteAttachment(kind, id, name, elId) {
 // and Tasks narrows further. Creation inherits the deepest selection.
 // Persisted across reloads; always visible in the bar under the topbar.
 let focusCtx = { project: null, workflow: null };
-try { focusCtx = JSON.parse(localStorage.getItem('nexusFocus') || '{}') || {}; } catch { }
-focusCtx.project = focusCtx.project || null;
-focusCtx.workflow = focusCtx.workflow || null;
+
+// Focus is PER USER (Block 1): each user's project/workflow focus lives under
+// their own key. Loaded in bootAuth() once the user is known; the legacy
+// un-namespaced key migrates to the current user once, then is removed.
+function focusKey() {
+  return 'nexusFocus:' + ((authState.user && authState.user.id) || 'u_owner');
+}
+
+function loadFocus() {
+  try {
+    let raw = localStorage.getItem(focusKey());
+    if (raw == null) {
+      // The legacy un-namespaced key predates multi-user, so it can only be
+      // the OWNER's focus — migrating it to whoever logs in next on this
+      // browser would hand another user the owner's project context.
+      const legacy = localStorage.getItem('nexusFocus');
+      if (legacy != null && focusKey() === 'nexusFocus:u_owner') {
+        localStorage.setItem(focusKey(), legacy);
+        localStorage.removeItem('nexusFocus');
+        raw = legacy;
+      }
+    }
+    focusCtx = JSON.parse(raw || '{}') || {};
+  } catch { focusCtx = {}; }
+  focusCtx.project = focusCtx.project || null;
+  focusCtx.workflow = focusCtx.workflow || null;
+}
+
+// Called wherever the (user-scoped) projects list arrives: focus pointing at
+// a project this user cannot see — stale localStorage, ownership change — is
+// cleared instead of silently scoping their boards to an invisible project.
+function pruneStaleFocus(projects) {
+  if (!focusCtx.project || !Array.isArray(projects)) return;
+  if (!projects.some(p => p && p.path === focusCtx.project.path)) {
+    focusCtx.project = null;
+    focusCtx.workflow = null;
+    saveFocus();
+  }
+}
 
 function saveFocus() {
-  try { localStorage.setItem('nexusFocus', JSON.stringify(focusCtx)); } catch { }
+  try { localStorage.setItem(focusKey(), JSON.stringify(focusCtx)); } catch { }
   renderFocusBar();
 }
 
@@ -1190,7 +1335,20 @@ function viewManual() {
   return `<div class="manual-wrap">
   <div class="view-intro" style="margin-bottom:14px">This manual explains the whole system in plain language — no IT background needed — and ends with the full technical architecture for those who want it. On any other tab, the <b>?</b> button in the top bar starts a guided walkthrough of exactly that tab.</div>
   <div class="manual-toc">
-    <a href="#m-what">What is this?</a><a href="#m-first">First steps</a><a href="#m-tasks">Creating work</a><a href="#m-projects">Projects</a><a href="#m-results">Getting results</a><a href="#m-quality">Quality machinery</a><a href="#m-coding">Coding on your repos</a><a href="#m-jarvis">JARVIS</a><a href="#m-memory">Memory</a><a href="#m-money">Costs &amp; limits</a><a href="#m-trouble">Troubleshooting</a><a href="#m-tech">🔧 Technical architecture</a>
+    <a href="#m-what">What is this?</a><a href="#m-first">First steps</a><a href="#m-tasks">Creating work</a><a href="#m-projects">Projects</a><a href="#m-results">Getting results</a><a href="#m-quality">Quality machinery</a><a href="#m-coding">Coding on your repos</a><a href="#m-jarvis">JARVIS</a><a href="#m-memory">Memory</a><a href="#m-users">Users &amp; remote access</a><a href="#m-money">Costs &amp; limits</a><a href="#m-trouble">Troubleshooting</a><a href="#m-tech">🔧 Technical architecture</a>
+  </div>
+
+  <div class="manual-sec" id="m-users">
+    <h2>👥 Users &amp; remote access</h2>
+    <div class="m-sub">One machine, personal workspaces — and access from your phone</div>
+    <p>Nexus supports multiple people on this one installation. With a single user there is <b>no login</b> — everything works exactly as before. The moment a second account exists (Settings → <b>Users &amp; access</b>), a login screen appears for everyone, and each person gets their <b>own</b> task board, projects, deliverables, focus, JARVIS conversation and memories. Nobody sees anybody else's work — this is enforced by the server on every request, not just hidden in the UI.</p>
+    <div class="m-steps">
+      <div class="m-step"><div>Go to <b>Settings → Users &amp; access</b> and first set <b>your own password</b>.</div></div>
+      <div class="m-step"><div>Click <b>+ Add user</b> — username, display name, a password of at least 8 characters. From now on everyone signs in.</div></div>
+      <div class="m-step"><div>Shared between users: the agent fleet, budgets/settings and the specialists' craft knowledge. Personal: everything you create.</div></div>
+    </div>
+    <p>Remote access runs over <b>Tailscale</b> (a private device-to-device network) — the phone and the second laptop join your tailnet and open <code>https://&lt;machine&gt;.&lt;tailnet&gt;.ts.net</code>. Nexus is <b>never</b> on the public internet. Setup: <code>bash scripts/setup_tailscale.sh</code> (details in docs/TAILSCALE.md). Locked out? On the machine itself: <code>.venv/bin/python scripts/auth_reset.py</code> returns it to single-user.</p>
+    <div class="m-tip">💡 The interface adapts to phones: the menu hides behind the ☰ button, and boards scroll sideways with a swipe.</div>
   </div>
 
   <div class="manual-sec" id="m-what">
@@ -1593,6 +1751,9 @@ function viewSettings() {
       <table class="data-table"><thead><tr><th>Model</th><th>Max parallel</th><th>Default effort</th><th></th></tr></thead>
       <tbody>${modelRows}</tbody></table>
     </div></div>
+    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>👥 Users & access</h3></div><div class="card-body" id="usersPanel">
+      <div class="muted" style="font-size:12px">Loading users…</div>
+    </div></div>
     <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🛡 Related</h3></div><div class="card-body" style="display:flex;gap:10px;flex-wrap:wrap">
       <button class="btn-ghost" onclick="showWatchdogModal()">Watchdog configuration</button>
       <button class="btn-ghost" onclick="switchView('issues')">Known issues</button>
@@ -1603,7 +1764,130 @@ function viewSettings() {
     </div>`;
 }
 
-function bindSettings() { /* inline handlers */ }
+function bindSettings() { loadUsersPanel(); }
+
+// ── Users & access (Block 1 multi-user) ──
+async function loadUsersPanel() {
+  const panel = $('#usersPanel');
+  if (!panel) return;
+  let users = null;
+  try { users = await api('GET', '/api/users'); } catch { }
+  const me = authState.user || {};
+  if (!users) {
+    // Member account (403) — offer only the self-service password change.
+    panel.innerHTML = `
+      <div class="form-hint" style="margin-bottom:8px">Signed in as <b>${esc(me.display_name || '?')}</b>. Ask the admin to manage accounts.</div>
+      <button class="btn-ghost" onclick="showPasswordModal()">Change my password</button>`;
+    return;
+  }
+  const rows = users.map(u => `
+    <tr>
+      <td><b>${esc(u.display_name)}</b> <span class="muted">@${esc(u.username)}</span>${u.id === me.id ? ' <span class="muted">(you)</span>' : ''}</td>
+      <td>${esc(u.role)}</td>
+      <td>${u.active ? (u.has_password ? '🔐 password set' : '⚠ no password') : '⛔ deactivated'}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn-ghost btn-sm" onclick="resetUserPassword('${esc(u.id)}','${esc(u.display_name)}')">Reset password</button>
+        ${u.id !== me.id ? `<button class="btn-ghost btn-sm" onclick="toggleUserActive('${esc(u.id)}',${u.active ? 'false' : 'true'})">${u.active ? 'Deactivate' : 'Reactivate'}</button>` : ''}
+      </td>
+    </tr>`).join('');
+  panel.innerHTML = `
+    <div class="form-hint" style="margin-bottom:8px">
+      With a single user, no login is asked — the machine works exactly as before.
+      <b>Adding a second user turns the login screen on for everyone</b> (set your own
+      password first). Each user gets their own tasks, projects, focus, memories and JARVIS.
+    </div>
+    <div style="overflow-x:auto"><table class="data-table">
+      <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn-ghost" onclick="showPasswordModal()">Change my password</button>
+      <button class="btn-primary" onclick="showAddUserModal()">+ Add user</button>
+    </div>`;
+}
+
+function showPasswordModal() {
+  const me = authState.user || {};
+  showModal(`
+    <div class="modal-head"><h3>Change my password</h3></div>
+    <div class="modal-body">
+      ${me.has_password ? `<div class="form-group"><label class="form-label">Current password</label>
+        <input class="form-input" id="pwCurrent" type="password" autocomplete="current-password"></div>` : ''}
+      <div class="form-group" style="margin-top:10px"><label class="form-label">New password (min 8 characters)</label>
+        <input class="form-input" id="pwNew" type="password" autocomplete="new-password"></div>
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn-primary" onclick="submitPasswordChange()">Save password</button>
+        <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      </div>
+    </div>`);
+}
+
+async function submitPasswordChange() {
+  try {
+    await api('POST', '/api/auth/password', {
+      current: ($('#pwCurrent') || {}).value || '',
+      password: $('#pwNew').value,
+    });
+    toast('Password saved', 'ok');
+    closeModal();
+    if (authState.user) authState.user.has_password = true;
+    loadUsersPanel();
+  } catch { }
+}
+
+function showAddUserModal() {
+  showModal(`
+    <div class="modal-head"><h3>Add user</h3></div>
+    <div class="modal-body">
+      <div class="form-hint" style="margin-bottom:10px">⚠ The moment this user exists, <b>everyone signs in with a password</b> — including you. Make sure your own password is set first.</div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Username</label>
+          <input class="form-input" id="nuName" autocapitalize="none" placeholder="e.g. anna"></div>
+        <div class="form-group"><label class="form-label">Display name</label>
+          <input class="form-input" id="nuDisplay" placeholder="e.g. Anna"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="form-group"><label class="form-label">Password (min 8 characters)</label>
+          <input class="form-input" id="nuPass" type="password" autocomplete="new-password"></div>
+        <div class="form-group"><label class="form-label">Role</label>
+          <select class="form-select" id="nuRole"><option value="member">member</option><option value="admin">admin</option></select></div>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn-primary" onclick="submitAddUser()">Create user</button>
+        <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      </div>
+    </div>`);
+}
+
+async function submitAddUser() {
+  try {
+    await api('POST', '/api/users', {
+      username: $('#nuName').value.trim(),
+      display_name: $('#nuDisplay').value.trim(),
+      password: $('#nuPass').value,
+      role: $('#nuRole').value,
+    });
+    toast('User created — login is now required for everyone', 'ok', 6000);
+    closeModal();
+    loadUsersPanel();
+  } catch { }
+}
+
+async function resetUserPassword(uid, name) {
+  const pw = prompt(`New password for ${name} (min 8 characters):`);
+  if (!pw) return;
+  try {
+    await api('PATCH', `/api/users/${uid}`, { password: pw });
+    toast(`Password reset for ${name} (their sessions were signed out)`, 'ok');
+    loadUsersPanel();
+  } catch { }
+}
+
+async function toggleUserActive(uid, active) {
+  try {
+    await api('PATCH', `/api/users/${uid}`, { active });
+    loadUsersPanel();
+  } catch { }
+}
 
 async function saveSettingsTab() {
   const body = {
@@ -3191,6 +3475,7 @@ function showTaskModal(status) {
     } catch { /* optional */ }
     try {
       const repos = (await api('GET', '/api/projects')).projects || [];
+      pruneStaleFocus(repos);
       const rsel = $('#m-task-repo');
       if (rsel && repos.length) {
         rsel.innerHTML = `<option value="">— None: fresh workspace (default) —</option>` +
@@ -3535,6 +3820,7 @@ async function loadProjects() {
   projectsState.loading = true; projectsState.data = null; render();
   try { projectsState.data = await api('GET', '/api/projects'); }
   catch { projectsState.data = { projects: [] }; }
+  pruneStaleFocus((projectsState.data || {}).projects);
   projectsState.loading = false; projectsState.fetched = true; render();
 }
 function viewProjects() {
@@ -6179,6 +6465,7 @@ function describeTaskUI() {
   const twSel = $('#twRepo');
   if (twSel) {
     api('GET', '/api/projects').then(d => {
+      pruneStaleFocus(d.projects);
       const ps = (d.projects || d || []).filter(x => x.is_repo);
       ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0));
       if (twSel.isConnected) {
@@ -6389,6 +6676,7 @@ function proposeWorkflowModal(wf, meta) {
   const repoSel = $('#wf-repo');
   if (repoSel) {
     api('GET', '/api/projects').then(d => {
+      pruneStaleFocus(d.projects);
       const ps = (d.projects || d || []).filter(p => p.is_repo);
       ps.sort((a, b2) => (b2.client ? 1 : 0) - (a.client ? 1 : 0)); // client repos first
       if (!repoSel.isConnected) return;
@@ -6553,4 +6841,6 @@ document.addEventListener('click', (e) => {
 });
 
 // ===== BOOT =====
-init();
+// Auth gate first: single-user machines fall straight through to init();
+// multi-user setups see the login screen until a valid session exists.
+bootAuth();

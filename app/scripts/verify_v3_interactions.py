@@ -6,8 +6,10 @@ import requests
 from playwright.async_api import async_playwright
 import urllib3
 urllib3.disable_warnings()
+from _gate_auth import owner_cookie, playwright_cookies
 
 BASE = "https://127.0.0.1:8777"
+CK = owner_cookie()  # {} while login is off; owner session when multi-user is live
 SHOTS = os.path.expanduser("~/.hermes/cache/screenshots/nexus-after")
 os.makedirs(SHOTS, exist_ok=True)
 P, F = 0, 0
@@ -16,13 +18,13 @@ console_errors = []
 # Self-sufficiency: the board starts EMPTY since the real-agents migration —
 # ensure at least one lane + one kanban card exist for the click-through checks.
 _spawned_lane = None
-if not [a for a in requests.get(BASE + "/api/agents", verify=False, timeout=10).json()
+if not [a for a in requests.get(BASE + "/api/agents", verify=False, timeout=10, cookies=CK).json()
         if a.get("status") != "retired"]:
-    _spawned_lane = requests.post(BASE + "/api/agents", verify=False, timeout=15,
+    _spawned_lane = requests.post(BASE + "/api/agents", verify=False, timeout=15, cookies=CK,
                                   json={"name": "UI-Gate-Lane", "auto_claim": False}).json()["id"]
 _spawned_task = None
-if not requests.get(BASE + "/api/tasks", verify=False, timeout=10).json():
-    _spawned_task = requests.post(BASE + "/api/tasks", verify=False, timeout=15,
+if not requests.get(BASE + "/api/tasks", verify=False, timeout=10, cookies=CK).json():
+    _spawned_task = requests.post(BASE + "/api/tasks", verify=False, timeout=15, cookies=CK,
                                   json={"title": "UI gate probe card",
                                         "status": "backlog"}).json()["id"]
 
@@ -37,14 +39,23 @@ async def main():
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1600, "height": 1000},
                                       ignore_https_errors=True)
+        await page.context.add_cookies(playwright_cookies(BASE))
         page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         page.on("pageerror", lambda e: console_errors.append(f"PAGEERROR: {e}"))
         await page.goto(BASE, wait_until="networkidle")
         await page.wait_for_timeout(2500)
 
-        # 1. Dashboard: 3D canvas mounted with real size, now-strip present
-        ok("3D canvas present", await page.locator("#nexus3d").count() == 1)
-        size = await page.evaluate("() => { const c = document.getElementById('nexus3d'); return c ? c.width : 0 }")
+        # 1. Dashboard: galaxy hero mounted with a real WebGL canvas, now-strip
+        # present (the hero is the memory galaxy since the 2026-07-08 dashboard
+        # redesign — #nexus3d was the OLD constellation mount)
+        ok("3D canvas present", await page.locator("#dashGalaxy").count() == 1)
+        size = 0
+        for _ in range(10):  # CDN module + WebGL init can lag
+            size = await page.evaluate(
+                "() => { const c = document.querySelector('#dashGalaxy canvas'); return c ? c.width : 0 }")
+            if size > 0:
+                break
+            await page.wait_for_timeout(500)
         ok("3D canvas has WebGL-sized backing store", size > 0, f"width={size}")
         ok("now-running strip", await page.locator("#nowStrip .now-row").count() > 0)
 
@@ -56,8 +67,11 @@ async def main():
         ok("drawer opens", await page.locator("#drawer.open").count() == 1)
         for tab, probe in [("Memory", ".drawer-sec"), ("Messages", ".drawer-sec"), ("Cost", ".stat-card"), ("Overview", ".kv-row")]:
             await page.click(f'.dtab:has-text("{tab}")')
-            await page.wait_for_timeout(900)
-            ok(f"drawer tab {tab} renders", await page.locator(f"#drawerBody {probe}").count() > 0)
+            try:  # wait-based: tab content is an async fetch, not a fixed 900ms
+                await page.wait_for_selector(f"#drawerBody {probe}", timeout=6000, state="attached")
+                ok(f"drawer tab {tab} renders", True)
+            except Exception:
+                ok(f"drawer tab {tab} renders", False, "probe never attached")
         await page.screenshot(path=f"{SHOTS}/x-drawer.png")
         # teach a memory through the drawer
         await page.click('.dtab:has-text("Memory")')
@@ -126,9 +140,9 @@ async def main():
 
 asyncio.run(main())
 if _spawned_lane:
-    requests.post(f"{BASE}/api/agents/{_spawned_lane}/retire", verify=False, timeout=10)
-    requests.delete(f"{BASE}/api/agents/{_spawned_lane}", verify=False, timeout=10)
+    requests.post(f"{BASE}/api/agents/{_spawned_lane}/retire", verify=False, timeout=10, cookies=CK)
+    requests.delete(f"{BASE}/api/agents/{_spawned_lane}", verify=False, timeout=10, cookies=CK)
 if _spawned_task:
-    requests.delete(f"{BASE}/api/tasks/{_spawned_task}", verify=False, timeout=10)
+    requests.delete(f"{BASE}/api/tasks/{_spawned_task}", verify=False, timeout=10, cookies=CK)
 print(f"\n=== V3 INTERACTION RESULT: {P} passed, {F} failed ===")
 sys.exit(1 if F else 0)

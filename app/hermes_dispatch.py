@@ -329,30 +329,56 @@ import worktree as wt
 _CLIENT_SCOPES_FILE = os.path.expanduser("~/.hermes/client-scopes.json")
 
 
-def _publish_client_scope(session_id: str, client: str | None):
-    """Session→client map for the mem0-client provider (M3 isolation).
-    Memories extracted from this session get stamped with the client tag;
-    retrieval in OTHER clients' (and personal) sessions filters them out.
+def publish_session_scope(session_id: str, client: str | None = None,
+                          user: str | None = None):
+    """Session→scope maps for the mem0-client provider.
+
+    Two scopes, same bridge-file mechanism (M3 generalized one level up):
+      "sessions" {sid: client} — client isolation (M3, unchanged name for
+                                 backward compatibility)
+      "users"    {sid: user}   — Block-1 per-user isolation: memories
+                                 extracted from this session are stamped
+                                 metadata.user and invisible to other users'
+                                 sessions.
     Same bridge-file pattern as model-efforts.json; pruned at 800 entries."""
-    if not client:
+    if not client and not user:
         return
     try:
-        data = {"sessions": {}, "updated": {}}
+        data = {}
         if os.path.isfile(_CLIENT_SCOPES_FILE):
             with open(_CLIENT_SCOPES_FILE) as f:
                 data = json.load(f)
         sessions = data.get("sessions") or {}
+        users = data.get("users") or {}
         updated = data.get("updated") or {}
-        sessions[session_id] = client
+        if (client and sessions.get(session_id) == client and not user) or \
+           (user and users.get(session_id) == user and not client) or \
+           (client and user and sessions.get(session_id) == client
+                and users.get(session_id) == user):
+            return  # idempotent: nothing to write (hot path on session reuse)
+        if client:
+            sessions[session_id] = client
+        if user:
+            users[session_id] = user
         updated[session_id] = time.time()
-        if len(sessions) > 800:
-            for sid in sorted(updated, key=updated.get)[:len(sessions) - 800]:
+        if len(updated) > 800:
+            for sid in sorted(updated, key=updated.get)[:len(updated) - 800]:
                 sessions.pop(sid, None)
+                users.pop(sid, None)
                 updated.pop(sid, None)
+        # rewrite the three maps but PRESERVE any other top-level keys the
+        # file carries (e.g. "default_user", the unmapped-session fallback
+        # written by the mem0 user backfill migration)
+        data.update({"sessions": sessions, "users": users, "updated": updated})
         with open(_CLIENT_SCOPES_FILE, "w") as f:
-            json.dump({"sessions": sessions, "updated": updated}, f, indent=1)
+            json.dump(data, f, indent=1)
     except Exception as e:
-        db.log_activity("warn", "system", f"client-scope publish failed: {str(e)[:80]}")
+        db.log_activity("warn", "system", f"session-scope publish failed: {str(e)[:80]}")
+
+
+def _task_user(task_id: str) -> str | None:
+    row = db.query_one("SELECT user_id FROM tasks WHERE id=?", (task_id,))
+    return (row or {}).get("user_id")
 
 
 def _repo_is_code(path: str) -> bool:
@@ -567,9 +593,11 @@ def _make_on_event(dispatch_id: str, task_id: str, agent_id: str):
                        (f"{task_id}: …{tail}", agent_id))
         elif name == "tool.completed":
             db.log_activity("info", agent_id,
-                            f"[{task_id}] tool {data.get('tool_name') or data.get('tool') or '?'} done")
+                            f"[{task_id}] tool {data.get('tool_name') or data.get('tool') or '?'} done",
+                            user_id=_task_user(task_id))
         elif name == "run.started":
-            db.log_activity("info", agent_id, f"[{task_id}] Hermes run started")
+            db.log_activity("info", agent_id, f"[{task_id}] Hermes run started",
+                            user_id=_task_user(task_id))
 
     return on_event
 
@@ -600,7 +628,8 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
         _set_dispatch(dispatch_id, state="failed", ended_at=time.time(),
                       tokens_in=tin, tokens_out=tout, error=err_text)
         db.execute("UPDATE agents SET tasks_failed=tasks_failed+1 WHERE id=?", (agent_id,))
-        db.log_activity("error", agent_id, f"Task {task_id} dispatch failed: {err_text[:120]}")
+        db.log_activity("error", agent_id, f"Task {task_id} dispatch failed: {err_text[:120]}",
+                        user_id=task.get("user_id"))
         notify_desktop("Nexus: task failed", f"{task['title']} — {err_text[:120]}")
         return
 
@@ -620,12 +649,14 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
         # surfaces it in the approvals UI (+ nav badge) until a human decides.
         db.execute(
             "INSERT INTO approvals (id, agent_id, action_type, description, payload, "
-            "status, risk_level, requested_at) VALUES (?,?,?,?,?,?,?,?)",
+            "status, risk_level, requested_at, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
             (f"appr-{uuid.uuid4().hex[:10]}", agent_id, "deliverable",
              f"High-stakes deliverable ready for review: '{task['title']}'",
-             json.dumps({"task_id": task_id}), "pending", "high", time.time()))
+             json.dumps({"task_id": task_id}), "pending", "high", time.time(),
+             task.get("user_id")))  # the approval belongs to the task's owner
         db.log_activity("warn", agent_id,
-                        f"Task {task_id} awaits approval (high-stakes) — nothing ships unjudged")
+                        f"Task {task_id} awaits approval (high-stakes) — nothing ships unjudged",
+                        user_id=task.get("user_id"))
         notify_desktop("Nexus: approval needed ⚖",
                        f"High-stakes deliverable ready for review: {task['title']}")
     else:
@@ -635,7 +666,7 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     db.execute("UPDATE agents SET tasks_completed=tasks_completed+1 WHERE id=?", (agent_id,))
     db.log_activity("info", agent_id,
                     f"Task {task_id} {'harvested' if harvested else 'completed'} "
-                    f"({total} tokens) → {new_status}")
+                    f"({total} tokens) → {new_status}", user_id=task.get("user_id"))
 
 
 _FAILURE_PREFIXES = ("API call failed", "⏳", "⚠️ The model declined")
@@ -774,7 +805,8 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             _set_task(task_id, dispatch_state=blocked,
                       dispatch_error=f"{blocked} at dispatch time")
             _set_dispatch(dispatch_id, state=blocked, ended_at=time.time(), error=blocked)
-            db.log_activity("warn", agent_id, f"Task {task_id} not dispatched: {blocked}")
+            db.log_activity("warn", agent_id, f"Task {task_id} not dispatched: {blocked}",
+                            user_id=task.get("user_id"))
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
         session_id = task.get("session_id")
@@ -783,14 +815,17 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             session_id = create_session(f"nexus:{task_id}", model=task.get("model"))
             _set_task(task_id, session_id=session_id)
             task["session_id"] = session_id
-        # M3: client-tagged sessions get isolated memory (mem0-client provider)
-        _publish_client_scope(session_id, task.get("client"))
+        # M3 + Block 1: session memory scoping — client tag isolates client
+        # facts, user tag isolates the owner's memories from other users.
+        publish_session_scope(session_id, client=task.get("client"),
+                              user=task.get("user_id"))
         _set_dispatch(dispatch_id, session_id=session_id, state="streaming",
                       heartbeat_at=time.time())
         _set_task(task_id, dispatch_state="streaming", dispatch_error=None)
         db.log_activity("info", agent_id,
                         f"{'Resuming' if resume else 'Dispatched'} task {task_id} "
-                        f"('{task['title']}') via Hermes session {session_id}")
+                        f"('{task['title']}') via Hermes session {session_id}",
+                        user_id=task.get("user_id"))
 
         repo_ctx = _repo_context(task)
         if task.get("repo_path") and not repo_ctx:
@@ -845,12 +880,14 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         backoff = note_quota_hit()
         _set_task(task_id, dispatch_state="blocked_quota", dispatch_error=str(e)[:300])
         _set_dispatch(dispatch_id, state="blocked_quota", ended_at=time.time(), error=str(e)[:300])
-        db.log_activity("warn", agent_id, f"Task {task_id} blocked by quota — backoff {backoff}s")
+        db.log_activity("warn", agent_id, f"Task {task_id} blocked by quota — backoff {backoff}s",
+                        user_id=_task_user(task_id))
     except Exception as e:
         _set_task(task_id, dispatch_state="failed", dispatch_error=str(e)[:300])
         _set_dispatch(dispatch_id, state="failed", ended_at=time.time(), error=str(e)[:300])
         db.execute("UPDATE agents SET tasks_failed=tasks_failed+1 WHERE id=?", (agent_id,))
-        db.log_activity("error", agent_id, f"Task {task_id} dispatch crashed: {str(e)[:120]}")
+        db.log_activity("error", agent_id, f"Task {task_id} dispatch crashed: {str(e)[:120]}",
+                        user_id=_task_user(task_id))
     finally:
         # A lane with a live worker is always 'running' (never 'idle') — the
         # watchdog only heals running/busy/crashed, so 'idle' would be a

@@ -207,9 +207,18 @@ def _verdict_from_summary(summary: str | None) -> str | None:
     return "PASS" if p < f else "FAIL"
 
 
-def _api(method: str, path: str, body: dict | None = None) -> bool:
+def _api(method: str, path: str, body: dict | None = None,
+         user_id: str | None = None) -> bool:
+    """Local API call, authenticated as the OWNING USER of the work being
+    looped (in-process service token — see auth.INTERNAL_TOKEN). The engine
+    runs in the server process, so the token is shared module state."""
     try:
-        r = httpx.request(method, API + path, json=body, verify=False, timeout=20)
+        import auth as _auth
+        headers = {_auth.INTERNAL_HEADER: _auth.INTERNAL_TOKEN}
+        if user_id:
+            headers[_auth.INTERNAL_USER_HEADER] = user_id
+        r = httpx.request(method, API + path, json=body, headers=headers,
+                          verify=False, timeout=20)
         return r.status_code < 300
     except Exception as e:
         db.log_activity("warn", "loop", f"engine API call {path} failed: {str(e)[:80]}")
@@ -246,8 +255,10 @@ def _sweep_workflow_loops(actions_left: int) -> int:
             "feedback": "The acceptance verification FAILED. Fix every blocking "
                         "finding below, then the inspection re-runs automatically "
                         "(closed loop, round "
-                        f"{int(trig['used']) + 1}/{trig['max_rounds']}):\n" + findings})
-        ok2 = _api("POST", f"/api/tasks/{ver['id']}/retry", {})  # re-verify after fix
+                        f"{int(trig['used']) + 1}/{trig['max_rounds']}):\n" + findings},
+                   user_id=fixer.get("user_id"))
+        ok2 = _api("POST", f"/api/tasks/{ver['id']}/retry", {},
+                   user_id=ver.get("user_id"))  # re-verify after fix
         if ok1 and ok2:
             trig["used"] = int(trig.get("used") or 0) + 1
             _save_cfg("workflow", wf["id"], cfg)
@@ -302,7 +313,7 @@ def _sweep_task_loops(actions_left: int) -> int:
         # 1) auto-judge a fresh deliverable (quality mode, high-stakes, rubric)
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \
                 and bool(t.get("high_stakes")) and _judgeable(t.get("domain")):
-            if _api("POST", f"/api/tasks/{t['id']}/judge", {}):
+            if _api("POST", f"/api/tasks/{t['id']}/judge", {}, user_id=t.get("user_id")):
                 db.log_activity("info", "loop",
                                 f"Loop auto-ran the frontier judge on '{t['title'][:50]}'"
                                 + (" (project loop)" if per_task else ""))
@@ -314,7 +325,8 @@ def _sweep_task_loops(actions_left: int) -> int:
                          if x.get("id") == "judge_revise" and x.get("enabled")), None)
             if not trig or _trigger_rounds(trig, per_task) >= int(trig.get("max_rounds") or 0):
                 continue
-            if _api("POST", f"/api/tasks/{t['id']}/retry", {}):  # retry auto-attaches judge findings
+            if _api("POST", f"/api/tasks/{t['id']}/retry", {},
+                    user_id=t.get("user_id")):  # retry auto-attaches judge findings
                 _bump_rounds(trig, per_task)
                 _save_cfg(owner_kind, owner_id, cfg)
                 used = _trigger_rounds(trig, per_task)
