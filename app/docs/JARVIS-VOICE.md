@@ -17,16 +17,22 @@ dormant). The v2 stack:
   static/avatar/male_head.glb. `scripts/build_avatar_from_glb.py` samples it
   into static/avatar/head_points.json incl. the opaque head-occluder mesh;
   jarvis3d.js loads that (procedural sculpt = fallback). The v8 procedural
-  torso is GONE: the bust is anchored at the frame BOTTOM (crown y=1.5) so
-  the scan's open neck/shoulder cut stays below the visible edge.
+  torso is GONE: the bust is anchored at the frame BOTTOM so the scan's open
+  neck/shoulder cut stays below the visible edge. v11: the bust is 1.5×
+  (MODEL_H 63, crown y=22.5, cut −40.5 — still off-frame), SAME 46k points
+  (face-weighted sampling + sculpted two-key shading = the extra detail),
+  eye-glint positions are MEASURED from the scan and baked into the JSON
+  ("glints"), and the blink writes eye colors absolutely per frame (the old
+  compounding ×= made blinks smear); glints close with the lids.
   NOTE: the GLB faces +z as authored — do NOT "fix" its orientation.
 - **Memory galaxy in the JARVIS scene (v10, 2026-07-08)** — the old node
   streams/pulse sprites are GONE. jarvis3d.js now embeds the Memory tab's
   real 3D map (`/api/memory3d`: PCA positions, similarity links, identity
   hues, region callouts, ambient electric pulses) at **10× node spacing**
-  in a slowly spinning group (the tab's auto-orbit rate) at z≈-2600 —
+  in a slowly spinning group (the tab's auto-orbit rate) at z≈-7800,
+  y≈1540 (raised so the distant cloud clears the head silhouette) —
   between the bust and the static memory-matrix backdrop (the same scatter,
-  pushed to z≈-5200). **100 links** run from the back of the skull to the
+  pushed to z≈-11500). **100 links** run from the back of the skull to the
   100 most-linked ("most used") nodes, endpoint-tracked every frame.
   Signals: idle = a thin inbound trickle; **thinking** = rapid amber pulses
   between the avatar-connected nodes; **leaving thinking** (the answer is

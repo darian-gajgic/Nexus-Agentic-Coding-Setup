@@ -18,7 +18,7 @@
 
    Scene layers, front to back (v10): bust (z≈0, anchored at the frame
    bottom) → the REAL memory galaxy (the memory-tab map at 10× node spacing,
-   slowly spinning, z≈-1600) → the static memory matrix backdrop (z≈-3800).
+   slowly spinning, z≈-7800) → the static memory matrix backdrop (z≈-11500).
    100 links run from the back of the skull to the 100 most-linked memory
    nodes; electric signals ride them (rapid inter-node traffic while
    thinking, a flood into the head when the answer starts). toggleGalaxy()
@@ -258,7 +258,7 @@ function buildFromPrebuilt(cloud) {
              b * (MODE_TINT.idle[1] * (1 - w) + w),
              b * (MODE_TINT.idle[2] * (1 - w) + w));
     if (z > 2 && y > my0 && y < my1 && Math.abs(x) < mxh) mouthIdx.push(n);
-    if (z > 2 && y > ey0 && y < ey1 && Math.abs(x) > 1.5 && Math.abs(x) < exh) eyeIdx.push(n);
+    if (z > 2 && y > ey0 && y < ey1 && Math.abs(x) > exh * 0.22 && Math.abs(x) < exh) eyeIdx.push(n);
   }
   return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY: [my0, my1] };
 }
@@ -404,10 +404,12 @@ const DISTINCT_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6, 0xec4899,
 // world layout, front to back: bust (z≈0) → memory galaxy → static matrix.
 // The galaxy cloud spans ±1200 (tab ±120 × GALAXY_SCALE), so its center must
 // sit deep enough that the front edge stays FAR behind the bust.
-const GALAXY_CENTER = { x: 0, y: 30, z: -2600 };
+// y is raised so the (angularly smaller) distant cloud clears the 1.5× head
+// silhouette from the home camera instead of hiding fully eclipsed behind it
+const GALAXY_CENTER = { x: 0, y: 1540, z: -7800 };
 const GALAXY_SCALE = 10;     // 10× the memory-tab node spacing (operator ask)
 const GALAXY_SPIN = 0.0011;  // rad/frame — the tab's idle auto-orbit rate
-const MATRIX_CENTER = { x: 0, y: 30, z: -5200 };
+const MATRIX_CENTER = { x: 0, y: 30, z: -11500 };
 const TOP_N = 100;           // avatar ↔ the 100 most-linked memory nodes
 
 async function buildGalaxyData() {
@@ -514,7 +516,7 @@ function buildMatrix(data) {
   J.matrix = new THREE.Group();
   J.matrix.position.set(MATRIX_CENTER.x, MATRIX_CENTER.y, MATRIX_CENTER.z);
   J.matrix.add(new THREE.Points(geo, new THREE.PointsMaterial({
-    size: 44, map: glowTexture(), vertexColors: true, transparent: true,
+    size: 70, map: glowTexture(), vertexColors: true, transparent: true,
     opacity: 0.8, depthWrite: false, blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
   })));
@@ -545,14 +547,14 @@ function buildMemoryGalaxy(data) {
   coreGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(cp), 3));
   coreGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(cc), 3));
   mem.cores = new THREE.Points(coreGeo, new THREE.PointsMaterial({
-    map: glowTexture(), size: 4, vertexColors: true, transparent: true,
+    map: glowTexture(), size: 9, vertexColors: true, transparent: true,
     opacity: 0.95, depthWrite: false, sizeAttenuation: true }));
   mem.group.add(mem.cores);
   const glowGeo = new THREE.BufferGeometry();
   glowGeo.setAttribute('position', coreGeo.getAttribute('position'));
   glowGeo.setAttribute('color', coreGeo.getAttribute('color'));
   mem.glows = new THREE.Points(glowGeo, new THREE.PointsMaterial({
-    map: glowTexture(), size: 34, vertexColors: true, transparent: true,
+    map: glowTexture(), size: 56, vertexColors: true, transparent: true,
     opacity: 0.75, blending: THREE.AdditiveBlending, depthWrite: false,
     sizeAttenuation: true }));
   mem.group.add(mem.glows);
@@ -588,7 +590,7 @@ function buildMemoryGalaxy(data) {
 
   // ambient electrical pulses along the links (the tab's signature motion)
   if (links.length) {
-    const pulseGeo = new THREE.SphereGeometry(4, 8, 8);
+    const pulseGeo = new THREE.SphereGeometry(10, 8, 8);
     const n = Math.min(46, Math.max(10, Math.floor(links.length / 4)));
     for (let i = 0; i < n; i++) {
       const p = new THREE.Mesh(pulseGeo, new THREE.MeshBasicMaterial({
@@ -622,7 +624,7 @@ function buildMemoryGalaxy(data) {
     }
   }
   if (mem.thinkPairs.length) {
-    const thinkGeo = new THREE.SphereGeometry(8, 8, 8);
+    const thinkGeo = new THREE.SphereGeometry(22, 8, 8);
     for (let i = 0; i < 40; i++) {
       const p = new THREE.Mesh(thinkGeo, new THREE.MeshBasicMaterial({
         color: 0xffd28a, transparent: true, opacity: 0,   // thinking amber
@@ -667,7 +669,7 @@ function buildMemoryGalaxy(data) {
       const sp = new THREE.Sprite(new THREE.SpriteMaterial({
         map: glowTexture(), color: 0x9df5ff, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false }));
-      sp.scale.set(10, 10, 1);
+      sp.scale.set(12, 12, 1);
       sp.visible = false;
       sp.userData = { k: mem.top[i % nT], t: Math.random(), speed: 0.1 };
       J.scene.add(sp);
@@ -740,7 +742,7 @@ function toggleGalaxy() {
     toLook.set(0, 4, 0);
   }
   J.fly = {
-    t: 0, dur: entering ? 2.6 : 1.8,
+    t: 0, dur: entering ? 3.0 : 2.0,
     fromPos: J.camera.position.clone(),
     fromLook: (J.lookCur || new THREE.Vector3(0, 4, 0)).clone(),
     via: new THREE.Vector3(0, -25, -250),   // dip through the bust
@@ -799,7 +801,7 @@ function tick() {
     J.headGroup.scale.y = 1 + Math.sin(t * 1.1) * 0.005;
 
     // lip-sync: mouth band opens with the real audio level (down + forward
-    // so open lips stay in front of the occluder surface)
+    // so open lips stay in front of the occluder surface; ×1.5 head scale)
     const posAttr = J.headGeo.attributes.position;
     const open = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12);
     const mc = (J.mouthY[0] + J.mouthY[1]) / 2;
@@ -808,12 +810,16 @@ function tick() {
       const n = J.mouthIdx[k];
       const by = J.basePos[n * 3 + 1];
       const center = Math.max(0, 1 - Math.abs((by - mc) / mh));
-      posAttr.array[n * 3 + 1] = by - open * 2.2 * center - open * 0.3 * Math.random();
-      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] + open * 0.7 * center;
+      posAttr.array[n * 3 + 1] = by - open * 3.3 * center - open * 0.45 * Math.random();
+      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] + open * 1.05 * center;
     }
     if (J.mouthIdx.length) posAttr.needsUpdate = true;
 
-    const blink = (t % 4.7) > 4.55 ? 0.2 : 1;
+    // blink: a real eyelid curve every ~4.6s — smooth close+open over 320ms
+    const bph = t % 4.6;
+    const blink = bph > 4.28
+      ? 1 - 0.92 * Math.sin(Math.min(1, (bph - 4.28) / 0.32) * Math.PI)
+      : 1;
     const colAttr = J.headGeo.attributes.color;
     if ((Math.round(t * 60) & 3) === 0) {
       const mix = 0.14;
@@ -823,11 +829,19 @@ function tick() {
         colAttr.array[n * 3 + 1] += (b * (tint[1] * (1 - w) + w) - colAttr.array[n * 3 + 1]) * mix;
         colAttr.array[n * 3 + 2] += (b * (tint[2] * (1 - w) + w) - colAttr.array[n * 3 + 2]) * mix;
       }
-      for (const n of J.eyeIdx) {
-        colAttr.array[n * 3] *= blink; colAttr.array[n * 3 + 1] *= blink; colAttr.array[n * 3 + 2] *= blink;
-      }
       colAttr.needsUpdate = true;
     }
+    // eyes are written ABSOLUTELY every frame — the old ×= blink inside the
+    // throttled loop compounded to near-black and recovered sluggishly
+    for (const n of J.eyeIdx) {
+      const b = J.baseB[n], we = J.baseW[n];
+      colAttr.array[n * 3]     = b * (tint[0] * (1 - we) + we) * blink;
+      colAttr.array[n * 3 + 1] = b * (tint[1] * (1 - we) + we) * blink;
+      colAttr.array[n * 3 + 2] = b * (tint[2] * (1 - we) + we) * blink;
+    }
+    if (J.eyeIdx.length) colAttr.needsUpdate = true;
+    // the glints close with the lids
+    for (const g of J.glints) g.material.opacity = 0.85 * blink * blink * blink;
     J.head.material.size = 0.62 + Math.min(0.3, J.level * 0.22)
       + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.05 : 0);
   }
@@ -876,7 +890,7 @@ function tick() {
     if (mem.avatarLinks) {
       // the 100 links follow the galaxy spin and the bust sway
       const ry = mem.group.rotation.y, cry = Math.cos(ry), sry = Math.sin(ry);
-      const anchor = _tmpV.set(0, -8, -8);
+      const anchor = _tmpV.set(0, 2, -12);   // inside the (1.5×) skull, at the back
       if (J.headGroup) anchor.applyEuler(J.headGroup.rotation);
       const ap = mem.avatarLinks.geometry.attributes.position.array;
       const wOf = (ni, out) => {
@@ -964,9 +978,9 @@ async function mount(container, opts) {
   _tmpV = new THREE.Vector3();
   const w = container.clientWidth || 800, h = container.clientHeight || 600;
   J.scene = new THREE.Scene();
-  // fog light enough that the galaxy (~1600) and matrix (~3800) stay visible
-  J.scene.fog = new THREE.FogExp2(0x05050c, 0.00016);
-  J.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 9000);
+  // fog light enough that the galaxy (~7800) and matrix (~11500) stay visible
+  J.scene.fog = new THREE.FogExp2(0x05050c, 0.00006);
+  J.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 16000);
   J.camera.position.set(0, 4, 88);
   J.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   J.renderer.setSize(w, h);
@@ -1062,18 +1076,19 @@ async function mount(container, opts) {
   J.occluders = prebuilt ? buildPrebuiltOccluders(prebuilt) : buildOccluders();
   for (const m of J.occluders) J.headGroup.add(m);
 
-  // eye glints: two soft sparks in the sockets — the "alive" cue
+  // eye glints: two soft sparks ON the eye surface — positions are baked by
+  // the build script from the scan itself (no more floating in front)
   const eyeY = prebuilt ? (prebuilt.eyes[0] + prebuilt.eyes[1]) / 2 : null;
-  for (const side of [-1, 1]) {
-    const gp = prebuilt
-      ? { x: side * 3.6, y: eyeY, z: 9.6 }
-      : headPoint(58 * D2R, side * 13 * D2R);
+  const glintPts = prebuilt
+    ? (prebuilt.glints || [[-5.4, eyeY, 12], [5.4, eyeY, 12]]).map(g => ({ x: g[0], y: g[1], z: g[2] }))
+    : [headPoint(58 * D2R, -13 * D2R), headPoint(58 * D2R, 13 * D2R)];
+  for (const gp of glintPts) {
     const sp = new THREE.Sprite(new THREE.SpriteMaterial({
       map: glowTexture(), color: 0x9df5ff, transparent: true, opacity: 0.85,
       blending: THREE.AdditiveBlending, depthWrite: false,
     }));
-    sp.scale.set(1.6, 1.6, 1);
-    sp.position.set(gp.x, gp.y, gp.z + 0.6);
+    sp.scale.set(2.2, 2.2, 1);
+    sp.position.set(gp.x, gp.y, gp.z + 0.4);
     sp.renderOrder = 2;
     J.headGroup.add(sp);
     J.glints.push(sp);
