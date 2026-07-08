@@ -5828,533 +5828,609 @@ async function saveWatchdogConfig() {
   } catch { /* error toast shown */ }
 }
 // ===== JARVIS =====
+// v2 (2026-07-08): particle avatar in the BACKGROUND (Jarvis3D point-cloud
+// head + node streams into the real memory galaxy), chat floating in front,
+// sessions sidebar with resume, drag&drop file exchange with Hermes,
+// WS-streamed chunked TTS with native-timing lip-sync (AnalyserNode on the
+// real audio drives the mouth), adaptive VAD + barge-in conversation mode,
+// webcam/screen share indexed into SigLIP visual memory, vision search popup,
+// /imagine image generation, morning briefing, spoken task callbacks.
 let jarvisState = {
   connected: false,
   voiceAvailable: false,
+  visionAvailable: false,
   mode: 'idle',        // idle | listening | thinking | talking
   messages: [],
-  skills: [],
   sessions: [],
+  currentSession: null,
   recording: false,
   streaming: false,
-  ttsQueue: [],
   mediaRecorder: null,
   audioChunks: [],
   micAnalyser: null,
-  ttsAnalyser: null,
+  micStream: null,
   audioContext: null,
-  ttsAudioEl: null,
-  avatar: null,
-  avatarVideo: null,
+  ttsAudioEl: null,     // HTTP-fallback audio element (WS is the primary path)
   conversationMode: false,
-  jarvisReady: false,
+  voiceOn: localStorage.getItem('jvVoiceOn') !== '0',
+  fxOn: localStorage.getItem('jvFxOn') !== '0',
   abortController: null,
-  ttsAnimating: false,
+  ttsAnimating: false,  // true while the WS audio pipeline is speaking
+  statusGen: 0,
+  eventsGen: 0,
+  eventsSince: 0,
+  capture: { webcam: null, screen: null },  // {stream, video, timer}
+  _vad: null,
+  _barge: null,
+  _titled: {},
 };
-const jarvisBootLines = [
-  ['Initializing kernel', 'OK'],
-  ['Loading neural lattice', 'OK'],
-  ['Establishing Hermes link', 'OK'],
-  ['Calibrating voice pipeline', 'OK'],
-  ['Spawning avatar construct', 'OK'],
-  ['J.A.R.V.I.S online', 'READY'],
-];
 
+// ── WS TTS pipeline: server streams raw PCM (16-bit mono 22050) per sentence;
+//    chunks are scheduled gaplessly on an AudioContext; an AnalyserNode on the
+//    SAME graph feeds the avatar's mouth = native-timing lip-sync. ──
+const jTTS = { ws: null, nextTime: 0, sources: [], pending: 0, analyser: null, data: null };
+
+function jarvisAudioCtx() {
+  if (!jarvisState.audioContext) {
+    jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (jarvisState.audioContext.state === 'suspended') {
+    jarvisState.audioContext.resume().catch(() => { });
+  }
+  return jarvisState.audioContext;
+}
+
+function jarvisTTSGraph() {
+  const ctx = jarvisAudioCtx();
+  if (!jTTS.analyser) {
+    jTTS.analyser = ctx.createAnalyser();
+    jTTS.analyser.fftSize = 256;
+    jTTS.analyser.connect(ctx.destination);
+    jTTS.data = new Uint8Array(jTTS.analyser.frequencyBinCount);
+  }
+  return jTTS.analyser;
+}
+
+function jarvisTTSWs() {
+  return new Promise((resolve) => {
+    if (jTTS.ws && jTTS.ws.readyState === 1) return resolve(jTTS.ws);
+    const ws = new WebSocket(`wss://${location.host}/ws/jarvis/tts`);
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        let d = {};
+        try { d = JSON.parse(e.data); } catch { }
+        if (d.done) { jTTS.pending = Math.max(0, jTTS.pending - 1); jarvisTTSMaybeFinish(); }
+        if (d.error) { jTTS.pending = Math.max(0, jTTS.pending - 1); jarvisTTSMaybeFinish(); }
+        return;
+      }
+      // binary PCM chunk → schedule right after whatever is already queued
+      const ctx = jarvisAudioCtx();
+      const i16 = new Int16Array(e.data);
+      if (!i16.length) return;
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+      const buf = ctx.createBuffer(1, f32.length, 22050);
+      buf.getChannelData(0).set(f32);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(jarvisTTSGraph());
+      const at = Math.max(jTTS.nextTime, ctx.currentTime + 0.06);
+      src.start(at);
+      jTTS.nextTime = at + buf.duration;
+      jTTS.sources.push(src);
+      src.onended = () => {
+        jTTS.sources = jTTS.sources.filter(s => s !== src);
+        jarvisTTSMaybeFinish();
+      };
+      if (!jarvisState.ttsAnimating) {
+        jarvisState.ttsAnimating = true;
+        jarvisSetMode('talking');
+        jarvisTtsLevelLoop();
+        jarvisBargeMonitorStart();
+      }
+    };
+    ws.onopen = () => { jTTS.ws = ws; resolve(ws); };
+    ws.onerror = () => resolve(null);
+    ws.onclose = () => { if (jTTS.ws === ws) jTTS.ws = null; };
+  });
+}
+
+function jarvisTTSMaybeFinish() {
+  if (!jarvisState.ttsAnimating) return;
+  const ctx = jarvisState.audioContext;
+  if (jTTS.pending === 0 && jTTS.sources.length === 0 &&
+      (!ctx || ctx.currentTime >= jTTS.nextTime - 0.05)) {
+    jarvisState.ttsAnimating = false;
+    jarvisBargeMonitorStop();
+    if (jarvisState.mode === 'talking') jarvisSetMode('idle');
+    if (window.Jarvis3D) window.Jarvis3D.setLevel(0);
+    jarvisMaybeAutoListen();
+  }
+}
+
+// gate-contract name: speak a reply (sentence-split, streamed over the WS)
+async function jarvisSpeak(text) {
+  if (!jarvisState.voiceAvailable || !jarvisState.voiceOn) return;
+  const sentences = (text.match(/[^.!?]+[.!?]*/g) || [text])
+    .map(s => s.trim()).filter(s => s.length > 1);
+  if (!sentences.length) return;
+  const ws = await jarvisTTSWs();
+  if (!ws) { jarvisSpeakFallback(sentences); return; }
+  for (const s of sentences) {
+    jTTS.pending++;
+    ws.send(JSON.stringify({ text: s }));
+  }
+}
+
+// HTTP fallback when the WS is unavailable (gate-contract name kept: fetches
+// audio for one utterance — WAV via /api/jarvis/tts; Wav2Lip /talk retired)
+async function jarvisFetchClip(text) {
+  try {
+    const resp = await fetch('/api/jarvis/tts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (resp.ok) return await resp.blob();
+  } catch { }
+  return null;
+}
+
+async function jarvisSpeakFallback(sentences) {
+  jarvisState.ttsAnimating = true;
+  jarvisSetMode('talking');
+  for (const s of sentences) {
+    if (!jarvisState.ttsAnimating) break;   // stopped
+    const blob = await jarvisFetchClip(s);
+    if (!blob) continue;
+    await new Promise((res) => {
+      if (!jarvisState.ttsAudioEl) jarvisState.ttsAudioEl = new Audio();
+      const a = jarvisState.ttsAudioEl;
+      a.src = URL.createObjectURL(blob);
+      a.onended = a.onerror = () => { URL.revokeObjectURL(a.src); res(); };
+      a.play().catch(() => res());
+    });
+  }
+  jarvisState.ttsAnimating = false;
+  if (jarvisState.mode === 'talking') jarvisSetMode('idle');
+  jarvisMaybeAutoListen();
+}
+
+function jarvisStopTTS() {
+  jTTS.pending = 0;
+  if (jTTS.ws && jTTS.ws.readyState === 1) jTTS.ws.send(JSON.stringify({ stop: true }));
+  for (const s of jTTS.sources) { try { s.stop(); } catch { } }
+  jTTS.sources = [];
+  jTTS.nextTime = 0;
+  if (jarvisState.ttsAudioEl) { try { jarvisState.ttsAudioEl.pause(); } catch { } }
+  jarvisState.ttsAnimating = false;
+  jarvisBargeMonitorStop();
+  if (window.Jarvis3D) window.Jarvis3D.setLevel(0);
+  if (jarvisState.mode === 'talking') jarvisSetMode('idle');
+}
+
+function jarvisTtsLevelLoop() {
+  if (!jarvisState.ttsAnimating || !jTTS.analyser) {
+    if (window.Jarvis3D && !jarvisState.recording) window.Jarvis3D.setLevel(0);
+    return;
+  }
+  jTTS.analyser.getByteTimeDomainData(jTTS.data);
+  let sum = 0;
+  for (let i = 0; i < jTTS.data.length; i++) { const d = (jTTS.data[i] - 128) / 128; sum += d * d; }
+  const rms = Math.sqrt(sum / jTTS.data.length);
+  if (window.Jarvis3D) window.Jarvis3D.setLevel(rms * 6);
+  requestAnimationFrame(jarvisTtsLevelLoop);
+}
+
+// ── view ──
 function renderJarvisView() {
   const c = $('#content');
   c.innerHTML = `
-    <div class="jarvis-boot" id="jarvisBoot">
-      <div class="boot-logo">J.A.R.V.I.S</div>
-      <div class="boot-sub">JUST A RATHER VERY INTELLIGENT SYSTEM</div>
-      <div class="boot-lines" id="jarvisBootLines"></div>
-    </div>
-    <div class="jarvis-layout">
-      <!-- LEFT COLUMN -->
-      <div class="jarvis-col">
-        <div class="jarvis-panel">
-          <div class="jarvis-panel-title">System <span class="num">01</span></div>
-          <div class="j-kv"><span><span class="j-dot" id="jDotHermes"></span> Hermes Link</span><b id="jHermesStatus">—</b></div>
-          <div class="j-kv"><span><span class="j-dot" id="jDotVoice"></span> Voice Pipeline</span><b id="jVoiceStatus">—</b></div>
-          <div class="j-kv"><span>Session</span><b id="jSession">—</b></div>
-          <div class="j-kv"><span>Model</span><b id="jModel">—</b></div>
-          <div class="j-kv"><span>Version</span><b id="jVersion">—</b></div>
+    <div class="jv2">
+      <aside class="jv2-side">
+        <button class="btn-primary" id="jNewChat" style="width:100%">✚ New conversation</button>
+        <div class="jv2-panel-title">Recent sessions</div>
+        <div class="jv2-sessions" id="jSessions"><div class="muted" style="font-size:11.5px">—</div></div>
+        <div class="jv2-panel-title">File exchange <button class="jv2-mini-btn" id="jFilesRefresh" title="refresh">⟳</button></div>
+        <div class="jv2-files" id="jFilesList"><div class="muted" style="font-size:11.5px">—</div></div>
+        <div class="attach-dz jv2-dz" id="jFilesDz">
+          <div style="font-size:11.5px">📎 Drop files for JARVIS<br><span class="muted" style="font-size:10.5px">…or click to browse. He reads, edits and creates files here.</span></div>
+          <input type="file" id="jFilesInput" multiple style="display:none">
         </div>
-        <div class="jarvis-panel">
-          <div class="jarvis-panel-title">Skills <span class="num" id="jSkillCount">0</span></div>
-          <div class="j-skills" id="jSkills"><div style="color:var(--text-faint)">Loading…</div></div>
+      </aside>
+      <div class="jv2-stage" id="jStage">
+        <div class="jv2-topbar">
+          <span class="jv2-chip" id="jStateChip">IDLE</span>
+          <span class="jv2-chip"><span class="j-dot" id="jDotHermes"></span> Hermes</span>
+          <span class="jv2-chip"><span class="j-dot" id="jDotVoice"></span> Voice</span>
+          <span class="jv2-chip" id="jVisionChip" title="frames in visual memory">👁 —</span>
+          <span style="flex:1"></span>
+          <button class="jv2-btn" id="jCamBtn" title="Share webcam — JARVIS sees and remembers frames">🎥 Cam</button>
+          <button class="jv2-btn" id="jScreenBtn" title="Share screen — JARVIS sees and remembers frames">🖥 Screen</button>
+          <button class="jv2-btn" id="jVisMemBtn" title="Search everything JARVIS has seen">👁 Memory</button>
+          <button class="jv2-btn" id="jImagineBtn" title="Generate an image (local SDXL)">🎨 Imagine</button>
+          <button class="jv2-btn" id="jBriefBtn" title="Status briefing">📋 Brief</button>
+          <button class="jv2-btn" id="jVoiceBtn" title="Voice replies on/off">${jarvisState.voiceOn ? '🔊' : '🔇'}</button>
+          <button class="jv2-btn" id="jFxBtn" title="Avatar animations on/off">${jarvisState.fxOn ? '✨ FX' : '▪ FX'}</button>
+          <label class="conv-toggle" title="Hands-free conversation: JARVIS listens after each reply, detects when you stop talking, and you can talk over him to interrupt">
+            <input type="checkbox" id="jConvToggle" ${jarvisState.conversationMode ? 'checked' : ''}>
+            <span class="conv-slider"></span><span class="conv-label">CONV</span>
+          </label>
+          <div class="mic-level"><i id="jMicLevel"></i></div>
         </div>
-        <div class="jarvis-panel">
-          <div class="jarvis-panel-title">Recent Sessions</div>
-          <div class="j-skills" id="jSessions"><div style="color:var(--text-faint)">—</div></div>
-        </div>
-      </div>
-
-      <!-- CENTER COLUMN — holographic stage -->
-      <div class="jarvis-center">
-        <div id="jStage" class="jarvis-stage">
-          <!-- Jarvis3D mounts its canvas here (absolute, behind everything) -->
-          <div class="avatar-reactor-row stage-center">
-            <!-- Face IS the button: reactor animation wraps around the avatar.
-                 Clicking the face toggles recording (start/stop talking). -->
-            <div class="reactor-wrap" id="jReactorWrap" title="Click to talk">
-              <canvas id="jReactor"></canvas>
-              <div class="avatar-wrap" id="jAvatarWrap"><div class="holo-scan"></div></div>
-              <div class="reactor-state">
-                <div class="st" id="jState">IDLE</div>
-                <div class="hint" id="jHint">CLICK TO TALK</div>
-              </div>
-            </div>
-          </div>
-          <div class="voice-controls stage-controls">
-            <div class="mic-level"><i id="jMicLevel"></i></div>
-            <span class="voice-state-label" id="jVoiceLabel">IDLE</span>
-            <label class="conv-toggle" title="Hands-free conversation: auto-listen after JARVIS replies, auto-stop on silence">
-              <input type="checkbox" id="jConvToggle">
-              <span class="conv-slider"></span>
-              <span class="conv-label">CONV</span>
-            </label>
+        <div class="jv2-chat">
+          <div class="jv2-feed" id="jFeed"></div>
+          <div class="jv2-inputrow">
+            <button class="jv2-mic" id="jMicBtn" title="Hold a conversation — click to talk">🎙</button>
+            <input class="jarvis-chat-input" id="jInput" placeholder="Talk or type — /see  /imagine  /find <what you showed me>…" autocomplete="off">
+            <button class="jarvis-send-btn" id="jSendBtn">SEND</button>
+            <button class="jarvis-stop-btn" id="jStopBtn" style="display:none">STOP</button>
           </div>
         </div>
-        <div class="jarvis-feed" id="jFeed"></div>
-        <div class="jarvis-chat-row">
-          <input class="jarvis-chat-input" id="jInput" placeholder="Type a message or use the mic…" autocomplete="off">
-          <button class="jarvis-send-btn" id="jSendBtn">SEND</button>
-          <button class="jarvis-stop-btn" id="jStopBtn">STOP</button>
-        </div>
-      </div>
-
-      <!-- RIGHT COLUMN -->
-      <div class="jarvis-col">
-        <div class="jarvis-panel">
-          <div class="jarvis-panel-title">Activity <span class="num">LIVE</span></div>
-          <div class="j-activity" id="jActivity"></div>
-        </div>
-        <div class="jarvis-panel">
-          <div class="jarvis-panel-title">Diagnostics</div>
-          <div class="j-kv"><span>Avatar FPS</span><b id="jFps">—</b></div>
-          <div class="j-kv"><span>Messages</span><b id="jMsgCount">0</b></div>
-          <div class="j-kv"><span>TTS Queue</span><b id="jTtsCount">0</b></div>
-          <div class="j-kv"><span>State</span><b id="jStateKv" style="color:var(--accent)">idle</b></div>
-          <div class="j-bar"><i id="jBar"></i></div>
-        </div>
+        <video id="jCapPreview" class="jv2-cap-preview" style="display:none" muted playsinline></video>
       </div>
     </div>
   `;
-
-  // Boot sequence
-  jarvisBootSequence();
-
-  // Init avatar
-  jarvisInitAvatar();
-
-  // Init reactor
-  jarvisInitReactor();
-
-  // Wire up controls
   jarvisBindControls();
-
-  // Load status (generation token kills any previous self-poll chain —
-  // each visit used to stack another 15s polling loop forever)
-  jarvisState.statusGen = (jarvisState.statusGen || 0) + 1;
+  jarvisState.statusGen++;
   jarvisLoadStatus(jarvisState.statusGen);
-
-  // Holographic stage + restore feed from state (was rendered empty on
-  // re-entry while old messages silently lived on in jarvisState)
-  if (window.Jarvis3D) window.Jarvis3D.mount($('#jStage'));
+  jarvisState.eventsGen++;
+  if (!jarvisState.eventsSince) jarvisState.eventsSince = Date.now() / 1000;
+  jarvisPollEvents(jarvisState.eventsGen);
+  jarvisLoadSessions();
+  jarvisLoadFiles();
+  if (window.Jarvis3D) {
+    window.Jarvis3D.mount($('#jStage'));
+    window.Jarvis3D.setAnimations(jarvisState.fxOn);
+  }
   if (jarvisState.messages.length) jarvisRenderFeed();
-  if (!jarvisState.streaming && !jarvisState.ttsAnimating) jarvisSetMode('idle');
-  else jarvisSetMode(jarvisState.mode);
+  jarvisSetMode(jarvisState.streaming ? 'thinking' : jarvisState.ttsAnimating ? 'talking' : 'idle');
+  jarvisMaybeBrief();
 }
 
 function jarvisTeardown() {
-  // Called when leaving the view: without this the mic stayed HOT, the
-  // level RAF ran forever, TTS kept talking to nobody and each visit
-  // stacked another status-poll chain.
   try {
     if (jarvisState.mediaRecorder && jarvisState.recording) {
-      jarvisState.mediaRecorder.onstop = null; // don't transcribe on teardown
+      jarvisState.mediaRecorder.onstop = null;
       jarvisState.mediaRecorder.stop();
       jarvisState.mediaRecorder.stream.getTracks().forEach(t => t.stop());
     }
   } catch { }
   jarvisState.recording = false;
-  jarvisState.micAnalyser = null;         // ends jarvisMicLevelLoop's RAF
+  jarvisState.micAnalyser = null;
   try { jarvisStopTTS(); } catch { }
   try { jarvisStopStreaming(); } catch { }
-  jarvisState.statusGen = (jarvisState.statusGen || 0) + 1; // kill poll chain
+  jarvisCaptureStop('webcam');
+  jarvisCaptureStop('screen');
+  jarvisBargeMonitorStop();
+  if (jTTS.ws) { try { jTTS.ws.close(); } catch { } jTTS.ws = null; }
+  jarvisState.statusGen++;
+  jarvisState.eventsGen++;
   if (window.Jarvis3D) window.Jarvis3D.dispose();
 }
 
-async function jarvisBootSequence() {
-  const boot = $('#jarvisBoot');
-  const linesEl = $('#jarvisBootLines');
-  for (let i = 0; i < jarvisBootLines.length; i++) {
-    const [text, status] = jarvisBootLines[i];
-    const div = document.createElement('div');
-    div.innerHTML = `${text}<b>${status}</b>`;
-    linesEl.appendChild(div);
-    await new Promise(r => setTimeout(r, 250));
-  }
-  await new Promise(r => setTimeout(r, 400));
-  boot.classList.add('done');
-  setTimeout(() => { boot.style.display = 'none'; jarvisState.jarvisReady = true; jarvisLoadData(); }, 600);
-}
-
-function jarvisInitAvatar() {
-  const wrap = $('#jAvatarWrap');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  const video = document.createElement('video');
-  video.id = 'jAvatarVideo';
-  video.className = 'avatar-video idle';
-  video.muted = true;
-  video.loop = true;
-  video.playsInline = true;
-  video.autoplay = true;
-  video.poster = '/static/avatar/reference.jpg';
-  video.style.width = '100%';
-  video.style.height = '100%';
-  video.style.objectFit = 'cover';
-  video.style.display = 'block';
-  video.style.background = 'var(--bg-2)';
-  wrap.appendChild(video);
-  jarvisState.avatarVideo = video;
-  jarvisSetIdleAvatar();
-}
-
-function jarvisSetIdleAvatar() {
-  const video = jarvisState.avatarVideo;
-  if (!video) return;
-  video.className = 'avatar-video idle';
-  video.loop = true;
-  video.removeAttribute('src');
-  video.load();
-  video.play().catch(() => {});
-}
-
-// ===== ARC REACTOR (canvas 2D) =====
-let reactorCtx, reactorAnimId;
-function jarvisInitReactor() {
-  const canvas = $('#jReactor');
-  if (!canvas) return;
-  const dpr = window.devicePixelRatio || 1;
-  const size = canvas.parentElement.clientWidth;
-  canvas.width = size * dpr;
-  canvas.height = size * dpr;
-  canvas.style.width = size + 'px';
-  canvas.style.height = size + 'px';
-  reactorCtx = canvas.getContext('2d');
-  reactorCtx.scale(dpr, dpr);
-  jarvisDrawReactor();
-}
-
-function jarvisDrawReactor() {
-  if (!reactorCtx) return;
-  const canvas = $('#jReactor');
-  if (!canvas) return;
-  const w = canvas.parentElement.clientWidth;
-  const h = w;
-  reactorCtx.clearRect(0, 0, w, h);
-  const cx = w / 2, cy = h / 2;
-  const t = Date.now() / 1000;
-
-  const modeColors = {
-    idle: { primary: '#7c5cff', glow: '#5eead4' },
-    listening: { primary: '#5eead4', glow: '#5eead4' },
-    thinking: { primary: '#fbbf24', glow: '#fbbf24' },
-    talking: { primary: '#5eead4', glow: '#5eead4' },
-  };
-  const colors = modeColors[jarvisState.mode] || modeColors.idle;
-
-  // Outer ring
-  reactorCtx.strokeStyle = '#2a2a3a';
-  reactorCtx.lineWidth = 2;
-  reactorCtx.beginPath();
-  reactorCtx.arc(cx, cy, w * 0.46, 0, Math.PI * 2);
-  reactorCtx.stroke();
-
-  // Rotating segments
-  const segments = 8;
-  for (let i = 0; i < segments; i++) {
-    const angle = t * 0.5 + (i / segments) * Math.PI * 2;
-    const startA = angle;
-    const endA = angle + 0.3;
-    reactorCtx.strokeStyle = i % 2 === 0 ? colors.primary : colors.glow;
-    reactorCtx.lineWidth = 3;
-    reactorCtx.globalAlpha = 0.4 + Math.sin(t * 2 + i) * 0.3;
-    reactorCtx.beginPath();
-    reactorCtx.arc(cx, cy, w * 0.42, startA, endA);
-    reactorCtx.stroke();
-  }
-  reactorCtx.globalAlpha = 1;
-
-  // Inner ring
-  reactorCtx.strokeStyle = colors.primary;
-  reactorCtx.lineWidth = 1.5;
-  reactorCtx.globalAlpha = 0.3;
-  reactorCtx.beginPath();
-  reactorCtx.arc(cx, cy, w * 0.32, 0, Math.PI * 2);
-  reactorCtx.stroke();
-
-  // Core glow
-  const pulseR = w * 0.18 + Math.sin(t * 3) * 4;
-  const grad = reactorCtx.createRadialGradient(cx, cy, 0, cx, cy, pulseR);
-  grad.addColorStop(0, colors.glow);
-  grad.addColorStop(0.4, colors.primary + '80');
-  grad.addColorStop(1, 'transparent');
-  reactorCtx.globalAlpha = 0.6;
-  reactorCtx.fillStyle = grad;
-  reactorCtx.beginPath();
-  reactorCtx.arc(cx, cy, pulseR, 0, Math.PI * 2);
-  reactorCtx.fill();
-
-  // Tick marks
-  reactorCtx.globalAlpha = 0.3;
-  for (let i = 0; i < 60; i++) {
-    const a = (i / 60) * Math.PI * 2;
-    const r1 = w * 0.47;
-    const r2 = i % 5 === 0 ? w * 0.43 : w * 0.45;
-    reactorCtx.strokeStyle = colors.primary;
-    reactorCtx.lineWidth = 1;
-    reactorCtx.beginPath();
-    reactorCtx.moveTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
-    reactorCtx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2);
-    reactorCtx.stroke();
-  }
-  reactorCtx.globalAlpha = 1;
-
-  reactorAnimId = requestAnimationFrame(jarvisDrawReactor);
-}
-
 function jarvisBindControls() {
-  const input = $('#jInput');
-  const sendBtn = $('#jSendBtn');
-  const stopBtn = $('#jStopBtn');
-
-  sendBtn.addEventListener('click', () => jarvisSendText());
-  input.addEventListener('keydown', (e) => {
+  $('#jSendBtn').addEventListener('click', () => jarvisSendText());
+  $('#jInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); jarvisSendText(); }
   });
-
-  stopBtn.addEventListener('click', () => jarvisStopStreaming());
-
-  // Face IS the button — click the avatar to toggle recording.
-  // Barge-in: clicking while JARVIS is speaking interrupts it and listens.
-  $('#jReactorWrap').addEventListener('click', () => {
+  $('#jStopBtn').addEventListener('click', () => jarvisStopStreaming());
+  $('#jMicBtn').addEventListener('click', () => {
     if (jarvisState.recording) { jarvisStopRecording(); return; }
-    if (jarvisState.ttsAnimating) jarvisStopTTS();
+    if (jarvisState.ttsAnimating) jarvisStopTTS();   // click barge-in
     jarvisStartRecording();
   });
-
-  // Conversation mode toggle
   const convToggle = $('#jConvToggle');
-  if (convToggle) {
-    convToggle.addEventListener('change', () => {
-      jarvisState.conversationMode = convToggle.checked;
-    });
-  }
+  convToggle.addEventListener('change', () => {
+    jarvisState.conversationMode = convToggle.checked;
+    if (convToggle.checked && !jarvisState.recording && !jarvisState.streaming
+        && !jarvisState.ttsAnimating) jarvisStartRecording();
+  });
+  $('#jNewChat').addEventListener('click', async () => {
+    try {
+      const r = await api('POST', '/api/jarvis/session');
+      jarvisState.currentSession = r.session_id;
+      jarvisState.messages = [];
+      jarvisRenderFeed();
+      jarvisLoadSessions();
+      toast('Fresh conversation started', 'ok');
+    } catch (e) { toast('Failed: ' + e.message, 'err'); }
+  });
+  $('#jCamBtn').addEventListener('click', () => jarvisCaptureToggle('webcam'));
+  $('#jScreenBtn').addEventListener('click', () => jarvisCaptureToggle('screen'));
+  $('#jVisMemBtn').addEventListener('click', () => jarvisVisionSearchModal(''));
+  $('#jImagineBtn').addEventListener('click', () => {
+    const q = prompt('Describe the image JARVIS should create:');
+    if (q) jarvisImagine(q);
+  });
+  $('#jBriefBtn').addEventListener('click', () => jarvisBrief(true));
+  $('#jVoiceBtn').addEventListener('click', () => {
+    jarvisState.voiceOn = !jarvisState.voiceOn;
+    localStorage.setItem('jvVoiceOn', jarvisState.voiceOn ? '1' : '0');
+    $('#jVoiceBtn').textContent = jarvisState.voiceOn ? '🔊' : '🔇';
+    if (!jarvisState.voiceOn) jarvisStopTTS();
+  });
+  $('#jFxBtn').addEventListener('click', () => {
+    jarvisState.fxOn = !jarvisState.fxOn;
+    localStorage.setItem('jvFxOn', jarvisState.fxOn ? '1' : '0');
+    $('#jFxBtn').textContent = jarvisState.fxOn ? '✨ FX' : '▪ FX';
+    if (window.Jarvis3D) window.Jarvis3D.setAnimations(jarvisState.fxOn);
+  });
+  // file exchange dropzone
+  const dz = $('#jFilesDz'), finput = $('#jFilesInput');
+  dz.addEventListener('click', () => finput.click());
+  finput.addEventListener('change', () => { jarvisUploadFiles([...finput.files]); finput.value = ''; });
+  ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); dz.classList.add('dz-hover');
+  }));
+  dz.addEventListener('dragleave', e => { e.preventDefault(); dz.classList.remove('dz-hover'); });
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation(); dz.classList.remove('dz-hover');
+    jarvisUploadFiles([...((e.dataTransfer || {}).files || [])]);
+  });
+  $('#jFilesRefresh').addEventListener('click', () => jarvisLoadFiles());
+  // dropping an image anywhere on the chat = "look at this"
+  const feed = $('#jFeed');
+  ['dragenter', 'dragover'].forEach(ev => feed.addEventListener(ev, e => e.preventDefault()));
+  feed.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = [...((e.dataTransfer || {}).files || [])].find(f => f.type.startsWith('image/'));
+    if (f) jarvisLookAtFile(f);
+  });
 }
 
-// ===== STATUS =====
+// ── status + sessions + files ──
 async function jarvisLoadStatus(gen) {
-  if (gen !== jarvisState.statusGen) return; // superseded poll chain — die
+  if (gen !== jarvisState.statusGen) return;
   try {
     const s = await api('GET', '/api/jarvis/status');
     jarvisState.connected = s.connected;
-    $('#jDotHermes').classList.toggle('on', s.connected);
-    $('#jDotHermes').classList.toggle('off', !s.connected);
-    $('#jHermesStatus').textContent = s.connected ? 'ONLINE' : 'OFFLINE';
-    $('#jSession').textContent = (s.session_id || '—').slice(0, 12);
-    $('#jVersion').textContent = s.hermes_version || '—';
-  } catch (e) {
-    $('#jDotHermes').classList.add('off');
-    $('#jHermesStatus').textContent = 'ERROR';
-  }
-
+    const d = $('#jDotHermes');
+    if (d) { d.classList.toggle('on', s.connected); d.classList.toggle('off', !s.connected); }
+    if (!jarvisState.currentSession) jarvisState.currentSession = s.session_id;
+  } catch { const d = $('#jDotHermes'); if (d) d.classList.add('off'); }
   try {
     const v = await api('GET', '/api/jarvis/voice/status');
     jarvisState.voiceAvailable = v.available;
-    $('#jDotVoice').classList.toggle('on', v.available);
-    $('#jDotVoice').classList.toggle('off', !v.available);
-    $('#jVoiceStatus').textContent = v.available ? 'GPU READY' : 'OFF';
-  } catch (e) {
-    $('#jDotVoice').classList.add('off');
-    $('#jVoiceStatus').textContent = 'OFF';
-  }
-
-  // Update every 15s — only the newest generation's chain survives
+    const d = $('#jDotVoice');
+    if (d) { d.classList.toggle('on', v.available); d.classList.toggle('off', !v.available); }
+  } catch { const d = $('#jDotVoice'); if (d) d.classList.add('off'); }
+  try {
+    const vi = await api('GET', '/api/jarvis/vision/status');
+    jarvisState.visionAvailable = !!vi.available;
+    const c = $('#jVisionChip');
+    if (c) c.textContent = vi.available ? `👁 ${vi.frames ?? 0}` : '👁 off';
+  } catch { }
   setTimeout(() => {
     if (currentView === 'jarvis' && gen === jarvisState.statusGen) jarvisLoadStatus(gen);
   }, 15000);
 }
 
-async function jarvisLoadData() {
-  // Skills
+async function jarvisLoadSessions() {
   try {
-    const s = await api('GET', '/api/jarvis/skills');
-    jarvisState.skills = s.skills || [];
-    const el = $('#jSkills');
-    if (jarvisState.skills.length === 0) {
-      el.innerHTML = '<div style="color:var(--text-faint)">No skills loaded</div>';
-    } else {
-      el.innerHTML = jarvisState.skills.map(sk => `<div>${sk}</div>`).join('');
-    }
-    $('#jSkillCount').textContent = jarvisState.skills.length;
-  } catch (e) { /* ignore */ }
-
-  // Sessions
-  try {
-    const s = await api('GET', '/api/jarvis/sessions');
-    jarvisState.sessions = s.sessions || [];
+    const r = await api('GET', '/api/jarvis/my-sessions');
+    jarvisState.sessions = r.sessions || [];
+    if (r.current) jarvisState.currentSession = r.current;
     const el = $('#jSessions');
-    if (jarvisState.sessions.length === 0) {
-      el.innerHTML = '<div style="color:var(--text-faint)">—</div>';
-    } else {
-      el.innerHTML = jarvisState.sessions.slice(0, 5).map(s => {
-        const title = s.title || s.id?.slice(0, 12) || 'session';
-        const time = s.updated_at ? new Date(s.updated_at * 1000).toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
-        return `<div>${title} <span style="color:var(--text-faint);float:right">${time}</span></div>`;
-      }).join('');
+    if (!el) return;
+    el.innerHTML = jarvisState.sessions.slice(0, 14).map(s => `
+      <div class="jv2-session${s.id === jarvisState.currentSession ? ' active' : ''}"
+           onclick="jarvisSwitchSession('${esc(s.id)}')">
+        <button class="jv2-mini-btn jv2-session-x" title="forget this conversation"
+          onclick="event.stopPropagation();jarvisForgetSession('${esc(s.id)}')">✕</button>
+        <div class="jv2-session-title">${esc(s.title || 'Conversation')}</div>
+        <div class="jv2-session-time">${s.ts ? fmtAgo(s.ts) : ''}</div>
+      </div>`).join('') || '<div class="muted" style="font-size:11.5px">No conversations yet</div>';
+  } catch { }
+}
+
+async function jarvisForgetSession(sid) {
+  if (!confirm('Forget this conversation? Its messages are removed from the sidebar.')) return;
+  try {
+    const r = await api('POST', '/api/jarvis/session/forget', { id: sid });
+    if (sid === jarvisState.currentSession) {
+      jarvisState.currentSession = r.current;
+      jarvisState.messages = [];
+      jarvisRenderFeed();
     }
-  } catch (e) { /* ignore */ }
-
-  // Activity from global state
-  jarvisUpdateActivity();
+    jarvisLoadSessions();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
 }
 
-function jarvisUpdateActivity() {
-  const el = $('#jActivity');
-  if (!el) return;
-  const items = (state.activity || []).slice(0, 8);
-  if (items.length === 0) {
-    el.innerHTML = '<div style="color:var(--text-faint)">No activity</div>';
-    return;
+async function jarvisSwitchSession(sid) {
+  if (sid === jarvisState.currentSession) return;
+  try {
+    await api('POST', '/api/jarvis/session/switch', { id: sid });
+    jarvisState.currentSession = sid;
+    jarvisState.messages = [];
+    const h = await api('GET', `/api/jarvis/messages/${sid}`);
+    const msgs = h.messages || h.data || [];
+    for (const m of msgs) {
+      const role = (m.role || '').includes('user') ? 'user' : 'jarvis';
+      const text = typeof m.content === 'string' ? m.content
+        : Array.isArray(m.content) ? m.content.map(b => b.text || '').join('') : '';
+      if (text) jarvisState.messages.push({ role, text });
+    }
+    jarvisRenderFeed();
+    jarvisLoadSessions();
+  } catch (e) { toast('Switch failed: ' + e.message, 'err'); }
+}
+
+async function jarvisLoadFiles() {
+  try {
+    const r = await api('GET', '/api/jarvis/files');
+    const el = $('#jFilesList');
+    if (!el) return;
+    el.innerHTML = (r.files || []).map(f => `
+      <div class="jv2-file">
+        <a href="/api/jarvis/files/${encodeURIComponent(f.name)}" target="_blank">📄 ${esc(f.name)}</a>
+        <span class="muted" style="font-size:10px">${(f.size / 1024).toFixed(0)}K</span>
+        <button class="jv2-mini-btn" title="delete" onclick="jarvisDeleteFile('${esc(f.name)}')">✕</button>
+      </div>`).join('') || '<div class="muted" style="font-size:11.5px">Empty — drop a file below</div>';
+  } catch { }
+}
+
+async function jarvisDeleteFile(name) {
+  try { await api('DELETE', `/api/jarvis/files/${encodeURIComponent(name)}`); jarvisLoadFiles(); }
+  catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+async function jarvisUploadFiles(files) {
+  let done = 0;
+  for (const f of files) {
+    const fd = new FormData();
+    fd.append('file', f);
+    try {
+      const r = await fetch('/api/jarvis/files', { method: 'POST', body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.status);
+      done++;
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
   }
-  el.innerHTML = items.map(a => `<div><b>${esc(a.source)}</b> ${esc(a.message)}</div>`).join('');
+  if (done) {
+    toast(`${done} file${done > 1 ? 's' : ''} shared with JARVIS`, 'ok');
+    jarvisLoadFiles();
+    jarvisAddMessage('tool', `📎 ${done} file${done > 1 ? 's' : ''} uploaded to the exchange — mention them to JARVIS by name.`);
+  }
 }
 
-// ===== MODE =====
+// ── mode + feed ──
 function jarvisSetMode(mode) {
   jarvisState.mode = mode;
-  if (window.Jarvis3D) window.Jarvis3D.setMode(mode); // holographic stage follows
+  if (window.Jarvis3D) window.Jarvis3D.setMode(mode);
   const labels = { idle: 'IDLE', listening: 'LISTENING', thinking: 'THINKING', talking: 'SPEAKING' };
-  const labelEl = $('#jState');
-  if (labelEl) labelEl.textContent = labels[mode] || mode.toUpperCase();
-  const labelEl2 = $('#jVoiceLabel');
-  if (labelEl2) labelEl2.textContent = labels[mode] || mode.toUpperCase();
-  const kvEl = $('#jStateKv');
-  if (kvEl) kvEl.textContent = mode;
-  if (kvEl) {
-    const colors = { idle: 'var(--accent)', listening: 'var(--accent-2)', thinking: 'var(--yellow)', talking: 'var(--green)' };
-    kvEl.style.color = colors[mode] || 'var(--accent)';
+  const chip = $('#jStateChip');
+  if (chip) {
+    chip.textContent = labels[mode] || mode.toUpperCase();
+    chip.className = 'jv2-chip mode-' + mode;
   }
-  // Avatar video state class
-  const video = jarvisState.avatarVideo;
-  if (video) {
-    video.classList.remove('idle', 'listening', 'thinking', 'talking');
-    video.classList.add(mode);
-  }
-  // Avatar wrap visual glow
-  const wrap = $('#jAvatarWrap');
-  if (wrap) {
-    wrap.classList.remove('listening', 'thinking', 'talking');
-    if (mode !== 'idle') wrap.classList.add(mode);
-  }
-  // Bar
-  const bar = $('#jBar');
-  if (bar) {
-    const widths = { idle: '15%', listening: '45%', thinking: '60%', talking: '85%' };
-    bar.style.width = widths[mode] || '15%';
-  }
+  const mic = $('#jMicBtn');
+  if (mic) mic.classList.toggle('rec', mode === 'listening');
 }
 
-// ===== CHAT =====
-function jarvisAddMessage(role, text) {
-  jarvisState.messages.push({ role, text });
+function jarvisAddMessage(role, text, extra) {
+  jarvisState.messages.push(Object.assign({ role, text }, extra || {}));
   jarvisRenderFeed();
 }
 
 function jarvisRenderFeed() {
   const feed = $('#jFeed');
   if (!feed) return;
-  feed.innerHTML = jarvisState.messages.map(m => {
+  feed.innerHTML = jarvisState.messages.map((m, i) => {
     const cls = m.role === 'user' ? 'you' : m.role === 'tool' ? 'tool' : m.role === 'error' ? 'error' : 'jarvis';
     const cls2 = m.live ? ' live' : '';
-    // esc() — transcripts and streamed LLM text were interpolated raw (XSS)
-    return `<div class="j-msg ${cls}${cls2}">${esc(m.text)}</div>`;
+    const files = (m.files || []).map(f =>
+      `<a class="jv2-filechip" href="/api/jarvis/files/${encodeURIComponent(f)}" target="_blank">📄 ${esc(f)}</a>`).join('');
+    const imgs = (m.images || []).map(u =>
+      `<a href="${esc(u)}" target="_blank"><img class="jv2-msg-img" src="${esc(u)}"></a>`).join('');
+    const copy = m.role === 'jarvis' && m.text && !m.live
+      ? `<button class="jv2-copy" title="copy" onclick="jarvisCopyMsg(${i})">⧉</button>` : '';
+    return `<div class="j-msg ${cls}${cls2}">${esc(m.text)}${imgs}${files ? `<div class="jv2-filerow">${files}</div>` : ''}${copy}</div>`;
   }).join('');
   feed.scrollTop = feed.scrollHeight;
-  const mc = $('#jMsgCount');
-  if (mc) mc.textContent = jarvisState.messages.length;
 }
 
-function jarvisSendText() {
+function jarvisCopyMsg(i) {
+  const m = jarvisState.messages[i];
+  if (!m) return;
+  navigator.clipboard.writeText(m.text).then(() => toast('Copied', 'ok')).catch(() => { });
+}
+
+// ── send + intents ──
+function jarvisSendText(forced) {
   const input = $('#jInput');
-  const text = input.value.trim();
+  const text = (forced != null ? forced : input ? input.value : '').trim();
   if (!text || jarvisState.streaming) return;
-  input.value = '';
+  if (input && forced == null) input.value = '';
+
+  // local intents that never need the LLM round-trip
+  const mImag = text.match(/^\/imagine\s+(.+)/i) ||
+    text.match(/^(?:create|generate|make|draw|paint)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|photo|drawing|illustration)\s+(?:of|showing|with)\s+(.+)/i);
+  if (mImag) { jarvisAddMessage('user', text); jarvisImagine(mImag[1]); return; }
+  const mFind = text.match(/^\/(?:find|see)\s+(.+)/i) ||
+    text.match(/\bwhen did (?:i|we|you)\b.*\b(?:show|see|saw|shown|watch)\b/i) ||
+    text.match(/\b(?:search|find|look up|look for)\b.*\b(?:visual memory|you (?:have )?seen|i showed|screen history|camera history)\b/i);
+  if (mFind) {
+    jarvisAddMessage('user', text);
+    const q = (mFind[1] || text).replace(/^\/(find|see)\s+/i, '');
+    jarvisVisionSearchModal(q, true);
+    return;
+  }
+
   jarvisAddMessage('user', text);
   jarvisStreamChat(text);
 }
 
+// ── chat streaming (progressive speech: sentences are spoken WHILE the reply
+//    is still streaming — clause-level latency, not whole-reply latency) ──
 async function jarvisStreamChat(text) {
   jarvisState.streaming = true;
   jarvisSetMode('thinking');
-  $('#jSendBtn').disabled = true;
-  $('#jStopBtn').style.display = 'block';
+  const sendBtn = $('#jSendBtn'), stopBtn = $('#jStopBtn');
+  if (sendBtn) sendBtn.disabled = true;
+  if (stopBtn) stopBtn.style.display = 'block';
 
-  const liveMsg = { role: 'jarvis', text: '', live: true };
+  const liveMsg = { role: 'jarvis', text: '', live: true, _spoken: 0 };
   jarvisState.messages.push(liveMsg);
   jarvisState.abortController = new AbortController();
+
+  // session titling: first message names the conversation in the sidebar
+  const sid = jarvisState.currentSession;
+  if (sid && !jarvisState._titled[sid]) {
+    jarvisState._titled[sid] = true;
+    api('POST', '/api/jarvis/session/title', { id: sid, title: text.slice(0, 60) })
+      .then(() => jarvisLoadSessions()).catch(() => { });
+  }
+
+  // eyes: if a share is live and the words reference seeing, ride the frame along
+  let frame = null, frameKind = null;
+  const wantsEyes = /\b(see|look|watch|read|this|screen|camera|showing|show you|front of)\b/i.test(text);
+  if (wantsEyes) {
+    const cap = jarvisState.capture.webcam || jarvisState.capture.screen;
+    if (cap) {
+      frame = jarvisCaptureGrab(cap);
+      frameKind = jarvisState.capture.webcam === cap ? 'webcam' : 'screen';
+      if (frame) jarvisAddMessage('tool', '👁 Showing JARVIS the current frame…');
+    }
+  }
 
   try {
     const resp = await fetch('/api/jarvis/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: text }),
+      body: JSON.stringify(frame ? { input: text, frame_b64: frame, frame_kind: frameKind }
+                                 : { input: text }),
       signal: jarvisState.abortController.signal,
     });
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let fullText = '';
     let currentEvent = '';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep incomplete line
-
+      buffer = lines.pop();
       for (const line of lines) {
         if (line.startsWith('event: ')) {
           currentEvent = line.slice(7).trim();
         } else if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim();
-          await jarvisHandleSSE(currentEvent, data, liveMsg);
-          if (liveMsg.text) fullText = liveMsg.text;
+          await jarvisHandleSSE(currentEvent, line.slice(6).trim(), liveMsg);
         }
       }
     }
-
     liveMsg.live = false;
 
-    // Empty reply = the provider dropped the run (peak-time 429 load-shedding
-    // after retries). The empty bubble rendered as a lone dot with no text —
-    // replace it with an honest, actionable message instead.
     if (!liveMsg.text.trim()) {
       const i = jarvisState.messages.indexOf(liveMsg);
       if (i >= 0) jarvisState.messages.splice(i, 1);
       jarvisAddMessage('error',
         '⚠ No reply arrived — the AI provider is overloaded right now (peak-time load shedding). Wait a few seconds and send it again.');
-    }
-
-    // Speak the response
-    if (fullText && jarvisState.voiceAvailable) {
-      jarvisSpeak(fullText);
+    } else {
+      jarvisSpeakProgress(liveMsg, true);   // flush the unspoken tail
     }
   } catch (e) {
     if (e.name === 'AbortError') {
@@ -6369,9 +6445,25 @@ async function jarvisStreamChat(text) {
     jarvisState.streaming = false;
     jarvisState.abortController = null;
     jarvisRenderFeed();
-    $('#jSendBtn').disabled = false;
-    $('#jStopBtn').style.display = 'none';
-    if (jarvisState.mode === 'thinking') jarvisSetMode('idle');
+    if (sendBtn) sendBtn.disabled = false;
+    if (stopBtn) stopBtn.style.display = 'none';
+    if (jarvisState.mode === 'thinking') jarvisSetMode(jarvisState.ttsAnimating ? 'talking' : 'idle');
+  }
+}
+
+// speak completed sentences as they stream in; final=true flushes the rest
+function jarvisSpeakProgress(liveMsg, final) {
+  if (!jarvisState.voiceAvailable || !jarvisState.voiceOn) return;
+  const unspoken = liveMsg.text.slice(liveMsg._spoken || 0);
+  if (final) {
+    if (unspoken.trim().length > 1) jarvisSpeak(unspoken);
+    liveMsg._spoken = liveMsg.text.length;
+    return;
+  }
+  const m = unspoken.match(/^[\s\S]*[.!?](?=\s|$)/);
+  if (m && m[0].trim().length > 2) {
+    jarvisSpeak(m[0]);
+    liveMsg._spoken = (liveMsg._spoken || 0) + m[0].length;
   }
 }
 
@@ -6385,12 +6477,14 @@ async function jarvisHandleSSE(event, data, liveMsg) {
     case 'text':
       if (parsed.delta || parsed.text) {
         liveMsg.text += parsed.delta || parsed.text || '';
+        jarvisSpeakProgress(liveMsg, false);
         jarvisRenderFeed();
       }
       break;
     case 'content_block_delta':
       if (parsed.delta?.text) {
         liveMsg.text += parsed.delta.text;
+        jarvisSpeakProgress(liveMsg, false);
         jarvisRenderFeed();
       }
       break;
@@ -6405,10 +6499,19 @@ async function jarvisHandleSSE(event, data, liveMsg) {
       break;
     case 'tool.progress':
     case 'tool_use':
-    case 'tool_call':
+    case 'tool_call': {
       const toolName = parsed.name || parsed.tool || parsed.tool_name || 'tool';
       if (toolName && toolName !== '_thinking') {
         jarvisAddMessage('tool', `⚙ TOOL · ${toolName}`);
+      }
+      break;
+    }
+    case 'files':
+      // server diffed the exchange folder after the turn — show what appeared
+      if ((parsed.files || []).length) {
+        jarvisAddMessage('tool', `📦 JARVIS produced ${parsed.files.length} file${parsed.files.length > 1 ? 's' : ''}:`,
+          { files: parsed.files.map(f => f.name) });
+        jarvisLoadFiles();
       }
       break;
     case 'run.completed':
@@ -6418,7 +6521,6 @@ async function jarvisHandleSSE(event, data, liveMsg) {
       break;
     case 'run.failed':
     case 'error': {
-      // error payloads can be nested objects — never render [object Object]
       const raw = parsed.error ?? parsed.detail ?? parsed.message ?? 'Unknown error';
       const msg = typeof raw === 'string' ? raw : (raw.message || JSON.stringify(raw).slice(0, 200));
       jarvisAddMessage('error',
@@ -6432,271 +6534,47 @@ async function jarvisHandleSSE(event, data, liveMsg) {
 }
 
 function jarvisStopStreaming() {
-  if (jarvisState.abortController) {
-    jarvisState.abortController.abort();
-  }
-  // Also stop TTS
+  if (jarvisState.abortController) jarvisState.abortController.abort();
   jarvisStopTTS();
 }
 
-// ===== TTS =====
-async function jarvisSpeak(text) {
-  // Split into sentences for lower latency
-  const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
-  for (const sentence of sentences) {
-    const trimmed = sentence.trim();
-    if (!trimmed) continue;
-    jarvisState.ttsQueue.push(trimmed);
-  }
-  $('#jTtsCount').textContent = jarvisState.ttsQueue.length;
-  jarvisProcessTTSQueue();
-}
-
-// ── TTS playback pipeline ──
-//
-// Design: the avatar video plays MUTED (muted video autoplay is NEVER blocked
-// by Chrome's autoplay policy, so it works on every clip — not just the first).
-// The voice comes from a separate persistent HTMLAudioElement that was unlocked
-// by the user's mic-click gesture. This avoids the "follow-up clips frozen"
-// bug where Chrome silently rejects unmuted video.play() after the gesture
-// context expires.
-//
-// To keep audio + video perfectly synced, we fetch both the WAV (audio) and
-// the lip-sync MP4 (video) in parallel, wait until BOTH are ready, then start
-// them at the same instant. The MP4 is generated FROM the WAV by Wav2Lip, so
-// they have identical duration and content by construction.
-
-async function jarvisProcessTTSQueue() {
-  if (jarvisState.ttsAnimating) return;
-  if (jarvisState.ttsQueue.length === 0) {
-    jarvisSetMode('idle');
-    jarvisSetIdleAvatar();
-    jarvisMaybeAutoListen();
-    return;
-  }
-  jarvisState.ttsAnimating = true;
-  jarvisState.ttsStopped = false;
-  jarvisSetMode('talking');
-  if (jarvisState.audioContext && jarvisState.audioContext.state === 'suspended') {
-    jarvisState.audioContext.resume().catch(() => { });
-  }
-  jarvisTtsLevelLoop(); // stage pulses with the real voice amplitude
-
-  // Prefetch pipeline: render sentence N+1 WHILE sentence N plays, so the
-  // ~4s Wav2Lip render hides behind playback and sentences flow seamlessly.
-  let firstText = jarvisState.ttsQueue.shift();
-  $('#jTtsCount').textContent = jarvisState.ttsQueue.length;
-  let pending = jarvisFetchClip(firstText);
-
-  while (pending) {
-    const clip = await pending;
-    if (jarvisState.ttsStopped) { pending = null; break; } // barge-in/stop
-    // Kick off NEXT render now (runs in parallel with current playback)
-    let nextPending = null;
-    if (jarvisState.ttsQueue.length > 0) {
-      const nt = jarvisState.ttsQueue.shift();
-      $('#jTtsCount').textContent = jarvisState.ttsQueue.length;
-      nextPending = jarvisFetchClip(nt);
-    }
-    if (clip) await jarvisPlayClip(clip);
-    pending = nextPending;
-    // a sentence queued in the shift/flag race window gets picked up here
-    // instead of stranding in the queue with no drainer
-    if (!pending && jarvisState.ttsQueue.length > 0 && !jarvisState.ttsStopped) {
-      const nt = jarvisState.ttsQueue.shift();
-      $('#jTtsCount').textContent = jarvisState.ttsQueue.length;
-      pending = jarvisFetchClip(nt);
-    }
-  }
-
-  jarvisState.ttsAnimating = false;
-  jarvisState.ttsStopped = false;
-  jarvisSetMode('idle');
-  jarvisSetIdleAvatar();   // reset to idle picture (not frozen last frame)
-  jarvisMaybeAutoListen();
-}
-
-// Fetch a single combined TTS+lip-sync MP4 from /talk.
-// ONE call returns audio+video muxed together — we split it client-side:
-// muted <video> for the face + <audio> for the voice (same blob, both tracks).
-// This halves GPU load vs fetching /tts AND /talk in parallel (which caused
-// /talk to 500 under concurrent pressure → face not moving until sentence 2-3).
-async function jarvisFetchClip(text) {
-  try {
-    const resp = await fetch('/api/jarvis/talk', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-    if (resp.ok) {
-      const blob = await resp.blob();
-      if (blob.size > 1000) return blob;
-    }
-  } catch (e) {}
-  // Fallback: audio-only if lip-sync unavailable
-  try {
-    const resp = await fetch('/api/jarvis/tts', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-    if (resp.ok) return await resp.blob();
-  } catch (e) {}
-  return null;
-}
-
-// Play one clip. If it's an MP4 (/talk): video muted (face) + audio (voice)
-// both from the SAME blob — synced by construction. If WAV (/tts fallback):
-// audio only.
-function jarvisPlayClip(blob) {
-  // decide by CONTENT TYPE only: the old `size > 20000` heuristic classified
-  // every /tts WAV over ~0.45s as video, whose decode then failed → the
-  // audio-only fallback never actually played
-  const isVideo = (blob.type || '').startsWith('video');
-  return new Promise((resolve) => {
-    let resolved = false;
-    const url = URL.createObjectURL(blob);
-    const audio = jarvisAudioEl();
-    const video = jarvisState.avatarVideo;
-    let audioReady = false, videoReady = !isVideo;
-    let started = false;
-
-    const cleanup = () => {
-      if (resolved) return;
-      resolved = true;
-      if (jarvisState.currentClipCleanup === cleanup) jarvisState.currentClipCleanup = null;
-      audio.oncanplay = null; audio.onended = null; audio.onerror = null;
-      if (video) { video.oncanplay = null; video.onended = null; video.onerror = null; }
-      URL.revokeObjectURL(url);
-      resolve();
-    };
-    // stop/barge-in resolves the in-flight clip immediately instead of
-    // waiting for the 30s watchdog (which wedged the pipeline)
-    jarvisState.currentClipCleanup = cleanup;
-
-    const startIfReady = () => {
-      if (started || !audioReady || !videoReady) return;
-      started = true;
-      if (isVideo && video) video.play().catch(() => {});
-      audio.play().catch(() => cleanup());
-    };
-
-    // ── Audio (voice) — same blob as video if MP4 ──
-    audio.oncanplay = () => { audioReady = true; startIfReady(); };
-    audio.onended = cleanup;
-    audio.onerror = cleanup;
-    audio.src = url;
-    audio.load();
-
-    // ── Video (face) — MUTED, same blob as audio ──
-    if (isVideo && video) {
-      video.pause();
-      try { video.currentTime = 0; } catch (e) {}
-      video.className = 'avatar-video talking';
-      video.loop = false;
-      video.muted = true;       // muted → autoplay never blocked
-      video.oncanplay = () => { videoReady = true; startIfReady(); };
-      video.onended = cleanup;
-      video.onerror = cleanup;
-      video.src = url;          // SAME blob as audio
-      video.load();
-    }
-    setTimeout(cleanup, 30000);
-  });
-}
-
-// Persistent audio element — unlocked once by the user gesture (mic click) and
-// reused for every clip so play() is never rejected by autoplay policy.
-function jarvisAudioEl() {
-  if (!jarvisState.ttsAudioEl) {
-    const el = new Audio();
-    jarvisState.ttsAudioEl = el;
-    // Route through an analyser so the holographic stage pulses with the
-    // REAL speech amplitude. createMediaElementSource is once-per-element,
-    // which is exactly why the element must stay persistent. Fail-soft.
-    try {
-      if (!jarvisState.audioContext) {
-        jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      const ctx = jarvisState.audioContext;
-      const src = ctx.createMediaElementSource(el);
-      const an = ctx.createAnalyser();
-      an.fftSize = 128;
-      src.connect(an);
-      an.connect(ctx.destination); // rerouted — must reconnect or it goes silent
-      jarvisState.ttsAnalyser = an;
-      jarvisState._ttsData = new Uint8Array(an.frequencyBinCount);
-    } catch { }
-  }
-  return jarvisState.ttsAudioEl;
-}
-
-function jarvisTtsLevelLoop() {
-  if (!jarvisState.ttsAnimating || !jarvisState.ttsAnalyser) {
-    if (window.Jarvis3D && !jarvisState.recording) window.Jarvis3D.setLevel(0);
-    return;
-  }
-  jarvisState.ttsAnalyser.getByteFrequencyData(jarvisState._ttsData);
-  let sum = 0;
-  for (let i = 0; i < jarvisState._ttsData.length; i++) sum += jarvisState._ttsData[i];
-  if (window.Jarvis3D) window.Jarvis3D.setLevel((sum / jarvisState._ttsData.length / 255) * 2.4);
-  requestAnimationFrame(jarvisTtsLevelLoop);
-}
-
+// ── recording + adaptive VAD (auto-detects when you stop talking) ──
 function jarvisMaybeAutoListen() {
-  if (jarvisState.conversationMode && !jarvisState.recording && jarvisState.voiceAvailable) {
+  if (jarvisState.conversationMode && !jarvisState.recording && !jarvisState.streaming
+      && jarvisState.voiceAvailable && currentView === 'jarvis') {
     jarvisStartRecording();
   }
 }
 
-function jarvisStopTTS() {
-  jarvisState.ttsQueue = [];
-  jarvisState.ttsStopped = true;   // drain loop exits at the next await
-  const ttsCount = $('#jTtsCount');
-  if (ttsCount) ttsCount.textContent = 0;
-  if (jarvisState.ttsAudioEl) {
-    // pause but KEEP the element — it carries the user-gesture autoplay
-    // unlock; nulling it made the next reply's play() rejectable by Chrome
-    jarvisState.ttsAudioEl.pause();
-    try { jarvisState.ttsAudioEl.currentTime = 0; } catch { }
-  }
-  if (jarvisState.avatarVideo) jarvisState.avatarVideo.pause();
-  // resolve the in-flight clip NOW — pausing never fires onended, so the
-  // pipeline stayed wedged (ttsAnimating=true) for up to 30s after STOP
-  if (jarvisState.currentClipCleanup) jarvisState.currentClipCleanup();
-  jarvisSetIdleAvatar();
-}
-
-// ===== VOICE RECORDING =====
 async function jarvisStartRecording() {
   if (!jarvisState.voiceAvailable) {
     jarvisAddMessage('error', 'Voice pipeline not available');
     return;
   }
-  // Secure-context check: getUserMedia only works on https:// or http://localhost.
-  // Opening via a LAN IP (http://192.168.x.x) makes navigator.mediaDevices undefined.
   if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    jarvisAddMessage('error', 'Microphone needs a secure context. Open http://localhost:8777 (not a LAN IP), or use HTTPS.');
+    jarvisAddMessage('error', 'Microphone needs a secure context. Open https://localhost:8777 or use HTTPS.');
     return;
   }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    jarvisState.micStream = stream;
     jarvisState.mediaRecorder = new MediaRecorder(stream);
     jarvisState.audioChunks = [];
-
-    // Mic level analyser
-    if (!jarvisState.audioContext) {
-      jarvisState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    const ctx = jarvisState.audioContext;
-    if (ctx.state === 'suspended') ctx.resume().catch(() => { });
+    const ctx = jarvisAudioCtx();
     if (jarvisState._micSource) { try { jarvisState._micSource.disconnect(); } catch { } }
     const micSource = ctx.createMediaStreamSource(stream);
-    jarvisState._micSource = micSource; // kept so we can disconnect (nodes accumulated per recording)
+    jarvisState._micSource = micSource;
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
+    analyser.fftSize = 512;
     micSource.connect(analyser);
     jarvisState.micAnalyser = analyser;
-    jarvisState._micDataArray = new Uint8Array(analyser.frequencyBinCount);
-    jarvisState._vad = { spokeAt: 0, startedAt: performance.now() };
+    jarvisState._micData = new Uint8Array(analyser.fftSize);
+    // adaptive VAD: noise floor calibrates itself from the ambient signal
+    jarvisState._vad = {
+      startedAt: performance.now(), spokeAt: 0, floor: 0.008, spoke: false,
+    };
     jarvisMicLevelLoop();
 
     jarvisState.mediaRecorder.ondataavailable = (e) => {
@@ -6704,14 +6582,12 @@ async function jarvisStartRecording() {
     };
     jarvisState.mediaRecorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
+      jarvisState.micStream = null;
       jarvisHandleRecording();
     };
-
     jarvisState.mediaRecorder.start();
     jarvisState.recording = true;
     jarvisSetMode('listening');
-    $('#jReactorWrap').classList.add('recording');
-    const hint = $('#jHint'); if (hint) hint.textContent = 'CLICK TO STOP';
   } catch (e) {
     jarvisAddMessage('error', `Mic error: ${e.message}`);
   }
@@ -6722,32 +6598,43 @@ async function jarvisStopRecording() {
     jarvisState.mediaRecorder.stop();
   }
   jarvisState.recording = false;
-  $('#jReactorWrap').classList.remove('recording');
-  const hint = $('#jHint'); if (hint) hint.textContent = 'CLICK TO TALK';
   if (jarvisState.mode === 'listening') jarvisSetMode('idle');
 }
 
 async function jarvisHandleRecording() {
-  jarvisSetMode('thinking');
   const blob = new Blob(jarvisState.audioChunks, { type: 'audio/webm' });
+  if (blob.size < 2500) {   // nothing meaningful was said — don't bother STT
+    if (jarvisState.mode === 'thinking') jarvisSetMode('idle');
+    return;
+  }
+  jarvisSetMode('thinking');
   const formData = new FormData();
   formData.append('file', blob, 'speech.webm');
-
   try {
     const resp = await fetch('/api/jarvis/stt', { method: 'POST', body: formData });
     const data = await resp.json();
     const text = (data.text || '').trim();
     if (!text) {
-      jarvisAddMessage('error', 'No speech detected');
+      if (!jarvisState.conversationMode) jarvisAddMessage('error', 'No speech detected');
       jarvisSetMode('idle');
       return;
     }
     jarvisAddMessage('user', text);
-    jarvisStreamChat(text);
+    jarvisSendTextFromVoice(text);
   } catch (e) {
     jarvisAddMessage('error', `STT error: ${e.message}`);
     jarvisSetMode('idle');
   }
+}
+
+// voice goes through the same intent routing as typed text
+function jarvisSendTextFromVoice(text) {
+  const mImag = text.match(/^(?:create|generate|make|draw|paint)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|photo|drawing|illustration)\s+(?:of|showing|with)\s+(.+)/i);
+  if (mImag) { jarvisImagine(mImag[1]); return; }
+  const mFind = text.match(/\bwhen did (?:i|we|you)\b.*\b(?:show|see|saw|shown|watch)\b/i) ||
+    text.match(/\b(?:search|find|look up|look for)\b.*\b(?:visual memory|you (?:have )?seen|i showed|screen history|camera history)\b/i);
+  if (mFind) { jarvisVisionSearchModal(text, true); return; }
+  jarvisStreamChat(text);
 }
 
 function jarvisMicLevelLoop() {
@@ -6757,35 +6644,308 @@ function jarvisMicLevelLoop() {
     if (window.Jarvis3D && jarvisState.mode !== 'talking') window.Jarvis3D.setLevel(0);
     return;
   }
-  jarvisState.micAnalyser.getByteFrequencyData(jarvisState._micDataArray);
+  jarvisState.micAnalyser.getByteTimeDomainData(jarvisState._micData);
   let sum = 0;
-  for (let i = 0; i < jarvisState._micDataArray.length; i++) sum += jarvisState._micDataArray[i];
-  const avg = sum / jarvisState._micDataArray.length / 255;
+  for (let i = 0; i < jarvisState._micData.length; i++) {
+    const d = (jarvisState._micData[i] - 128) / 128;
+    sum += d * d;
+  }
+  const rms = Math.sqrt(sum / jarvisState._micData.length);
   const el = $('#jMicLevel');
-  if (el) el.style.width = (avg * 100 * 2) + '%';
-  if (window.Jarvis3D) window.Jarvis3D.setLevel(avg * 2.2); // stage reacts to the real mic
+  if (el) el.style.width = Math.min(100, rms * 320) + '%';
+  if (window.Jarvis3D) window.Jarvis3D.setLevel(rms * 7);
 
-  // Hands-free: in conversation mode, stop on ~1.8s of silence after speech
-  // (before this, "auto-listen" still required a click to stop — not hands-free)
   const v = jarvisState._vad;
-  if (jarvisState.conversationMode && v) {
+  if (v) {
     const now = performance.now();
-    if (avg > 0.06) v.spokeAt = now;
-    const spoke = v.spokeAt > 0;
-    if (spoke && now - v.spokeAt > 1800) { jarvisStopRecording(); return; }
-    if (!spoke && now - v.startedAt > 8000) { jarvisStopRecording(); return; } // nothing said
+    const speechThresh = Math.max(0.028, v.floor * 3.0);
+    if (rms > speechThresh) {
+      v.spoke = true;
+      v.spokeAt = now;
+    } else if (!v.spoke) {
+      v.floor = v.floor * 0.92 + rms * 0.08;   // calibrate on ambient noise
+    }
+    // end-of-speech: hangover after the last speech burst (auto-send —
+    // shorter leash hands-free, longer when the mic was clicked manually)
+    const hang = jarvisState.conversationMode ? 1150 : 2100;
+    if (v.spoke && now - v.spokeAt > hang) { jarvisStopRecording(); return; }
+    // nothing said at all
+    const patience = jarvisState.conversationMode ? 15000 : 9000;
+    if (!v.spoke && now - v.startedAt > patience) {
+      jarvisStopRecording();
+      if (jarvisState.conversationMode) {
+        jarvisState.conversationMode = false;
+        const t = $('#jConvToggle');
+        if (t) t.checked = false;
+        toast('Conversation mode paused — nothing heard for a while', 'info');
+      }
+      return;
+    }
   }
   requestAnimationFrame(jarvisMicLevelLoop);
 }
 
-// ===== FPS COUNTER =====
-setInterval(() => {
-  if (currentView !== 'jarvis') return;
-  if (jarvisState.avatarVideo) {
-    const el = $('#jFps');
-    if (el) el.textContent = jarvisState.avatarVideo.paused ? 'IDLE' : 'ACTIVE';
+// ── barge-in: while JARVIS talks in CONV mode, a live mic monitor watches for
+//    the user's voice (echoCancellation strips JARVIS's own output) and cuts
+//    playback so he immediately listens. ──
+async function jarvisBargeMonitorStart() {
+  if (!jarvisState.conversationMode || jarvisState._barge || jarvisState.recording) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    const ctx = jarvisAudioCtx();
+    const src = ctx.createMediaStreamSource(stream);
+    const an = ctx.createAnalyser();
+    an.fftSize = 512;
+    src.connect(an);
+    const data = new Uint8Array(an.fftSize);
+    const st = { stream, src, an, data, hot: 0, gen: setInterval(() => {
+      if (!jarvisState.ttsAnimating || !jarvisState.conversationMode) { jarvisBargeMonitorStop(); return; }
+      an.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) { const d = (data[i] - 128) / 128; sum += d * d; }
+      const rms = Math.sqrt(sum / data.length);
+      st.hot = rms > 0.05 ? st.hot + 1 : 0;
+      if (st.hot >= 5) {          // ~450ms of sustained speech = interrupt
+        jarvisBargeMonitorStop();
+        jarvisStopTTS();
+        jarvisStartRecording();
+      }
+    }, 90) };
+    jarvisState._barge = st;
+  } catch { }
+}
+
+function jarvisBargeMonitorStop() {
+  const b = jarvisState._barge;
+  if (!b) return;
+  jarvisState._barge = null;
+  clearInterval(b.gen);
+  try { b.src.disconnect(); } catch { }
+  try { b.stream.getTracks().forEach(t => t.stop()); } catch { }
+}
+
+// ── webcam / screen share → SigLIP visual memory ──
+function jarvisCaptureGrab(cap) {
+  try {
+    const v = cap.video;
+    if (!v || v.readyState < 2) return null;
+    const cv = document.createElement('canvas');
+    const scale = Math.min(1, 768 / v.videoWidth);
+    cv.width = Math.round(v.videoWidth * scale);
+    cv.height = Math.round(v.videoHeight * scale);
+    cv.getContext('2d').drawImage(v, 0, 0, cv.width, cv.height);
+    return cv.toDataURL('image/jpeg', 0.82);
+  } catch { return null; }
+}
+
+async function jarvisCaptureToggle(kind) {
+  if (jarvisState.capture[kind]) { jarvisCaptureStop(kind); return; }
+  if (!jarvisState.visionAvailable) { toast('Vision memory is not available', 'err'); return; }
+  try {
+    const stream = kind === 'webcam'
+      ? await navigator.mediaDevices.getUserMedia({ video: { width: 960 } })
+      : await navigator.mediaDevices.getDisplayMedia({ video: true });
+    const video = $('#jCapPreview');
+    video.srcObject = stream;
+    video.style.display = 'block';
+    await video.play().catch(() => { });
+    const cap = { stream, video, timer: null };
+    jarvisState.capture[kind] = cap;
+    stream.getVideoTracks()[0].onended = () => jarvisCaptureStop(kind);
+    const period = kind === 'webcam' ? 4000 : 5000;
+    let busy = false;
+    cap.timer = setInterval(async () => {
+      if (busy || currentView !== 'jarvis') return;
+      const dataUrl = jarvisCaptureGrab(cap);
+      if (!dataUrl) return;
+      busy = true;
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        const fd = new FormData();
+        fd.append('file', blob, 'frame.jpg');
+        const r = await fetch(`/api/jarvis/vision/frame?kind=${kind}`, { method: 'POST', body: fd });
+        const j = await r.json().catch(() => ({}));
+        if (j.indexed) {
+          const c = $('#jVisionChip');
+          const n = c ? parseInt((c.textContent.match(/\d+/) || [])[0], 10) : NaN;
+          if (c && !isNaN(n)) c.textContent = `👁 ${n + 1}`;
+        }
+      } catch { }
+      busy = false;
+    }, period);
+    const btn = $(kind === 'webcam' ? '#jCamBtn' : '#jScreenBtn');
+    if (btn) btn.classList.add('active');
+    jarvisAddMessage('tool', kind === 'webcam'
+      ? '🎥 Webcam ON — JARVIS sees and remembers what you show him (say "look at this").'
+      : '🖥 Screen share ON — JARVIS sees and remembers your screen (ask "what am I looking at?").');
+  } catch (e) {
+    toast(`${kind} share failed: ${e.message}`, 'err');
   }
-}, 2000);
+}
+
+function jarvisCaptureStop(kind) {
+  const cap = jarvisState.capture[kind];
+  if (!cap) return;
+  jarvisState.capture[kind] = null;
+  clearInterval(cap.timer);
+  try { cap.stream.getTracks().forEach(t => t.stop()); } catch { }
+  const other = jarvisState.capture[kind === 'webcam' ? 'screen' : 'webcam'];
+  const video = $('#jCapPreview');
+  if (video) {
+    if (other) video.srcObject = other.stream;
+    else { video.srcObject = null; video.style.display = 'none'; }
+  }
+  const btn = $(kind === 'webcam' ? '#jCamBtn' : '#jScreenBtn');
+  if (btn) btn.classList.remove('active');
+}
+
+// "look at this file" — an image dropped straight onto the chat
+async function jarvisLookAtFile(file) {
+  const b64 = await new Promise((res) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.readAsDataURL(file);
+  });
+  jarvisAddMessage('user', `👁 [showed JARVIS an image: ${file.name}]`);
+  jarvisSetMode('thinking');
+  try {
+    const r = await api('POST', '/api/jarvis/see', { image_b64: b64, prompt: '' });
+    jarvisAddMessage('jarvis', r.description || '(no description)');
+    jarvisSpeak(r.description || '');
+    // index it too, so "when did I show you…" finds it later
+    const blob = await (await fetch(b64)).blob();
+    const fd = new FormData();
+    fd.append('file', blob, 'upload.jpg');
+    fetch('/api/jarvis/vision/frame?kind=upload', { method: 'POST', body: fd }).catch(() => { });
+  } catch (e) {
+    jarvisAddMessage('error', 'Vision failed: ' + e.message);
+  }
+  if (jarvisState.mode === 'thinking') jarvisSetMode('idle');
+}
+
+// ── vision memory search popup (scroll / select / copy) ──
+async function jarvisVisionSearchModal(query, run) {
+  showModal(`
+    <div class="modal-head"><h2>👁 Visual memory</h2></div>
+    <div class="modal-body">
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <input class="form-input" id="jvsQuery" placeholder="e.g. the red box · an error dialog · invoice pdf on screen" value="${esc(query || '')}">
+        <button class="btn-primary" onclick="jarvisVisionSearchRun()">Search</button>
+      </div>
+      <div id="jvsResults" class="jvs-results"><div class="muted">Search everything JARVIS has seen through your camera and screen shares. Results show when he saw it, with the frame and any text he read in it.</div></div>
+      <div class="modal-actions" style="justify-content:space-between">
+        <button class="btn-sm danger" onclick="jarvisVisionForget()">🗑 Forget ALL visual memory</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn-ghost" id="jvsCopyAll" style="display:none" onclick="jarvisVisionCopyAll()">⧉ Copy results</button>
+          <button class="btn-primary" onclick="closeModal()">Close</button>
+        </div>
+      </div>
+    </div>`);
+  const inp = document.getElementById('jvsQuery');
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') jarvisVisionSearchRun(); });
+  if (run && query) jarvisVisionSearchRun();
+}
+
+let _jvsLast = [];
+async function jarvisVisionSearchRun() {
+  const q = (document.getElementById('jvsQuery') || {}).value || '';
+  const box = document.getElementById('jvsResults');
+  if (!q.trim() || !box) return;
+  box.innerHTML = '<div class="muted">Searching…</div>';
+  try {
+    const r = await api('POST', '/api/jarvis/vision/search', { query: q.trim(), limit: 18 });
+    const hits = r.hits || [];
+    _jvsLast = hits;
+    document.getElementById('jvsCopyAll').style.display = hits.length ? 'inline-block' : 'none';
+    if (!hits.length) {
+      box.innerHTML = '<div class="muted">Nothing matched. JARVIS only remembers what was shared while 🎥/🖥 was on.</div>';
+      return;
+    }
+    box.innerHTML = hits.map(h => `
+      <div class="jvs-hit">
+        <a href="/api/jarvis/vision/frame/${encodeURIComponent(h.file)}" target="_blank">
+          <img src="/api/jarvis/vision/frame/${encodeURIComponent(h.file)}" loading="lazy"></a>
+        <div class="jvs-meta">
+          <div><b>${esc(h.when || '')}</b> <span class="chip ${h.kind === 'screen' ? 'c-cyan' : 'c-green'}">${esc(h.kind || '')}</span> <span class="muted">match ${(h.score * 100).toFixed(0)}%</span></div>
+          ${h.note ? `<div class="jvs-note">you said: "${esc(h.note)}"</div>` : ''}
+          ${h.ocr ? `<div class="jvs-ocr">${esc(h.ocr)}</div>` : ''}
+          <button class="jv2-mini-btn" onclick="navigator.clipboard.writeText(${JSON.stringify('')}+this.closest('.jvs-hit').innerText).then(()=>toast('Copied','ok'))">⧉ copy</button>
+        </div>
+      </div>`).join('');
+    const top = hits[0];
+    jarvisAddMessage('jarvis', `I found ${hits.length} moment${hits.length > 1 ? 's' : ''} matching "${q.trim()}" — the closest is from ${top.when} (${top.kind}).`);
+    jarvisSpeak(`I found ${hits.length} matching moment${hits.length > 1 ? 's' : ''}. The closest is from ${top.when}.`);
+  } catch (e) {
+    box.innerHTML = `<div class="muted">Search failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function jarvisVisionCopyAll() {
+  const txt = _jvsLast.map(h =>
+    `[${h.when}] (${h.kind}, ${(h.score * 100).toFixed(0)}%)${h.note ? ` note: ${h.note}` : ''}${h.ocr ? `\n  text seen: ${h.ocr}` : ''}`).join('\n');
+  navigator.clipboard.writeText(txt).then(() => toast('Results copied', 'ok')).catch(() => { });
+}
+
+async function jarvisVisionForget() {
+  if (!confirm('Erase EVERYTHING JARVIS has seen (all indexed frames)? This cannot be undone.')) return;
+  try {
+    const r = await api('DELETE', '/api/jarvis/vision');
+    toast(`Forgot ${r.forgotten} frames`, 'ok');
+    closeModal();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+// ── image generation (local SDXL-Turbo) ──
+async function jarvisImagine(prompt) {
+  jarvisAddMessage('tool', `🎨 Painting: "${prompt.trim()}" (local SDXL — first run loads the model, ~30s)…`);
+  jarvisSetMode('thinking');
+  try {
+    const r = await api('POST', '/api/jarvis/imagine', { prompt: prompt.trim() });
+    jarvisAddMessage('jarvis', `Here's "${prompt.trim().slice(0, 80)}" — saved to the file exchange as ${r.name}.`,
+      { images: [r.url], files: [r.name] });
+    jarvisSpeak('Done — the image is in your file exchange.');
+    jarvisLoadFiles();
+  } catch (e) {
+    jarvisAddMessage('error', 'Image generation failed: ' + e.message);
+  }
+  if (jarvisState.mode === 'thinking') jarvisSetMode('idle');
+}
+
+// ── briefing + spoken task callbacks ──
+async function jarvisMaybeBrief() {
+  const today = new Date().toDateString();
+  if (localStorage.getItem('jvBriefDate') === today) return;
+  localStorage.setItem('jvBriefDate', today);
+  jarvisBrief(false);
+}
+
+async function jarvisBrief(manual) {
+  try {
+    const r = await api('GET', '/api/jarvis/briefing');
+    if (r.text) {
+      jarvisAddMessage('jarvis', `📋 ${r.text}`);
+      if (manual || jarvisState.voiceOn) jarvisSpeak(r.text);
+    }
+  } catch { }
+}
+
+async function jarvisPollEvents(gen) {
+  if (gen !== jarvisState.eventsGen || currentView !== 'jarvis') return;
+  try {
+    const r = await api('GET', `/api/jarvis/events?since=${jarvisState.eventsSince}`);
+    jarvisState.eventsSince = r.now || (Date.now() / 1000);
+    for (const ev of (r.events || [])) {
+      const line = ev.kind === 'completed'
+        ? `✅ Task "${ev.title}" just finished.`
+        : `❌ Task "${ev.title}" failed — want me to look into it?`;
+      jarvisAddMessage('tool', line);
+      if (!jarvisState.ttsAnimating) jarvisSpeak(line.replace(/^[✅❌] /, ''));
+    }
+  } catch { }
+  setTimeout(() => jarvisPollEvents(gen), 12000);
+}
 
 
 function showModal(html) {

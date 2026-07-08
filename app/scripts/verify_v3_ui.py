@@ -166,7 +166,7 @@ async def main():
         # ── JARVIS still boots (untouched view) ──
         await page.click('a.nav-item[data-view="jarvis"]')
         await page.wait_for_timeout(2500)
-        ok("jarvis view renders", await page.locator("#jAvatarVideo, .reactor-wrap, .jarvis-layout").count() > 0)
+        ok("jarvis view renders", await page.locator(".jv2-stage, .jv2").count() > 0)
 
         ok("no console errors", len(console_errors) == 0, str(console_errors[:4]))
         await browser.close()

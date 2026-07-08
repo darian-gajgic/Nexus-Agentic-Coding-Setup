@@ -1,9 +1,76 @@
 # JARVIS Voice & Avatar — Implementation Documentation
 
-> **Status:** Working. Last verified 2026-07-05.
-> This document describes the complete wiring of the JARVIS talking-head avatar:
-> voice input (STT), LLM reply, voice output (TTS), neural lip-sync (Wav2Lip),
-> and the avatar-as-button UI. Read this before touching any JARVIS code.
+> **Status:** v2 — particle avatar + WS-streamed TTS. Last verified 2026-07-08.
+> Read this before touching any JARVIS code.
+
+---
+
+## 0. ARCHITECTURE v2 (2026-07-08) — READ THIS FIRST
+
+The Wav2Lip talking-head is **RETIRED from the pipeline** (endpoints `/talk`
+and `/lipsync` still exist for compat but nothing calls them; lipsync.py is
+dormant). The v2 stack:
+
+- **Avatar** = `static/jarvis3d.js`: a Three.js POINT-CLOUD HEAD sampled from
+  `static/avatar/reference.jpg` (contrast-stretched luminance + edge boost →
+  particle density/brightness; ellipsoid relief), with node streams flowing
+  from the back of the skull into the user's REAL memory galaxy
+  (`/api/memory3d` data, memory3d.js palette). The avatar renders BEHIND the
+  chat (`.jarvis3d-canvas` z-0). States idle/listening/thinking/talking =
+  tint + motion. `window.Jarvis3D = {mount, dispose, setMode, setLevel,
+  setAnimations}` — setAnimations(false) is the FX on/off button (freezes RAF).
+- **Voice out** = `/ws/jarvis/tts` WebSocket: client sends `{"text": sentence}`,
+  server streams raw PCM chunks (16-bit mono 22050) from `voice.synthesize_stream`
+  (Piper incremental) + `{"done":true}`; `{"stop":true}` aborts (barge-in).
+  Browser schedules chunks gaplessly on an AudioContext; an AnalyserNode on the
+  SAME graph feeds `Jarvis3D.setLevel()` → **native-timing lip-sync** (the mouth
+  region of the point cloud opens with real amplitude — nothing to align).
+  First audio ≈100-300ms warm. Sentences are spoken PROGRESSIVELY while the
+  LLM reply is still streaming (`jarvisSpeakProgress`). HTTP `/api/jarvis/tts`
+  WAV remains as fallback (`jarvisFetchClip`).
+- **Voice in** = adaptive VAD in `jarvisMicLevelLoop`: time-domain RMS with a
+  self-calibrating noise floor (floor EMA while no speech), speech threshold
+  `max(0.028, floor*3)`, end-of-speech hangover 1.15s (conversation mode) /
+  2.1s (manual) → auto-transcribe+send. Conversation mode also runs a
+  **barge-in monitor** during TTS (echoCancellation'd mic, ~450ms sustained
+  voice → stop TTS + listen). getUserMedia uses echoCancellation +
+  noiseSuppression + autoGainControl.
+- **Eyes** = webcam (`getUserMedia`) / screen (`getDisplayMedia`) share
+  buttons; frames every 4-5s → `POST /api/jarvis/vision/frame` → vision.py:
+  SigLIP so400m embeddings + RapidOCR in a persistent ml-env worker
+  (`vision_worker.py`, killed after 10min idle), stored in qdrant
+  `jarvis_vision` (per-user, deduped, capped 4000). Search =
+  `POST /api/jarvis/vision/search` (SigLIP text→image + OCR keyword boost),
+  surfaced in a scroll/select/copy popup (`jarvisVisionSearchModal`). Chat
+  turns mentioning look/see/screen ride the current frame along
+  (`frame_b64`) → described locally by ollama `qwen3-vl:8b` → injected as
+  `[JARVIS EYES …]` context AND indexed with the user's words as note.
+- **Image generation** = `POST /api/jarvis/imagine` → SDXL-Turbo in the same
+  worker (sequential CPU offload — 12GB card; ollama VLM is evicted first)
+  → PNG into the file exchange. Z.AI vision/CogView are NOT available on the
+  coding-plan key (error 1113, verified) — vision is fully local.
+- **File exchange** = `workspaces/jarvis/<uid>/files/`, drag&drop in the
+  sidebar; the per-turn `system_message` framing tells Hermes to read/write
+  THERE; after each turn the server diffs the folder and emits an SSE
+  `files` event → chips in the chat.
+- **System control** = the framing gives Hermes curl access to the Nexus API
+  via the per-boot `auth.INTERNAL_TOKEN` + `x-nexus-user` (scoped to the
+  chatting user; restart invalidates). Readback-confirmation rule is in the
+  prompt. Board snapshot rides in each turn.
+- **Sessions** = per-user MULTIPLE conversations (`jarvis_session.json`
+  history), sidebar with switch/forget/title; messages endpoint allows any
+  session in the caller's own history.
+- **Extras**: daily spoken briefing (`/api/jarvis/briefing`, deterministic),
+  task completion/failure callbacks spoken while the tab is open
+  (`/api/jarvis/events` polling), voice/text intents for `/find` (vision
+  search) and `/imagine`, per-message copy buttons.
+- **Gates**: `scripts/verify_jarvis_e2e.py` (live turn incl. WS TTS),
+  `scripts/verify_jarvis_v2_backend.py` (23 checks: vision memory, VLM,
+  imagine, files, sessions, briefing, WS TTS).
+
+Sections below describe the v1 Wav2Lip pipeline for historical context —
+its lessons (cache-busting, autoplay policy, persistent audio element,
+GPU discipline) still apply.
 
 ---
 

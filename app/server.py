@@ -3,6 +3,7 @@ import os
 import time
 import json
 import uuid
+import base64
 import asyncio
 import threading
 from pathlib import Path
@@ -153,6 +154,11 @@ def startup():
             try:
                 if _voice_ready and _voice is not None:
                     _voice.check_and_unload_idle()
+            except Exception:
+                pass
+            try:
+                import vision as _vision_mod
+                _vision_mod.check_and_unload_idle()  # kills the SigLIP/SDXL worker
             except Exception:
                 pass
     ilt = threading.Thread(target=_idle_unloader_loop, daemon=True)
@@ -1577,8 +1583,11 @@ def _hermes_headers() -> dict:
 
 
 def _load_jarvis_session() -> dict:
-    """Per-user JARVIS store: {"sessions": {user_id: hermes_session_id}}.
-    Legacy single-session shape {"session_id": ...} migrates to u_owner."""
+    """Per-user JARVIS store:
+      {"sessions": {user_id: current_sid},
+       "history":  {user_id: [{"id","title","ts"}, ...]}}   (newest last)
+    Legacy shapes migrate: {"session_id": ...} → u_owner current;
+    a current sid missing from history is backfilled."""
     try:
         data = json.loads(JARVIS_SESSION_FILE.read_text())
     except Exception:
@@ -1586,6 +1595,11 @@ def _load_jarvis_session() -> dict:
     if "sessions" not in data:
         data = {"sessions": ({auth.DEFAULT_USER_ID: data["session_id"]}
                              if data.get("session_id") else {})}
+    data.setdefault("history", {})
+    for uid, sid in (data.get("sessions") or {}).items():
+        hist = data["history"].setdefault(uid, [])
+        if sid and not any(h.get("id") == sid for h in hist):
+            hist.append({"id": sid, "title": "Conversation", "ts": time.time()})
     return data
 
 
@@ -1597,14 +1611,15 @@ def _jarvis_sid_for(user_id: str) -> str | None:
     return (_load_jarvis_session().get("sessions") or {}).get(user_id)
 
 
-async def _get_or_create_jarvis_session() -> str:
-    """Get the CURRENT USER's persistent JARVIS session ID, create if missing.
-    Each user has their own conversation; the session is user-scope-published
-    so mem0 memories extracted from it are stamped with this user."""
+async def _get_or_create_jarvis_session(force_new: bool = False) -> str:
+    """Get the CURRENT USER's active JARVIS session ID, create if missing.
+    force_new=True always creates a fresh conversation (and makes it current).
+    Each user has their own conversations; sessions are user-scope-published
+    so mem0 memories extracted from them are stamped with this user."""
     user = auth.current_user()
     uid = user["id"] if user else auth.DEFAULT_USER_ID
     state = _load_jarvis_session()
-    sid = (state.get("sessions") or {}).get(uid)
+    sid = None if force_new else (state.get("sessions") or {}).get(uid)
     if sid:
         # Verify session still exists
         async with httpx.AsyncClient() as client:
@@ -1643,6 +1658,8 @@ async def _get_or_create_jarvis_session() -> str:
         data = r.json()
         sid = (data.get("session") or data).get("id")
     state.setdefault("sessions", {})[uid] = sid
+    state.setdefault("history", {}).setdefault(uid, []).append(
+        {"id": sid, "title": "New conversation", "ts": time.time()})
     _save_jarvis_session(state)
     _publish_jarvis_user_scope(sid, uid)
     db.log_activity("info", "jarvis", f"JARVIS session created: {sid}", user_id=uid)
@@ -1686,9 +1703,77 @@ async def jarvis_status():
 
 @app.post("/api/jarvis/session")
 async def jarvis_create_session():
-    """Force-create a fresh JARVIS session."""
-    sid = await _get_or_create_jarvis_session()
+    """Force-create a fresh JARVIS conversation and make it current."""
+    sid = await _get_or_create_jarvis_session(force_new=True)
     return {"session_id": sid}
+
+
+@app.get("/api/jarvis/my-sessions")
+async def jarvis_my_sessions():
+    """The CALLER's own JARVIS conversations (newest first) — unlike
+    /api/jarvis/sessions this never spans other users."""
+    uid = auth.current_user_id()
+    state = _load_jarvis_session()
+    hist = list((state.get("history") or {}).get(uid, []))
+    hist.reverse()
+    return {"sessions": hist, "current": (state.get("sessions") or {}).get(uid)}
+
+
+@app.post("/api/jarvis/session/switch")
+async def jarvis_switch_session(body: dict):
+    """Go back to one of YOUR previous conversations."""
+    uid = auth.current_user_id()
+    sid = (body.get("id") or "").strip()
+    state = _load_jarvis_session()
+    hist = (state.get("history") or {}).get(uid, [])
+    if not any(h.get("id") == sid for h in hist):
+        return JSONResponse(status_code=404, content={"error": "not your session"})
+    state["sessions"][uid] = sid
+    _save_jarvis_session(state)
+    _publish_jarvis_user_scope(sid, uid)
+    return {"ok": True, "session_id": sid}
+
+
+@app.post("/api/jarvis/session/forget")
+async def jarvis_forget_session(body: dict):
+    """Remove one of YOUR conversations from the sidebar (and try to delete
+    the underlying Hermes session). Forgetting the current one falls back to
+    the most recent remaining conversation."""
+    uid = auth.current_user_id()
+    sid = (body.get("id") or "").strip()
+    state = _load_jarvis_session()
+    hist = (state.get("history") or {}).get(uid, [])
+    if not any(h.get("id") == sid for h in hist):
+        return JSONResponse(status_code=404, content={"error": "not your session"})
+    state["history"][uid] = [h for h in hist if h.get("id") != sid]
+    if (state.get("sessions") or {}).get(uid) == sid:
+        rest = state["history"][uid]
+        state["sessions"][uid] = rest[-1]["id"] if rest else None
+    _save_jarvis_session(state)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.delete(f"{HERMES_API_BASE}/api/sessions/{sid}",
+                                headers=_hermes_headers(), timeout=5)
+    except Exception:
+        pass
+    return {"ok": True, "current": state["sessions"].get(uid)}
+
+
+@app.post("/api/jarvis/session/title")
+async def jarvis_session_title(body: dict):
+    """Name a conversation (the UI sets this from the first message)."""
+    uid = auth.current_user_id()
+    sid, title = (body.get("id") or "").strip(), (body.get("title") or "").strip()[:80]
+    if not sid or not title:
+        return JSONResponse(status_code=400, content={"error": "id and title required"})
+    state = _load_jarvis_session()
+    for h in (state.get("history") or {}).get(uid, []):
+        if h.get("id") == sid:
+            if h.get("title") in ("New conversation", "Conversation", ""):
+                h["title"] = title
+                _save_jarvis_session(state)
+            return {"ok": True}
+    return JSONResponse(status_code=404, content={"error": "not your session"})
 
 
 @app.get("/api/jarvis/skills")
@@ -1740,9 +1825,13 @@ async def jarvis_list_sessions(limit: int = 10):
 
 @app.get("/api/jarvis/messages/{session_id}")
 async def jarvis_messages(session_id: str, limit: int = 50):
-    """Get message history — ONLY for the caller's own JARVIS session.
+    """Get message history — ONLY for the caller's own JARVIS conversations.
     (Arbitrary session ids would read other users' conversations.)"""
-    if session_id != _jarvis_sid_for(auth.current_user_id()):
+    uid = auth.current_user_id()
+    state = _load_jarvis_session()
+    own = {h.get("id") for h in (state.get("history") or {}).get(uid, [])}
+    own.add(_jarvis_sid_for(uid))
+    if session_id not in own:
         return JSONResponse(status_code=404, content={"error": "not found"})
     try:
         async with httpx.AsyncClient() as client:
@@ -1761,21 +1850,93 @@ async def jarvis_messages(session_id: str, limit: int = 50):
 from fastapi.responses import StreamingResponse
 
 
+def _jarvis_files_dir(uid: str) -> Path:
+    d = Path(__file__).parent / "workspaces" / "jarvis" / uid / "files"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _jarvis_files_list(uid: str) -> list[dict]:
+    out = []
+    for f in sorted(_jarvis_files_dir(uid).iterdir()):
+        if f.is_file():
+            st = f.stat()
+            out.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
+    return out
+
+
+def _jarvis_framing(uid: str) -> str:
+    """Ephemeral per-turn system message: persona + the levers JARVIS may pull.
+    The internal token is per-boot random and never persisted — a server
+    restart invalidates whatever older turns saw."""
+    files_dir = _jarvis_files_dir(uid)
+    try:
+        rows = db.query_all(
+            "SELECT status, COUNT(*) n FROM tasks WHERE user_id=? AND status!='archived' "
+            "GROUP BY status", (uid,))
+        board = ", ".join(f"{r['status']}:{r['n']}" for r in rows) or "empty"
+        running = db.query_all(
+            "SELECT title FROM tasks WHERE user_id=? AND dispatch_state IN "
+            "('queued','dispatching','streaming','finalizing') LIMIT 3", (uid,))
+        running_s = "; ".join(r["title"] for r in running) or "none"
+    except Exception:
+        board, running_s = "unknown", "unknown"
+    return f"""You are JARVIS, the spoken+written operator interface of this user's Nexus Agent OS (a local dashboard managing a fleet of real AI agents on a kanban). Voice replies are read aloud — default to tight, natural sentences; no markdown tables or code fences unless the user is clearly reading.
+
+FILE EXCHANGE: the operator's shared folder with you is {files_dir} — files they upload land there; ANY file you create for them MUST be written there (use your file tools). Mention created files by name.
+
+SYSTEM CONTROL — you can manage the user's Nexus board over its local REST API:
+  curl -sk -H "x-nexus-internal: {auth.INTERNAL_TOKEN}" -H "x-nexus-user: {uid}" https://127.0.0.1:8777/api/...
+  GET /api/tasks (their board) · POST /api/tasks {{"title","description","status":"todo"}} · PATCH /api/tasks/ID {{"status":...}} · POST /api/tasks/ID/dispatch (run it NOW with a real agent) · GET /api/workflows (projects) · GET /api/approvals?status=pending · PATCH /api/approvals/ID {{"decision":"approved"}} · GET/POST /api/scheduler (cron jobs: {{"name","cron","action"}})
+  Board now: {board}. Running: {running_s}.
+  RULES: read back and get an explicit yes BEFORE dispatching, deleting, approving, or scheduling anything. Never invent task IDs — list first. After acting, state plainly what changed.
+
+VISION: the UI indexes what the camera/screen share sees into your visual memory; when the user asks what you saw or when they showed you something, the UI searches it — you may reference "[JARVIS EYES]" context blocks in the conversation as things you personally saw.
+
+Current date/time: {time.strftime('%A %Y-%m-%d %H:%M')}."""
+
+
 @app.post("/api/jarvis/chat/stream")
 async def jarvis_chat_stream(body: dict):
     """Proxy SSE stream from Hermes Agent API.
     The browser reads this as EventSource-style text/event-stream.
-    """
+    Extras over plain proxying: per-turn system framing (persona, file
+    exchange, system control), optional 'eyes' frame (described by the local
+    VLM, injected as context AND indexed into visual memory), and a post-turn
+    files diff event so new output files appear in the chat."""
     user_input = body.get("input", "").strip()
     if not user_input:
         return JSONResponse(status_code=400, content={"error": "empty input"})
 
+    uid = auth.current_user_id()
     session_id = await _get_or_create_jarvis_session()
+    turn_start = time.time()
+    files_before = {f["name"]: f["mtime"] for f in _jarvis_files_list(uid)}
+
+    # 'Eyes': a webcam/screen frame rides along with the words. Describe it
+    # locally (never leaves the machine) and hand the description to Hermes.
+    frame_note = ""
+    frame_b64 = body.get("frame_b64") or ""
+    if frame_b64:
+        try:
+            import vision as _vision_mod
+            raw = base64.b64decode(frame_b64.split(",")[-1])
+            frame_note = await _vision_mod.describe_image(raw, user_input)
+            asyncio.create_task(_vision_mod.ingest_frame(
+                uid, raw, body.get("frame_kind") or "webcam",
+                note=user_input[:200]))
+        except Exception as e:
+            frame_note = f"(vision unavailable: {str(e)[:120]})"
+
+    hermes_input = user_input
+    if frame_note:
+        hermes_input = (f"[JARVIS EYES — what your camera/screen sees right now: "
+                        f"{frame_note}]\n\n{user_input}")
 
     async def event_generator():
         """Stream SSE events from Hermes, re-emit as SSE for the browser."""
         url = f"{HERMES_API_BASE}/api/sessions/{session_id}/chat/stream"
-        payload = {"input": user_input}
+        payload = {"input": hermes_input, "system_message": _jarvis_framing(uid)}
         try:
             async with httpx.AsyncClient() as client:
                 async with client.stream(
@@ -1806,6 +1967,15 @@ async def jarvis_chat_stream(body: dict):
             yield f"event: error\ndata: {json.dumps({'error': 'timeout'})}\n\n"
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
+        # Files JARVIS produced (or changed) this turn → chips in the chat
+        try:
+            fresh = [f for f in _jarvis_files_list(uid)
+                     if f["mtime"] >= turn_start - 1
+                     and files_before.get(f["name"]) != f["mtime"]]
+            if fresh:
+                yield f"event: files\ndata: {json.dumps({'files': fresh})}\n\n"
+        except Exception:
+            pass
 
     return StreamingResponse(
         event_generator(),
@@ -1917,6 +2087,284 @@ async def jarvis_talk(body: dict):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"talk render failed: {e}"})
     return RawResponse(content=mp4_bytes, media_type="video/mp4")
+
+
+# ===== JARVIS v2 — file exchange, visual memory, vision, imagine, briefing =====
+
+_JARVIS_FILE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf",
+                     ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
+                     ".txt", ".md", ".csv", ".json", ".py", ".js", ".html",
+                     ".css", ".sh", ".yaml", ".yml", ".toml", ".zip", ".mp3",
+                     ".wav", ".mp4"}
+
+
+def _jarvis_safe_file(raw: str) -> str | None:
+    name = os.path.basename(raw or "").strip().replace(" ", "_")
+    name = _re.sub(r"[^A-Za-z0-9._()\-]", "", name)[:140]
+    if not name or name.startswith("."):
+        return None
+    if os.path.splitext(name)[1].lower() not in _JARVIS_FILE_EXTS:
+        return None
+    return name
+
+
+@app.get("/api/jarvis/files")
+async def jarvis_files():
+    return {"files": _jarvis_files_list(auth.current_user_id())}
+
+
+@app.post("/api/jarvis/files")
+async def jarvis_file_upload(file: UploadFile = File(...)):
+    name = _jarvis_safe_file(file.filename)
+    if not name:
+        return JSONResponse(status_code=400, content={
+            "error": "unsupported file name/type"})
+    data = await file.read()
+    if len(data) > 50 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": "max 50 MB"})
+    (_jarvis_files_dir(auth.current_user_id()) / name).write_bytes(data)
+    return {"ok": True, "name": name, "size": len(data)}
+
+
+@app.get("/api/jarvis/files/{name}")
+async def jarvis_file_download(name: str):
+    safe = _jarvis_safe_file(name)
+    uid = auth.current_user_id()
+    if not safe or not (_jarvis_files_dir(uid) / safe).is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return FileResponse(str(_jarvis_files_dir(uid) / safe),
+                        headers={"Content-Disposition": f'inline; filename="{safe}"'})
+
+
+@app.delete("/api/jarvis/files/{name}")
+async def jarvis_file_delete(name: str):
+    safe = _jarvis_safe_file(name)
+    uid = auth.current_user_id()
+    if safe and (_jarvis_files_dir(uid) / safe).is_file():
+        (_jarvis_files_dir(uid) / safe).unlink()
+        return {"ok": True}
+    return JSONResponse(status_code=404, content={"error": "not found"})
+
+
+# ── Visual memory (SigLIP + OCR frames in qdrant — vision.py) ──
+
+_vision_ok = False
+try:
+    import vision as _vision
+    _vision_ok = True
+except Exception as _e:
+    print(f"[vision] WARNING: vision module not available: {_e}", flush=True)
+
+
+@app.get("/api/jarvis/vision/status")
+async def jarvis_vision_status():
+    if not _vision_ok:
+        return {"available": False}
+    counts = {}
+    try:
+        counts = await _vision.vision_counts(auth.current_user_id())
+    except Exception as e:
+        return {"available": False, "error": str(e)[:150]}
+    return {"available": True, **_vision.vision_status(), **counts}
+
+
+@app.post("/api/jarvis/vision/frame")
+async def jarvis_vision_frame(file: UploadFile = File(...), kind: str = "webcam"):
+    """Index one webcam/screen frame into this user's visual memory."""
+    if not _vision_ok:
+        return JSONResponse(status_code=503, content={"error": "vision unavailable"})
+    if kind not in ("webcam", "screen", "upload"):
+        kind = "webcam"
+    jpeg = await file.read()
+    if not jpeg or len(jpeg) > 8 * 1024 * 1024:
+        return JSONResponse(status_code=400, content={"error": "bad frame"})
+    try:
+        r = await _vision.ingest_frame(auth.current_user_id(), jpeg, kind)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+    return r
+
+
+@app.post("/api/jarvis/vision/search")
+async def jarvis_vision_search(body: dict):
+    """Natural-language search over everything JARVIS has seen ('when did I
+    show you the red box?'). Hybrid: SigLIP similarity + OCR keyword boost."""
+    if not _vision_ok:
+        return JSONResponse(status_code=503, content={"error": "vision unavailable"})
+    q = (body.get("query") or "").strip()
+    if not q:
+        return JSONResponse(status_code=400, content={"error": "empty query"})
+    try:
+        hits = await _vision.search_frames(auth.current_user_id(), q,
+                                           int(body.get("limit") or 12))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+    for h in hits:
+        if h.get("ts"):
+            h["when"] = time.strftime("%a %d %b %H:%M", time.localtime(h["ts"]))
+    return {"query": q, "hits": hits}
+
+
+@app.get("/api/jarvis/vision/frame/{name}")
+async def jarvis_vision_frame_get(name: str):
+    uid = auth.current_user_id()
+    safe = os.path.basename(name)
+    p = Path(__file__).parent / "workspaces" / "jarvis" / uid / "frames" / safe
+    if not p.is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return FileResponse(str(p), media_type="image/jpeg")
+
+
+@app.delete("/api/jarvis/vision")
+async def jarvis_vision_forget():
+    if not _vision_ok:
+        return JSONResponse(status_code=503, content={"error": "vision unavailable"})
+    n = await _vision.forget_all(auth.current_user_id())
+    return {"ok": True, "forgotten": n}
+
+
+@app.post("/api/jarvis/see")
+async def jarvis_see(body: dict):
+    """Describe an image (b64) with the local VLM — 'what am I looking at'."""
+    if not _vision_ok:
+        return JSONResponse(status_code=503, content={"error": "vision unavailable"})
+    b64 = (body.get("image_b64") or "").split(",")[-1]
+    if not b64:
+        return JSONResponse(status_code=400, content={"error": "image_b64 required"})
+    try:
+        text = await _vision.describe_image(base64.b64decode(b64),
+                                            body.get("prompt") or "")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+    return {"description": text}
+
+
+@app.post("/api/jarvis/imagine")
+async def jarvis_imagine(body: dict):
+    """Create an image (SDXL-Turbo, local) into the JARVIS file exchange."""
+    if not _vision_ok:
+        return JSONResponse(status_code=503, content={"error": "vision unavailable"})
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse(status_code=400, content={"error": "empty prompt"})
+    uid = auth.current_user_id()
+    name = f"imagine-{int(time.time())}.png"
+    try:
+        await _vision.generate_image(prompt, _jarvis_files_dir(uid) / name)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:250]})
+    db.log_activity("info", "jarvis", f"Image generated: {name}", user_id=uid)
+    return {"ok": True, "name": name, "url": f"/api/jarvis/files/{name}"}
+
+
+# ── Briefing + spoken task callbacks ──
+
+@app.get("/api/jarvis/briefing")
+async def jarvis_briefing():
+    """Deterministic morning-briefing text (the UI speaks it once per day)."""
+    uid = auth.current_user_id()
+    cutoff = time.time() - 16 * 3600
+    rows = db.query_all(
+        "SELECT status, COUNT(*) n FROM tasks WHERE user_id=? AND status!='archived' "
+        "GROUP BY status", (uid,))
+    by = {r["status"]: r["n"] for r in rows}
+    done = db.query_all(
+        "SELECT title FROM tasks WHERE user_id=? AND completed_at>=? "
+        "ORDER BY completed_at DESC LIMIT 5", (uid, cutoff))
+    failed = db.query_all(
+        "SELECT title FROM tasks WHERE user_id=? AND dispatch_state='failed' "
+        "AND updated_at>=? LIMIT 5", (uid, cutoff))
+    approvals = db.query_one(
+        "SELECT COUNT(*) n FROM approvals WHERE status='pending'")["n"]
+    parts = [f"Good {'morning' if time.localtime().tm_hour < 12 else 'afternoon' if time.localtime().tm_hour < 18 else 'evening'}."]
+    if done:
+        parts.append(f"Since yesterday, {len(done)} task{'s' if len(done) > 1 else ''} finished: "
+                     + "; ".join(d["title"] for d in done[:3]) + ".")
+    if failed:
+        parts.append(f"{len(failed)} task{'s' if len(failed) > 1 else ''} failed and may need a look: "
+                     + "; ".join(f["title"] for f in failed[:2]) + ".")
+    active = by.get("in_progress", 0)
+    todo = by.get("todo", 0) + by.get("backlog", 0)
+    parts.append(f"The board has {active} running and {todo} waiting.")
+    if approvals:
+        parts.append(f"{approvals} approval{'s' if approvals > 1 else ''} awaiting your decision.")
+    if not done and not failed and not active:
+        parts.append("All quiet.")
+    return {"text": " ".join(parts)}
+
+
+@app.get("/api/jarvis/events")
+async def jarvis_events(since: float = 0):
+    """Task completions/failures for THIS user since `since` — the UI polls
+    while the JARVIS tab is open and speaks them (async voice callbacks)."""
+    uid = auth.current_user_id()
+    since = float(since or 0)
+    if since <= 0:
+        return {"events": [], "now": time.time()}
+    evs = []
+    for r in db.query_all(
+            "SELECT id, title, dispatch_state, completed_at, updated_at FROM tasks "
+            "WHERE user_id=? AND ((completed_at IS NOT NULL AND completed_at>?) "
+            "OR (dispatch_state='failed' AND updated_at>?)) LIMIT 10",
+            (uid, since, since)):
+        evs.append({"task_id": r["id"], "title": r["title"],
+                    "kind": "completed" if r.get("completed_at") and r["completed_at"] > since else "failed",
+                    "ts": r.get("completed_at") or r.get("updated_at")})
+    return {"events": evs, "now": time.time()}
+
+
+# ── Streaming TTS over WebSocket (native-timing lip-sync feed) ──
+
+@app.websocket("/ws/jarvis/tts")
+async def jarvis_tts_ws(ws: WebSocket):
+    """One connection per JARVIS visit. Client sends {"text": "..."} per
+    utterance; server streams raw PCM chunks (16-bit mono 22050 Hz) as Piper
+    produces them, then {"done": true}. First audio lands in ~100-300 ms —
+    the browser schedules chunks gaplessly and drives the avatar's mouth from
+    an AnalyserNode on the SAME audio (native timing, nothing to align).
+    {"stop": true} between chunks aborts the current utterance (barge-in)."""
+    user = auth.resolve_session(ws.cookies.get(auth.COOKIE_NAME, ""))
+    if user is None:
+        if auth.auth_required():
+            await ws.close(code=4401)
+            return
+        user = auth.sole_user()
+    if not _voice_ready:
+        await ws.close(code=4503)
+        return
+    await ws.accept()
+    stop_flag = {"stop": False}
+
+    async def watch_incoming(q: asyncio.Queue):
+        while True:
+            msg = await ws.receive_json()
+            if msg.get("stop"):
+                stop_flag["stop"] = True
+                while not q.empty():          # barge-in kills queued sentences too
+                    q.get_nowait()
+            elif msg.get("text"):
+                stop_flag["stop"] = False
+                await q.put(msg["text"])
+
+    q: asyncio.Queue = asyncio.Queue()
+    watcher = asyncio.create_task(watch_incoming(q))
+    try:
+        while True:
+            text = await q.get()
+            try:
+                async for chunk in _voice.synthesize_stream(text):
+                    if stop_flag["stop"]:
+                        break
+                    await ws.send_bytes(chunk)
+                await ws.send_json({"done": True, "stopped": stop_flag["stop"]})
+            except Exception as e:
+                await ws.send_json({"error": str(e)[:200]})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        watcher.cancel()
 
 
 # ===== AGENTIC OS CAPABILITIES (v1) =====
