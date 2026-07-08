@@ -1518,7 +1518,9 @@ code, pre, .mono { font-family: var(--font-mono); }
 }
 .jv2-btn:hover { color:var(--text); border-color:var(--accent); }
 .jv2-btn.active { color:var(--accent-2); border-color:var(--accent-2); box-shadow:0 0 10px rgba(94,234,212,.3); }
-.jv2-chat { position:relative; z-index:2; margin-top:auto; display:flex; flex-direction:column; padding:0 14px 14px; max-height:74%; }
+.jv2-chat { position:relative; z-index:2; margin-top:auto; display:flex; flex-direction:column; padding:0 14px 14px; max-height:74%; transition:opacity .45s; }
+/* memory-galaxy mode: the chat melts away so the galaxy can be navigated/edited */
+.jv2-stage.galaxy-on .jv2-chat { opacity:0; pointer-events:none; }
 .jv2-feed { overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:10px 4px; user-select:text; }
 .jv2-feed .j-msg { position:relative; background:rgba(10,10,20,.74); backdrop-filter:blur(9px); max-width:72%; }
 .jv2-feed .j-msg.you { align-self:flex-end; }

@@ -6048,6 +6048,7 @@ function renderJarvisView() {
           <button class="jv2-btn" id="jCamBtn" title="Share webcam — JARVIS sees and remembers frames">🎥 Cam</button>
           <button class="jv2-btn" id="jScreenBtn" title="Share screen — JARVIS sees and remembers frames">🖥 Screen</button>
           <button class="jv2-btn" id="jVisMemBtn" title="Search everything JARVIS has seen">👁 Memory</button>
+          <button class="jv2-btn" id="jGalaxyBtn" title="Fly into the memory galaxy — orbit, inspect and edit memories">🧠 Memory</button>
           <button class="jv2-btn" id="jImagineBtn" title="Generate an image (local SDXL)">🎨 Imagine</button>
           <button class="jv2-btn" id="jBriefBtn" title="Status briefing">📋 Brief</button>
           <button class="jv2-btn" id="jVoiceBtn" title="Voice replies on/off">${jarvisState.voiceOn ? '🔊' : '🔇'}</button>
@@ -6080,7 +6081,8 @@ function renderJarvisView() {
   jarvisLoadSessions();
   jarvisLoadFiles();
   if (window.Jarvis3D) {
-    window.Jarvis3D.mount($('#jStage'));
+    // the galaxy inside the JARVIS scene is editable, like the Memory tab's map
+    window.Jarvis3D.mount($('#jStage'), { onMemorySelect: openMemoryNodeModal });
     window.Jarvis3D.setAnimations(jarvisState.fxOn);
   }
   if (jarvisState.messages.length) jarvisRenderFeed();
@@ -6139,6 +6141,13 @@ function jarvisBindControls() {
   $('#jCamBtn').addEventListener('click', () => jarvisCaptureToggle('webcam'));
   $('#jScreenBtn').addEventListener('click', () => jarvisCaptureToggle('screen'));
   $('#jVisMemBtn').addEventListener('click', () => jarvisVisionSearchModal(''));
+  $('#jGalaxyBtn').addEventListener('click', () => {
+    if (!window.Jarvis3D || !window.Jarvis3D.toggleGalaxy) return;
+    const on = window.Jarvis3D.toggleGalaxy();
+    $('#jStage').classList.toggle('galaxy-on', on);
+    $('#jGalaxyBtn').classList.toggle('active', on);
+    $('#jGalaxyBtn').textContent = on ? '↩ JARVIS' : '🧠 Memory';
+  });
   $('#jImagineBtn').addEventListener('click', () => {
     const q = prompt('Describe the image JARVIS should create:');
     if (q) jarvisImagine(q);

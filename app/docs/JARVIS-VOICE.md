@@ -20,6 +20,23 @@ dormant). The v2 stack:
   torso is GONE: the bust is anchored at the frame BOTTOM (crown y=1.5) so
   the scan's open neck/shoulder cut stays below the visible edge.
   NOTE: the GLB faces +z as authored — do NOT "fix" its orientation.
+- **Memory galaxy in the JARVIS scene (v10, 2026-07-08)** — the old node
+  streams/pulse sprites are GONE. jarvis3d.js now embeds the Memory tab's
+  real 3D map (`/api/memory3d`: PCA positions, similarity links, identity
+  hues, region callouts, ambient electric pulses) at **10× node spacing**
+  in a slowly spinning group (the tab's auto-orbit rate) at z≈-2600 —
+  between the bust and the static memory-matrix backdrop (the same scatter,
+  pushed to z≈-5200). **100 links** run from the back of the skull to the
+  100 most-linked ("most used") nodes, endpoint-tracked every frame.
+  Signals: idle = a thin inbound trickle; **thinking** = rapid amber pulses
+  between the avatar-connected nodes; **leaving thinking** (the answer is
+  forming) = a 2.4s flood of signals from the galaxy into the head
+  (`setMode` triggers it). The topbar **🧠 Memory** button calls
+  `Jarvis3D.toggleGalaxy()`: the camera flies THROUGH the bust into the
+  galaxy (chat overlay fades via `.jv2-stage.galaxy-on`), then drag-orbit /
+  scroll-zoom / hover panel / click-to-edit (`onMemorySelect` →
+  `openMemoryNodeModal`, the same editor as the Memory tab). Only events
+  targeting the canvas navigate — toolbar clicks never open stars.
   Historical (superseded) approach below:
 - ~~Avatar~~ = `static/jarvis3d.js`: a Three.js POINT-CLOUD HEAD sampled from
   `static/avatar/reference.jpg` (contrast-stretched luminance + edge boost →
