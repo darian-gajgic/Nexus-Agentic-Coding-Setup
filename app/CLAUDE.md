@@ -94,6 +94,14 @@ Key points (current architecture):
 - **Runtime gate — Block 2 UI (Playwright):** `.venv/bin/python scripts/verify_block2_ui.py` —
   review modal (gutters, highlight spans, unified⇄split toggle, line-comment composer,
   retry-with-feedback button), memory modal confirm-gating, Create-PR button. 21 checks.
+- **Runtime gate — Onboarding (SPEC-ONBOARDING):** `.venv/bin/python scripts/verify_onboarding_e2e.py` —
+  37-slot schema + explanations, per-user answers (save/resume/un-answer/isolation), apply
+  renders + git-commits (dirty-tree snapshot first), owner→canonical vs member→overlay,
+  per-user framing paths. 27 checks; runs on a scratch knowledge root (settings
+  onboarding.root, restored), owner's real answers backed up.
+- **Runtime gate — Onboarding UI (Playwright):** `.venv/bin/python scripts/verify_onboarding_ui.py` —
+  CTA banner, welcome step, section explanations, auto-save on Next, n/a toggle, review
+  counts, confirm-gated apply → success, Settings entry. 12 checks.
 - **Per-edit gate:** `.claude/check.sh` (auto-run by Claude Code PostToolUse on Write|Edit).
 - Playwright is installed in `.venv`. Screenshots save to `~/.hermes/cache/screenshots/`.
 

@@ -470,6 +470,22 @@ def _repo_context(task: dict) -> dict | None:
             "code_map": _code_map(info["worktree_path"])}
 
 
+def _knowledge_paths(task: dict) -> dict:
+    """SPEC-ONBOARDING R2.3: the Business-Brain context/voice paths for THIS
+    task's owner — a non-owner user with a completed personal onboarding gets
+    their overlay; everyone else (and every legacy task) gets the canonical
+    files. PLAYBOOK/RUBRIC stay shared (craft, not identity)."""
+    root = Path(db.get_setting("onboarding.root", "") or os.path.expanduser("~/knowledge"))
+    uid = (task.get("user_id") or "").strip()
+    if uid and uid != "u_owner":
+        d = root / "users" / uid
+        if (d / "BUSINESS-CONTEXT.md").is_file() and (d / "STYLE-VOICE.md").is_file():
+            return {"context": str(d / "BUSINESS-CONTEXT.md"),
+                    "style": str(d / "STYLE-VOICE.md")}
+    return {"context": str(root / "BUSINESS-CONTEXT.md"),
+            "style": str(root / "STYLE-VOICE.md")}
+
+
 def _attachment_lines(task: dict, workspace: Path) -> list[str]:
     """Operator-attached input files: the task's own + its project's."""
     dirs = [workspace / "attachments"]
@@ -552,10 +568,13 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
               "(pypdf, python-docx, openpyxl, python-pptx).")
     domain = (task.get("domain") or "").strip()
     if domain and domain != "general":
+        kp = _knowledge_paths(task)
         parts.append(
             f"This is a business deliverable in the '{domain}' domain. Follow the Business Brain "
-            "knowledge protocol: read ~/knowledge/BUSINESS-CONTEXT.md, ~/knowledge/STYLE-VOICE.md "
-            f"and ~/knowledge/domains/{domain}/PLAYBOOK.md before working; self-score the result "
+            f"knowledge protocol: read {kp['context']}, {kp['style']} "
+            f"and ~/knowledge/domains/{domain}/PLAYBOOK.md before working (those first two files "
+            "are THIS task owner's business context and voice — use exactly these paths even if "
+            "a specialist definition names other defaults); self-score the result "
             f"against ~/knowledge/domains/{domain}/RUBRIC.md and state the score in one line; end "
             "with a '**Learn:**' section of up to 3 bullets."
         )
