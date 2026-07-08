@@ -220,7 +220,11 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   endpoints `GET/POST/DELETE /api/{tasks|workflows}/{id}/attachments(/{name})`. Dispatch
   framing lists them as MUST-READ input; extraction + binary OUTPUT formats (pdf, docx,
   xlsx, pptx, png) run through the nexus `.venv` python, which has python-docx, openpyxl,
-  python-pptx, reportlab, pypdf, pillow, markdown preinstalled.
+  python-pptx, reportlab, pypdf, pillow, markdown preinstalled. Since 2026-07-08 the
+  project modal has an "Attach to" target picker (project-wide vs ONE member task) with
+  per-task placement groups, every upload spot takes multi-file + drag & drop
+  (`attachWire`/`attachUploadFiles` in app.js), and the task modal shows inherited
+  project-wide files read-only.
 - **Task wizard** (v3): `POST /api/tasks/wizard {instruction, answers?}` — two-phase.
   Phase 1 may return `{type:"questions"}` (ONE round, ≤6 — ask-when-in-doubt; each option carries pros/cons + a ★ recommended best-practice pick; unknowns that change the
   plan's SHAPE — stack/platform, acceptance criteria, real-money blast radius; every
