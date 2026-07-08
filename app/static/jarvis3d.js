@@ -16,14 +16,23 @@
    - per-point lighting (key lambert + fill + rim) is baked from real
      surface normals; hair/beard/brows darken the right regions.
 
-   Same public API + galaxy + node streams as before:
-   window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations }
+   Scene layers, front to back (v10): bust (z≈0, anchored at the frame
+   bottom) → the REAL memory galaxy (the memory-tab map at 10× node spacing,
+   slowly spinning, z≈-1600) → the static memory matrix backdrop (z≈-3800).
+   100 links run from the back of the skull to the 100 most-linked memory
+   nodes; electric signals ride them (rapid inter-node traffic while
+   thinking, a flood into the head when the answer starts). toggleGalaxy()
+   flies the camera through the bust into the galaxy for orbit / hover /
+   click-to-edit (onMemorySelect), like the Memory tab's 3D map.
+
+   window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations, toggleGalaxy }
    Lazy CDN three.js import — the string "three" never appears in index.html
    (verify.sh gate). Lip-sync: mouth-band points (exact by construction)
    displaced by setLevel; eye-band points blink. */
 
 let THREE = null;
 let threePromise = null;
+let _tmpV = null;   // scratch Vector3 (allocated once THREE is loaded)
 
 function loadThree() {
   if (!threePromise) {
@@ -36,12 +45,24 @@ function loadThree() {
 
 const J = {
   renderer: null, scene: null, camera: null, raf: null, container: null,
-  head: null, headGroup: null, headGeo: null, occluders: [], galaxy: null, streams: [],
-  pulses: [], glints: [], mouthIdx: [], eyeIdx: [], basePos: null,
+  head: null, headGroup: null, headGeo: null, occluders: [],
+  glints: [], mouthIdx: [], eyeIdx: [], basePos: null,
   baseB: null, baseW: null, mouthY: [0, 1], level: 0, mode: 'idle', t: 0,
   animOn: true, disposed: false, resizeObs: null,
   pointer: { x: 0, y: 0 }, pointerHandler: null,
+  // memory galaxy + static matrix + camera modes
+  mem: emptyMem(), matrix: null, galaxyMode: false, fly: null,
+  gCam: { theta: Math.PI / 2, phi: 1.35, dist: 700 }, lookCur: null,
+  onMemorySelect: null, drag: null, downAt: null,
+  downHandler: null, upHandler: null, wheelHandler: null,
 };
+
+function emptyMem() {
+  return { group: null, data: null, nodeColor: null, cores: null, glows: null,
+           linkLines: null, labels: [], pulses: [], thinkPulses: [], thinkPairs: [],
+           top: [], avatarLinks: null, avatarPulses: [], burst: 0, hover: -1,
+           marker: null, panel: null, hint: null };
+}
 
 const MODE_TINT = {
   idle:      [0.30, 0.85, 1.00],
@@ -374,10 +395,20 @@ function buildOccluders() {
   return meshes;
 }
 
-/* ═══════════════ galaxy + streams (unchanged aesthetics) ═══════════════ */
+/* ═══════ memory galaxy (the memory-tab 3D map, embedded) + matrix ═══════ */
 const CYAN_FAMILY = [0x22d3ee, 0x67e8f9, 0x0ea5b7];
 const DISTINCT_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6, 0xec4899,
-                       0x60a5fa, 0x2dd4bf, 0xfb7185, 0xfacc15, 0x34d399];
+                       0x60a5fa, 0x2dd4bf, 0xfb7185, 0xfacc15, 0x34d399,
+                       0xc084fc, 0xf97316];
+
+// world layout, front to back: bust (z≈0) → memory galaxy → static matrix.
+// The galaxy cloud spans ±1200 (tab ±120 × GALAXY_SCALE), so its center must
+// sit deep enough that the front edge stays FAR behind the bust.
+const GALAXY_CENTER = { x: 0, y: 30, z: -2600 };
+const GALAXY_SCALE = 10;     // 10× the memory-tab node spacing (operator ask)
+const GALAXY_SPIN = 0.0011;  // rad/frame — the tab's idle auto-orbit rate
+const MATRIX_CENTER = { x: 0, y: 30, z: -5200 };
+const TOP_N = 100;           // avatar ↔ the 100 most-linked memory nodes
 
 async function buildGalaxyData() {
   try {
@@ -399,67 +430,327 @@ async function buildGalaxyData() {
   return { nodes, groups: [] };
 }
 
-function mountGalaxy(data) {
+// identity hues, exactly as the memory tab assigns them (memory3d.js)
+function buildHueMapJ(data) {
+  const groups = data.groups || [];
+  const total = groups.reduce((s, g) => s + g.size, 0) || 1;
+  const hueByGroup = [];
+  let cyanShare = 0, ci = 0, di = 0;
+  groups.forEach((g, rank) => {
+    if (cyanShare < 0.20 && ci < CYAN_FAMILY.length) {
+      hueByGroup[rank] = CYAN_FAMILY[ci++];
+      cyanShare += g.size / total;
+    } else hueByGroup[rank] = DISTINCT_HUES[di++ % DISTINCT_HUES.length];
+  });
+  const tally = {};
+  (data.nodes || []).forEach((n) => {
+    if (n.cluster == null) return;
+    (tally[n.cluster] = tally[n.cluster] || {})[n.group] =
+      (tally[n.cluster]?.[n.group] || 0) + 1;
+  });
+  const hueByCluster = {};
+  Object.entries(tally).forEach(([cid, byGroup]) => {
+    const top = Object.entries(byGroup).sort((a, b) => b[1] - a[1])[0];
+    hueByCluster[cid] = hueByGroup[+top[0]] ?? CYAN_FAMILY[0];
+  });
+  return { hueByGroup, hueByCluster };
+}
+
+// region callout in the memory-tab style, scaled for the ×10 galaxy.
+// depthTest ON (unlike the tab): the bust occluder must be able to hide it.
+function memLabel(text, sub, hex) {
+  const c = document.createElement('canvas');
+  const g = c.getContext('2d');
+  const label = String(text).toUpperCase();
+  g.font = '700 26px "JetBrains Mono", monospace';
+  const w = Math.max(140, Math.ceil(g.measureText(label).width) + 46);
+  c.width = w;
+  c.height = 92;
+  const col = '#' + (hex || 0xa3e635).toString(16).padStart(6, '0');
+  g.font = '700 26px "JetBrains Mono", monospace';
+  g.textAlign = 'left';
+  g.shadowColor = col;
+  g.shadowBlur = 12;
+  g.fillStyle = col;
+  g.fillText(label, 34, 34);
+  g.shadowBlur = 0;
+  g.strokeStyle = col;
+  g.globalAlpha = 0.85;
+  g.lineWidth = 2.5;
+  g.beginPath();
+  g.moveTo(6, 66); g.lineTo(26, 44); g.lineTo(w - 8, 44);
+  g.stroke();
+  g.globalAlpha = 1;
+  g.font = '500 19px "JetBrains Mono", monospace';
+  g.fillStyle = 'rgba(168,168,200,.9)';
+  g.fillText(sub, 34, 88);
+  const tex = new THREE.CanvasTexture(c);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, opacity: 0.9, depthWrite: false }));
+  s.scale.set(c.width / 1.6, c.height / 1.6, 1);
+  s.center.set(0.06, 0.28);
+  return s;
+}
+
+// the far backdrop: the same memory scatter, pushed deep — a static matrix
+function buildMatrix(data) {
   const nodes = data.nodes || [];
+  if (!nodes.length) return;
   const pos = new Float32Array(nodes.length * 3);
   const col = new Float32Array(nodes.length * 3);
-  const centers = {}, ccount = {};
   const color = new THREE.Color();
   nodes.forEach((n, i) => {
-    const gx = (n.x || 0) * 1.7, gy = (n.y || 0) * 1.25 + 8, gz = -150 + (n.z || 0) * 1.3;
-    pos[i * 3] = gx; pos[i * 3 + 1] = gy; pos[i * 3 + 2] = gz;
+    pos[i * 3] = (n.x || 0) * 14;
+    pos[i * 3 + 1] = (n.y || 0) * 10;
+    pos[i * 3 + 2] = (n.z || 0) * 8;
     const grp = n.group || 0;
-    const hex = grp < 2 ? CYAN_FAMILY[grp % CYAN_FAMILY.length]
-                        : DISTINCT_HUES[grp % DISTINCT_HUES.length];
-    color.setHex(hex);
+    color.setHex(grp < 2 ? CYAN_FAMILY[grp % CYAN_FAMILY.length]
+                         : DISTINCT_HUES[grp % DISTINCT_HUES.length]);
     col[i * 3] = color.r; col[i * 3 + 1] = color.g; col[i * 3 + 2] = color.b;
-    const key = n.cluster != null ? n.cluster : grp;
-    (centers[key] = centers[key] || [0, 0, 0])[0] += gx;
-    centers[key][1] += gy; centers[key][2] += gz;
-    ccount[key] = (ccount[key] || 0) + 1;
   });
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  J.galaxy = new THREE.Points(geo, new THREE.PointsMaterial({
-    size: 3.6, map: glowTexture(), vertexColors: true, transparent: true,
-    opacity: 1.0, depthWrite: false, blending: THREE.AdditiveBlending,
+  J.matrix = new THREE.Group();
+  J.matrix.position.set(MATRIX_CENTER.x, MATRIX_CENTER.y, MATRIX_CENTER.z);
+  J.matrix.add(new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 44, map: glowTexture(), vertexColors: true, transparent: true,
+    opacity: 0.8, depthWrite: false, blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
-  }));
-  J.scene.add(J.galaxy);
-  return Object.entries(centers).map(([k, s]) => new THREE.Vector3(
-    s[0] / ccount[k], s[1] / ccount[k], s[2] / ccount[k]));
+  })));
+  J.scene.add(J.matrix);
 }
 
-function mountStreams(clusterCenters) {
-  const targets = clusterCenters.length ? clusterCenters : [new THREE.Vector3(0, 10, -170)];
-  const N = Math.min(16, Math.max(8, targets.length * 2));
-  for (let i = 0; i < N; i++) {
-    const tgt = targets[i % targets.length];
-    const a = (i / N) * Math.PI * 2;
-    // starts hug the bust, which is anchored at the frame bottom (crown y≈1.5)
-    const start = new THREE.Vector3(Math.cos(a) * 8, -10 + Math.sin(a * 2) * 7, -9 - Math.random() * 4);
-    const mid1 = new THREE.Vector3(start.x * 3.2, start.y * 0.5 + 10, -46 - Math.random() * 22);
-    const mid2 = new THREE.Vector3(tgt.x * 0.55 + (Math.random() - .5) * 24,
-                                   tgt.y * 0.7 + (Math.random() - .5) * 18, -110);
-    const curve = new THREE.CatmullRomCurve3([start, mid1, mid2, tgt]);
-    const geo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(48));
-    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
-      color: 0x22d3ee, transparent: true, opacity: 0.28,
-      blending: THREE.AdditiveBlending, depthWrite: false,
-    }));
-    J.scene.add(line);
-    J.streams.push({ curve, line });
-    for (let p = 0; p < 2; p++) {
-      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: glowTexture(), color: 0x67e8f9, transparent: true,
-        opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false,
-      }));
-      sp.scale.set(2.6, 2.6, 1);
-      J.scene.add(sp);
-      J.pulses.push({ sprite: sp, curve, t: Math.random(), speed: 0.04 + Math.random() * 0.05 });
+function buildMemoryGalaxy(data) {
+  const nodes = data.nodes || [], links = data.links || [];
+  if (!nodes.length) return;
+  const { hueByGroup, hueByCluster } = buildHueMapJ(data);
+  const mem = J.mem;
+  const S = GALAXY_SCALE;
+  mem.data = data;
+  mem.nodeColor = (n) => (hueByGroup && hueByGroup[n.group]) ?? CYAN_FAMILY[0];
+  mem.group = new THREE.Group();
+  mem.group.position.set(GALAXY_CENTER.x, GALAXY_CENTER.y, GALAXY_CENTER.z);
+  J.scene.add(mem.group);
+
+  // node cores + additive glow layer (two Points clouds — node size stays at
+  // tab scale so the ×10 spread reads as real distance between memories)
+  const cp = [], cc = [];
+  nodes.forEach((n) => {
+    const c = new THREE.Color(mem.nodeColor(n));
+    cp.push(n.x * S, n.y * S, n.z * S);
+    cc.push(c.r, c.g, c.b);
+  });
+  const coreGeo = new THREE.BufferGeometry();
+  coreGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(cp), 3));
+  coreGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(cc), 3));
+  mem.cores = new THREE.Points(coreGeo, new THREE.PointsMaterial({
+    map: glowTexture(), size: 4, vertexColors: true, transparent: true,
+    opacity: 0.95, depthWrite: false, sizeAttenuation: true }));
+  mem.group.add(mem.cores);
+  const glowGeo = new THREE.BufferGeometry();
+  glowGeo.setAttribute('position', coreGeo.getAttribute('position'));
+  glowGeo.setAttribute('color', coreGeo.getAttribute('color'));
+  mem.glows = new THREE.Points(glowGeo, new THREE.PointsMaterial({
+    map: glowTexture(), size: 34, vertexColors: true, transparent: true,
+    opacity: 0.75, blending: THREE.AdditiveBlending, depthWrite: false,
+    sizeAttenuation: true }));
+  mem.group.add(mem.glows);
+
+  // hair-thin similarity web, endpoint-tinted, brightness = real similarity
+  if (links.length) {
+    const lp = [], lc = [];
+    links.forEach((ln) => {
+      const a = nodes[ln.a], b = nodes[ln.b];
+      const t = 0.35 + 0.65 * Math.min(1, Math.max(0, (ln.s - 0.45) / 0.5));
+      const ca = new THREE.Color(mem.nodeColor(a)).multiplyScalar(t);
+      const cb = new THREE.Color(mem.nodeColor(b)).multiplyScalar(t);
+      lp.push(a.x * S, a.y * S, a.z * S, b.x * S, b.y * S, b.z * S);
+      lc.push(ca.r, ca.g, ca.b, cb.r, cb.g, cb.b);
+    });
+    const linkGeo = new THREE.BufferGeometry();
+    linkGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(lp), 3));
+    linkGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(lc), 3));
+    mem.linkLines = new THREE.LineSegments(linkGeo, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0.30,
+      blending: THREE.AdditiveBlending, depthWrite: false }));
+    mem.group.add(mem.linkLines);
+  }
+
+  // semantic region callouts
+  (data.clusters || []).forEach((cl) => {
+    const s = memLabel(cl.label, `${cl.size} memories`,
+                       (hueByCluster && hueByCluster[cl.id]) ?? CYAN_FAMILY[0]);
+    s.position.set(cl.x * S, cl.y * S + 70, cl.z * S);
+    mem.group.add(s);
+    mem.labels.push(s);
+  });
+
+  // ambient electrical pulses along the links (the tab's signature motion)
+  if (links.length) {
+    const pulseGeo = new THREE.SphereGeometry(4, 8, 8);
+    const n = Math.min(46, Math.max(10, Math.floor(links.length / 4)));
+    for (let i = 0; i < n; i++) {
+      const p = new THREE.Mesh(pulseGeo, new THREE.MeshBasicMaterial({
+        color: 0x9df5ff, transparent: true, opacity: 0.9,
+        blending: THREE.AdditiveBlending, depthWrite: false }));
+      const link = links[Math.floor(Math.random() * links.length)];
+      p.userData = { link, t: Math.random(), speed: 0.15 + link.s * 0.5 };
+      mem.group.add(p);
+      mem.pulses.push(p);
     }
   }
+
+  // the avatar's memory taps: the TOP_N most-linked ("most used") nodes
+  mem.top = nodes.map((_, i) => i)
+    .sort((a, b) => (nodes[b].degree || 0) - (nodes[a].degree || 0))
+    .slice(0, TOP_N);
+  const topSet = new Set(mem.top);
+
+  // think-traffic paths: real links with BOTH ends avatar-connected, topped
+  // up with links touching one end, else direct node↔node paths
+  mem.thinkPairs = links.filter((l) => topSet.has(l.a) && topSet.has(l.b));
+  if (mem.thinkPairs.length < 40) {
+    mem.thinkPairs = mem.thinkPairs.concat(
+      links.filter((l) => topSet.has(l.a) !== topSet.has(l.b)));
+  }
+  if (!mem.thinkPairs.length && mem.top.length > 1) {
+    for (let i = 0; i < 60; i++) {
+      const a = mem.top[Math.floor(Math.random() * mem.top.length)];
+      const b = mem.top[Math.floor(Math.random() * mem.top.length)];
+      if (a !== b) mem.thinkPairs.push({ a, b, s: 0.6 });
+    }
+  }
+  if (mem.thinkPairs.length) {
+    const thinkGeo = new THREE.SphereGeometry(8, 8, 8);
+    for (let i = 0; i < 40; i++) {
+      const p = new THREE.Mesh(thinkGeo, new THREE.MeshBasicMaterial({
+        color: 0xffd28a, transparent: true, opacity: 0,   // thinking amber
+        blending: THREE.AdditiveBlending, depthWrite: false }));
+      const link = mem.thinkPairs[Math.floor(Math.random() * mem.thinkPairs.length)];
+      p.userData = { link, t: Math.random(), speed: 1.2 + Math.random() * 1.4 };
+      p.visible = false;
+      mem.group.add(p);
+      mem.thinkPulses.push(p);
+    }
+  }
+
+  // hover marker (galaxy mode): one bright sprite snapped to the picked star
+  mem.marker = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTexture(), color: 0xffffff, transparent: true, opacity: 0.95,
+    blending: THREE.AdditiveBlending, depthWrite: false }));
+  mem.marker.scale.set(44, 44, 1);
+  mem.marker.visible = false;
+  mem.group.add(mem.marker);
+
+  // 100 links: back of the skull → the top nodes (endpoints track per frame)
+  if (mem.top.length) {
+    const nT = mem.top.length;
+    const apos = new Float32Array(nT * 6);
+    const acol = new Float32Array(nT * 6);
+    mem.top.forEach((ni, k) => {
+      const c = new THREE.Color(mem.nodeColor(nodes[ni])).multiplyScalar(0.85);
+      acol[k * 6] = 0.14; acol[k * 6 + 1] = 0.50; acol[k * 6 + 2] = 0.62; // dim cyan at the head
+      acol[k * 6 + 3] = c.r; acol[k * 6 + 4] = c.g; acol[k * 6 + 5] = c.b;
+    });
+    const aGeo = new THREE.BufferGeometry();
+    aGeo.setAttribute('position', new THREE.BufferAttribute(apos, 3));
+    aGeo.setAttribute('color', new THREE.BufferAttribute(acol, 3));
+    mem.avatarLinks = new THREE.LineSegments(aGeo, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0.10,
+      blending: THREE.AdditiveBlending, depthWrite: false }));
+    mem.avatarLinks.frustumCulled = false; // endpoints rewritten every frame
+    J.scene.add(mem.avatarLinks);
+
+    // pooled signals riding those links into the head (idle trickle → flood)
+    for (let i = 0; i < 80; i++) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glowTexture(), color: 0x9df5ff, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false }));
+      sp.scale.set(10, 10, 1);
+      sp.visible = false;
+      sp.userData = { k: mem.top[i % nT], t: Math.random(), speed: 0.1 };
+      J.scene.add(sp);
+      mem.avatarPulses.push(sp);
+    }
+  }
+}
+
+/* ═══════════ galaxy mode: camera, hover picking, edit panel ═══════════ */
+function galaxyCamPos(out) {
+  const c = J.gCam;
+  c.phi = Math.max(0.15, Math.min(Math.PI - 0.15, c.phi));
+  c.dist = Math.max(150, Math.min(4500, c.dist));
+  return out.set(
+    GALAXY_CENTER.x + c.dist * Math.sin(c.phi) * Math.cos(c.theta),
+    GALAXY_CENTER.y + c.dist * Math.cos(c.phi),
+    GALAXY_CENTER.z + c.dist * Math.sin(c.phi) * Math.sin(c.theta));
+}
+
+function escJ(s) {
+  return String(s).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function memPanelHTML(n) {
+  const by = n.by === 'user' ? ['OPERATOR', '#5eead4'] : ['AGENT', '#7c5cff'];
+  const when = n.created_at ? String(n.created_at).replace('T', ' ').slice(0, 19) : '—';
+  return `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="width:9px;height:9px;border-radius:50%;background:${by[1]};box-shadow:0 0 8px ${by[1]}"></span>
+      <span style="font-family:var(--font-mono);font-size:10.5px;letter-spacing:.14em;color:${by[1]}">${by[0]} MEMORY</span>
+      <span style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--text-dim)">${n.degree || 0} link${n.degree === 1 ? '' : 's'}</span>
+    </div>
+    <div style="font-size:13px;line-height:1.5;color:var(--text);margin-bottom:10px;max-height:150px;overflow:hidden">${escJ(n.text || '—')}</div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim)">${escJ(n.agent || '—')} · ${escJ(n.channel || '—')} · ${escJ(when)}${n.id ? ' · click to edit' : ''}</div>`;
+}
+
+function setMemHover(idx) {
+  const mem = J.mem;
+  if (idx === mem.hover) return;
+  mem.hover = idx;
+  if (!mem.marker) return;
+  if (idx < 0) {
+    mem.marker.visible = false;
+    if (mem.panel) mem.panel.style.opacity = '0';
+    if (J.container) J.container.style.cursor = J.galaxyMode ? 'grab' : '';
+    return;
+  }
+  const n = mem.data.nodes[idx];
+  mem.marker.visible = true;
+  mem.marker.position.set(n.x * GALAXY_SCALE, n.y * GALAXY_SCALE, n.z * GALAXY_SCALE);
+  mem.marker.material.color = new THREE.Color(mem.nodeColor(n));
+  if (mem.panel) { mem.panel.innerHTML = memPanelHTML(n); mem.panel.style.opacity = '1'; }
+  if (J.container) J.container.style.cursor = 'pointer';
+}
+
+// fly the camera through the bust into the galaxy (and back). Returns the
+// new state so the app layer can swap the chat overlay in/out.
+function toggleGalaxy() {
+  if (!J.camera || !J.mem.group) return false;
+  const entering = !J.galaxyMode;
+  J.galaxyMode = entering;
+  const toPos = new THREE.Vector3();
+  const toLook = new THREE.Vector3();
+  if (entering) {
+    galaxyCamPos(toPos);
+    toLook.set(GALAXY_CENTER.x, GALAXY_CENTER.y, GALAXY_CENTER.z);
+  } else {
+    toPos.set(0, 4, 88);
+    toLook.set(0, 4, 0);
+  }
+  J.fly = {
+    t: 0, dur: entering ? 2.6 : 1.8,
+    fromPos: J.camera.position.clone(),
+    fromLook: (J.lookCur || new THREE.Vector3(0, 4, 0)).clone(),
+    via: new THREE.Vector3(0, -25, -250),   // dip through the bust
+    toPos, toLook,
+  };
+  setMemHover(-1);
+  J.drag = null; J.downAt = null;
+  if (J.mem.hint) J.mem.hint.style.display = entering ? 'block' : 'none';
+  if (J.container) J.container.style.cursor = entering ? 'grab' : '';
+  return entering;
 }
 
 /* ═══════════════ frame loop ═══════════════ */
@@ -472,11 +763,33 @@ function tick() {
   const tint = MODE_TINT[J.mode] || MODE_TINT.idle;
 
   if (J.camera) {
-    const ox = Math.sin(t * 0.13) * 6 + J.pointer.x * 7;
-    const oy = 4 + Math.sin(t * 0.081) * 2.5 - J.pointer.y * 4;
-    J.camera.position.x += (ox - J.camera.position.x) * 0.03;
-    J.camera.position.y += (oy - J.camera.position.y) * 0.03;
-    J.camera.lookAt(0, 4, 0);
+    if (J.fly) {
+      // quadratic bezier dipped through the bust — the camera pierces the
+      // particle head on its way into (or out of) the galaxy
+      J.fly.t += dt / J.fly.dur;
+      const k = Math.min(1, J.fly.t);
+      const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+      const q = 1 - e;
+      const A = J.fly.fromPos, B = J.fly.via, C = J.fly.toPos;
+      J.camera.position.set(
+        q * q * A.x + 2 * q * e * B.x + e * e * C.x,
+        q * q * A.y + 2 * q * e * B.y + e * e * C.y,
+        q * q * A.z + 2 * q * e * B.z + e * e * C.z);
+      J.lookCur.lerpVectors(J.fly.fromLook, J.fly.toLook, e);
+      J.camera.lookAt(J.lookCur);
+      if (k >= 1) J.fly = null;
+    } else if (J.galaxyMode) {
+      galaxyCamPos(J.camera.position);
+      J.lookCur.set(GALAXY_CENTER.x, GALAXY_CENTER.y, GALAXY_CENTER.z);
+      J.camera.lookAt(J.lookCur);
+    } else {
+      const ox = Math.sin(t * 0.13) * 6 + J.pointer.x * 7;
+      const oy = 4 + Math.sin(t * 0.081) * 2.5 - J.pointer.y * 4;
+      J.camera.position.x += (ox - J.camera.position.x) * 0.03;
+      J.camera.position.y += (oy - J.camera.position.y) * 0.03;
+      J.lookCur.set(0, 4, 0);
+      J.camera.lookAt(0, 4, 0);
+    }
   }
 
   if (J.head && J.headGroup) {
@@ -519,31 +832,141 @@ function tick() {
       + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.05 : 0);
   }
 
-  if (J.galaxy) J.galaxy.rotation.y = Math.sin(t * 0.05) * 0.12;
-  const speedMul = J.mode === 'thinking' ? 3.2 : J.mode === 'talking' ? 1.7 : 1;
-  for (const p of J.pulses) {
-    p.t += p.speed * speedMul * dt * 2.2;
-    if (p.t > 1) p.t = 0;
-    p.sprite.position.copy(p.curve.getPoint(p.t));
-    p.sprite.material.opacity = 0.25 + 0.65 * Math.sin(p.t * Math.PI);
-  }
-  for (const s of J.streams) {
-    s.line.material.opacity = 0.10 + (J.mode === 'thinking' ? 0.14 : 0.05) * (0.6 + 0.4 * Math.sin(t * 2));
+  if (J.matrix) J.matrix.rotation.y = Math.sin(t * 0.02) * 0.03;
+
+  const mem = J.mem;
+  if (mem.group && mem.data) {
+    mem.group.rotation.y += GALAXY_SPIN;   // the tab's slow spin
+    const nodes = mem.data.nodes;
+    const S = GALAXY_SCALE;
+    const thinking = J.mode === 'thinking';
+
+    // ambient electrical signals along the similarity links
+    for (const p of mem.pulses) {
+      const u = p.userData;
+      u.t += u.speed * dt;
+      if (u.t >= 1) {
+        u.link = mem.data.links[Math.floor(Math.random() * mem.data.links.length)];
+        u.t = 0; u.speed = 0.15 + u.link.s * 0.5;
+      }
+      const a = nodes[u.link.a], b = nodes[u.link.b];
+      p.position.set((a.x + (b.x - a.x) * u.t) * S,
+                     (a.y + (b.y - a.y) * u.t) * S,
+                     (a.z + (b.z - a.z) * u.t) * S);
+      p.material.opacity = 0.35 + Math.sin(u.t * Math.PI) * 0.6;
+    }
+
+    // THINKING: rapid amber traffic between the avatar-connected nodes
+    for (const p of mem.thinkPulses) {
+      if (!thinking) { p.visible = false; continue; }
+      p.visible = true;
+      const u = p.userData;
+      u.t += u.speed * dt;
+      if (u.t >= 1) {
+        u.link = mem.thinkPairs[Math.floor(Math.random() * mem.thinkPairs.length)];
+        u.t = 0; u.speed = 1.2 + Math.random() * 1.4;
+      }
+      const a = nodes[u.link.a], b = nodes[u.link.b];
+      p.position.set((a.x + (b.x - a.x) * u.t) * S,
+                     (a.y + (b.y - a.y) * u.t) * S,
+                     (a.z + (b.z - a.z) * u.t) * S);
+      p.material.opacity = 0.5 + Math.sin(u.t * Math.PI) * 0.5;
+    }
+
+    if (mem.avatarLinks) {
+      // the 100 links follow the galaxy spin and the bust sway
+      const ry = mem.group.rotation.y, cry = Math.cos(ry), sry = Math.sin(ry);
+      const anchor = _tmpV.set(0, -8, -8);
+      if (J.headGroup) anchor.applyEuler(J.headGroup.rotation);
+      const ap = mem.avatarLinks.geometry.attributes.position.array;
+      const wOf = (ni, out) => {
+        const n = nodes[ni];
+        const lx = n.x * S, lz = n.z * S;
+        out[0] = GALAXY_CENTER.x + lx * cry + lz * sry;
+        out[1] = GALAXY_CENTER.y + n.y * S;
+        out[2] = GALAXY_CENTER.z - lx * sry + lz * cry;
+      };
+      const w = [0, 0, 0];
+      mem.top.forEach((ni, k) => {
+        wOf(ni, w);
+        ap[k * 6] = anchor.x; ap[k * 6 + 1] = anchor.y; ap[k * 6 + 2] = anchor.z;
+        ap[k * 6 + 3] = w[0]; ap[k * 6 + 4] = w[1]; ap[k * 6 + 5] = w[2];
+      });
+      mem.avatarLinks.geometry.attributes.position.needsUpdate = true;
+      mem.avatarLinks.material.opacity +=
+        ((thinking ? 0.22 : 0.10) - mem.avatarLinks.material.opacity) * 0.06;
+
+      // inbound signals: idle trickle → flood while the answer forms
+      if (mem.burst > 0) mem.burst -= dt;
+      const want = mem.burst > 0 ? 80 : J.mode === 'talking' ? 16 : 6;
+      mem.avatarPulses.forEach((sp, i) => {
+        const u = sp.userData;
+        const on = i < want;
+        if (!sp.visible) {
+          if (!on) return;
+          sp.visible = true;
+          u.t = Math.random() * 0.35;
+          u.k = mem.top[Math.floor(Math.random() * mem.top.length)];
+        }
+        u.speed = mem.burst > 0 ? 0.9 + (i % 7) * 0.12 : 0.10 + (i % 5) * 0.02;
+        u.t += u.speed * dt;
+        if (u.t >= 1) {
+          if (!on) { sp.visible = false; return; }
+          u.t = 0;
+          u.k = mem.top[Math.floor(Math.random() * mem.top.length)];
+        }
+        wOf(u.k, w);
+        sp.position.set(w[0] + (anchor.x - w[0]) * u.t,
+                        w[1] + (anchor.y - w[1]) * u.t,
+                        w[2] + (anchor.z - w[2]) * u.t);
+        sp.material.opacity = (mem.burst > 0 ? 0.95 : 0.5)
+          * (0.4 + 0.6 * Math.sin(u.t * Math.PI));
+      });
+    }
+
+    // galaxy mode: screen-space nearest-star picking (geometric raycasts
+    // miss sub-pixel star points — same approach as the memory tab)
+    if (J.galaxyMode && !J.fly && J.pointer && J.container) {
+      const cw = J.container.clientWidth, ch = J.container.clientHeight;
+      const px = (J.pointer.x + 1) / 2 * cw, py = (J.pointer.y + 1) / 2 * ch;
+      let best = -1, bestD = 16 * 16;
+      mem.group.updateMatrixWorld();
+      const mw = mem.group.matrixWorld;
+      for (let i = 0; i < nodes.length; i++) {
+        _tmpV.set(nodes[i].x * S, nodes[i].y * S, nodes[i].z * S)
+          .applyMatrix4(mw).project(J.camera);
+        if (_tmpV.z > 1) continue;
+        const dx = (_tmpV.x + 1) / 2 * cw - px, dy = (1 - _tmpV.y) / 2 * ch - py;
+        const d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      setMemHover(best);
+    } else if (mem.hover >= 0) {
+      setMemHover(-1);
+    }
   }
 
   J.renderer.render(J.scene, J.camera);
 }
 
 /* ═══════════════ public API ═══════════════ */
-async function mount(container) {
+async function mount(container, opts) {
   const three = await loadThree();
   if (!three || !container || J.renderer) return;
   J.disposed = false;
   J.container = container;
+  J.onMemorySelect = (opts && opts.onMemorySelect) || null;
+  J.lookCur = new THREE.Vector3(0, 4, 0);
+  J.galaxyMode = false;
+  J.fly = null;
+  // dist 1400 vs the ±1200 cloud ≈ the tab's default framing at 10× scale
+  J.gCam = { theta: Math.PI / 2, phi: 1.35, dist: 1400 };
+  _tmpV = new THREE.Vector3();
   const w = container.clientWidth || 800, h = container.clientHeight || 600;
   J.scene = new THREE.Scene();
-  J.scene.fog = new THREE.FogExp2(0x05050c, 0.0028);
-  J.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 600);
+  // fog light enough that the galaxy (~1600) and matrix (~3800) stay visible
+  J.scene.fog = new THREE.FogExp2(0x05050c, 0.00016);
+  J.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 9000);
   J.camera.position.set(0, 4, 88);
   J.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   J.renderer.setSize(w, h);
@@ -555,8 +978,55 @@ async function mount(container) {
     const r = container.getBoundingClientRect();
     J.pointer.x = ((e.clientX - r.left) / r.width) * 2 - 1;
     J.pointer.y = ((e.clientY - r.top) / r.height) * 2 - 1;
+    if (J.drag && J.galaxyMode && !J.fly) {
+      J.gCam.theta += (e.clientX - J.drag.x) * 0.0052;
+      J.gCam.phi -= (e.clientY - J.drag.y) * 0.0052;
+      J.drag = { x: e.clientX, y: e.clientY };
+    }
   };
   container.addEventListener('pointermove', J.pointerHandler);
+
+  // galaxy-mode navigation. Only pointer events whose TARGET is the canvas
+  // count — clicks on toolbar buttons/chrome must never orbit or open a star.
+  J.downHandler = (e) => {
+    if (!J.galaxyMode || J.fly || e.target !== J.renderer.domElement) return;
+    J.drag = { x: e.clientX, y: e.clientY };
+    J.downAt = { x: e.clientX, y: e.clientY, t: performance.now() };
+    try { container.setPointerCapture(e.pointerId); } catch { }
+  };
+  J.upHandler = (e) => {
+    if (J.galaxyMode && !J.fly && J.onMemorySelect && J.downAt && J.mem.hover >= 0 &&
+        Math.hypot(e.clientX - J.downAt.x, e.clientY - J.downAt.y) <= 6 &&
+        performance.now() - J.downAt.t <= 600) {
+      const n = J.mem.data.nodes[J.mem.hover];
+      if (n && n.id) { try { J.onMemorySelect(n); } catch { } }
+    }
+    J.drag = null;
+    J.downAt = null;
+  };
+  J.wheelHandler = (e) => {
+    if (!J.galaxyMode) return;
+    e.preventDefault();
+    J.gCam.dist *= (1 + Math.sign(e.deltaY) * 0.09);
+  };
+  container.addEventListener('pointerdown', J.downHandler);
+  container.addEventListener('pointerup', J.upHandler);
+  container.addEventListener('wheel', J.wheelHandler, { passive: false });
+
+  // galaxy-mode chrome: hover panel + help hint (DOM, above the canvas)
+  J.mem.panel = document.createElement('div');
+  J.mem.panel.style.cssText =
+    'position:absolute;top:56px;left:14px;width:330px;max-width:44%;padding:14px 16px;' +
+    'background:rgba(13,13,26,.85);border:1px solid rgba(124,92,255,.35);border-radius:14px;' +
+    'backdrop-filter:blur(14px);opacity:0;transition:opacity .22s;pointer-events:none;z-index:6';
+  container.appendChild(J.mem.panel);
+  J.mem.hint = document.createElement('div');
+  J.mem.hint.style.cssText =
+    'position:absolute;left:16px;bottom:12px;font-family:var(--font-mono);font-size:10.5px;' +
+    'color:var(--text-dim);pointer-events:none;z-index:6;display:none';
+  J.mem.hint.textContent =
+    'memory galaxy · drag orbit · scroll zoom · hover a star · click to edit · 🧠 Memory returns to JARVIS';
+  container.appendChild(J.mem.hint);
 
   // primary: the prebuilt real-scan bust; fallback: the procedural sculpt
   let prebuilt = null;
@@ -610,9 +1080,10 @@ async function mount(container) {
   }
   J.scene.add(J.headGroup);
 
-  const centers = mountGalaxy(await buildGalaxyData());
+  const memData = await buildGalaxyData();
   if (J.disposed) return;
-  mountStreams(centers);
+  buildMatrix(memData);
+  buildMemoryGalaxy(memData);
 
   J.resizeObs = new ResizeObserver(() => {
     if (!J.renderer || !J.container) return;
@@ -632,24 +1103,45 @@ function dispose() {
   if (J.raf) cancelAnimationFrame(J.raf);
   J.raf = null;
   if (J.resizeObs) { J.resizeObs.disconnect(); J.resizeObs = null; }
-  if (J.container && J.pointerHandler) {
-    J.container.removeEventListener('pointermove', J.pointerHandler);
-    J.pointerHandler = null;
+  if (J.container) {
+    if (J.pointerHandler) J.container.removeEventListener('pointermove', J.pointerHandler);
+    if (J.downHandler) J.container.removeEventListener('pointerdown', J.downHandler);
+    if (J.upHandler) J.container.removeEventListener('pointerup', J.upHandler);
+    if (J.wheelHandler) J.container.removeEventListener('wheel', J.wheelHandler);
+    J.container.style.cursor = '';
+    J.pointerHandler = J.downHandler = J.upHandler = J.wheelHandler = null;
   }
   if (J.renderer) {
     try { J.renderer.dispose(); J.renderer.domElement.remove(); } catch { }
   }
-  for (const k of ['head', 'galaxy']) {
-    if (J[k]) { try { J[k].geometry.dispose(); J[k].material.dispose(); } catch { } J[k] = null; }
+  if (J.head) { try { J.head.geometry.dispose(); J.head.material.dispose(); } catch { } J.head = null; }
+  for (const root of [J.mem.group, J.matrix]) {
+    if (!root) continue;
+    root.traverse((o) => {
+      try { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); } catch { }
+    });
   }
+  if (J.mem.avatarLinks) {
+    try { J.mem.avatarLinks.geometry.dispose(); J.mem.avatarLinks.material.dispose(); } catch { }
+  }
+  for (const sp of J.mem.avatarPulses) { try { sp.material.dispose(); } catch { } }
+  if (J.mem.panel) J.mem.panel.remove();
+  if (J.mem.hint) J.mem.hint.remove();
+  J.mem = emptyMem();
+  J.matrix = null; J.galaxyMode = false; J.fly = null;
+  J.drag = null; J.downAt = null; J.onMemorySelect = null;
   for (const m of J.occluders) { try { m.geometry.dispose(); } catch { } }
   for (const g of J.glints) { try { g.material.dispose(); } catch { } }
   J.occluders = []; J.glints = []; J.headGroup = null;
-  J.streams = []; J.pulses = []; J.renderer = null; J.scene = null;
+  J.renderer = null; J.scene = null;
   J.headGeo = null; J.basePos = null; J.baseB = null; J.baseW = null;
 }
 
-function setMode(mode) { J.mode = mode; }
+function setMode(mode) {
+  // leaving THINKING = the answer is forming → memory floods into the head
+  if (J.mode === 'thinking' && mode !== 'thinking') J.mem.burst = 2.4;
+  J.mode = mode;
+}
 function setLevel(v) { J.level = Math.max(0, v || 0); }
 function setAnimations(on) {
   J.animOn = !!on;
@@ -657,4 +1149,4 @@ function setAnimations(on) {
   else if (!on && J.raf) { cancelAnimationFrame(J.raf); J.raf = null; }
 }
 
-window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations };
+window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations, toggleGalaxy };
