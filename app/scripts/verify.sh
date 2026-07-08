@@ -4,7 +4,9 @@
 # Run this before any commit. Non-zero exit = DO NOT COMMIT.
 # ═══════════════════════════════════════════════════════════
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+# app root from the script's own location — since the 2026-07-09 unification
+# the git toplevel is the PACKAGE repo, one level above the app tree
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -5,7 +5,7 @@
 # Browser tests run if server is live.
 # ═══════════════════════════════════════════════════════════
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."  # app root (unified repo: git toplevel is the package)
 
 echo "━━━ PRE-COMMIT GATE ━━━"
 
