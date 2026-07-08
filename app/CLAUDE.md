@@ -244,6 +244,26 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   Deliverables rows + task detail → modal with live log → opens the app in a new tab when
   it answers. Caveat: dev servers that ignore the PORT env (vite without --port) show as
   'starting' forever — the log tells the truth.
+- **Project app preview (v3.6)**: ▶ Test project — run the WHOLE assembled project (every
+  stage's changes together, not one task's output), at the current state OR any earlier one,
+  side by side on separate ports to compare new vs old / spot regressions. `project_preview.py`
+  resolves the project's runnable history two ways: REPO projects (member tasks carry
+  repo_path) → the shared task branch nexus/<wf-slug>; states = commits from `merge-base..branch`
+  (the project's own commits, so a big repo's history never buries them) + the fork-point
+  "baseline" anchor; materialize = `git archive <sha>` (read-only on the repo, cached since
+  commits are immutable). WORKSPACE projects → states = DONE member tasks in completion order;
+  state vK = overlay of the first K task workspaces (later stages overwrite same-named files,
+  each deliverable.md collected into _deliverables/); fingerprint-cached by contributing tasks'
+  updated_at so a repeat start reuses the built copy (keeps npm install / .next) and only
+  rebuilds when a stage was retried. Every state materializes into a DISPOSABLE dir
+  (workspaces/workflow-<id>/_project_preview/<key>/state) and runs via the SAME app_runner
+  (registry key wf:<id>:<state>, so old+new run concurrently under the 3-app cap / 30-min TTL /
+  reaper); the live worktree + task workspaces are NEVER run in place or mutated. State keys
+  come only from list_states — membership is the injection gate (no arbitrary git revs / paths).
+  Endpoints: GET/POST /api/workflows/{id}/app(/start|/stop|/log) ({version} body). UI: ▶ Test
+  project on the project card + inside its panel → modal with a state picker, running-states
+  list (each with Open/Log/Stop), live log, Stop-all. Non-runnable states (spec-only stages,
+  the bare init commit) return a clean 409.
 - **Looping (v3.2)**: per-task and per-project improve-and-recheck loops.
   `tasks.loop_config` / `workflows.loop_config` (JSON: enabled, mode open|closed,
   preference quality|speed, auto_judge, triggers[] with per-trigger max_rounds/used).

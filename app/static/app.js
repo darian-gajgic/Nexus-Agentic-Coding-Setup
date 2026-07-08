@@ -1754,6 +1754,7 @@ function viewManual() {
     <p>Everything agents produce is collected under <b>Deliverables</b>: reports, images, documents, whole applications. Markdown reports preview inline; everything is downloadable.</p>
     <h4>▶ Test app — run what they built</h4>
     <p>When a task produced a program or website, the <b>▶ Test app</b> button starts it safely on your machine and opens it in a new tab. It shuts down by itself after 30 minutes. If it shows "starting" forever, open the log in the same dialog — it tells the truth.</p>
+    <p>Projects have the same button one level up: <b>▶ Test project</b> (on the project card and inside its panel) runs the <b>complete assembled project</b> — every stage's changes together, not one task's output. You can also pick an <b>earlier state</b> from its history and run it next to the latest one on a second port, to compare old vs new and see whether the newest changes broke something. Every run uses a disposable copy, so your real project files are never touched.</p>
     <h4>🔍 Review changes — the pull-request view for everything</h4>
     <p>Every task's detail (and every workflow via "Review results") offers a per-file comparison against the previous version: code shows real line-by-line diffs (green added, red removed), <b>PDFs are compared by their extracted text</b>, images side-by-side, and each rework round becomes a new version automatically. Judge the update like a programmer judges a pull request — then approve or reject with feedback.</p>
     <h4>Follow-ups</h4>
@@ -3018,6 +3019,105 @@ async function stopAppUI(taskId) {
   if (appPreviewPoll) { clearInterval(appPreviewPoll); appPreviewPoll = null; }
   try { await api('POST', `/api/tasks/${taskId}/app/stop`); toast('App stopped', 'ok'); }
   catch (e) { toast('Stop failed: ' + e.message, 'err'); }
+  closeModal();
+}
+
+// ═══════════════════ PROJECT APP PREVIEW (▶ run the WHOLE project — current or a past state) ═══════════════════
+// Unlike the per-task ▶ Test app, this assembles the COMPLETE project (every
+// stage's changes) into a disposable copy and runs that. Any earlier state can
+// be started NEXT TO the latest one — each gets its own port — so old and new
+// compare side by side (did the newest stage break something?).
+let projAppPoll = null;
+let projAppFocus = null;      // version whose log the pane shows
+let projAppStarted = new Set(); // versions started from this modal → auto-open on ready
+let projAppLastHtml = '';
+
+async function projectAppUI(wfId, name) {
+  let info;
+  try { info = await api('GET', `/api/workflows/${wfId}/app`); }
+  catch (e) { toast('Could not load project states: ' + e.message, 'err'); return; }
+  projectAppModal(wfId, name, info);
+}
+
+function projectAppModal(wfId, name, info) {
+  if (projAppPoll) { clearInterval(projAppPoll); projAppPoll = null; }
+  projAppFocus = null; projAppStarted = new Set(); projAppLastHtml = '';
+  const states = info.states || [];
+  const when = ts => ts ? new Date(ts * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  const opt = (s, i) => `<option value="${esc(s.key)}">${i === 0 ? '★ latest — ' : ''}${esc(info.mode === 'git' ? '#' + s.key + ' ' : s.key + ' ')}· ${esc(s.label || '')} · ${esc(when(s.ts))}</option>`;
+  showModal(`
+    <h2>▶ Test project — ${esc(name)}</h2>
+    <div class="view-intro" style="margin-bottom:8px">Runs the <b>complete assembled project</b> (every stage's changes together), not one task's output. ${info.mode === 'git' ? 'Its history is the task branch — every commit is a testable state.' : 'Its history is the completed stages — each checkpoint is a testable state.'}</div>
+    ${states.length ? `
+    <div class="form-group"><label class="form-label">Project state to run</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select class="form-select" id="pa-ver" style="flex:1">${states.map(opt).join('')}</select>
+        <button class="btn-primary" onclick="projAppStart('${esc(wfId)}')">▶ Start</button>
+      </div>
+      <div class="form-hint">Start an older state <b>while the latest runs</b> — each state gets its own port, so old and new open side by side to spot what changed or broke. File-by-file diffs live in 🔍 Review results.</div>
+    </div>` : `<div class="empty" style="margin-bottom:8px">${esc(info.note || 'No project history yet — finish a stage first.')}</div>`}
+    <div class="form-group"><label class="form-label">Running states</label>
+      <div id="pa-running"><span class="muted" style="font-size:11.5px">none — start one above</span></div></div>
+    <div class="form-group"><label class="form-label">Live log <span class="muted" id="pa-logsrc"></span></label>
+      <pre id="pa-log" style="max-height:200px;overflow-y:auto;font-size:11px;background:rgba(0,0,0,.35);border-radius:8px;padding:8px 10px;white-space:pre-wrap">…</pre></div>
+    <div class="form-hint">Every state runs from a disposable copy on its own local port and stops by itself after 30 minutes. Your live project files and the agents' branch are never touched — testing an old state cannot damage anything.</div>
+    <div class="modal-actions" style="justify-content:space-between">
+      <button class="btn-sm danger" onclick="projAppStop('${esc(wfId)}','')">⏹ Stop all</button>
+      <button class="btn-primary" onclick="closeProjApp()">Close (apps keep running)</button>
+    </div>`);
+  const tick = async () => {
+    if (!$('#pa-running')) { clearInterval(projAppPoll); projAppPoll = null; return; }
+    try {
+      const st = await api('GET', `/api/workflows/${wfId}/app`);
+      const run = st.running || [];
+      const rows = run.map(a => `
+        <div class="agentic-row slim" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-family:var(--font-mono);font-size:11px">${esc(a.version)}</span>
+          <span class="chip ${a.ready ? 'c-green' : 'c-orange'}">${a.ready ? '✅ running' : (a.state === 'installing' ? '📦 installing…' : '⏳ starting…')}</span>
+          <span style="flex:1;font-size:11px;color:var(--text-faint)">${esc(a.label || '')}</span>
+          ${a.ready ? `<a class="btn-sm" href="${esc(a.url)}" target="_blank" style="text-decoration:none;border-color:var(--accent-2)">↗ Open</a>` : ''}
+          <button class="btn-sm" onclick="projAppFocus='${esc(a.version)}'">📜 Log</button>
+          <button class="btn-sm danger" onclick="projAppStop('${esc(wfId)}','${esc(a.version)}')">⏹</button>
+        </div>`).join('') || '<span class="muted" style="font-size:11.5px">none — start one above</span>';
+      if (rows !== projAppLastHtml && $('#pa-running')) { $('#pa-running').innerHTML = rows; projAppLastHtml = rows; }
+      run.forEach(a => {
+        if (a.ready && projAppStarted.has(a.version)) { projAppStarted.delete(a.version); window.open(a.url, '_blank'); }
+      });
+      const focus = run.find(a => a.version === projAppFocus) || run[0];
+      if (focus) {
+        const lg = await api('GET', `/api/workflows/${wfId}/app/log?version=${encodeURIComponent(focus.version)}`);
+        const el = $('#pa-log');
+        if (el && lg.log !== el.textContent) { el.textContent = lg.log || '…'; el.scrollTop = el.scrollHeight; }
+        if ($('#pa-logsrc')) $('#pa-logsrc').textContent = '— ' + focus.version;
+      }
+    } catch { /* transient */ }
+  };
+  tick();
+  projAppPoll = setInterval(tick, 2500);
+}
+
+async function projAppStart(wfId) {
+  const ver = $('#pa-ver') ? $('#pa-ver').value : '';
+  toast('Preparing that project state — assembling a disposable copy…', 'ok');
+  try {
+    const r = await api('POST', `/api/workflows/${wfId}/app/start`, { version: ver });
+    projAppFocus = r.version || ver;
+    projAppStarted.add(projAppFocus);
+    projAppLastHtml = '';
+    toast(`State ${r.version || ver} starting — it opens in a new tab when it answers`, 'ok');
+  } catch (e) { toast('Could not start: ' + e.message, 'err'); }
+}
+
+async function projAppStop(wfId, version) {
+  try {
+    await api('POST', `/api/workflows/${wfId}/app/stop`, { version: version || '' });
+    projAppLastHtml = '';
+    toast(version ? `Stopped ${version}` : 'All project preview states stopped', 'ok');
+  } catch (e) { toast('Stop failed: ' + e.message, 'err'); }
+}
+
+function closeProjApp() {
+  if (projAppPoll) { clearInterval(projAppPoll); projAppPoll = null; }
   closeModal();
 }
 
@@ -7698,6 +7798,7 @@ function viewWorkflows() {
     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
         <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
+        <button class="focus-btn" title="Run the complete assembled project — current state or any earlier one" onclick="event.stopPropagation(); projectAppUI('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">▶ test</button>
         <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span>${replanChipHTML(w)}</div>
       <div class="card-body">
         ${w.goal ? `<div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">${esc(w.goal)}</div>` : ''}
@@ -7812,7 +7913,10 @@ async function openWorkflowDetail(id) {
     ${w.goal ? `<div class="view-intro" style="margin-bottom:10px">${esc(w.goal)}</div>` : ''}
     ${rpPanel}
     <div style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto">${taskRows || '<div class="empty">No tasks yet — add the first one.</div>'}</div>
-    <div style="margin:8px 0"><button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">🔍 Review results — what every stage changed</button></div>
+    <div style="margin:8px 0;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">🔍 Review results — what every stage changed</button>
+      <button class="btn-sm" style="border-color:var(--accent-2)" title="Run the complete assembled project — the current state or any earlier one, side by side" onclick="projectAppUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">▶ Test project — run any version</button>
+    </div>
     <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Attachments (input files — attach to the whole project or to one task)</label>
       <div id="wf-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
     <div class="form-group"><label class="form-label">🔁 Project looping (automatic improve-and-recheck rounds)</label>

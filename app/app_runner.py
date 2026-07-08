@@ -199,6 +199,20 @@ def start_app(task_id: str, workspace: str) -> dict:
         return {"ok": True, **entry}
 
 
+def instances(prefix: str) -> list[dict]:
+    """Live registry entries whose key starts with prefix — how project
+    previews (keys wf:<id>:<state>) enumerate their running states."""
+    out = []
+    for key, a in _load().items():
+        if not key.startswith(prefix) or not _pid_is_ours(a.get("pid", -1)):
+            continue
+        ready = _listening(a["port"])
+        out.append({**a, "key": key, "ready": ready,
+                    "state": "ready" if ready else
+                    ("installing" if a.get("installing") else "starting")})
+    return out
+
+
 def app_status(task_id: str, workspace: str) -> dict:
     reg = _load()
     cur = reg.get(task_id)
