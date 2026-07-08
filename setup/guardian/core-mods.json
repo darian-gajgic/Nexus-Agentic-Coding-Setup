@@ -40,6 +40,14 @@
       "sentinel": "_extract_reasoning",
       "description": "Langfuse plugin: (1) drop the two deprecated set_trace_io() calls (trace I/O is derived from the as_root root observation on Langfuse 3.205.0); (2) _serialize_assistant_message reads reasoning via _extract_reasoning() so GLM(Z.AI)/DeepSeek/Kimi chain-of-thought (returned in reasoning_content, not reasoning) is captured instead of logged as null.",
       "impact_if_dropped": "The set_trace_io DeprecationWarning returns and GLM/DeepSeek/Kimi reasoning is logged as reasoning:null in every trace."
+    },
+    {
+      "name": "session-model-api-server",
+      "file": "gateway/platforms/api_server.py",
+      "patch": "session-model-api-server.patch",
+      "sentinel": "NEXUS CORE-MOD (session-model)",
+      "description": "api_server honors the per-session stored model on session chat turns (upstream always ran the config.yaml default \u2014 Nexus per-task models were cosmetic) + accepts an optional per-turn body 'model' override on /api/sessions/{id}/chat[/stream] (JARVIS peak-overload fallback runs ONE turn on dispatch.fallback_model in the SAME session).",
+      "impact_if_dropped": "Every api_server session turn silently runs the config.yaml default model again: per-task models (glm-5.1/glm-4.5-air pools), the dispatch overload fallback and the JARVIS glm-5-turbo fallback all stop switching models."
     }
   ]
 }

@@ -282,6 +282,14 @@ unlocked by the user gesture and persists across clips.
 ### `/api/jarvis/chat/stream` (POST, JSON `{input}`)
 - SSE proxy to Hermes Agent API (`localhost:8642`).
 - Streams `event: token` / `event: done` SSE events.
+- **Overload fallback (2026-07-08):** if the turn dies with a Z.AI 429
+  load-shed signature before any content streamed, the server emits
+  `event: fallback` `{from, to}` and retries the turn ONCE in the SAME
+  session with a per-turn model override (settings
+  `dispatch.fallback_enabled` / `dispatch.fallback_model`, default
+  glm-5-turbo; needs the `session-model-api-server` guardian core-mod).
+  The frontend renders the fallback event as a tool-style note. Test knob:
+  setting `jarvis.force_429=1` sheds the primary pass without sending it.
 
 ### `/api/jarvis/voice/status` (GET)
 - Returns model load state, engine names, `last_voice_use`, `idle_timeout`.

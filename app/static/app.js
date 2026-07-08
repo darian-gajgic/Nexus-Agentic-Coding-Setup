@@ -6514,6 +6514,11 @@ async function jarvisHandleSSE(event, data, liveMsg) {
         jarvisLoadFiles();
       }
       break;
+    case 'fallback':
+      // primary model load-shed by the provider — this reply continues on the fallback model
+      jarvisAddMessage('tool',
+        `⚡ ${parsed.from || 'The usual model'} is overloaded right now — answering on ${parsed.to || 'the fallback model'} instead.`);
+      break;
     case 'run.completed':
     case 'message_complete':
     case 'done':
