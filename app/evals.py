@@ -136,9 +136,29 @@ def fingerprint(domain: str, specialists: list) -> dict:
 
 # ─────────────────────────── Judge integration ───────────────────────────
 
-def run_judge_cmd(file_path: str, domain: str) -> str:
+def judge_model_for(user_id: str | None) -> tuple[str | None, str | None]:
+    """Settings v2: the owner's 'frontier_judge' purpose → (model_id, api_key).
+    No assignment → (None, None) = the historical behavior (cjudge runs the
+    Claude CLI's saved default, subscription auth). The key is the owner's
+    credential for the judge model's provider — None keeps the CLI default."""
+    import secrets_store
+    row = db.resolve_assignment(user_id, "frontier_judge")
+    if not row or row["route"] != "cli":
+        return None, None
+    key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
+    return row["model_id"], key
+
+
+def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
+                  api_key: str | None = None) -> str:
     """Run the frontier judge command on a file (shared with the task judge).
     Template lives in settings judge.cmd so gates can stub it (R4.3).
+
+    Settings v2: `model` (the resolved frontier_judge assignment) replaces an
+    optional {model} token and is always exported as JUDGE_MODEL; `api_key`
+    (per-user credential) is exported as JUDGE_ANTHROPIC_API_KEY for the
+    subprocess only — cjudge decides what to do with both, so a stubbed or
+    legacy judge.cmd keeps working unchanged.
 
     Runs with cwd=~/knowledge AND copies the deliverable there first: headless
     `claude -p` (inside cjudge) can only read files under its working directory
@@ -156,18 +176,26 @@ def run_judge_cmd(file_path: str, domain: str) -> str:
         judged_path = str(tmp_file)
     except Exception:
         pass  # fall back to the original path
-    # shell=False + per-token formatting: template values are validated, and
-    # this removes the shell layer entirely (defense in depth for judge.cmd).
-    tokens = [t.format(file=judged_path, domain=domain)
+    # shell=False + per-token replacement (NOT .format — deliverable titles and
+    # model ids may contain braces): template values are validated, and this
+    # removes the shell layer entirely (defense in depth for judge.cmd).
+    tokens = [t.replace("{file}", judged_path).replace("{domain}", domain)
+               .replace("{model}", model or "")
               for t in shlex.split(db.get_setting("judge.cmd", "cjudge {file} {domain}"))]
+    tokens = [t for t in tokens if t != ""]  # a {model} token with no model vanishes
     # Under the systemd unit PATH may lack ~/.local/bin (where cjudge lives).
     if tokens and not shutil.which(tokens[0]):
         candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
         if os.path.isfile(candidate):
             tokens[0] = candidate
+    env = dict(os.environ)
+    if model:
+        env["JUDGE_MODEL"] = model
+    if api_key:
+        env["JUDGE_ANTHROPIC_API_KEY"] = api_key
     try:
         r = sp.run(tokens, capture_output=True, text=True, timeout=900,
-                   cwd=KNOWLEDGE_DIR)
+                   cwd=KNOWLEDGE_DIR, env=env)
         out = (r.stdout or "")
         if r.returncode != 0:
             out += f"\n[judge exited {r.returncode}] {(r.stderr or '')[-1000:]}"
@@ -249,9 +277,10 @@ def _generate(case: dict, domain: str, run_id: str, uid: str | None) -> dict:
         "model": case.get("model"),
     }
     framing = hd.build_framing(synth, ws)
-    sid = hd.create_session(f"nexus:eval:{run_id}:{case['id']}",
-                            model=case.get("model"))
+    run_model = case.get("model") or db.default_task_model(uid)  # Settings v2
+    sid = hd.create_session(f"nexus:eval:{run_id}:{case['id']}", model=run_model)
     hd.publish_session_scope(sid, user=uid)  # memory stays the runner's scope
+    hd.publish_session_key(sid, uid, run_model)  # owner's key, if configured
     try:
         res = hd.stream_turn(sid, f"{synth['title']}\n\n{case['brief']}",
                              system_message=framing, max_seconds=GEN_MAX_SECONDS)
@@ -317,7 +346,8 @@ def _run_thread(run_id: str, domain: str, uid: str | None):
                 "UPDATE eval_results SET status='judging', deliverable_path=?, "
                 "tokens_used=?, gen_seconds=? WHERE id=?",
                 (gen["path"], gen["tokens"], gen["seconds"], row["id"]))
-            out = run_judge_cmd(gen["path"], domain)
+            jmodel, jkey = judge_model_for(uid)
+            out = run_judge_cmd(gen["path"], domain, model=jmodel, api_key=jkey)
             m = parse_judge_metrics(out)
             db.execute(
                 "UPDATE eval_results SET status='scored', verdict=?, score=?, score_max=?, "

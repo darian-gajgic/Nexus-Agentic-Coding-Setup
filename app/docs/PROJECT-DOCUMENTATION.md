@@ -155,9 +155,15 @@ Context-aware help: `TOURS` registry + spotlight engine (`startTour`),
 - **Restart discipline**: check nothing is `queued/dispatching/streaming/
   finalizing` before restarting nexus (`systemctl --user restart nexus`);
   harvest recovers interruptions but don't provoke them.
-- **Budgets/limits** (Settings tab or `settings` table): default task budget,
-  daily cap, per-model concurrency, per-model effort (bridged live to Hermes
-  via `~/.hermes/model-efforts.json`).
+- **Settings v2** (docs/SPEC-SETTINGS-V2.md): the Settings tab exposes the
+  FULL settings registry (`settings_registry.py` — dispatch budgets/limits,
+  judge/PR command templates, knowledge/eval roots, watchdog, auth.force,
+  service endpoints with env fallback), a per-user **model registry** with
+  purpose routing (complicated/easy/mechanical/frontier_judge — seeded to the
+  historical GLM trio + Claude Opus 4.8 as judge), and per-user **encrypted
+  credentials**. Per-model effort still bridges live to Hermes via
+  `~/.hermes/model-efforts.json`; per-user API keys bridge per session via
+  `~/.hermes/session-keys.json` (0600).
 - **Backups**: config-only encrypted USB snapshot + Timeshift (system-only);
   the reproducible install lives in the **Nexus-Agentic-Coding-Setup** repo
   (full source, patches, installer, docs — secrets excluded by design).
@@ -175,8 +181,10 @@ client-scopes.json` `"users"` map; reads post-filter other users' rows).
 Cookie sessions (scrypt passwords, hashed tokens, HttpOnly + SameSite=Lax,
 sliding 30-day expiry, login rate-limit); WS handshakes authenticate the
 cookie and task/workflow events broadcast only to the owner's sockets.
-Shared by design: agents fleet, scheduler, approvals, watchdog, settings
-(admin-write), specialists/lessons/skills, shared-context. Emergency:
+Shared by design: agents fleet, scheduler, watchdog, settings (admin-write),
+specialists/lessons/skills, shared-context. Per-user since Settings v2:
+model registry + purpose routing and encrypted credentials (approvals became
+per-user in the Block-1 gap fix). Emergency:
 `scripts/auth_reset.py` (local) returns the box to single-user.
 Proof: `scripts/verify_multiuser_e2e.py` (55 checks) — HTTP/WS/JARVIS/mem0
 isolation probed E2E against the live server + qdrant, self-cleaning.
@@ -184,9 +192,14 @@ Remote access: **Tailscale only, never public** — see docs/TAILSCALE.md
 (`tailscale serve` on the tailnet; nexus stays loopback-bound).
 
 ## 8. Security posture
-- HTTPS-only UI; localhost binding everywhere; API keys only in
-  `~/.hermes/.env` (guardrail-protected, never in git; template + credential
-  scanner in the setup repo).
+- HTTPS-only UI; localhost binding everywhere. MACHINE-default API keys live
+  only in `~/.hermes/.env` (guardrail-protected, never in git; template +
+  credential scanner in the setup repo). USER-added keys (Settings v2) are
+  Fernet-encrypted in nexus.db (`secrets_store.py`; master key `secret.key`
+  0600, gitignored) and are never returned by any endpoint — masked hints
+  only. At execution they surface only as a per-session entry in
+  `~/.hermes/session-keys.json` (0600 — same at-rest posture as .env) or as
+  env vars into the judge subprocess. ⚠ flag for the pending security review.
 - Multi-user auth + per-user data isolation (see 7b); remote access is
   tailnet-only via `tailscale serve` — never port-forwarded, never funneled.
 - No command allowlist auto-approval (removed — guardian-enforced absence);

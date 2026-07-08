@@ -31,11 +31,27 @@ Steps:
 
 Be adversarial and specific. Do NOT rewrite the whole deliverable. Do NOT modify any files."
 
-exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+# Nexus Settings v2 hooks (both optional, absent = original behavior):
+#   JUDGE_MODEL              — explicit judge model (Settings → Models & routing,
+#                              'frontier judge' purpose) → claude --model
+#   JUDGE_ANTHROPIC_API_KEY  — per-user Anthropic key; when set, the call runs
+#                              key-authed instead of the CLI's subscription auth
+MODEL_ARGS=()
+if [ -n "${JUDGE_MODEL:-}" ]; then MODEL_ARGS=(--model "$JUDGE_MODEL"); fi
+
+KEY_ENV=(-u ANTHROPIC_API_KEY)
+if [ -n "${JUDGE_ANTHROPIC_API_KEY:-}" ]; then
+  KEY_ENV=(ANTHROPIC_API_KEY="$JUDGE_ANTHROPIC_API_KEY")
+fi
+
+# NOTE: env requires -u options BEFORE NAME=VALUE assignments — KEY_ENV
+# (either `-u ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY=…`) must come last.
+exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
   -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL \
   -u ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES -u ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
   -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_SUBAGENT_MODEL -u CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY \
   -u CLAUDE_CODE_EFFORT_LEVEL -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u CLAUDE_CODE_WORKFLOWS \
   -u CLAUDE_CODE_ALWAYS_ENABLE_EFFORT -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC -u API_TIMEOUT_MS \
   -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
-  claude -p "$PROMPT"
+  "${KEY_ENV[@]}" \
+  claude "${MODEL_ARGS[@]}" -p "$PROMPT"

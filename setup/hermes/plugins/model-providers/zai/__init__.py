@@ -62,6 +62,34 @@ _WIRE_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 _EFFORTS_FILE = os.path.expanduser("~/.hermes/model-efforts.json")
 _efforts_cache: dict = {"mtime": 0.0, "efforts": {}}
 
+# Per-session API keys (Nexus Settings v2), published to
+# ~/.hermes/session-keys.json — {"sessions": {"api_…": {"api_key": "…"}}}.
+# Same mtime-cached bridge pattern as model-efforts. A hit becomes a
+# per-request Authorization header (the OpenAI SDK merges request headers
+# OVER the client's env-key auth); a miss = env GLM_API_KEY, the pre-bridge
+# behavior. NEVER log the key.
+_SESSION_KEYS_FILE = os.path.expanduser("~/.hermes/session-keys.json")
+_session_keys_cache: dict = {"mtime": 0.0, "sessions": {}}
+
+
+def _session_api_key(session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    try:
+        mtime = os.stat(_SESSION_KEYS_FILE).st_mtime
+        if mtime != _session_keys_cache["mtime"]:
+            import json as _json
+            with open(_SESSION_KEYS_FILE) as f:
+                data = _json.load(f)
+            _session_keys_cache["sessions"] = {
+                str(k): str(v.get("api_key"))
+                for k, v in (data.get("sessions") or {}).items()
+                if isinstance(v, dict) and v.get("api_key")}
+            _session_keys_cache["mtime"] = mtime
+    except Exception:
+        return None
+    return _session_keys_cache["sessions"].get(session_id)
+
 
 def _operator_effort(model: str | None) -> str | None:
     try:
@@ -115,6 +143,13 @@ class ZaiProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+
+        # Per-session key override FIRST — it must apply to every zai request
+        # (also non-thinking models, which early-return below). top_level is
+        # merged into api_kwargs unconditionally by the transport.
+        _skey = _session_api_key(context.get("session_id"))
+        if _skey:
+            top_level["extra_headers"] = {"Authorization": f"Bearer {_skey}"}
 
         if not _model_supports_thinking(model):
             return extra_body, top_level

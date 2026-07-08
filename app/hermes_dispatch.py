@@ -32,11 +32,12 @@ from pathlib import Path
 import httpx
 
 import database as db
+import settings_registry as sreg
 
 BASE_DIR = Path(__file__).parent
 WORKSPACES = BASE_DIR / "workspaces"
 
-HERMES_API_BASE = os.environ.get("HERMES_API_BASE", "http://127.0.0.1:8642")
+HERMES_API_BASE = sreg.conf("hermes.api_base")  # setting → env → default; restart applies
 
 # SSE keepalives arrive every ~30s, so a 120s read timeout only trips when the
 # stream is genuinely dead. No overall HTTP timeout — the turn cap below rules.
@@ -124,6 +125,7 @@ def delete_session(session_id: str):
                      headers=_headers(), timeout=10)
     except Exception:
         pass
+    remove_session_key(session_id)  # Settings v2: no dangling bridge keys
 
 
 def get_messages(session_id: str, limit: int = 100) -> list:
@@ -391,6 +393,74 @@ def publish_session_scope(session_id: str, client: str | None = None,
 def _task_user(task_id: str) -> str | None:
     row = db.query_one("SELECT user_id FROM tasks WHERE id=?", (task_id,))
     return (row or {}).get("user_id")
+
+
+# ── Per-session API keys (Settings v2 — docs/SPEC-SETTINGS-V2.md §6) ──
+# Same bridge-file pattern as model-efforts.json / client-scopes.json: the
+# patched Hermes zai provider checks this map per request and falls back to
+# its env key. Only sessions whose owner configured a personal/global-override
+# credential get an entry — an absent entry = today's behavior. The file is
+# 0600 like ~/.hermes/.env (same plaintext-at-rest posture as the default key
+# it overrides); the DB copy stays encrypted.
+
+_SESSION_KEYS_FILE = os.path.expanduser("~/.hermes/session-keys.json")
+_SESSION_KEYS_MAX_AGE_S = 7 * 86400
+
+
+def resolve_task_model(task: dict) -> str | None:
+    """The model this task's session runs on: explicit per-task choice, else
+    the owner's 'complicated' purpose assignment, else None (Hermes default)."""
+    return task.get("model") or db.default_task_model(task.get("user_id"))
+
+
+def _session_key_for(user_id: str | None, model_id: str | None) -> str | None:
+    """The owner's key for the provider serving model_id (None = env default).
+    Import here, not module-top: worker lanes only pay for cryptography once a
+    credential actually exists."""
+    if not user_id:
+        return None
+    rows = [m for m in db.visible_models(user_id, enabled_only=True)
+            if m["route"] == "hermes" and (model_id is None or m["model_id"] == model_id)]
+    if not rows:
+        return None
+    m = rows[0]
+    import secrets_store
+    return secrets_store.resolve_key(user_id, m["provider"], m.get("credential_id"))
+
+
+def _rewrite_session_keys(mutate):
+    try:
+        data = {}
+        if os.path.isfile(_SESSION_KEYS_FILE):
+            with open(_SESSION_KEYS_FILE) as f:
+                data = json.load(f)
+        sessions = data.get("sessions") or {}
+        mutate(sessions)
+        now = time.time()
+        sessions = {sid: e for sid, e in sessions.items()
+                    if (e.get("ts") or now) > now - _SESSION_KEYS_MAX_AGE_S}
+        fd = os.open(_SESSION_KEYS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"sessions": sessions, "updated_at": now}, f, indent=1)
+    except Exception as e:
+        db.log_activity("warn", "system", f"session-keys bridge write failed: {str(e)[:80]}")
+
+
+def publish_session_key(session_id: str, user_id: str | None, model_id: str | None):
+    """Give this session the owner's API key (bridge entry) — no-op when the
+    owner has no credential for the serving provider."""
+    key = _session_key_for(user_id, model_id)
+    if not key:
+        return
+    _rewrite_session_keys(lambda s: s.__setitem__(
+        session_id, {"api_key": key, "ts": time.time()}))
+
+
+def remove_session_key(session_id: str):
+    """Drop a finished session's bridge entry (retries re-publish on dispatch)."""
+    if not os.path.isfile(_SESSION_KEYS_FILE):
+        return
+    _rewrite_session_keys(lambda s: s.pop(session_id, None))
 
 
 def _repo_is_code(path: str) -> bool:
@@ -695,6 +765,10 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
         db.log_activity("warn", agent_id,
                         f"Task {task_id} was deleted while its dispatch ran — result discarded")
         return
+    if task.get("session_id"):
+        # Settings v2: the run is over — drop its bridge-key entry (a retry
+        # re-publishes on its next dispatch).
+        remove_session_key(task["session_id"])
     if err_text and is_quota_error(err_text):
         raise QuotaError(err_text)
 
@@ -898,15 +972,20 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
         session_id = task.get("session_id")
+        run_model = resolve_task_model(task)
         if not session_id:
             _set_task(task_id, dispatch_state="dispatching")
-            session_id = create_session(f"nexus:{task_id}", model=task.get("model"))
+            session_id = create_session(f"nexus:{task_id}", model=run_model)
             _set_task(task_id, session_id=session_id)
             task["session_id"] = session_id
         # M3 + Block 1: session memory scoping — client tag isolates client
         # facts, user tag isolates the owner's memories from other users.
         publish_session_scope(session_id, client=task.get("client"),
                               user=task.get("user_id"))
+        # Settings v2: the owner's personal API key (if configured) rides the
+        # same bridge mechanism — re-published on every (re)dispatch, removed
+        # at finalize.
+        publish_session_key(session_id, task.get("user_id"), run_model)
         _set_dispatch(dispatch_id, session_id=session_id, state="streaming",
                       heartbeat_at=time.time())
         _set_task(task_id, dispatch_state="streaming", dispatch_error=None)

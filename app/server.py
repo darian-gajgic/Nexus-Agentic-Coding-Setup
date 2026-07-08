@@ -16,6 +16,8 @@ from typing import Optional
 import database as db
 import agent_manager as am
 import auth
+import secrets_store
+import settings_registry as sreg
 
 app = FastAPI(title="NEXUS Agent OS", version="1.0.0")
 
@@ -498,9 +500,12 @@ async def create_task(body: TaskCreate):
     if body.repo_path and not _visible_repo_path(body.repo_path):
         return JSONResponse(status_code=400, content={
             "error": f"repo_path is not one of your git repositories: {body.repo_path}"})
+    uid = auth.current_user_id()
+    if body.model and body.model not in db.task_models_for(uid):
+        return JSONResponse(status_code=400, content={
+            "error": f"model '{body.model}' is not in your model registry (Settings → Models)"})
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
-    uid = auth.current_user_id()
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
          domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id)
@@ -546,6 +551,9 @@ async def update_task(task_id: str, body: TaskUpdate):
     if body.budget_tokens is not None:
         updates["budget_tokens"] = body.budget_tokens
     if body.model is not None:
+        if body.model and body.model not in db.task_models_for(auth.current_user_id()):
+            return JSONResponse(status_code=400, content={
+                "error": f"model '{body.model}' is not in your model registry (Settings → Models)"})
         updates["model"] = body.model or None
     if body.workflow_id is not None:
         updates["workflow_id"] = body.workflow_id or None
@@ -717,9 +725,13 @@ def get_observability(days: int = 30):
     import base64 as _b64
     import urllib.request as _url
 
-    pk = os.environ.get("HERMES_LANGFUSE_PUBLIC_KEY", "")
-    sk = os.environ.get("HERMES_LANGFUSE_SECRET_KEY", "")
-    base = os.environ.get("HERMES_LANGFUSE_BASE_URL", "http://localhost:3000").rstrip("/")
+    # Settings v2: a stored credential (providers 'langfuse_public'/'langfuse_secret')
+    # beats the env default — adding a row narrows config, absence keeps ~/.hermes/.env.
+    pk = secrets_store.resolve_key(None, "langfuse_public") \
+        or os.environ.get("HERMES_LANGFUSE_PUBLIC_KEY", "")
+    sk = secrets_store.resolve_key(None, "langfuse_secret") \
+        or os.environ.get("HERMES_LANGFUSE_SECRET_KEY", "")
+    base = sreg.conf("langfuse.base_url").rstrip("/")
     out = {
         "configured": bool(pk and sk),
         "langfuse_url": base,
@@ -931,7 +943,7 @@ def get_specialists():
     out = {"specialists": []}
     mems = {}
     try:
-        qurl = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+        qurl = sreg.conf("qdrant.url")
         # Paginate the scroll (the collection grows every turn; a single
         # capped request silently drops lessons once points exceed the cap).
         pts, offset = [], None
@@ -1023,7 +1035,7 @@ def get_archived_lessons(name: str):
     import urllib.request
     out = {"archived": []}
     try:
-        qurl = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+        qurl = sreg.conf("qdrant.url")
         req = urllib.request.Request(
             f"{qurl}/collections/mem0/points/scroll",
             data=json.dumps({"limit": 500, "with_payload": True,
@@ -1044,7 +1056,7 @@ async def restore_lesson(name: str, mem_id: str):
     """Restore an archived lesson back into the specialist's active memory."""
     import urllib.request
     try:
-        qurl = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+        qurl = sreg.conf("qdrant.url")
         req = urllib.request.Request(
             f"{qurl}/collections/mem0/points/payload",
             data=json.dumps({"payload": {"agent_id": _specialist_mem0_id(name)}, "points": [mem_id]}).encode(),
@@ -1206,8 +1218,9 @@ async def specialist_wizard(body: dict):
     uid = auth.current_user_id()  # contextvar doesn't reach the executor thread
 
     def _run():
-        sid = hd.create_session("nexus:specialist-wizard")
+        sid = hd.create_session("nexus:specialist-wizard", model=db.default_task_model(uid))
         hd.publish_session_scope(sid, user=uid)  # never the scopes-file default
+        hd.publish_session_key(sid, uid, db.default_task_model(uid))
         try:
             return hd.stream_turn(sid, input_text, system_message=_WIZARD_FRAMING, max_seconds=240)
         finally:
@@ -1238,7 +1251,7 @@ def get_shared_context():
     import urllib.request
     out = {"memories": []}
     try:
-        qurl = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+        qurl = sreg.conf("qdrant.url")
         req = urllib.request.Request(
             f"{qurl}/collections/mem0/points/scroll",
             data=json.dumps({"limit": 500, "with_payload": True, "with_vector": False,
@@ -1279,7 +1292,7 @@ def get_memory():
     per-agent breakdown so memory scoping is visible.
     """
     import urllib.request
-    base = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+    base = sreg.conf("qdrant.url")
     coll = "mem0"
     out = {"count": 0, "memories": [], "agents": {}, "collection": coll, "vector_dims": None}
     known = {"data", "memory", "agent_id", "user_id", "channel", "attributed_to",
@@ -1341,7 +1354,7 @@ def _qdrant_point(point_id: str):
     """Fetch one qdrant point (payload only). None if missing."""
     import urllib.request
     import urllib.parse
-    base = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+    base = sreg.conf("qdrant.url")
     try:
         url = (f"{base}/collections/mem0/points/"
                f"{urllib.parse.quote(str(point_id), safe='')}")
@@ -1500,7 +1513,7 @@ except Exception as _e:
     _voice_err = traceback.format_exc()
     print(f"[voice] WARNING: voice pipeline not available: {_e}", flush=True)
 
-HERMES_API_BASE = os.environ.get("HERMES_API_BASE", "http://127.0.0.1:8642")
+HERMES_API_BASE = sreg.conf("hermes.api_base")  # setting → env → default; restart applies
 HERMES_API_KEY = os.environ.get("API_SERVER_KEY", "")
 JARVIS_SESSION_FILE = Path(__file__).parent / "jarvis_session.json"
 
@@ -1556,18 +1569,24 @@ async def _get_or_create_jarvis_session() -> str:
                 pass
     # Create new session. Hermes session titles are UNIQUE — retry with a
     # hex suffix on collision (same pattern as hermes_dispatch.create_session).
+    # Settings v2: the session runs on the user's 'complicated' model (None =
+    # Hermes' own default, identical to pre-registry behavior).
     title = f"JARVIS — {(user or {}).get('display_name') or uid}"
+    payload = {"title": title}
+    jarvis_model = db.default_task_model(uid)
+    if jarvis_model:
+        payload["model"] = jarvis_model
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{HERMES_API_BASE}/api/sessions",
             headers=_hermes_headers(),
-            json={"title": title}, timeout=10,
+            json=payload, timeout=10,
         )
         if r.status_code >= 400:
             r = await client.post(
                 f"{HERMES_API_BASE}/api/sessions",
                 headers=_hermes_headers(),
-                json={"title": f"{title} ~{uuid.uuid4().hex[:6]}"}, timeout=10,
+                json={**payload, "title": f"{title} ~{uuid.uuid4().hex[:6]}"}, timeout=10,
             )
         r.raise_for_status()
         data = r.json()
@@ -1581,10 +1600,13 @@ async def _get_or_create_jarvis_session() -> str:
 
 def _publish_jarvis_user_scope(sid: str, uid: str):
     """Tag the JARVIS session with its owner in the mem0 scopes bridge file
-    (idempotent) so extracted memories are user-isolated."""
+    (idempotent) so extracted memories are user-isolated. Settings v2: the
+    owner's personal API key (if configured) rides along — re-published per
+    chat, which keeps the long-lived session's entry fresh."""
     try:
         import hermes_dispatch as _hd
         _hd.publish_session_scope(sid, user=uid)
+        _hd.publish_session_key(sid, uid, db.default_task_model(uid))
     except Exception:
         pass
 
@@ -2209,7 +2231,11 @@ async def scheduler_delete(job_id: str):
 
 # ── 8. Cost guardrails ──
 
-COST_PER_1M = float(os.environ.get("NEXUS_COST_PER_1M_TOKENS", "2.0"))
+# Settings v2: setting → env → default; module-level read = restart applies it.
+try:
+    COST_PER_1M = float(sreg.conf("cost.per_1m_tokens"))
+except ValueError:
+    COST_PER_1M = 2.0
 
 
 @app.get("/api/agents/{agent_id}/cost")
@@ -2625,9 +2651,14 @@ def _parse_judge_output(text: str):
 def _judge_thread(task_id: str, file_path: str, domain: str):
     """Run the frontier judge (minutes) and persist the verdict. The command
     execution is shared with the eval runner (evals.run_judge_cmd — template in
-    settings key judge.cmd so gates can stub it, R4.3)."""
+    settings key judge.cmd so gates can stub it, R4.3). Settings v2: the model
+    (+ optional per-user key) comes from the task OWNER's frontier_judge
+    purpose assignment — resolved here, inside the thread, from the task row
+    (never the request contextvar, which doesn't reach threads)."""
     import evals as _ev
-    out = _ev.run_judge_cmd(file_path, domain)
+    owner = (db.query_one("SELECT user_id FROM tasks WHERE id=?", (task_id,)) or {}).get("user_id")
+    jmodel, jkey = _ev.judge_model_for(owner)
+    out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey)
     verdict, learning = _parse_judge_output(out)
     db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=? WHERE id=?",
                (verdict or "error", out[-30000:], time.time(), task_id))
@@ -2841,7 +2872,7 @@ async def health_full():
     ok_, d = await _probe_http("http://localhost:6333/readyz")
     checks.append({"id": "qdrant", "name": "Qdrant (memory)", "ok": ok_, "detail": d,
                    "fix": "docker start qdrant   # or: docker restart qdrant"})
-    ok_, d = await _probe_http(os.environ.get("HERMES_LANGFUSE_BASE_URL", "http://localhost:3000")
+    ok_, d = await _probe_http(sreg.conf("langfuse.base_url")
                                + "/api/public/health")
     checks.append({"id": "langfuse", "name": "Langfuse (observability)", "ok": ok_, "detail": d,
                    "fix": "cd ~/langfuse && docker compose up -d"})
@@ -3045,7 +3076,32 @@ async def onboarding_apply():
 _TASK_DOMAINS = ["general", "marketing", "content-creation", "brand", "ecommerce",
                  "consulting-bizdev", "saas-business", "software-engineering",
                  "research-learning", "music-dj"]
-_TASK_MODELS = ["glm-5.2", "glm-5.1", "glm-4.5-air"]
+_TASK_MODELS = ["glm-5.2", "glm-5.1", "glm-4.5-air"]  # pre-registry fallback only
+
+
+def _user_task_models(uid: str | None) -> list:
+    """Hermes-routable model ids this user's tasks may run on (Settings v2
+    registry: global + own rows; falls back to the historical trio)."""
+    try:
+        return db.task_models_for(uid)
+    except Exception:
+        return list(_TASK_MODELS)
+
+
+def _purpose_model(uid: str | None, purpose: str) -> str | None:
+    row = db.resolve_assignment(uid, purpose)
+    return row["model_id"] if row else None
+
+
+def _model_guidance(uid: str | None) -> str:
+    """Wizard framing line describing which model serves which purpose —
+    built from the caller's model routing so the plan uses THEIR models."""
+    hard = _purpose_model(uid, "complicated") or "glm-5.2"
+    easy = _purpose_model(uid, "easy") or "glm-5.1"
+    mech = _purpose_model(uid, "mechanical") or "glm-4.5-air"
+    return (f"- model: one of {_user_task_models(uid)} — {hard} for real deliverables and "
+            f"hard thinking (default), {easy} for light/simple tasks, {mech} only for "
+            f"mechanical formatting/extraction. All dev-pipeline stages: {hard}.\n")
 
 
 def _specialist_roster() -> str:
@@ -3095,7 +3151,7 @@ _WIZARD_ROLE_LOCK = (
 )
 
 
-def _task_wizard_framing(allow_questions: bool = True) -> str:
+def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None) -> str:
     base = (
         "You are the project-planning assistant for the Nexus agent control plane. The operator "
         "describes a goal in plain words (German or English); you turn it into a properly "
@@ -3126,9 +3182,7 @@ def _task_wizard_framing(allow_questions: bool = True) -> str:
         "- high_stakes: true when the output goes to real customers/public/money "
         "(ads, listings, prices, mass emails, homepage) — it then pauses for human approval "
         "+ frontier judge\n"
-        f"- model: one of {_TASK_MODELS} — glm-5.2 for real deliverables and hard thinking "
-        "(default), glm-5.1 for light/simple tasks, glm-4.5-air only for mechanical "
-        "formatting/extraction. All dev-pipeline stages: glm-5.2.\n"
+        + _model_guidance(uid) +
         "- priority: 0 critical, 1 high, 2 normal, 3 low (one value for a whole project)\n"
         "- budget_tokens: null for default (1M); set lower (e.g. 200000) for small tasks\n"
         "- tags: 1-3 short lowercase tags\n\n"
@@ -3223,20 +3277,23 @@ def _task_wizard_framing(allow_questions: bool = True) -> str:
 
 
 def _clamp_wizard_task(t: dict, repairs: list | None = None,
-                       valid_names: set | None = None) -> dict:
+                       valid_names: set | None = None,
+                       uid: str | None = None) -> dict:
+    allowed = _user_task_models(uid)
+    default_model = _purpose_model(uid, "complicated") or "glm-5.2"
     out = {
         "title": str(t.get("title") or "").strip()[:200],
         "description": str(t.get("description") or "").strip()[:4000],
         "domain": t.get("domain") if t.get("domain") in _TASK_DOMAINS else "general",
         "specialist": (t.get("specialist") or None),
         "high_stakes": bool(t.get("high_stakes")),
-        "model": t.get("model") if t.get("model") in _TASK_MODELS else None,
+        "model": t.get("model") if t.get("model") in allowed else None,
         "priority": t.get("priority") if t.get("priority") in (0, 1, 2, 3) else 2,
         "budget_tokens": int(t["budget_tokens"]) if str(t.get("budget_tokens") or "").isdigit() else None,
         "tags": [str(x)[:24] for x in (t.get("tags") or [])][:3],
     }
-    if out["model"] == "glm-5.2":
-        out["model"] = None  # default — keep the column clean
+    if out["model"] == default_model:
+        out["model"] = None  # default — keep the column clean (resolved at dispatch)
     sp = out["specialist"]
     if sp:
         names = valid_names if valid_names is not None else _specialist_names()
@@ -3244,10 +3301,11 @@ def _clamp_wizard_task(t: dict, repairs: list | None = None,
             if repairs is not None:
                 repairs.append(f"unknown specialist '{str(sp)[:40]}' cleared (agent self-routes)")
             out["specialist"] = None
-    # Dev-pipeline stages always run on the hard-thinking tier.
-    if out["specialist"] in _DEV_SPECIALISTS and out["model"] in ("glm-5.1", "glm-4.5-air"):
+    # Dev-pipeline stages always run on the hard-thinking tier (the owner's
+    # 'complicated' model — NULL means exactly that at dispatch time).
+    if out["specialist"] in _DEV_SPECIALISTS and out["model"] is not None:
         if repairs is not None:
-            repairs.append(f"'{out['title'][:40]}' raised to glm-5.2 (dev stage floor)")
+            repairs.append(f"'{out['title'][:40]}' raised to {default_model} (dev stage floor)")
         out["model"] = None
     return out
 
@@ -3337,7 +3395,8 @@ def _clamp_wizard_questions(data: dict) -> list:
     return out
 
 
-def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5) -> tuple[list, list]:
+def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
+                     uid: str | None = None) -> tuple[list, list]:
     """Deterministic post-LLM validation + auto-repair of a proposed project DAG.
     Never trusts the model's wiring: enforces the earlier-index invariant (acyclic
     by construction), inserts the mandatory quality gates for coding projects
@@ -3352,7 +3411,7 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5) -> tuple[l
     names = _specialist_names()
     tasks = []
     for i, rt in enumerate((raw_tasks or [])[:max_raw]):
-        t = _clamp_wizard_task(rt if isinstance(rt, dict) else {}, repairs, names)
+        t = _clamp_wizard_task(rt if isinstance(rt, dict) else {}, repairs, names, uid=uid)
         deps = (rt.get("depends_on") if isinstance(rt, dict) else None) or []
         t["depends_on_idx"] = sorted({d for d in deps if isinstance(d, int) and 0 <= d < i})
         tasks.append(t)
@@ -3593,15 +3652,18 @@ async def task_wizard(body: dict):
     wizard_uid = auth.current_user_id()
 
     async def _call(allow_questions: bool) -> dict:
-        framing = _task_wizard_framing(allow_questions)
+        framing = _task_wizard_framing(allow_questions, uid=wizard_uid)
 
         def _run():
             # Session-level system prompt = persistent role lock (stronger
             # than the per-turn framing alone).
-            sid = hd.create_session("nexus:task-wizard", system_prompt=_WIZARD_ROLE_LOCK)
+            sid = hd.create_session("nexus:task-wizard",
+                                    model=db.default_task_model(wizard_uid),
+                                    system_prompt=_WIZARD_ROLE_LOCK)
             # user-scope the throwaway session: its memory reads/writes stay
             # the requesting user's, never the scopes-file default (owner)
             hd.publish_session_scope(sid, user=wizard_uid)
+            hd.publish_session_key(sid, wizard_uid, db.default_task_model(wizard_uid))
             try:
                 # 300s: a 5-task project plan at xhigh effort exceeds 180s
                 # under evening Z.ai load — the old cap 502'd mid-generation.
@@ -3676,7 +3738,7 @@ async def task_wizard(body: dict):
     if data.get("type") == "workflow" and isinstance(data.get("workflow"), dict):
         wf = data["workflow"]
         name = str(wf.get("name") or "").strip()[:120] or "New project"
-        tasks, repairs = _repair_workflow(wf.get("tasks") or [], name)
+        tasks, repairs = _repair_workflow(wf.get("tasks") or [], name, uid=wizard_uid)
         if tasks and assumptions:
             tasks[0]["description"] = _with_assumptions(tasks[0]["description"])
         out = {"type": "workflow", "workflow": {
@@ -3689,7 +3751,8 @@ async def task_wizard(body: dict):
             db.log_activity("info", "system", f"Task wizard auto-repair: {r}")
     else:
         repairs: list = []
-        t = _clamp_wizard_task(data.get("task") or data, repairs, _specialist_names())
+        t = _clamp_wizard_task(data.get("task") or data, repairs, _specialist_names(),
+                               uid=wizard_uid)
         t["description"] = _with_assumptions(t["description"])
         out = {"type": "task", "task": t, "assumptions": assumptions, "repairs": repairs}
     if valid_repo:
@@ -3715,7 +3778,7 @@ async def task_wizard_revalidate(body: dict):
         # _repair_workflow reads depends_on. Accept both.
         if isinstance(rt, dict) and "depends_on" not in rt:
             rt["depends_on"] = rt.get("depends_on_idx") or []
-    tasks, repairs = _repair_workflow(raw, name, max_raw=7)
+    tasks, repairs = _repair_workflow(raw, name, max_raw=7, uid=auth.current_user_id())
     if repairs:
         db.log_activity("info", "system",
                         f"Plan editor auto-repair on '{name[:40]}': " + " · ".join(repairs)[:300])
@@ -3919,11 +3982,13 @@ def _replan_context(w: dict, tasks: list, reason: str) -> str:
 def _wizard_plan_sync(title: str, user_msg: str, uid: str | None) -> dict:
     """Synchronous planning-only wizard call (for background threads): fresh
     role-locked session, one silent retry on a malformed reply, session deleted."""
-    framing = _task_wizard_framing(allow_questions=False)
+    framing = _task_wizard_framing(allow_questions=False, uid=uid)
     last_err: Exception = RuntimeError("wizard returned nothing")
     for _attempt in (0, 1):
-        sid = hd.create_session(title, system_prompt=_WIZARD_ROLE_LOCK)
+        sid = hd.create_session(title, model=db.default_task_model(uid),
+                                system_prompt=_WIZARD_ROLE_LOCK)
         hd.publish_session_scope(sid, user=uid)
+        hd.publish_session_key(sid, uid, db.default_task_model(uid))
         try:
             res = hd.stream_turn(sid, user_msg, system_message=framing, max_seconds=300)
         finally:
@@ -3956,7 +4021,7 @@ def _replan_draft_thread(wf_id: str, uid: str | None):
         data = _wizard_plan_sync(f"nexus:replan-{wf_id}", user_msg, uid)
         wf = data.get("workflow") if data.get("type") == "workflow" else None
         raw_tasks = (wf or {}).get("tasks") or ([data.get("task")] if data.get("task") else [])
-        new_tasks, repairs = _repair_workflow(raw_tasks, w["name"])
+        new_tasks, repairs = _repair_workflow(raw_tasks, w["name"], uid=uid)
         if not new_tasks:
             raise RuntimeError("the wizard proposed no tasks")
         rp.update({
@@ -4025,7 +4090,8 @@ async def replan_apply(wf_id: str, body: dict):
     for rt in raw:
         if isinstance(rt, dict) and "depends_on" not in rt:
             rt["depends_on"] = rt.get("depends_on_idx") or []
-    new_tasks, repairs = _repair_workflow(raw, w["name"], max_raw=7)
+    new_tasks, repairs = _repair_workflow(raw, w["name"], max_raw=7,
+                                          uid=auth.current_user_id())
     if not new_tasks:
         return JSONResponse(status_code=400, content={"error": "no valid tasks in the plan"})
     now = time.time()
@@ -4358,8 +4424,9 @@ async def hermes_skill_wizard(body: dict):
     uid = auth.current_user_id()  # contextvar doesn't reach the executor thread
 
     def _run():
-        sid = hd.create_session("nexus:skill-wizard")
+        sid = hd.create_session("nexus:skill-wizard", model=db.default_task_model(uid))
         hd.publish_session_scope(sid, user=uid)  # never the scopes-file default
+        hd.publish_session_key(sid, uid, db.default_task_model(uid))
         try:
             return hd.stream_turn(sid, input_text, system_message=_SKILL_FRAMING, max_seconds=240)
         finally:
@@ -4383,8 +4450,9 @@ async def hermes_skill_wizard(body: dict):
     return {"ok": True, "content": content}
 
 
-# Settings for the dispatch layer (whitelisted prefixes only — watchdog has its own endpoint)
-_SETTINGS_PREFIXES = ("dispatch.", "judge.", "model.")
+# Settings whitelist — derived from the registry (docs/SPEC-SETTINGS-V2.md) so
+# every Settings-tab section is writable through the one gated endpoint.
+_SETTINGS_PREFIXES = sreg.PREFIXES
 
 
 def _write_model_efforts_bridge():
@@ -4417,12 +4485,236 @@ async def patch_settings(body: dict):
     if bad:
         return JSONResponse(status_code=400, content={
             "error": f"keys must start with one of {_SETTINGS_PREFIXES}", "rejected": bad})
-    for k, v in body.items():
-        db.set_setting(k, "1" if v is True else "0" if v is False else str(v))
+    coerced = {k: ("1" if v is True else "0" if v is False else str(v))
+               for k, v in body.items()}
+    errors = [e for k, v in coerced.items() if v != "" and (e := sreg.validate(k, v))]
+    if errors:
+        return JSONResponse(status_code=400, content={"error": "; ".join(errors)})
+    for k, v in coerced.items():
+        if v == "":
+            # Empty = back to default. Env-backed and non-registry keys clear
+            # (row removed → env/code fallback); plain registry keys pin the
+            # registry default EXPLICITLY — code-site fallbacks are not all
+            # identical to it (e.g. dispatch.enabled defaults "0" in the
+            # worker but ships seeded "1"), so a deleted row would surprise.
+            item = sreg.item_for(k)
+            if item and not item.get("env") and item.get("default", "") != "":
+                db.set_setting(k, item["default"])
+            else:
+                db.execute("DELETE FROM settings WHERE key=?", (k,))
+        else:
+            db.set_setting(k, v)
     if any(k.startswith("model.effort.") for k in body):
         _write_model_efforts_bridge()
     db.log_activity("info", "system", f"Settings updated: {', '.join(body.keys())}")
     return {"ok": True, "settings": {k: db.get_setting(k) for k in body}}
+
+
+@app.get("/api/settings/schema")
+async def settings_schema():
+    """The full Settings-tab registry: every section/setting with its current
+    and effective value, so the UI renders configuration generically
+    (docs/SPEC-SETTINGS-V2.md R1). Values are non-secret by construction —
+    secrets live in the credential store, never in the settings table."""
+    keys = [i["key"] for s in sreg.SECTIONS for i in s["items"]]
+    marks = ",".join("?" * len(keys))
+    rows = db.query_all(f"SELECT key, value FROM settings WHERE key IN ({marks})", keys)
+    values = {r["key"]: r["value"] for r in rows}
+    return sreg.schema(values, auth.is_admin())
+
+
+# ── Settings v2: encrypted credentials (per-user, global fallback) ──
+# Self-scoped: members manage their OWN keys; global rows are admin-only.
+# No endpoint returns a stored secret — metadata + 4-char hint only.
+
+@app.get("/api/credentials")
+async def credentials_list():
+    return {"credentials": secrets_store.list_credentials(auth.current_user_id())}
+
+
+@app.post("/api/credentials")
+async def credentials_set(body: dict):
+    provider = str(body.get("provider") or "").strip().lower()
+    value = str(body.get("value") or "")
+    is_global = bool(body.get("global"))
+    if not secrets_store.valid_provider(provider):
+        return JSONResponse(status_code=400, content={
+            "error": "provider must be a short slug (a-z, 0-9, -, _)"})
+    if len(value) < 8:
+        return JSONResponse(status_code=400, content={"error": "key looks too short"})
+    if is_global and not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only for global keys"})
+    uid = auth.current_user_id()
+    row = secrets_store.set_credential(None if is_global else uid, provider,
+                                       value, str(body.get("label") or "")[:80], uid)
+    db.log_activity("info", "settings",
+                    f"{'Global' if is_global else 'Personal'} credential set: {provider}",
+                    user_id=None if is_global else uid)
+    return {"ok": True, "credential": row}
+
+
+@app.delete("/api/credentials/{cred_id}")
+async def credentials_delete(cred_id: str):
+    row = secrets_store.get_credential(cred_id)
+    uid = auth.current_user_id()
+    # Foreign row ≡ nonexistent (matches _owned_task doctrine); global rows are admin-only.
+    if not row or (row["user_id"] not in (None, uid)) or (row["user_id"] is None and not auth.is_admin()):
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    secrets_store.delete_credential(cred_id)
+    db.log_activity("info", "settings", f"Credential removed: {row['provider']}",
+                    user_id=row["user_id"])
+    return {"ok": True}
+
+
+# ── Settings v2: per-user model registry + purpose routing ──
+
+def _model_public(m: dict) -> dict:
+    return {k: m[k] for k in ("id", "user_id", "provider", "model_id", "label", "route",
+                              "credential_id", "enabled", "config", "created_at", "updated_at")}
+
+
+def _visible_model(mid: str, uid: str):
+    m = db.query_one("SELECT * FROM user_models WHERE id=?", (mid,))
+    return m if m and m["user_id"] in (None, uid) else None
+
+
+@app.get("/api/models")
+async def models_list():
+    """Global + own model rows, effective purpose assignments, and what each
+    purpose means — everything the model manager and task dropdowns render."""
+    uid = auth.current_user_id()
+    models = [_model_public(m) for m in db.visible_models(uid)]
+    assignments, sources = {}, {}
+    for p in db.MODEL_PURPOSES:
+        row = db.resolve_assignment(uid, p)
+        own = db.query_one("SELECT model_row_id FROM model_assignments WHERE user_id=? AND purpose=?",
+                           (uid, p))
+        assignments[p] = row["id"] if row else None
+        sources[p] = "user" if own else "global"
+    return {"models": models, "assignments": assignments, "assignment_sources": sources,
+            "purposes": sreg.PURPOSES, "task_models": db.task_models_for(uid),
+            "is_admin": auth.is_admin()}
+
+
+def _validate_model_body(body: dict) -> str | None:
+    if not secrets_store.valid_provider(str(body.get("provider") or "").strip().lower()):
+        return "provider must be a short slug (a-z, 0-9, -, _)"
+    if not str(body.get("model_id") or "").strip():
+        return "model_id required"
+    if len(str(body.get("model_id"))) > 80:
+        return "model_id too long"
+    if body.get("route") not in ("hermes", "cli"):
+        return "route must be 'hermes' or 'cli'"
+    return None
+
+
+@app.post("/api/models")
+async def models_create(body: dict):
+    uid = auth.current_user_id()
+    is_global = bool(body.get("global"))
+    if is_global and not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only for global models"})
+    err = _validate_model_body(body)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
+    cred = body.get("credential_id")
+    if cred and not secrets_store.get_credential(cred):
+        return JSONResponse(status_code=400, content={"error": "unknown credential"})
+    mid = f"mdl-{uuid.uuid4().hex[:10]}"
+    now = time.time()
+    db.execute(
+        "INSERT INTO user_models (id, user_id, provider, model_id, label, route, "
+        "credential_id, enabled, config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (mid, None if is_global else uid, str(body["provider"]).strip().lower(),
+         str(body["model_id"]).strip(), str(body.get("label") or "")[:120],
+         body["route"], cred, 1 if body.get("enabled", True) else 0,
+         json.dumps(body.get("config") or {})[:2000], now, now))
+    db.log_activity("info", "settings", f"Model added: {body['model_id']} ({body['route']})",
+                    user_id=None if is_global else uid)
+    return {"ok": True, "model": _model_public(db.query_one(
+        "SELECT * FROM user_models WHERE id=?", (mid,)))}
+
+
+@app.patch("/api/models/{mid}")
+async def models_update(mid: str, body: dict):
+    uid = auth.current_user_id()
+    m = _visible_model(mid, uid)
+    if not m or (m["user_id"] is None and not auth.is_admin()):
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    merged = {**m, **{k: body[k] for k in
+                      ("provider", "model_id", "label", "route", "credential_id", "enabled")
+                      if k in body}}
+    err = _validate_model_body(merged)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
+    if merged.get("credential_id") and not secrets_store.get_credential(merged["credential_id"]):
+        return JSONResponse(status_code=400, content={"error": "unknown credential"})
+    cfg = json.dumps(body["config"])[:2000] if isinstance(body.get("config"), dict) else m["config"]
+    db.execute(
+        "UPDATE user_models SET provider=?, model_id=?, label=?, route=?, credential_id=?, "
+        "enabled=?, config=?, updated_at=? WHERE id=?",
+        (str(merged["provider"]).strip().lower(), str(merged["model_id"]).strip(),
+         str(merged["label"] or "")[:120], merged["route"], merged.get("credential_id"),
+         1 if merged.get("enabled") in (1, True, "1") else 0, cfg, time.time(), mid))
+    return {"ok": True, "model": _model_public(db.query_one(
+        "SELECT * FROM user_models WHERE id=?", (mid,)))}
+
+
+@app.delete("/api/models/{mid}")
+async def models_delete(mid: str):
+    uid = auth.current_user_id()
+    m = _visible_model(mid, uid)
+    if not m or (m["user_id"] is None and not auth.is_admin()):
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    db.execute("DELETE FROM model_assignments WHERE model_row_id=?", (mid,))
+    db.execute("DELETE FROM user_models WHERE id=?", (mid,))
+    db.log_activity("info", "settings", f"Model removed: {m['model_id']}", user_id=m["user_id"])
+    return {"ok": True}
+
+
+@app.put("/api/models/assignments")
+async def models_assign(body: dict):
+    """Assign purposes → models. Body {purpose: model_row_id | null, ...} plus
+    optional global:true (admin — edits the defaults every user inherits).
+    null clears a personal override back to the global default."""
+    uid = auth.current_user_id()
+    is_global = bool(body.pop("global", False))
+    if is_global and not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only for global assignments"})
+    scope = "global" if is_global else uid
+    for purpose, mid in body.items():
+        if purpose not in db.MODEL_PURPOSES:
+            return JSONResponse(status_code=400, content={"error": f"unknown purpose '{purpose}'"})
+        if mid is None:
+            continue
+        m = _visible_model(str(mid), uid)
+        if not m or not m["enabled"]:
+            return JSONResponse(status_code=400, content={"error": f"{purpose}: model not available"})
+        if is_global and m["user_id"] is not None:
+            return JSONResponse(status_code=400, content={
+                "error": f"{purpose}: a personal model can't be a global default"})
+        # Purposes bind to what can actually run there: worker purposes need a
+        # Hermes-routable session model; the judge runs through the CLI path.
+        if purpose in sreg.WORKER_PURPOSES and m["route"] != "hermes":
+            return JSONResponse(status_code=400, content={
+                "error": f"{purpose}: needs a hermes-route model (CLI models can only judge). "
+                         "More providers become task-routable when Hermes gains them."})
+        if purpose == "frontier_judge" and m["route"] != "cli":
+            return JSONResponse(status_code=400, content={
+                "error": "frontier_judge: needs a cli-route model (runs via judge.cmd)"})
+    now = time.time()
+    for purpose, mid in body.items():
+        if mid is None:
+            db.execute("DELETE FROM model_assignments WHERE user_id=? AND purpose=?",
+                       (scope, purpose))
+        else:
+            db.execute(
+                "INSERT OR REPLACE INTO model_assignments (user_id, purpose, model_row_id, "
+                "updated_at) VALUES (?,?,?,?)", (scope, purpose, str(mid), now))
+    db.log_activity("info", "settings",
+                    f"{'Global' if is_global else 'Personal'} model routing updated: "
+                    f"{', '.join(body.keys())}", user_id=None if is_global else uid)
+    return {"ok": True}
 
 
 # ── Known issues: operator feedback with interaction context (v3.4) ──

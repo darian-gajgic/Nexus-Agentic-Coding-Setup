@@ -59,13 +59,14 @@ _slot_wait_logged: dict = {}  # task_id -> last log ts (avoid 2s-tick log spam)
 
 def _slot_ok(task: dict, agent_id: str) -> bool:
     """Per-model concurrency gate: a task without a free GLM slot WAITS."""
-    if hd.slot_available(task.get("model")):
+    run_model = hd.resolve_task_model(task)  # Settings v2: owner default counts too
+    if hd.slot_available(run_model):
         return True
     now = time.time()
     if now - _slot_wait_logged.get(task["id"], 0) > 60:
         _slot_wait_logged[task["id"]] = now
         db.log_activity("info", agent_id,
-                        f"Task {task['id']} waiting for a free {task.get('model') or hd.DEFAULT_MODEL} "
+                        f"Task {task['id']} waiting for a free {run_model or hd.DEFAULT_MODEL} "
                         f"slot (in flight: {hd.slots_in_use()})", user_id=task.get("user_id"))
     return False
 
