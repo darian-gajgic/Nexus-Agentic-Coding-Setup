@@ -6641,8 +6641,41 @@ function showModal(html) {
 function closeModal() {
   const m = $('#modal');
   if (m) m.style.display = 'none';
+  const c = $('#modalContent');
+  if (c) c.classList.remove('modal-fs'); // next popup opens at normal size
   if (pendingRender && !uiLocked()) { pendingRender = false; render(); }
 }
+
+// ── Full-screen toggle for every popup. The observer (not showModal) injects the
+//    button because many builders set #modalContent.innerHTML directly; the
+//    .modal-fs class lives on #modalContent itself so it survives in-place
+//    re-renders (wizard steps, onboarding) until closeModal resets it. ──
+const MODAL_FS_MAX = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>';
+const MODAL_FS_MIN = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>';
+function toggleModalFS() {
+  const c = $('#modalContent');
+  if (!c) return;
+  const on = c.classList.toggle('modal-fs');
+  const b = document.getElementById('modalFsBtn');
+  if (b) { b.innerHTML = on ? MODAL_FS_MIN : MODAL_FS_MAX; b.title = on ? 'Exit full screen' : 'Full screen'; }
+}
+function injectModalFsBtn() {
+  const c = $('#modalContent');
+  if (!c || c.querySelector('#modalFsBtn')) return;
+  const on = c.classList.contains('modal-fs');
+  const b = document.createElement('button');
+  b.id = 'modalFsBtn'; b.type = 'button';
+  b.className = 'help-btn modal-fs-btn';
+  b.title = on ? 'Exit full screen' : 'Full screen';
+  b.setAttribute('aria-label', 'Toggle full screen');
+  b.innerHTML = on ? MODAL_FS_MIN : MODAL_FS_MAX;
+  b.onclick = toggleModalFS;
+  c.appendChild(b);
+}
+(() => {
+  const c = document.getElementById('modalContent');
+  if (c) new MutationObserver(injectModalFsBtn).observe(c, { childList: true });
+})();
 
 // ═══════════════════════════════ SPECIALISTS ═══════════════════════════════
 const specialistsState = { data: null, loading: false, fetched: false, tab: 'team' };

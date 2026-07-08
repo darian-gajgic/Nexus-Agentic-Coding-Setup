@@ -552,8 +552,8 @@ code, pre, .mono { font-family: var(--font-mono); }
 .modal {
   background: linear-gradient(160deg, #171724, #101019);
   border:1px solid var(--border-l);
-  border-radius:16px; padding:26px; min-width:520px; max-width:min(860px, 92vw);
-  width:720px; max-height:88vh; overflow-y:auto;
+  border-radius:16px; padding:26px; min-width:520px; max-width:min(1100px, 94vw);
+  width:860px; max-height:90vh; overflow-y:auto;
   resize:both; overflow:auto; min-height:200px;
   box-shadow:0 24px 80px rgba(0,0,0,.6);
   animation: modalIn .22s cubic-bezier(.2,.8,.3,1.15) both;
@@ -1329,6 +1329,19 @@ code, pre, .mono { font-family: var(--font-mono); }
 }
 .modal { position:relative; }
 .modal-help { position:absolute; top:14px; right:14px; z-index:5; }
+.modal-fs-btn {
+  position:absolute; top:14px; right:52px; z-index:5;
+  display:inline-flex; align-items:center; justify-content:center;
+}
+/* Full-screen popups: .modal-fs on #modalContent (⛶ button, injected into every modal) */
+.modal.modal-fs {
+  width:100vw !important; max-width:100vw !important; min-width:0 !important;
+  height:100vh; height:100dvh;
+  max-height:100vh !important; max-height:100dvh !important;
+  border-radius:0; border:none; resize:none;
+}
+.modal.modal-fs .review-layout { max-height:none; height:calc(100dvh - 250px); }
+.modal.modal-fs .mem-merge-list { max-height:62vh; }
 
 /* ═══ Global focus context (Projects › Workflows › Tasks scoping) ═══ */
 .focus-bar {
