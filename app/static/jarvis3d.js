@@ -1,25 +1,27 @@
-/* JARVIS 3D v2 — rendered particle AI avatar (inspiration: cyan point-cloud
-   head with node streams flowing out of the back of the skull into the real
-   memory galaxy behind it).
+/* JARVIS 3D v3 — sculpted particle bust (true 3D form).
 
-   - The head is a point cloud sampled from the avatar reference image:
-     pixel luminance → point density/brightness, curved over an ellipsoid
-     shell, so the face relief is REAL structure, not a texture. Renders like
-     the memory galaxy (additive glow sprites), runs smooth (positions are
-     static; only the mouth/jaw subset animates per frame).
-   - Lip-sync is native-timing: app.js feeds setLevel() from an AnalyserNode
-     on the ACTUAL playing TTS audio; mouth points open with amplitude.
-   - The galaxy behind is the user's real mem0 galaxy (/api/memory3d data,
-     same palette as memory3d.js); node streams (curves + traveling pulses)
-     connect the back of the head to its clusters. Falls back to a procedural
-     starfield when the galaxy is empty.
-   - States: idle / listening / thinking / talking (color + motion).
-   - setAnimations(false) freezes the RAF loop on a rendered frame (the
-     animations on/off button); dispose() tears everything down.
+   v2 sampled the reference PHOTO into a flat relief — it read as a 2D poster
+   of dots (operator feedback 2026-07-08). v3 builds a real 3D bust:
 
-   Pattern mirrors nexus3d.js/memory3d.js: lazy CDN import; the string
-   "three" never appears in index.html (verify.sh gate).
-   window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations } */
+   - GEOMETRY: parametric skull — cranium + jaw ellipsoids, neck cylinder,
+     shoulder capsule — sampled as ~28k surface points with real NORMALS.
+     The silhouette is a smooth sculpted form from every angle.
+   - SHADING: per-point lambert from a virtual key light + rim light on
+     grazing normals (the thing that makes a point cloud read as VOLUME),
+     plus depth dimming. This is computed once at build; the tint crossfade
+     preserves it.
+   - IDENTITY: the reference photo is projected onto the FRONT of the skull
+     (anchored at the eye/mouth lines): luminance + edges modulate point
+     brightness, so brows/eyes/nose/lips/beard appear as his features.
+   - MOTION PARALLAX: slow camera orbit + pointer parallax + a deeper idle
+     head turn — motion parallax is the second half of "looks 3D".
+   - Same lip-sync (mouth-band points driven by setLevel), states, galaxy
+     backdrop from /api/memory3d, and node streams out of the back of the
+     skull. Same public API:
+     window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations }
+
+   Lazy CDN import as in nexus3d/memory3d — the string "three" never appears
+   in index.html (verify.sh gate). */
 
 let THREE = null;
 let threePromise = null;
@@ -35,10 +37,10 @@ function loadThree() {
 
 const J = {
   renderer: null, scene: null, camera: null, raf: null, container: null,
-  head: null, headGeo: null, backShell: null, galaxy: null, streams: [],
-  pulses: [], mouthIdx: [], eyeIdx: [], basePos: null, baseCol: null,
+  head: null, headGeo: null, galaxy: null, streams: [], pulses: [],
+  mouthIdx: [], eyeIdx: [], basePos: null, baseB: null, baseW: null,
   level: 0, mode: 'idle', t: 0, animOn: true, disposed: false,
-  resizeObs: null,
+  resizeObs: null, pointer: { x: 0, y: 0 }, pointerHandler: null,
 };
 
 const MODE_TINT = {
@@ -64,117 +66,156 @@ function glowTexture() {
   return _glowTex;
 }
 
-/* ── Head: sample the reference face into a curved particle relief ── */
-async function buildHead() {
+/* ── photo → feature map (luminance + edges, subject-masked) ── */
+async function loadFaceMap() {
   const img = await new Promise((res) => {
     const i = new Image();
     i.onload = () => res(i);
     i.onerror = () => res(null);
     i.src = '/static/avatar/reference.jpg';
   });
-  const S = 150;                       // sample grid
+  const S = 180;
   const cv = document.createElement('canvas');
   cv.width = cv.height = S;
   const g = cv.getContext('2d');
-  if (img) g.drawImage(img, 0, 0, S, S);
-  else {                               // fallback: soft radial "face" blob
-    const rg = g.createRadialGradient(S / 2, S / 2, 6, S / 2, S / 2, S / 2);
-    rg.addColorStop(0, '#cccccc'); rg.addColorStop(1, '#000000');
-    g.fillStyle = rg; g.fillRect(0, 0, S, S);
-  }
+  if (!img) return null;
+  g.drawImage(img, 0, 0, S, S);
   const px = g.getImageData(0, 0, S, S).data;
-
-  // The reference is a portrait on a BRIGHT wall — luminance alone renders
-  // the wall, not the person (the "egg" bug). So: (1) background removal by
-  // color distance from the top-corner average → the SUBJECT silhouette is
-  // the head shape, hair and shoulders included; (2) density is uniform-ish
-  // inside the subject (additive blending flattens density anyway);
-  // (3) photo luminance drives per-point BRIGHTNESS (with contrast stretch),
-  // edges (eyes/brows/nose/lips) always pop. Tuned offline 2026-07-08.
-  const rgbAt = (i) => [px[i * 4] / 255, px[i * 4 + 1] / 255, px[i * 4 + 2] / 255];
-  const lumAt = new Float32Array(S * S);
+  const lum = new Float32Array(S * S);
   for (let i = 0; i < S * S; i++) {
-    lumAt[i] = (px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114) / 255;
+    lum[i] = (px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114) / 255;
   }
-  // background color ≈ mean of the two top corners
-  let br = 0, bgc = 0, bb = 0, bn = 0;
-  for (let y = 0; y < 12; y++) {
-    for (const x0 of [0, S - 12]) {
-      for (let x = x0; x < x0 + 12; x++) {
-        const c = rgbAt(y * S + x);
-        br += c[0]; bgc += c[1]; bb += c[2]; bn++;
+  // contrast stretch over the central face window (avoids the bright wall)
+  const tones = [];
+  for (let y = Math.floor(S * 0.28); y < S * 0.72; y++) {
+    for (let x = Math.floor(S * 0.30); x < S * 0.70; x++) tones.push(lum[y * S + x]);
+  }
+  tones.sort((a, b) => a - b);
+  const lo = tones[Math.floor(tones.length * 0.05)] ?? 0;
+  const hi = tones[Math.floor(tones.length * 0.97)] ?? 1;
+  return {
+    S,
+    lum: (u, v) => {
+      const x = Math.min(S - 2, Math.max(1, Math.round(u * S)));
+      const y = Math.min(S - 2, Math.max(1, Math.round(v * S)));
+      return Math.min(1, Math.max(0, (lum[y * S + x] - lo) / Math.max(0.01, hi - lo)));
+    },
+    edge: (u, v) => {
+      const x = Math.min(S - 2, Math.max(1, Math.round(u * S)));
+      const y = Math.min(S - 2, Math.max(1, Math.round(v * S)));
+      const i = y * S + x;
+      return Math.min(1, (Math.abs(lum[i + 1] - lum[i - 1]) + Math.abs(lum[i + S] - lum[i - S])) * 4.0);
+    },
+  };
+}
+
+/* ── parametric bust sampled as lit surface points ── */
+function buildBust(face) {
+  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
+  const KEY = new THREE.Vector3(-0.45, 0.55, 0.8).normalize();   // key light
+  const Zax = new THREE.Vector3(0, 0, 1);
+  const N = new THREE.Vector3();
+
+  // photo anchors (measured): eyes at v=0.36 ↔ head y=+3.5;
+  // mouth at v=0.556 ↔ head y=-4.5; face half-width 0.215 ↔ x=10.5
+  const photoV = (y) => 0.36 + (3.5 - y) * 0.0245;
+  const photoU = (x) => 0.5 + x * (0.215 / 10.5);
+
+  function addPoint(x, y, z, nx, ny, nz, part) {
+    N.set(nx, ny, nz).normalize();
+    const frontness = N.z;   // normalized! the raw nz param is ellipsoid-scaled
+    // volume shading: ambient + key lambert + frontal fill + rim on grazing
+    // normals — fill keeps the FACE readable, rim sells the silhouette
+    const lambert = Math.max(0, N.dot(KEY));
+    const fill = Math.max(0, frontness) * 0.20;
+    let rim = Math.pow(1 - Math.max(0, frontness), 2.6) * 0.42;
+    // identity: the photo CARVES the front of the face. Dark features REMOVE
+    // points (holes survive additive glow-bleed; dimming alone does not) and
+    // squared contrast keeps eye sockets/brows/lips dark vs lit skin.
+    let faceMul = 1, faceAdd = 0;
+    if (face && part === 'skull' && frontness > 0.30 && y > -9.5 && y < 15) {
+      const u = photoU(x), v = photoV(y);
+      if (u > 0.03 && u < 0.97 && v > 0.03 && v < 0.97) {
+        const l = face.lum(u, v);
+        const e = face.edge(u, v);
+        // inner-face oval: eyes/nose/mouth/beard — dark tones become HOLES
+        const inFace = Math.abs(u - 0.5) < 0.18 && v > 0.28 && v < 0.64;
+        if (inFace && l < 0.30 && e < 0.25 && Math.random() < 0.75) return -1;
+        // posterized tones — 4 bands read at particle resolution, raw
+        // luminance does not
+        faceMul = l < 0.22 ? 0.10 : l < 0.42 ? 0.42 : l < 0.68 ? 0.95 : 1.30;
+        faceAdd = e * 0.7;             // feature lines sparkle
+        rim *= 0.35;                   // silhouette glow must not fight the face
       }
     }
+    let b = (0.10 + 0.55 * Math.pow(lambert, 1.25) + fill + rim) * faceMul + faceAdd;
+    b = Math.min(1.35, b);
+    const n = pos.length / 3;
+    pos.push(x + (Math.random() - .5) * .4,
+             y + (Math.random() - .5) * .4,
+             z + (Math.random() - .5) * .4);
+    const w = b > 0.88 ? Math.min(1, (b - 0.88) / 0.25) * 0.45 : 0;
+    bri.push(b); wmi.push(w);
+    col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
+             b * (MODE_TINT.idle[1] * (1 - w) + w),
+             b * (MODE_TINT.idle[2] * (1 - w) + w));
+    // animation regions (head space): mouth band + eye band, front-facing
+    if (y > -6.3 && y < -2.7 && Math.abs(x) < 5.2 && frontness > 0.45) mouthIdx.push(n);
+    if (y > 2.2 && y < 5.4 && Math.abs(x) > 2.4 && Math.abs(x) < 7.2 && frontness > 0.45) eyeIdx.push(n);
+    return n;
   }
-  br /= bn; bgc /= bn; bb /= bn;
-  const isSubjectRaw = new Uint8Array(S * S);
-  for (let i = 0; i < S * S; i++) {
-    const c = rgbAt(i);
-    const d = Math.hypot(c[0] - br, c[1] - bgc, c[2] - bb);
-    isSubjectRaw[i] = d > 0.16 ? 1 : 0;
-  }
-  // despeckle: a subject pixel needs ≥3 subject neighbors
-  const isSubject = new Uint8Array(S * S);
-  for (let y = 1; y < S - 1; y++) {
-    for (let x = 1; x < S - 1; x++) {
-      const i = y * S + x;
-      if (!isSubjectRaw[i]) continue;
-      let nb = 0;
-      for (const o of [-S - 1, -S, -S + 1, -1, 1, S - 1, S, S + 1]) nb += isSubjectRaw[i + o];
-      isSubject[i] = nb >= 3 ? 1 : 0;
-    }
-  }
-  // contrast stretch from the subject's own tonal range (approx. quantiles)
-  const tones = [];
-  for (let i = 0; i < S * S; i++) if (isSubject[i]) tones.push(lumAt[i]);
-  tones.sort((a, b) => a - b);
-  const lo = tones[Math.floor(tones.length * 0.04)] ?? 0;
-  const hi = tones[Math.floor(tones.length * 0.97)] ?? 1;
-  const stretch = (l) => Math.min(1, Math.max(0, (l - lo) / Math.max(0.01, hi - lo)));
 
-  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
-  const W = 34, H = 44, DEPTH = 16;    // head proportions (world units)
-  for (let y = 1; y < S - 1; y++) {
-    for (let x = 1; x < S - 1; x++) {
-      const i = y * S + x;
-      if (!isSubject[i]) continue;
-      const lum = stretch(lumAt[i]);
-      const edge = Math.min(1, (Math.abs(lumAt[i + 1] - lumAt[i - 1])
-        + Math.abs(lumAt[i + S] - lumAt[i - S])) * 4.0);
-      const u = x / S - 0.5, v = 0.5 - y / S;      // -0.5..0.5
-      let density = 0.72 + edge * 0.28;
-      if (v < -0.30) density *= 0.25;              // shirt/shoulders fade out
-      if (Math.random() > density) continue;
-      // brightness: glowing skin, popping features, dim-but-visible hair
-      let b = Math.max(Math.pow(lum, 1.1), edge, 0.18);
-      if (v < -0.30) b *= 0.5;
-      const rr = (u * u) / 0.23 + (v * v) / 0.245; // dome only shapes depth now
-      const wx = u * W, wy = v * H;
-      const wz = Math.sqrt(Math.max(0, 1 - rr)) * DEPTH + lum * 4.0 + edge * 1.5;
-      const n = pos.length / 3;
-      pos.push(wx + (Math.random() - .5) * .45,
-               wy + (Math.random() - .5) * .45,
-               wz + (Math.random() - .5) * .45);
-      // brightest points tint toward white (lit-skin look from the inspiration)
-      const wmix = b > 0.72 ? (b - 0.72) / 0.28 * 0.45 : 0;
-      bri.push(b); wmi.push(wmix);
-      col.push(b * (MODE_TINT.idle[0] * (1 - wmix) + wmix),
-               b * (MODE_TINT.idle[1] * (1 - wmix) + wmix),
-               b * (MODE_TINT.idle[2] * (1 - wmix) + wmix));
-      // regions measured on THIS reference photo: eyes v≈0.14, mouth v≈-0.05
-      if (v < -0.005 && v > -0.11 && Math.abs(u) < 0.13) mouthIdx.push(n);
-      if (v > 0.09 && v < 0.17 && Math.abs(u) > 0.04 && Math.abs(u) < 0.20) eyeIdx.push(n);
-    }
+  const smooth = (a, b, x) => {
+    const s = Math.min(1, Math.max(0, (x - a) / (b - a)));
+    return s * s * (3 - 2 * s);
+  };
+
+  // SKULL: one continuous deformed ellipsoid — the lower-front bulges into a
+  // jaw/chin, the lower-back tapers slightly. A single surface = no seam
+  // rings (the v3.0 two-ellipsoid head drew a glowing circle mid-face).
+  const RX = 13.4, RY = 15.0, RZ = 14.6, CY = 7.5;
+  const skullPoint = (sx, sy, sz) => {
+    // jaw bulge: lower-front directions push outward, chin most of all
+    const jaw = smooth(-0.15, -0.75, sy) * smooth(0.05, 0.75, sz) * 1.25;
+    // slight cranial back-taper below the ears
+    const taper = 1 - 0.16 * smooth(-0.2, -0.9, sy) * smooth(0.1, 0.9, -sz);
+    const m = (1 + 0.24 * jaw) * taper;
+    addPoint(sx * RX * m, CY + sy * RY * m, sz * RZ * m,
+             sx / RX, sy / RY, sz / RZ, 'skull');
+  };
+  for (let k = 0; k < 20000; k++) {
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(2 * Math.random() - 1);
+    skullPoint(Math.sin(ph) * Math.cos(th), Math.cos(ph), Math.sin(ph) * Math.sin(th));
   }
-  // sparse back-of-skull shell so the head reads as a volume from the side
-  const back = [];
-  for (let k = 0; k < 2600; k++) {
-    const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+  // extra FACE-resolution pass: double the point density on the front so the
+  // projected features actually resolve at particle scale
+  for (let k = 0; k < 14000; k++) {
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(2 * Math.random() - 1);
     const sx = Math.sin(ph) * Math.cos(th), sy = Math.cos(ph), sz = Math.sin(ph) * Math.sin(th);
-    if (sz > 0.15) continue;                       // front stays the face
-    back.push(sx * W * 0.52, sy * H * 0.5, sz * DEPTH * 1.35);
+    if (sz < 0.25) continue;                       // front hemisphere only
+    skullPoint(sx, sy, sz);
   }
-  return { pos, col, bri, wmi, mouthIdx, eyeIdx, back };
+  // neck — cylinder
+  for (let k = 0; k < 2600; k++) {
+    const a = Math.random() * Math.PI * 2;
+    const y = -18 + Math.random() * 9.5;
+    const r = 5.7;
+    addPoint(Math.cos(a) * r, y, Math.sin(a) * r * 0.92 + 0.5,
+             Math.cos(a), 0, Math.sin(a), 'neck');
+  }
+  // shoulders — wide flattened capsule, upper half only
+  for (let k = 0; k < 9000; k++) {
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(2 * Math.random() - 1);
+    const sx = Math.sin(ph) * Math.cos(th), sy = Math.cos(ph), sz = Math.sin(ph) * Math.sin(th);
+    if (sy <= 0.05) continue;
+    addPoint(sx * 30, -23.5 + sy * 8.5, -1.5 + sz * 11,
+             sx / 30, sy / 8.5, sz / 11, 'shoulders');
+  }
+
+  return { pos, col, bri, wmi, mouthIdx, eyeIdx };
 }
 
 /* ── Galaxy backdrop from the user's REAL memory map ── */
@@ -190,7 +231,6 @@ async function buildGalaxyData() {
       if ((d.nodes || []).length >= 8) return d;
     }
   } catch { }
-  // procedural fallback: a few star clusters
   const nodes = [];
   for (let c = 0; c < 6; c++) {
     const cx = (Math.random() - .5) * 150, cy = (Math.random() - .5) * 90,
@@ -211,7 +251,6 @@ function mountGalaxy(data) {
   const ccount = {};
   const color = new THREE.Color();
   nodes.forEach((n, i) => {
-    // galaxy swarms wide AROUND and behind the head (inspiration look)
     const gx = (n.x || 0) * 1.7, gy = (n.y || 0) * 1.25 + 8, gz = -150 + (n.z || 0) * 1.3;
     pos[i * 3] = gx; pos[i * 3 + 1] = gy; pos[i * 3 + 2] = gz;
     const grp = n.group || 0;
@@ -245,7 +284,7 @@ function mountStreams(clusterCenters) {
   for (let i = 0; i < N; i++) {
     const tgt = targets[i % targets.length];
     const a = (i / N) * Math.PI * 2;
-    const start = new THREE.Vector3(Math.cos(a) * 10, 6 + Math.sin(a * 2) * 9, -10 - Math.random() * 6);
+    const start = new THREE.Vector3(Math.cos(a) * 9, 9 + Math.sin(a * 2) * 8, -11 - Math.random() * 5);
     const mid1 = new THREE.Vector3(start.x * 3.2, start.y * 1.6 + 6, -46 - Math.random() * 22);
     const mid2 = new THREE.Vector3(tgt.x * 0.55 + (Math.random() - .5) * 24,
                                    tgt.y * 0.7 + (Math.random() - .5) * 18, -110);
@@ -259,7 +298,6 @@ function mountStreams(clusterCenters) {
     const line = new THREE.Line(geo, mat);
     J.scene.add(line);
     J.streams.push({ curve, line });
-    // 2 pulses per stream
     for (let p = 0; p < 2; p++) {
       const sm = new THREE.SpriteMaterial({
         map: glowTexture(), color: 0x67e8f9, transparent: true,
@@ -282,38 +320,42 @@ function tick() {
   const t = J.t;
   const tint = MODE_TINT[J.mode] || MODE_TINT.idle;
 
+  // motion parallax: slow camera orbit + pointer-follow (eased)
+  if (J.camera) {
+    const px = J.pointer.x, py = J.pointer.y;
+    const ox = Math.sin(t * 0.13) * 6 + px * 7;
+    const oy = 4 + Math.sin(t * 0.081) * 2.5 - py * 4;
+    J.camera.position.x += (ox - J.camera.position.x) * 0.03;
+    J.camera.position.y += (oy - J.camera.position.y) * 0.03;
+    J.camera.lookAt(0, 1, 0);
+  }
+
   if (J.head) {
-    // breathing + idle sway (whole-group transforms — cheap)
     const breathe = 1 + Math.sin(t * 1.1) * 0.006;
     J.head.scale.set(1, breathe, 1);
-    J.head.rotation.y = Math.sin(t * 0.22) * 0.055 + (J.mode === 'listening' ? 0.03 : 0);
-    J.head.rotation.x = Math.sin(t * 0.15) * 0.02;
-    if (J.backShell) {
-      J.backShell.rotation.copy(J.head.rotation);
-      J.backShell.scale.copy(J.head.scale);
-    }
+    // deeper idle turn: the form reveal is what reads as 3D
+    J.head.rotation.y = Math.sin(t * 0.16) * 0.17 + (J.mode === 'listening' ? 0.05 : 0);
+    J.head.rotation.x = Math.sin(t * 0.11) * 0.035;
 
-    // mouth: native-timing lip-sync — displace mouth points by audio level
-    // (band center wy≈-2.5, half-height≈2.3 — measured on the reference)
+    // mouth: native-timing lip-sync (band center y≈-4.5, half-height≈1.8)
     const posAttr = J.headGeo.attributes.position;
     const open = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.15);
     for (let k = 0; k < J.mouthIdx.length; k++) {
       const n = J.mouthIdx[k];
       const by = J.basePos[n * 3 + 1];
-      const center = Math.max(0, 1 - Math.abs((by + 2.5) / 2.3));
-      posAttr.array[n * 3 + 1] = by - open * 3.0 * center - open * 0.5 * Math.random();
-      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] - open * 1.0;
+      const center = Math.max(0, 1 - Math.abs((by + 4.5) / 1.8));
+      posAttr.array[n * 3 + 1] = by - open * 2.8 * center - open * 0.4 * Math.random();
+      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] - open * 0.8 * center;
     }
     if (J.mouthIdx.length) posAttr.needsUpdate = true;
 
-    // eye blink: fade eye points every few seconds; mode tint crossfade
-    // (full-buffer writes only every 4th frame — they're the expensive part)
+    // eye blink + mode tint crossfade (full-buffer writes every 4th frame)
     const blink = (t % 4.7) > 4.55 ? 0.25 : 1;
     const colAttr = J.headGeo.attributes.color;
     if ((Math.round(t * 60) & 3) === 0) {
       const mix = 0.14;
       for (let n = 0; n < colAttr.count; n++) {
-        const b = J.baseB[n], w = J.baseW[n];   // true brightness + white-mix
+        const b = J.baseB[n], w = J.baseW[n];
         colAttr.array[n * 3]     += (b * (tint[0] * (1 - w) + w) - colAttr.array[n * 3]) * mix;
         colAttr.array[n * 3 + 1] += (b * (tint[1] * (1 - w) + w) - colAttr.array[n * 3 + 1]) * mix;
         colAttr.array[n * 3 + 2] += (b * (tint[2] * (1 - w) + w) - colAttr.array[n * 3 + 2]) * mix;
@@ -323,8 +365,7 @@ function tick() {
       }
       colAttr.needsUpdate = true;
     }
-    // talking glow
-    J.head.material.size = 0.9 + Math.min(0.5, J.level * 0.35)
+    J.head.material.size = 0.85 + Math.min(0.45, J.level * 0.32)
       + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.06 : 0);
   }
 
@@ -362,10 +403,18 @@ async function mount(container) {
   J.renderer.domElement.className = 'jarvis3d-canvas';
   container.prepend(J.renderer.domElement);
 
-  const { pos, col, bri, wmi, mouthIdx, eyeIdx, back } = await buildHead();
+  // pointer parallax (normalized -1..1 over the stage)
+  J.pointerHandler = (e) => {
+    const r = container.getBoundingClientRect();
+    J.pointer.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+    J.pointer.y = ((e.clientY - r.top) / r.height) * 2 - 1;
+  };
+  container.addEventListener('pointermove', J.pointerHandler);
+
+  const face = await loadFaceMap();
   if (J.disposed) return;
+  const { pos, col, bri, wmi, mouthIdx, eyeIdx } = buildBust(face);
   J.basePos = Float32Array.from(pos);
-  J.baseCol = Float32Array.from(col);
   J.baseB = Float32Array.from(bri);
   J.baseW = Float32Array.from(wmi);
   J.mouthIdx = mouthIdx;
@@ -374,21 +423,12 @@ async function mount(container) {
   J.headGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
   J.headGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(col), 3));
   J.head = new THREE.Points(J.headGeo, new THREE.PointsMaterial({
-    size: 0.9, map: glowTexture(), vertexColors: true, transparent: true,
+    size: 0.85, map: glowTexture(), vertexColors: true, transparent: true,
     opacity: 0.95, depthWrite: false, blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
   }));
-  J.head.position.set(0, 2, 0);
+  J.head.position.set(0, 4, 0);
   J.scene.add(J.head);
-
-  const bgeo = new THREE.BufferGeometry();
-  bgeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(back), 3));
-  J.backShell = new THREE.Points(bgeo, new THREE.PointsMaterial({
-    size: 0.7, map: glowTexture(), color: 0x1899b8, transparent: true,
-    opacity: 0.35, depthWrite: false, blending: THREE.AdditiveBlending,
-  }));
-  J.backShell.position.copy(J.head.position);
-  J.scene.add(J.backShell);
 
   const centers = mountGalaxy(await buildGalaxyData());
   if (J.disposed) return;
@@ -412,18 +452,21 @@ function dispose() {
   if (J.raf) cancelAnimationFrame(J.raf);
   J.raf = null;
   if (J.resizeObs) { J.resizeObs.disconnect(); J.resizeObs = null; }
+  if (J.container && J.pointerHandler) {
+    J.container.removeEventListener('pointermove', J.pointerHandler);
+    J.pointerHandler = null;
+  }
   if (J.renderer) {
     try {
       J.renderer.dispose();
       J.renderer.domElement.remove();
     } catch { }
   }
-  for (const k of ['head', 'backShell', 'galaxy']) {
+  for (const k of ['head', 'galaxy']) {
     if (J[k]) { try { J[k].geometry.dispose(); J[k].material.dispose(); } catch { } J[k] = null; }
   }
   J.streams = []; J.pulses = []; J.renderer = null; J.scene = null;
-  J.headGeo = null; J.basePos = null; J.baseCol = null;
-  J.baseB = null; J.baseW = null;
+  J.headGeo = null; J.basePos = null; J.baseB = null; J.baseW = null;
 }
 
 function setMode(mode) { J.mode = mode; }
