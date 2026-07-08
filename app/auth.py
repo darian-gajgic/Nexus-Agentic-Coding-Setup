@@ -28,6 +28,7 @@ import database as db
 COOKIE_NAME = "nexus_session"
 SESSION_TTL = 30 * 24 * 3600          # 30 days
 SESSION_RENEW_BELOW = 15 * 24 * 3600  # sliding: extend when < 15 days left
+SESSION_LAST_SEEN_THROTTLE = 60       # only rewrite last_seen when this stale (keep the hot path read-only)
 DEFAULT_USER_ID = "u_owner"
 
 # Paths reachable without a session even when login is required.
@@ -159,7 +160,7 @@ def resolve_session(token: str) -> dict | None:
         return None
     now = time.time()
     row = db.query_one(
-        "SELECT s.token_hash, s.expires_at, u.* FROM auth_sessions s "
+        "SELECT s.token_hash, s.expires_at, s.last_seen AS _last_seen, u.* FROM auth_sessions s "
         "JOIN users u ON u.id = s.user_id "
         "WHERE s.token_hash=? AND s.expires_at > ? AND u.active=1",
         (_token_hash(token), now))
@@ -168,11 +169,14 @@ def resolve_session(token: str) -> dict | None:
     if row["expires_at"] - now < SESSION_RENEW_BELOW:
         db.execute("UPDATE auth_sessions SET expires_at=?, last_seen=? WHERE token_hash=?",
                    (now + SESSION_TTL, now, row["token_hash"]))
-    else:
+    elif now - (row["_last_seen"] or 0) > SESSION_LAST_SEEN_THROTTLE:
+        # Throttle: keep the per-request path read-only unless last_seen is
+        # actually stale — a blocking SQLite write per request stalls the loop.
         db.execute("UPDATE auth_sessions SET last_seen=? WHERE token_hash=?",
                    (now, row["token_hash"]))
     row.pop("token_hash", None)
     row.pop("expires_at", None)
+    row.pop("_last_seen", None)
     return row
 
 
