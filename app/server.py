@@ -1142,7 +1142,12 @@ async def decide_lesson(lid: str, body: dict):
 
 @app.post("/api/specialists/save")
 async def save_specialist(body: dict):
-    """Write an edited specialist definition to ~/.hermes/agents/<name>.md and git-commit it."""
+    """Write an edited specialist definition to ~/.hermes/agents/<name>.md and git-commit it.
+    Admin-only (C2): specialist definitions are SHARED operator config — the house
+    coding pipeline routes to them, so a member-authored body would run as the
+    operator's Unix account on the operator's next dispatch (stored prompt injection)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import subprocess
     import re
     name = (body.get("name") or "").strip()
@@ -1928,7 +1933,12 @@ async def release_task(task_id: str, body: dict):
 
 @app.post("/api/verify")
 async def verify_run(body: dict):
-    """Run a command in a subprocess, capture result, persist a verify_run row."""
+    """Run a command in a subprocess, capture result, persist a verify_run row.
+    Admin-only (C1): `command` is executed verbatim as the operator's Unix account
+    (arbitrary binary + args = full host RCE), so this is operator-grade
+    infrastructure and must never be reachable by a member."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     command = body.get("command", "").strip()
     if not command:
         return JSONResponse(status_code=400, content={"error": "command required"})
@@ -1961,13 +1971,17 @@ async def verify_run(body: dict):
         (rid, task_id, agent_id, kind, command, code, out[-2000:], err[-2000:],
          1 if passed else 0, duration_ms, time.time()),
     )
-    # Update task verify_status when tied to a runtime run
-    if task_id and kind == "runtime":
+    # Update task verify_status when tied to a runtime run. Scope the write to the
+    # caller's own task (C1 secondary): never let a verify run flip another user's
+    # verify_status, and broadcast only to that task's owner (M3).
+    if task_id and kind == "runtime" and _owned_task(task_id):
         vstatus = "passing" if passed else "failing"
-        db.execute("UPDATE tasks SET verify_status=? WHERE id=?", (vstatus, task_id))
+        db.execute("UPDATE tasks SET verify_status=? WHERE id=? AND user_id=?",
+                   (vstatus, task_id, auth.current_user_id()))
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         if task:
-            await mgr.broadcast({"type": "task_updated", "data": task})
+            await mgr.broadcast({"type": "task_updated", "data": task},
+                                user_id=task.get("user_id"))
     row = db.query_one("SELECT * FROM verify_runs WHERE id = ?", (rid,))
     return {"passed": passed, "run": row}
 
