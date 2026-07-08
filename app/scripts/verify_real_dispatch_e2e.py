@@ -61,6 +61,31 @@ prev_flag = get("/api/settings", params={"prefix": "dispatch.enabled"}).json()["
     .get("dispatch.enabled", "0")
 clear_quota_keys()
 
+import atexit  # noqa: E402
+
+
+def _janitor():
+    """Crash-proof cleanup (runs on ANY exit, incl. mid-run exceptions):
+    leftover probe tasks are CLAIMABLE work — crashed runs littered the
+    operator's board for days and workers zombie-dispatched deleted probes
+    (2026-07-09). Also heals litter from historic crashed runs."""
+    try:
+        for t in get("/api/tasks").json():
+            title = str(t.get("title") or "")
+            if title.startswith("E2E ") and title.endswith("probe"):
+                dele(f"/api/tasks/{t['id']}")
+        for a in get("/api/agents").json():
+            if str(a.get("name") or "").startswith("E2E-"):
+                post(f"/api/agents/{a['id']}/retire")
+                dele(f"/api/agents/{a['id']}")
+        clear_quota_keys()
+        patch("/api/settings", json={"dispatch.enabled": prev_flag})
+    except Exception:
+        pass
+
+
+atexit.register(_janitor)
+
 print("=== 1. Real lane ===")
 # defensive: remove lanes leaked by a previous CRASHED gate run
 for a in get("/api/agents").json():

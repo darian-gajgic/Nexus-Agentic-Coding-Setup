@@ -535,20 +535,32 @@ def phase_e_projects_memory(owner, alice, bob):
         ok("creator can use their own project", r.status_code == 200, f"{r.status_code}")
 
     # memory views: legacy qdrant backlog is owner-tagged (one-time backfill),
-    # so the second user starts EMPTY. Untagged rows are shared/global BY
-    # DESIGN (shared-context, curator lessons) — if the ==0 check ever fails
-    # right after intentionally adding a global memory, that is why.
+    # so the second user starts with only SHARED-BY-DESIGN rows: untagged
+    # points carrying a specialist/team scope (agent_id != 'hermes' — lessons,
+    # team-shared context) are meant to reach every user. What must NEVER
+    # exist is an untagged USER-class row (agent_id == 'hermes'): that would
+    # be a personal memory leaking to everyone.
     import urllib.request
+    req = urllib.request.Request(
+        f"{QDRANT}/collections/mem0/points/count",
+        data=json.dumps({"exact": True,
+                         "filter": {"must": [{"is_empty": {"key": "user"}},
+                                             {"key": "agent_id",
+                                              "match": {"value": "hermes"}}]}}).encode(),
+        headers={"Content-Type": "application/json"})
+    stray = json.loads(urllib.request.urlopen(req, timeout=10).read())["result"]["count"]
+    ok("no untagged USER-class rows in qdrant (personal memories all scoped)",
+       stray == 0, f"{stray} stray")
     req = urllib.request.Request(
         f"{QDRANT}/collections/mem0/points/count",
         data=json.dumps({"exact": True,
                          "filter": {"must": [{"is_empty": {"key": "user"}}]}}).encode(),
         headers={"Content-Type": "application/json"})
     untagged = json.loads(urllib.request.urlopen(req, timeout=10).read())["result"]["count"]
-    ok("legacy mem0 backlog fully owner-tagged (0 untagged in qdrant)", untagged == 0,
-       f"{untagged} untagged")
     bmem = bob.get("/api/memory").json()
-    ok("second user's memory list is empty", bmem.get("count") == 0,
+    ok("second user's list holds ONLY shared-by-design rows (no user-class)",
+       all((m.get("agent_id") or "hermes") != "hermes"
+           for m in (bmem.get("memories") or [])),
        f"count={bmem.get('count')}")
     ok("second user sees exactly the global (untagged) rows",
        bmem.get("count") == untagged, f"{bmem.get('count')} vs {untagged} untagged")
@@ -556,7 +568,8 @@ def phase_e_projects_memory(owner, alice, bob):
     ok("owner still sees the legacy memories", (omem.get("count") or 0) >= 300,
        f"count={omem.get('count')}")
     b3d = bob.get("/api/memory3d?force=1").json()
-    ok("second user's galaxy is empty", not b3d.get("nodes"),
+    ok("second user's galaxy holds only shared-by-design stars",
+       all((n.get("agent") or "hermes") != "hermes" for n in (b3d.get("nodes") or [])),
        f"{len(b3d.get('nodes') or [])} nodes")
 
 

@@ -602,9 +602,9 @@ async def delete_task(task_id: str):
     if not task:
         return JSONResponse(status_code=404, content={"error": "not found"})
     db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    # Drop the deleted id from other tasks' depends_on so successors don't
-    # silently run without the input this predecessor was meant to produce
-    # (deps_satisfied skips ids that no longer resolve to a row).
+    # Drop the deleted id from other tasks' depends_on — deps_satisfied is
+    # fail-closed (a dangling id parks the dependent forever), so this scrub
+    # is what keeps successors runnable after a legitimate delete.
     for t in db.query_all("SELECT id, depends_on FROM tasks WHERE depends_on LIKE ?",
                           (f"%{task_id}%",)):
         try:
@@ -2310,7 +2310,9 @@ async def dispatch_task(task_id: str, body: dict):
     if not hd.deps_satisfied(task):
         waiting = [d["title"] for d in hd.task_dependencies(task) if d.get("status") != "done"]
         return JSONResponse(status_code=409, content={
-            "error": f"waiting for workflow dependencies to finish first: {', '.join(waiting)}"})
+            "error": ("waiting for workflow dependencies to finish first: " + ", ".join(waiting))
+            if waiting else
+            "a dependency no longer exists — edit this task's dependencies to unblock it"})
     # Queue-only: the lane's worker process is the SOLE executor (no competing
     # server-thread execution — that race is designed out).
     did = hd.start_dispatch(task_id, agent_id)
