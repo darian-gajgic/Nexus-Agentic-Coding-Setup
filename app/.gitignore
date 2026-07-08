@@ -20,3 +20,7 @@ logs/
 *.bak
 *.bak-*
 *.bak.*
+.claude/
+nexus.db.pre-*
+nexus_archive*
+.worktrees/
