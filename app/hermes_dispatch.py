@@ -253,6 +253,78 @@ def slot_available(model: str | None) -> bool:
     return counts.get(m, 0) < per_model_cap
 
 
+# ── Orphaned-dispatch reconciler ──
+# A task can end up with an ACTIVE dispatch_state ('queued'/'dispatching'/
+# 'streaming'/'finalizing') while no executor is actually working it: its worker
+# died leaving the row behind, or its kanban status drifted so the task matches
+# NEITHER the worker's resume query (status='in_progress' + its own claim) NOR the
+# auto-claim query (status='todo') — e.g. a 'backlog' task stuck at 'streaming'.
+# The watchdog heals dead LANES, not orphaned dispatch ROWS, so such a task — and
+# any workflow waiting on it — strands forever. This is the safety net: it spots
+# them (newest in-flight dispatch silent past the threshold) and resets each to a
+# clean, re-claimable state so a lane picks it up fresh.
+RECONCILE_STALE_S = 600  # a dispatch silent this long (>> the 30s keepalive and the
+                         # worker's own 90s resume window) has no live executor
+
+
+def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watchdog") -> list[str]:
+    """Re-queue tasks stranded in an active dispatch_state with a dead heartbeat.
+
+    Returns the reset task ids. Mirrors _retry_task's reset shape (session_id=NULL
+    forces a FRESH dispatch — never a 'continue' into a half-briefed/broken
+    session). Safe by construction: a live dispatch heartbeats at least every ~30s
+    (SSE keepalive, even mid-tool-call), so the default threshold never catches
+    running work; tune via setting dispatch.reconcile_stale_s.
+    """
+    if stale_s is None:
+        try:
+            stale_s = int(db.get_setting("dispatch.reconcile_stale_s", str(RECONCILE_STALE_S)))
+        except (TypeError, ValueError):
+            stale_s = RECONCILE_STALE_S
+    now = time.time()
+    cutoff = now - stale_s
+    default_budget = int(db.get_setting("dispatch.default_task_budget", "1000000"))
+    active = ("queued", "dispatching", "streaming", "finalizing")
+    placeholders = ",".join("?" * len(active))
+    reset: list[str] = []
+    for t in db.query_all(
+            "SELECT id, user_id, tokens_used, budget_tokens FROM tasks "
+            f"WHERE dispatch_state IN ({placeholders})", active):
+        tid = t["id"]
+        hb = db.query_one(
+            "SELECT MAX(COALESCE(heartbeat_at, started_at, 0)) AS ts FROM dispatches "
+            f"WHERE task_id=? AND state IN ({placeholders})", (tid, *active))
+        ts = (hb or {}).get("ts") or 0
+        if ts > cutoff:
+            continue  # a live (or recently-live) executor is on it — leave it
+        # 1) close the orphaned in-flight rows so they can't be resumed or miscounted
+        db.execute(
+            "UPDATE dispatches SET state='failed', ended_at=?, "
+            "error='reconciled: orphaned dispatch (stale heartbeat), task re-queued' "
+            f"WHERE task_id=? AND state IN ({placeholders})", (now, tid, *active))
+        # 2) one attempt's budget headroom so a stranded task doesn't re-block instantly
+        used = int(t.get("tokens_used") or 0)
+        if used > 0:
+            db.execute("UPDATE tasks SET budget_tokens=? WHERE id=?",
+                       (used + int(t.get("budget_tokens") or default_budget), tid))
+        # 3) reset to a clean, claimable state — session_id=NULL => fresh dispatch
+        db.execute(
+            "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
+            "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, updated_at=? WHERE id=?",
+            (now, tid))
+        # 4) expire the now-superseded deliverable approval, if any (parity with _retry_task)
+        db.execute(
+            "UPDATE approvals SET status='expired', decided_at=?, decided_by='reconciled: task reset' "
+            "WHERE status='pending' AND action_type='deliverable' AND payload LIKE ?",
+            (now, f'%"task_id": "{tid}"%'))
+        db.log_activity("warn", source,
+                        f"Task {tid}: reconciled orphaned dispatch (no heartbeat for "
+                        f"{int((now - ts) / 60)}m) — re-queued for a fresh attempt",
+                        user_id=t.get("user_id"))
+        reset.append(tid)
+    return reset
+
+
 # ── Budgets & quota backoff (SPEC R7) ──
 
 def check_budgets(task: dict) -> str | None:
