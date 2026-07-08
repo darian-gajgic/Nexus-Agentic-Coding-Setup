@@ -402,9 +402,54 @@ def _repo_slug(task: dict) -> str:
     return (task.get("workflow_id") or task.get("id") or "task").replace("wf-", "").replace("task-", "")
 
 
+def _code_map(worktree: str, max_chars: int = 4000) -> str:
+    """Compact repository layout from `git ls-files` (SPEC-BLOCK2 R3.5):
+    per-directory file counts + the files of the top two levels + a language
+    histogram — so the agent stops re-discovering the tree with shell calls
+    every round. Deterministic, no LLM, capped."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "ls-files"], cwd=worktree, capture_output=True,
+                           text=True, timeout=20)
+        if r.returncode != 0:
+            return ""
+        paths = [p for p in r.stdout.splitlines() if p.strip()]
+    except Exception:
+        return ""
+    if not paths:
+        return ""
+    by_dir: dict[str, int] = {}
+    langs: dict[str, int] = {}
+    shallow: list[str] = []
+    for p in paths:
+        parts = p.split("/")
+        top = parts[0] if len(parts) > 1 else "."
+        by_dir[top] = by_dir.get(top, 0) + 1
+        ext = os.path.splitext(p)[1].lower()
+        if ext:
+            langs[ext] = langs.get(ext, 0) + 1
+        if len(parts) <= 2:
+            shallow.append(p)
+    lines = [f"{len(paths)} tracked files. Layout (top-level → file count):"]
+    for d, n in sorted(by_dir.items(), key=lambda kv: -kv[1])[:20]:
+        lines.append(f"  {d}/  {n}" if d != "." else f"  (root)  {n}")
+    top_langs = ", ".join(f"{e} ×{n}" for e, n in
+                          sorted(langs.items(), key=lambda kv: -kv[1])[:8])
+    if top_langs:
+        lines.append(f"Languages: {top_langs}")
+    lines.append("Files (top two levels):")
+    for p in sorted(shallow)[:150]:
+        lines.append(f"  {p}")
+    if len(shallow) > 150:
+        lines.append(f"  … {len(shallow) - 150} more at this depth")
+    out = "\n".join(lines)
+    return out[:max_chars]
+
+
 def _repo_context(task: dict) -> dict | None:
     """Resolve the task's isolated worktree (idempotent) + repo conventions
-    file. Returns {worktree, branch, base, conventions} or None."""
+    file + code map. Returns {worktree, branch, base, conventions, code_map}
+    or None."""
     repo = (task.get("repo_path") or "").strip()
     if not repo:
         return None
@@ -421,7 +466,24 @@ def _repo_context(task: dict) -> dict | None:
                 pass
             break
     return {"worktree": info["worktree_path"], "branch": info["worktree_branch"],
-            "base": info.get("base_branch") or "main", "conventions": conventions}
+            "base": info.get("base_branch") or "main", "conventions": conventions,
+            "code_map": _code_map(info["worktree_path"])}
+
+
+def _knowledge_paths(task: dict) -> dict:
+    """SPEC-ONBOARDING R2.3: the Business-Brain context/voice paths for THIS
+    task's owner — a non-owner user with a completed personal onboarding gets
+    their overlay; everyone else (and every legacy task) gets the canonical
+    files. PLAYBOOK/RUBRIC stay shared (craft, not identity)."""
+    root = Path(db.get_setting("onboarding.root", "") or os.path.expanduser("~/knowledge"))
+    uid = (task.get("user_id") or "").strip()
+    if uid and uid != "u_owner":
+        d = root / "users" / uid
+        if (d / "BUSINESS-CONTEXT.md").is_file() and (d / "STYLE-VOICE.md").is_file():
+            return {"context": str(d / "BUSINESS-CONTEXT.md"),
+                    "style": str(d / "STYLE-VOICE.md")}
+    return {"context": str(root / "BUSINESS-CONTEXT.md"),
+            "style": str(root / "STYLE-VOICE.md")}
 
 
 def _attachment_lines(task: dict, workspace: Path) -> list[str]:
@@ -475,7 +537,9 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             "and why, files touched, and follow-ups. The DIFF on the branch is the real "
             "deliverable — the operator reviews and merges it manually."
             + (f"\n\nPROJECT CONVENTIONS {repo_ctx['conventions'][:6200]}"
-               if repo_ctx.get("conventions") else ""))
+               if repo_ctx.get("conventions") else "")
+            + (f"\n\nCODE MAP (repository layout):\n{repo_ctx['code_map']}"
+               if repo_ctx.get("code_map") else ""))
         parts.append(common_head + body + common_tail)
     else:
         parts.append(
@@ -504,10 +568,13 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
               "(pypdf, python-docx, openpyxl, python-pptx).")
     domain = (task.get("domain") or "").strip()
     if domain and domain != "general":
+        kp = _knowledge_paths(task)
         parts.append(
             f"This is a business deliverable in the '{domain}' domain. Follow the Business Brain "
-            "knowledge protocol: read ~/knowledge/BUSINESS-CONTEXT.md, ~/knowledge/STYLE-VOICE.md "
-            f"and ~/knowledge/domains/{domain}/PLAYBOOK.md before working; self-score the result "
+            f"knowledge protocol: read {kp['context']}, {kp['style']} "
+            f"and ~/knowledge/domains/{domain}/PLAYBOOK.md before working (those first two files "
+            "are THIS task owner's business context and voice — use exactly these paths even if "
+            "a specialist definition names other defaults); self-score the result "
             f"against ~/knowledge/domains/{domain}/RUBRIC.md and state the score in one line; end "
             "with a '**Learn:**' section of up to 3 bullets."
         )

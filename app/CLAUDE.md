@@ -78,6 +78,30 @@ Key points (current architecture):
 - **Screenshot sweep:** `.venv/bin/python scripts/screenshot_all_tabs.py <suffix>` — screenshots all 14 tabs to `~/.hermes/cache/screenshots/nexus-<suffix>/`, fails on any console error.
 - All runtime scripts target **https://127.0.0.1:8777** (self-signed → `verify=False` / `ignore_https_errors=True`).
 - **Runtime gate — JARVIS:** `.venv/bin/python scripts/verify_jarvis_e2e.py` — full Playwright run: page renders, reply streams (SSE), lip-sync video plays, state transitions, returns to idle.
+- **Runtime gate — Block 3 (replanning/evals/plan-editor):** `.venv/bin/python scripts/verify_block3_e2e.py` —
+  revalidate round-trip, replan detect→dismiss→re-arm→apply (archival, rewiring, loop reset,
+  approval expiry), eval run lifecycle on a scratch corpus with stubbed generation+judge,
+  per-user isolation. 33 checks, self-cleaning.
+- **Runtime gate — Block 3 UI (Playwright):** `.venv/bin/python scripts/verify_block3_ui.py` —
+  drives the plan editor inside the proposal modal (edit/add/revalidate without creating),
+  the replan review modal, and the Specialists→Evals tab. 15 checks.
+- **Runtime gate — Block 2 (review v2/memory edit/PR):** `.venv/bin/python scripts/verify_block2_e2e.py` —
+  review JSON line numbers + Pygments highlight, comment CRUD + cross-user 404, retry
+  consumes comments, memory edit/merge/delete on seeded qdrant probes (re-embed proof,
+  tag preservation, ownership), PR flow against a scratch repo + local bare origin with
+  stubbed gh (settings pr.cmd, restored), code map in framing. 48 checks, self-cleaning.
+  Needs qdrant + ollama up (both local, always on).
+- **Runtime gate — Block 2 UI (Playwright):** `.venv/bin/python scripts/verify_block2_ui.py` —
+  review modal (gutters, highlight spans, unified⇄split toggle, line-comment composer,
+  retry-with-feedback button), memory modal confirm-gating, Create-PR button. 21 checks.
+- **Runtime gate — Onboarding (SPEC-ONBOARDING):** `.venv/bin/python scripts/verify_onboarding_e2e.py` —
+  37-slot schema + explanations, per-user answers (save/resume/un-answer/isolation), apply
+  renders + git-commits (dirty-tree snapshot first), owner→canonical vs member→overlay,
+  per-user framing paths. 27 checks; runs on a scratch knowledge root (settings
+  onboarding.root, restored), owner's real answers backed up.
+- **Runtime gate — Onboarding UI (Playwright):** `.venv/bin/python scripts/verify_onboarding_ui.py` —
+  CTA banner, welcome step, section explanations, auto-save on Next, n/a toggle, review
+  counts, confirm-gated apply → success, Settings entry. 12 checks.
 - **Per-edit gate:** `.claude/check.sh` (auto-run by Claude Code PostToolUse on Write|Edit).
 - Playwright is installed in `.venv`. Screenshots save to `~/.hermes/cache/screenshots/`.
 
@@ -180,6 +204,35 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   modal shows stages (parallel tasks grouped), assumptions, auto-repairs, and lets the
   operator untick optional tasks (quality gates are locked; skipped tasks are spliced out
   of the DAG so dependents inherit their dependencies).
+
+### Block 3 (2026-07-08, docs/SPEC-BLOCK3.md is source of truth)
+- **Plan editor in the proposal modal (R1)**: every wizard-proposed task is editable in place
+  (title/brief/specialist/domain/model/stakes/budget/deps — deps only from EARLIER tasks, so
+  the DAG stays acyclic in the UI), tasks can be added/removed, quality gates stay locked.
+  An EDITED plan goes through `POST /api/tasks/wizard/revalidate` (same `_repair_workflow`,
+  `max_raw=7`) before creation; repairs re-render for one more confirm. Shared editor
+  functions `planEd*` in app.js are reused by the replan review modal.
+  `GET /api/specialists/names` = light roster for pickers (no qdrant scroll).
+- **Mid-run replanning (R2)** — three separate gates BY DESIGN: (1) the loop engine only
+  DETECTS (`_sweep_replan_detection`: terminal `dispatch_state='failed'`, or verifier FAIL
+  with no automatic fix round left) and flags `workflows.replan` (JSON status
+  needed/drafting/proposed/applied/dismissed); (2) DRAFTING is operator-triggered
+  (`POST /api/workflows/{id}/replan/draft`, judge-style background thread; boot resets
+  orphaned `drafting`→`needed`); (3) APPLY (`.../replan/apply`) is operator-approved after
+  editing in the plan editor — refuses while a stage executes (409), archives superseded
+  non-done tasks (`status='archived'`: kept for audit, excluded from rollups/board/engine),
+  creates recovery tasks in Backlog (roots inherit every DONE task as INPUT deps), expires
+  stale approvals, resets loop rounds. Dismissed failures don't re-flag; a NEW failed task
+  re-arms. The engine NEVER rewrites a pipeline itself.
+- **Eval corpus (R3, remediation #6)**: fixed briefs in `~/knowledge/domains/<domain>/evals/*.md`
+  (27 cases, format in `~/knowledge/domains/EVALS-README.md`) run through the REAL dispatch
+  framing (`hermes_dispatch.build_framing`) and scored by the frontier judge against the
+  domain RUBRIC — `evals.py` runner (sequential daemon thread, one run at a time), tables
+  `eval_runs`/`eval_results` (user-scoped), config fingerprint per run (playbook/rubric/
+  style/context/specialist hashes) so score deltas map to config changes. UI: Specialists →
+  📏 Evals (domain cards + trends, run history, per-case judge output). The task judge and
+  the eval runner share `evals.run_judge_cmd` (settings `judge.cmd` stays the stub hook);
+  gate-only hooks `evals.corpus_root`/`evals.stub` default off.
 
 ## Agentic OS Capabilities (v1 — added 2026-07-04)
 

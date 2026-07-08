@@ -96,6 +96,24 @@ def startup():
         "WHERE judge_verdict='running'").rowcount
     if stuck:
         db.log_activity("warn", "judge", f"Cleared {stuck} judge run(s) orphaned by restart")
+    # Same for replan drafts (R2.2) — a restart mid-draft would 409 forever.
+    for w in db.query_all("SELECT id, replan FROM workflows WHERE replan IS NOT NULL"):
+        try:
+            rp = json.loads(w["replan"] or "null")
+        except Exception:
+            rp = None
+        if isinstance(rp, dict) and rp.get("status") == "drafting":
+            rp["status"] = "needed"
+            rp["error"] = "draft interrupted by server restart — draft it again"
+            db.execute("UPDATE workflows SET replan=? WHERE id=?", (json.dumps(rp), w["id"]))
+            db.log_activity("warn", "system",
+                            f"Workflow {w['id']}: replan draft orphaned by restart — reset to 'needed'")
+    # Eval runs are sequential daemon threads — clear runs orphaned by restart.
+    orphaned = db.execute(
+        "UPDATE eval_runs SET status='failed', error='interrupted by server restart', "
+        "ended_at=? WHERE status IN ('running','cancelling')", (time.time(),)).rowcount
+    if orphaned:
+        db.log_activity("warn", "evals", f"Cleared {orphaned} eval run(s) orphaned by restart")
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
@@ -876,6 +894,22 @@ def _specialist_mem0_id(name):
         return name
 
 
+@app.get("/api/specialists/names")
+def get_specialist_names():
+    """Lightweight roster for pickers (name + one-liner) — no qdrant scroll."""
+    import glob
+    out = []
+    for fp in sorted(glob.glob(os.path.expanduser("~/.hermes/agents/*.md"))):
+        try:
+            fm, _b = _parse_agent_md(open(fp).read())
+            if fm.get("name"):
+                out.append({"name": str(fm["name"]).strip(),
+                            "description": (fm.get("description") or "").strip()[:180]})
+        except Exception:
+            pass
+    return {"specialists": out}
+
+
 @app.get("/api/specialists")
 def get_specialists():
     """Predefined specialist definitions (~/.hermes/agents/*.md) + each one's memory count."""
@@ -1284,6 +1318,123 @@ def get_memory():
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
+
+
+# ── Galaxy memory editing (SPEC-BLOCK2 R2) ────────────────────────────────
+# Mutations go through the mem0 backend (mem0_curate.py subprocess) so edits
+# are re-embedded (nomic-embed-text) and payload tags survive — never raw
+# qdrant payload writes.
+
+def _qdrant_point(point_id: str):
+    """Fetch one qdrant point (payload only). None if missing."""
+    import urllib.request
+    import urllib.parse
+    base = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+    try:
+        url = (f"{base}/collections/mem0/points/"
+               f"{urllib.parse.quote(str(point_id), safe='')}")
+        with urllib.request.urlopen(url, timeout=6) as r:
+            res = json.loads(r.read()).get("result") or {}
+        return res if res.get("id") is not None else None
+    except Exception:
+        return None
+
+
+def _memory_access(point_id: str):
+    """Block-2 ownership (mirrors the Block-1 read filter): my user tag →
+    mine; a FOREIGN tag is invisible (404, no existence disclosure); an
+    untagged point is shared by design — every user SEES it, but only admins
+    may rewrite what everyone reads (403). Returns (point, error|None)."""
+    pt = _qdrant_point(point_id)
+    if not pt:
+        return None, JSONResponse(status_code=404, content={"error": "memory not found"})
+    pl = pt.get("payload") or {}
+    tag = pl.get("user")
+    if tag and tag != auth.current_user_id():
+        return None, JSONResponse(status_code=404, content={"error": "memory not found"})
+    if not tag and not auth.is_admin():
+        return None, JSONResponse(status_code=403,
+                                  content={"error": "shared memory — only an admin can change it"})
+    return pt, None
+
+
+async def _memory_changed(action: str, point_id):
+    _MEM3D_CACHE.clear()  # every user's galaxy re-derives (shared points affect all)
+    db.log_activity("info", "system", f"Memory {action}: {point_id}")
+    try:
+        await mgr.broadcast({"type": "memory_updated",
+                             "data": {"action": action, "id": point_id}},
+                            user_id=auth.current_user_id())
+    except Exception:
+        pass
+
+
+@app.patch("/api/memory/{point_id}")
+async def edit_memory(point_id: str, body: dict):
+    pt, err = _memory_access(point_id)
+    if err:
+        return err
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+    res = _run_curate("update", "--id", str(point_id), "--text", text[:4000])
+    if not res.get("ok"):
+        return JSONResponse(status_code=500, content=res)
+    await _memory_changed("edited", point_id)
+    return {"ok": True, "id": point_id}
+
+
+@app.delete("/api/memory/{point_id}")
+async def delete_memory(point_id: str):
+    pt, err = _memory_access(point_id)
+    if err:
+        return err
+    res = _run_curate("delete", "--id", str(point_id))
+    if not res.get("ok"):
+        return JSONResponse(status_code=500, content=res)
+    await _memory_changed("deleted", point_id)
+    return {"ok": True, "id": point_id}
+
+
+@app.post("/api/memory/merge")
+async def merge_memory(body: dict):
+    """Create ONE merged point from 2-8 sources, then delete the sources —
+    only after the merged add succeeded. The operator edits the merged text
+    in the UI before confirming; the server never invents content."""
+    ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i).strip()]
+    text = str((body or {}).get("text") or "").strip()
+    if not (2 <= len(ids) <= 8):
+        return JSONResponse(status_code=400, content={"error": "merge needs 2-8 memory ids"})
+    if len(set(ids)) != len(ids):
+        return JSONResponse(status_code=400, content={"error": "duplicate ids"})
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "merged text is required"})
+    pts = []
+    for pid in ids:
+        pt, err = _memory_access(pid)
+        if err:
+            return err
+        pts.append(pt)
+    payloads = [(p.get("payload") or {}) for p in pts]
+    meta = {"channel": "nexus", "attributed_to": "user", "source": "merge"}
+    if any(pl.get("user") for pl in payloads):
+        meta["user"] = auth.current_user_id()  # shared stays shared ONLY if every source was
+    clients = {pl.get("client") for pl in payloads}
+    if len(clients) == 1 and next(iter(clients)):
+        meta["client"] = next(iter(clients))
+    agent_ids = {pl.get("agent_id") for pl in payloads}
+    args = ["add", "--text", text[:4000], "--metadata", json.dumps(meta)]
+    if len(agent_ids) == 1 and next(iter(agent_ids)):
+        args += ["--agent-id", next(iter(agent_ids))]  # e.g. merging one specialist's lessons
+    res = _run_curate(*args)
+    if not res.get("ok"):
+        return JSONResponse(status_code=500, content=res)
+    deleted, failed = [], []
+    for pid in ids:
+        r = _run_curate("delete", "--id", pid)
+        (deleted if r.get("ok") else failed).append(pid)
+    await _memory_changed("merged", res.get("id"))
+    return {"ok": True, "id": res.get("id"), "deleted": deleted, "failed": failed}
 
 
 @app.get("/api/activity")
@@ -2459,49 +2610,10 @@ def _parse_judge_output(text: str):
 
 def _judge_thread(task_id: str, file_path: str, domain: str):
     """Run the frontier judge (minutes) and persist the verdict. The command
-    template lives in settings key judge.cmd so gates can stub it (R4.3).
-
-    Runs with cwd=~/knowledge AND copies the deliverable there first: headless
-    `claude -p` (inside cjudge) can only read files under its working directory
-    without permission prompts, and the judge must read BOTH the rubric tree
-    and the deliverable."""
-    import shutil
-    tmpdir = Path(KNOWLEDGE_DIR) / ".nexus-judge-tmp"
-    judged_path = file_path
-    try:
-        tmpdir.mkdir(exist_ok=True)
-        tmp_file = tmpdir / f"{task_id}.md"
-        shutil.copy2(file_path, tmp_file)
-        judged_path = str(tmp_file)
-    except Exception:
-        pass  # fall back to the original path
-    import shlex
-    import shutil as _shutil
-    # shell=False + per-token formatting: the template values are validated, and
-    # this removes the shell layer entirely (defense in depth for judge.cmd).
-    tokens = [t.format(file=judged_path, domain=domain)
-              for t in shlex.split(db.get_setting("judge.cmd", "cjudge {file} {domain}"))]
-    # Under the systemd unit PATH may lack ~/.local/bin (where cjudge lives).
-    if tokens and not _shutil.which(tokens[0]):
-        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-        if os.path.isfile(candidate):
-            tokens[0] = candidate
-    try:
-        r = _sp.run(tokens, capture_output=True, text=True, timeout=900,
-                    cwd=KNOWLEDGE_DIR)
-        out = (r.stdout or "")
-        if r.returncode != 0:
-            out += f"\n[judge exited {r.returncode}] {(r.stderr or '')[-1000:]}"
-    except _sp.TimeoutExpired:
-        out = "[judge timed out after 900s]"
-    except Exception as e:
-        out = f"[judge failed to run: {e}]"
-    finally:
-        try:
-            if judged_path != file_path:
-                os.unlink(judged_path)
-        except Exception:
-            pass
+    execution is shared with the eval runner (evals.run_judge_cmd — template in
+    settings key judge.cmd so gates can stub it, R4.3)."""
+    import evals as _ev
+    out = _ev.run_judge_cmd(file_path, domain)
     verdict, learning = _parse_judge_output(out)
     db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=? WHERE id=?",
                (verdict or "error", out[-30000:], time.time(), task_id))
@@ -2612,6 +2724,24 @@ def _retry_task(task_id: str, feedback: str | None):
     if not fb and task.get("judge_verdict") in ("REVISE", "REWRITE") and task.get("judge_output"):
         fb = ("Frontier judge findings (attached automatically — fix every blocker):\n"
               + task["judge_output"][-3000:])
+    # Review v2 (SPEC-BLOCK2 R1.5): OPEN per-line comments ride every retry —
+    # operator retry, approval-reject and loop-engine rounds all pass through
+    # here, so line feedback can never be lost on the way to the agent.
+    open_comments = db.query_all(
+        "SELECT * FROM review_comments WHERE task_id=? AND status='open' "
+        "ORDER BY file_path, COALESCE(line_no, 0), created_at", (task_id,))
+    if open_comments:
+        notes = []
+        for c in open_comments:
+            loc = f"{c['file_path']}:{c['line_no']}" if c.get("line_no") else c["file_path"]
+            excerpt = (c.get("line_text") or "").strip()
+            quoted = f' "{excerpt[:160]}"' if excerpt else ""
+            notes.append(f"- {loc} [{c.get('side') or 'new'}]{quoted} → {c['body']}")
+        fb = ((fb + "\n\n") if fb else "") + \
+            "Reviewer LINE COMMENTS (address EVERY one):\n" + "\n".join(notes)
+        db.execute(
+            "UPDATE review_comments SET status='consumed', consumed_at=? "
+            "WHERE task_id=? AND status='open'", (time.time(), task_id))
     ws = task.get("workspace_path")
     if ws and os.path.isdir(ws) and not task.get("repo_path"):
         # review engine: each rework round becomes a comparable version
@@ -2643,7 +2773,7 @@ def _retry_task(task_id: str, feedback: str | None):
         "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
         "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, retry_feedback=?, "
         "updated_at=? WHERE id=?",
-        (fb[:4000] or None, now, task_id))
+        (fb[:8000] or None, now, task_id))  # 8000: line comments ride along (SPEC-BLOCK2 R1.5)
     # The old deliverable's pending approval is now moot — expire it so the
     # Agentic tab never offers a decision on superseded work.
     db.execute(
@@ -2818,24 +2948,82 @@ async def delete_template(tpl_id: str):
     return {"ok": True}
 
 
+# ── In-app Business-Brain onboarding (docs/SPEC-ONBOARDING.md) ─────────────
+import onboarding as ob
+
+
 @app.get("/api/onboarding-status")
 async def onboarding_status():
-    """X4: unfilled {{FILL: ...}} slots in the Business Brain — until 0, outputs
-    use generic placeholder context and the dashboard shows a call-to-action."""
-    out = {"files": [], "total": 0}
-    for name in ("BUSINESS-CONTEXT.md", "STYLE-VOICE.md"):
-        fp = os.path.join(KNOWLEDGE_DIR, name)
-        n = 0
-        try:
-            n = open(fp).read().count("{{FILL:")
-        except Exception:
-            pass
-        out["files"].append({"file": name, "unfilled": n})
-        out["total"] += n
-    out["done"] = out["total"] == 0
-    out["cta"] = None if out["done"] else \
-        "Run the onboarding: open a terminal → cd ~/knowledge && claude → say 'run the onboarding'"
-    return out
+    """X4 (reworked per SPEC-ONBOARDING): unfilled Business-Brain slots for
+    the CALLING user — the dashboard call-to-action now opens the in-app
+    guided wizard instead of pointing at a terminal."""
+    return ob.status_for(auth.current_user_id())
+
+
+@app.get("/api/onboarding")
+async def onboarding_schema():
+    """The wizard: sections with impact explanations + the caller's saved
+    answers (resumable — partial saves are the norm)."""
+    me = auth.current_user_id()
+    sections = ob.schema()
+    rows = db.query_all("SELECT * FROM onboarding_answers WHERE user_id=?", (me,))
+    answers = {r["slot_id"]: {"text": r["answer"] or "", "na": bool(r["na"])}
+               for r in rows}
+    answered = sum(1 for a in answers.values() if a["na"] or a["text"].strip())
+    st = db.query_one("SELECT * FROM onboarding_state WHERE user_id=?", (me,))
+    total = sum(len(s["questions"]) for s in sections)
+    return {"sections": sections, "answers": answers, "total": total,
+            "answered": answered, "applied_at": st["applied_at"] if st else None,
+            "target_dir": ob.target_dir(me),
+            "is_owner": me == auth.DEFAULT_USER_ID}
+
+
+@app.post("/api/onboarding/answers")
+async def onboarding_save(body: dict):
+    """Partial upsert of the caller's answers. Empty text + na=false
+    un-answers the slot. Unknown slot ids are rejected."""
+    me = auth.current_user_id()
+    answers = (body or {}).get("answers") or {}
+    if not isinstance(answers, dict) or not answers:
+        return JSONResponse(status_code=400, content={"error": "answers object is required"})
+    valid = ob.all_slot_ids()
+    unknown = [k for k in answers if k not in valid]
+    if unknown:
+        return JSONResponse(status_code=400,
+                            content={"error": f"unknown slot ids: {unknown[:5]}"})
+    now = time.time()
+    saved = removed = 0
+    for sid, a in answers.items():
+        text = str((a or {}).get("text") or "").strip()[:2000]
+        na = bool((a or {}).get("na"))
+        if not text and not na:
+            db.execute("DELETE FROM onboarding_answers WHERE user_id=? AND slot_id=?",
+                       (me, sid))
+            removed += 1
+        else:
+            db.execute("INSERT OR REPLACE INTO onboarding_answers "
+                       "(user_id, slot_id, answer, na, updated_at) VALUES (?,?,?,?,?)",
+                       (me, sid, text or None, 1 if na else 0, now))
+            saved += 1
+    n = db.query_one("SELECT COUNT(*) AS n FROM onboarding_answers WHERE user_id=? "
+                     "AND (na=1 OR TRIM(COALESCE(answer,'')) != '')", (me,))["n"]
+    return {"ok": True, "saved": saved, "removed": removed, "answered": n}
+
+
+@app.post("/api/onboarding/apply")
+async def onboarding_apply():
+    """Write the caller's Business Brain (u_owner -> canonical ~/knowledge,
+    everyone else -> their personal overlay). Confirm-gated in the UI."""
+    me = auth.current_user_id()
+    u = auth.current_user() or {}
+    try:
+        res = ob.apply_for(me, u.get("username") or me)
+    except FileNotFoundError as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"template missing: {e}"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+    return {"ok": True, **res}
 
 
 # ── Task wizard: describe the goal, AI sets every parameter (v2.2) ──
@@ -3135,17 +3323,21 @@ def _clamp_wizard_questions(data: dict) -> list:
     return out
 
 
-def _repair_workflow(raw_tasks: list, wf_name: str) -> tuple[list, list]:
+def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5) -> tuple[list, list]:
     """Deterministic post-LLM validation + auto-repair of a proposed project DAG.
     Never trusts the model's wiring: enforces the earlier-index invariant (acyclic
     by construction), inserts the mandatory quality gates for coding projects
     (code-reviewer + high-stakes acceptance-verifier — appended, so the invariant
     holds), fixes gate edges, chains orphans, and falls back to a sequential
-    chain rather than ever returning a broken graph."""
+    chain rather than ever returning a broken graph.
+
+    max_raw: 5 for LLM output; 7 when revalidating an operator-edited plan that
+    already contains the appended gates (slicing those off would discard the
+    operator's edits to the gate tasks and re-append pristine copies)."""
     repairs: list = []
     names = _specialist_names()
     tasks = []
-    for i, rt in enumerate((raw_tasks or [])[:5]):
+    for i, rt in enumerate((raw_tasks or [])[:max_raw]):
         t = _clamp_wizard_task(rt if isinstance(rt, dict) else {}, repairs, names)
         deps = (rt.get("depends_on") if isinstance(rt, dict) else None) or []
         t["depends_on_idx"] = sorted({d for d in deps if isinstance(d, int) and 0 <= d < i})
@@ -3493,13 +3685,38 @@ async def task_wizard(body: dict):
     return out
 
 
+@app.post("/api/tasks/wizard/revalidate")
+async def task_wizard_revalidate(body: dict):
+    """R1.3: deterministic re-validation of an OPERATOR-EDITED plan — no LLM.
+    The same `_repair_workflow()` that guards wizard output guards human edits:
+    specialist whitelist, dev-stage model floor, dependency invariant, mandatory
+    quality gates. Nothing is created; the UI shows the repaired plan (with the
+    repair notes) and creates only what the operator confirms."""
+    raw = body.get("tasks") if isinstance(body.get("tasks"), list) else []
+    if not raw:
+        return JSONResponse(status_code=400, content={"error": "tasks required"})
+    name = str(body.get("name") or "").strip()[:120] or "Edited project"
+    for rt in raw:
+        # The editor speaks depends_on_idx (like the proposal it renders);
+        # _repair_workflow reads depends_on. Accept both.
+        if isinstance(rt, dict) and "depends_on" not in rt:
+            rt["depends_on"] = rt.get("depends_on_idx") or []
+    tasks, repairs = _repair_workflow(raw, name, max_raw=7)
+    if repairs:
+        db.log_activity("info", "system",
+                        f"Plan editor auto-repair on '{name[:40]}': " + " · ".join(repairs)[:300])
+    return {"tasks": tasks, "repairs": repairs}
+
+
 # ── Workflows: multi-task projects/campaigns with dependencies (v2.1) ──
 # Professional pattern (Linear/Jira projects + a light dependency DAG): a
 # workflow groups tasks; a task with depends_on only runs once those shipped,
 # and their deliverable files are injected as INPUT into its dispatch framing.
 
 def _workflow_rollup(w: dict) -> dict:
-    tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? ORDER BY created_at", (w["id"],))
+    # archived = superseded by a replan (R2.3): kept for audit, out of the math
+    tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? AND status != 'archived' "
+                         "ORDER BY created_at", (w["id"],))
     by = {}
     for t in tasks:
         by[t["status"]] = by.get(t["status"], 0) + 1
@@ -3622,6 +3839,258 @@ async def delete_workflow(wf_id: str):
     return {"ok": True}
 
 
+# ── Mid-run replanning (Block 3 R2, docs/SPEC-BLOCK3.md) ──
+# Three separate gates by design: the loop engine only DETECTS (free, no LLM),
+# the operator triggers DRAFTING, and APPLYING is operator-approved after
+# review/edit in the plan editor. The engine never rewrites a pipeline itself.
+
+def _parse_replan(w: dict) -> dict | None:
+    try:
+        rp = json.loads(w.get("replan") or "null")
+        return rp if isinstance(rp, dict) else None
+    except Exception:
+        return None
+
+
+def _save_replan(wf_id: str, rp: dict):
+    db.execute("UPDATE workflows SET replan=?, updated_at=? WHERE id=?",
+               (json.dumps(rp), time.time(), wf_id))
+
+
+def _replan_context(w: dict, tasks: list, reason: str) -> str:
+    """Everything the planning session needs to replan the REMAINING work:
+    goal, DAG with per-task status, and the failure evidence."""
+    lines = [f"REPLAN REQUEST for the running project '{w['name']}'.",
+             f"Project goal: {w.get('goal') or '(none recorded)'}",
+             f"Domain: {w.get('domain') or 'general'}",
+             f"Why replanning is needed: {reason}",
+             "", "CURRENT PIPELINE STATE:"]
+    by_id = {t["id"]: i for i, t in enumerate(tasks)}
+    for i, t in enumerate(tasks):
+        if t.get("status") == "done":
+            mark = "DONE"
+        elif t.get("dispatch_state") == "failed":
+            mark = "FAILED"
+        else:
+            mark = (t.get("status") or "pending").upper()
+        try:
+            deps = [str(by_id[d] + 1) for d in json.loads(t.get("depends_on") or "[]") if d in by_id]
+        except Exception:
+            deps = []
+        lines.append(f"{i + 1}. [{mark}] '{t['title']}' (specialist: {t.get('specialist') or '—'}"
+                     + (f", waits for {','.join(deps)}" if deps else "") + ")")
+        if t.get("dispatch_state") == "failed" and t.get("dispatch_error"):
+            lines.append(f"   failure: {str(t['dispatch_error'])[:400]}")
+        if t.get("specialist") == "acceptance-verifier" and mark in ("DONE", "REVIEW") \
+                and (t.get("result_summary") or "").strip():
+            lines.append("   inspection findings: " + t["result_summary"][:1200].replace("\n", " "))
+    lines += [
+        "",
+        "YOUR JOB: plan ONLY the remaining work — the tasks that recover from the "
+        "failure and finish the goal. Rules:",
+        "- Do NOT recreate DONE tasks. Their deliverables are automatically injected "
+        "as INPUT into the first task(s) of your new plan.",
+        "- Address the failure explicitly: the first new task's description must say "
+        "what went wrong and how this attempt differs.",
+        "- Non-done tasks of the old plan are ARCHIVED when your plan is applied — "
+        "re-include their work in your new tasks where it is still needed.",
+        "- Same house rules as always: <=5 tasks, coding work keeps the "
+        "review/verification gates (they are re-enforced server-side anyway).",
+        'Reply with ONLY the JSON plan: {"type":"workflow","workflow":{"name":str,'
+        '"goal":str,"domain":str,"tasks":[...]},"assumptions":[...]}.',
+    ]
+    return "\n".join(lines)
+
+
+def _wizard_plan_sync(title: str, user_msg: str, uid: str | None) -> dict:
+    """Synchronous planning-only wizard call (for background threads): fresh
+    role-locked session, one silent retry on a malformed reply, session deleted."""
+    framing = _task_wizard_framing(allow_questions=False)
+    last_err: Exception = RuntimeError("wizard returned nothing")
+    for _attempt in (0, 1):
+        sid = hd.create_session(title, system_prompt=_WIZARD_ROLE_LOCK)
+        hd.publish_session_scope(sid, user=uid)
+        try:
+            res = hd.stream_turn(sid, user_msg, system_message=framing, max_seconds=300)
+        finally:
+            hd.delete_session(sid)
+        raw = (res.get("content") or "").strip()
+        if res.get("error") or not raw:
+            last_err = RuntimeError(res.get("error") or "the model returned nothing")
+            continue
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            last_err = RuntimeError("reply was not a JSON plan")
+            continue
+        try:
+            return json.loads(raw[start:end + 1])
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+    raise last_err
+
+
+def _replan_draft_thread(wf_id: str, uid: str | None):
+    w = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
+    if not w:
+        return
+    rp = _parse_replan(w) or {}
+    tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=? AND status != 'archived' "
+                         "ORDER BY created_at", (wf_id,))
+    try:
+        user_msg = _replan_context(w, tasks, rp.get("reason") or "operator requested a replan")
+        data = _wizard_plan_sync(f"nexus:replan-{wf_id}", user_msg, uid)
+        wf = data.get("workflow") if data.get("type") == "workflow" else None
+        raw_tasks = (wf or {}).get("tasks") or ([data.get("task")] if data.get("task") else [])
+        new_tasks, repairs = _repair_workflow(raw_tasks, w["name"])
+        if not new_tasks:
+            raise RuntimeError("the wizard proposed no tasks")
+        rp.update({
+            "status": "proposed",
+            "proposal": {
+                "name": w["name"],
+                "goal": str((wf or {}).get("goal") or w.get("goal") or "").strip()[:500],
+                "tasks": new_tasks,
+                "repairs": repairs,
+                "assumptions": [str(x).strip()[:200] for x in (data.get("assumptions") or [])[:8]
+                                if str(x).strip()],
+            },
+            "drafted_at": time.time(),
+            "error": None,
+        })
+        _save_replan(wf_id, rp)
+        db.log_activity("info", "system",
+                        f"Replan drafted for '{w['name']}' ({len(new_tasks)} remaining-work "
+                        "task(s)) — awaiting operator review", user_id=w.get("user_id"))
+        hd.notify_desktop("Nexus: replan ready 📋", f"{w['name']}: proposal awaits your review")
+    except Exception as e:
+        rp.update({"status": "needed", "error": str(e)[:300]})
+        _save_replan(wf_id, rp)
+        db.log_activity("error", "system",
+                        f"Replan draft failed for '{w['name']}': {str(e)[:160]}",
+                        user_id=w.get("user_id"))
+
+
+@app.post("/api/workflows/{wf_id}/replan/draft")
+async def replan_draft(wf_id: str):
+    """R2.2: operator-triggered — the planning wizard drafts a recovery plan for
+    the remaining work (async, minutes; poll the workflow's replan.status)."""
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    rp = _parse_replan(w) or {"reason": "operator requested a replan",
+                              "failed_task_id": None, "detected_at": time.time()}
+    if rp.get("status") == "drafting":
+        return JSONResponse(status_code=409, content={"error": "a draft is already running"})
+    rp["status"] = "drafting"
+    rp["error"] = None
+    _save_replan(wf_id, rp)
+    uid = auth.current_user_id()  # captured OUTSIDE the thread (contextvar)
+    threading.Thread(target=_replan_draft_thread, args=(wf_id, uid), daemon=True).start()
+    db.log_activity("info", "system", f"Replan draft started for '{w['name']}'", user_id=uid)
+    return {"ok": True, "status": "drafting"}
+
+
+@app.post("/api/workflows/{wf_id}/replan/apply")
+async def replan_apply(wf_id: str, body: dict):
+    """R2.3: operator-approved apply of the (possibly edited) recovery plan.
+    Superseded non-done tasks are archived (kept for audit), new tasks are
+    created in Backlog wired to each other and to every DONE predecessor."""
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    raw = body.get("tasks") if isinstance(body.get("tasks"), list) else []
+    if not raw:
+        return JSONResponse(status_code=400, content={"error": "tasks required"})
+    running = db.query_one(
+        "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND dispatch_state IN "
+        "('dispatching','streaming','finalizing')", (wf_id,))
+    if (running or {}).get("c"):
+        return JSONResponse(status_code=409, content={
+            "error": "a stage is still executing — wait for it to finish (or fail) first"})
+    for rt in raw:
+        if isinstance(rt, dict) and "depends_on" not in rt:
+            rt["depends_on"] = rt.get("depends_on_idx") or []
+    new_tasks, repairs = _repair_workflow(raw, w["name"], max_raw=7)
+    if not new_tasks:
+        return JSONResponse(status_code=400, content={"error": "no valid tasks in the plan"})
+    now = time.time()
+    uid = auth.current_user_id()
+    done_ids = [t["id"] for t in db.query_all(
+        "SELECT id FROM tasks WHERE workflow_id=? AND status='done' ORDER BY created_at",
+        (wf_id,))]
+    # Archive the superseded remainder: released from claims, out of rollups/
+    # board/loop-engine, kept in the DB + project detail for audit.
+    superseded = db.query_all(
+        "SELECT id FROM tasks WHERE workflow_id=? AND status NOT IN ('done','archived')",
+        (wf_id,))
+    for t in superseded:
+        db.execute("UPDATE tasks SET status='archived', claimed_by=NULL, claimed_at=NULL, "
+                   "updated_at=? WHERE id=?", (now, t["id"]))
+        # a pending approval on superseded work must never be decidable
+        db.execute(
+            "UPDATE approvals SET status='expired', decided_at=?, decided_by='superseded by replan' "
+            "WHERE status='pending' AND payload LIKE ?", (now, f'%"task_id": "{t["id"]}"%'))
+    # Create the recovery tasks; roots inherit every DONE task as dependency so
+    # their deliverables inject as INPUT (same mechanism as normal pipelines).
+    ids: list = []
+    for t in new_tasks:
+        deps = [ids[d] for d in (t.get("depends_on_idx") or []) if d < len(ids)]
+        if not deps and done_ids:
+            deps = list(done_ids)
+        created = await create_task(TaskCreate(
+            title=t["title"], description=t["description"], status="backlog",
+            priority=t.get("priority") if t.get("priority") in (0, 1, 2, 3) else 2,
+            domain=t.get("domain"), specialist=t.get("specialist"),
+            high_stakes=bool(t.get("high_stakes")) or bool(w.get("high_stakes")),
+            budget_tokens=t.get("budget_tokens"), model=t.get("model"),
+            tags=t.get("tags") or [], workflow_id=wf_id,
+            repo_path=(w.get("project_path") if t.get("specialist") in _DEV_SPECIALISTS else None),
+            client=w.get("client"), depends_on=deps))
+        if isinstance(created, JSONResponse):
+            return created  # foreign-ref/validation error — surface it verbatim
+        ids.append(created["id"])
+    # A new plan earns fresh automatic-fix rounds.
+    cfg = None
+    try:
+        cfg = json.loads(w.get("loop_config") or "null")
+    except Exception:
+        pass
+    if isinstance(cfg, dict):
+        for trig in cfg.get("triggers") or []:
+            trig["used"] = 0
+            trig.pop("used_tasks", None)
+        db.execute("UPDATE workflows SET loop_config=? WHERE id=?", (json.dumps(cfg), wf_id))
+    rp = _parse_replan(db.query_one("SELECT replan FROM workflows WHERE id=?", (wf_id,))) or {}
+    rp.update({"status": "applied", "applied_at": now, "created_task_ids": ids,
+               "archived_task_ids": [t["id"] for t in superseded], "error": None})
+    _save_replan(wf_id, rp)
+    db.log_activity("warn", "system",
+                    f"REPLAN applied on '{w['name']}': {len(superseded)} task(s) archived, "
+                    f"{len(ids)} recovery task(s) created (loop rounds reset)", user_id=uid)
+    roll = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+    await mgr.broadcast({"type": "workflow_updated", "data": roll}, user_id=uid)
+    return {"ok": True, "workflow": roll, "created_task_ids": ids, "repairs": repairs}
+
+
+@app.post("/api/workflows/{wf_id}/replan/dismiss")
+async def replan_dismiss(wf_id: str):
+    """Close the checkpoint without acting — it will not re-flag for the SAME
+    failed task (a new failure re-arms detection)."""
+    w = _owned_workflow(wf_id)
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    rp = _parse_replan(w)
+    if not rp:
+        return JSONResponse(status_code=404, content={"error": "nothing to dismiss"})
+    rp["status"] = "dismissed"
+    rp["dismissed_at"] = time.time()
+    _save_replan(wf_id, rp)
+    db.log_activity("info", "system", f"Replan dismissed on '{w['name']}'",
+                    user_id=auth.current_user_id())
+    return {"ok": True}
+
+
 # ── Deliverables: every agent output in one place (v2.1) ──
 
 @app.get("/api/deliverables")
@@ -3659,6 +4128,96 @@ async def list_deliverables(limit: int = 100):
             "app": app_detected,
         })
     return {"deliverables": out}
+
+
+# ── Eval corpus (Block 3 R3, docs/SPEC-BLOCK3.md) ──
+
+@app.get("/api/evals")
+async def evals_corpus():
+    """The per-domain eval corpus (cases without their briefs)."""
+    import evals as ev
+    return {"domains": ev.list_corpus()}
+
+
+@app.post("/api/evals/run")
+async def evals_run(body: dict):
+    """Start an eval run: fixed briefs → real dispatch framing → frontier judge
+    vs the domain rubric. One run at a time; refuses during quota backoff."""
+    import evals as ev
+    domain = (body.get("domain") or "").strip()
+    cases = body.get("cases") if isinstance(body.get("cases"), list) else None
+    run_id, err = ev.start_run(domain, cases, auth.current_user_id(),
+                               body.get("notes") or "")
+    if err:
+        code = 409 if "running" in err or "backoff" in err else 400
+        return JSONResponse(status_code=code, content={"error": err})
+    return {"ok": True, "run_id": run_id}
+
+
+@app.get("/api/evals/runs")
+async def evals_runs(domain: str | None = None):
+    q = "SELECT * FROM eval_runs WHERE user_id=?"
+    params: list = [auth.current_user_id()]
+    if domain:
+        q += " AND domain=?"
+        params.append(domain)
+    q += " ORDER BY started_at DESC LIMIT 100"
+    runs = db.query_all(q, tuple(params))
+    for r in runs:
+        try:
+            r["fingerprint"] = json.loads(r.get("fingerprint") or "{}")
+        except Exception:
+            r["fingerprint"] = {}
+    return {"runs": runs}
+
+
+@app.get("/api/evals/runs/{run_id}")
+async def evals_run_detail(run_id: str):
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    try:
+        run["fingerprint"] = json.loads(run.get("fingerprint") or "{}")
+    except Exception:
+        run["fingerprint"] = {}
+    results = db.query_all("SELECT * FROM eval_results WHERE run_id=? ORDER BY id",
+                           (run_id,))
+    for r in results:
+        if r.get("judge_output"):
+            r["judge_output"] = r["judge_output"][-8000:]
+    return {"run": run, "results": results}
+
+
+@app.get("/api/evals/runs/{run_id}/file")
+async def evals_run_file(run_id: str, case: str):
+    """The generated deliverable of one eval case (ownership-gated)."""
+    run = db.query_one("SELECT id FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    row = db.query_one("SELECT deliverable_path FROM eval_results WHERE run_id=? AND case_id=?",
+                       (run_id, case))
+    p = (row or {}).get("deliverable_path")
+    if not p or not os.path.isfile(p):
+        return JSONResponse(status_code=404, content={"error": "no deliverable"})
+    import evals as ev
+    resolved = Path(p).resolve()
+    if not str(resolved).startswith(str(ev.WORKSPACES.resolve()) + os.sep):
+        return JSONResponse(status_code=403, content={"error": "path escapes eval workspace"})
+    return FileResponse(str(resolved), media_type="text/plain")
+
+
+@app.post("/api/evals/runs/{run_id}/cancel")
+async def evals_run_cancel(run_id: str):
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    if run.get("status") != "running":
+        return JSONResponse(status_code=409, content={"error": f"run is {run.get('status')}"})
+    db.execute("UPDATE eval_runs SET status='cancelling' WHERE id=?", (run_id,))
+    return {"ok": True, "status": "cancelling"}
 
 
 # ── Hermes skills: list / read / save / AI wizard (v2.1) ──
@@ -4128,6 +4687,103 @@ async def task_review(task_id: str):
         return JSONResponse(status_code=500, content={"error": f"review failed: {str(e)[:200]}"})
 
 
+# ── Review v2: per-line comments (SPEC-BLOCK2 R1.4) ──
+# Comments anchor to a diff line (file, side, line no) and feed the next
+# retry via _retry_task. All routes are _owned_task-gated (foreign = 404).
+
+_COMMENT_MAX_BODY = 2000
+_COMMENT_MAX_OPEN = 200
+
+
+@app.get("/api/tasks/{task_id}/review/comments")
+async def list_review_comments(task_id: str):
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    rows = db.query_all(
+        "SELECT * FROM review_comments WHERE task_id=? "
+        "ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, file_path, "
+        "COALESCE(line_no, 0), created_at", (task_id,))
+    return {"comments": rows,
+            "open": sum(1 for r in rows if r["status"] == "open")}
+
+
+@app.post("/api/tasks/{task_id}/review/comments")
+async def create_review_comment(task_id: str, body: dict):
+    if not _owned_task(task_id):
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    text = str((body or {}).get("body") or "").strip()
+    file_path = str((body or {}).get("file_path") or "").strip()
+    side = (body or {}).get("side") or "new"
+    if not text or not file_path:
+        return JSONResponse(status_code=400, content={"error": "file_path and body are required"})
+    if side not in ("old", "new"):
+        return JSONResponse(status_code=400, content={"error": "side must be old|new"})
+    line_no = (body or {}).get("line_no")
+    try:
+        line_no = int(line_no) if line_no is not None else None
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "line_no must be an integer"})
+    n_open = db.query_one(
+        "SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? AND status='open'",
+        (task_id,))["n"]
+    if n_open >= _COMMENT_MAX_OPEN:
+        return JSONResponse(status_code=409, content={"error": f"comment limit reached ({_COMMENT_MAX_OPEN} open)"})
+    row = {
+        "id": f"rc-{uuid.uuid4().hex[:12]}",
+        "task_id": task_id,
+        "user_id": auth.current_user_id(),
+        "file_path": file_path[:500],
+        "side": side,
+        "line_no": line_no,
+        "line_text": str((body or {}).get("line_text") or "")[:500],
+        "body": text[:_COMMENT_MAX_BODY],
+        "status": "open",
+        "consumed_at": None,
+        "created_at": time.time(),
+    }
+    db.execute(
+        "INSERT INTO review_comments (id, task_id, user_id, file_path, side, "
+        "line_no, line_text, body, status, consumed_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (row["id"], row["task_id"], row["user_id"], row["file_path"], row["side"],
+         row["line_no"], row["line_text"], row["body"], row["status"],
+         row["consumed_at"], row["created_at"]))
+    return {"ok": True, "comment": row}
+
+
+def _owned_comment(task_id: str, comment_id: str):
+    """Comment must exist under an owned task — foreign anything = 404."""
+    if not _owned_task(task_id):
+        return None
+    return db.query_one(
+        "SELECT * FROM review_comments WHERE id=? AND task_id=?",
+        (comment_id, task_id))
+
+
+@app.patch("/api/tasks/{task_id}/review/comments/{comment_id}")
+async def edit_review_comment(task_id: str, comment_id: str, body: dict):
+    c = _owned_comment(task_id, comment_id)
+    if not c:
+        return JSONResponse(status_code=404, content={"error": "comment not found"})
+    if c["status"] != "open":
+        return JSONResponse(status_code=409, content={"error": "comment already consumed by a retry"})
+    text = str((body or {}).get("body") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "body is required"})
+    db.execute("UPDATE review_comments SET body=? WHERE id=?",
+               (text[:_COMMENT_MAX_BODY], comment_id))
+    return {"ok": True}
+
+
+@app.delete("/api/tasks/{task_id}/review/comments/{comment_id}")
+async def delete_review_comment(task_id: str, comment_id: str):
+    c = _owned_comment(task_id, comment_id)
+    if not c:
+        return JSONResponse(status_code=404, content={"error": "comment not found"})
+    db.execute("DELETE FROM review_comments WHERE id=?", (comment_id,))
+    return {"ok": True}
+
+
 @app.get("/api/workflows/{wf_id}/review")
 async def workflow_review(wf_id: str):
     """Aggregated change review across all member tasks (newest first)."""
@@ -4403,6 +5059,105 @@ async def project_tag(body: dict):
                     f"Tagged {os.path.basename(p)} {tag}" + ("" if pushed else " (local only — no remote)"))
     return {"ok": True, "pushed": pushed,
             "output": rout if pushed else "tag created locally; publish/push to back it up"}
+
+
+def _resolve_cli(tokens: list[str]) -> list[str]:
+    """Under the systemd unit PATH may lack ~/.local/bin (gh, cjudge live there)."""
+    import shutil as _sh
+    if tokens and not _sh.which(tokens[0]):
+        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+        if os.path.isfile(candidate):
+            tokens[0] = candidate
+    return tokens
+
+
+@app.post("/api/tasks/{task_id}/pr")
+async def task_create_pr(task_id: str):
+    """SPEC-BLOCK2 R3.1: push the task's nexus/<slug> branch to origin and
+    open a GitHub PR via gh — the repo-task counterpart of approve-and-merge,
+    for projects whose review happens on GitHub. Operator-triggered only
+    (confirm-gated in the UI). settings pr.cmd stubs the gh step for gates."""
+    task = _owned_task(task_id)
+    if not task or not task.get("repo_path"):
+        return JSONResponse(status_code=404, content={"error": "task not found or not repo-native"})
+    repo = _visible_repo_path(task["repo_path"])
+    if not repo:
+        return JSONResponse(status_code=404, content={"error": "project not found"})
+    if task.get("pr_url"):
+        return {"ok": True, "url": task["pr_url"], "existing": True}
+    import worktree as _wt
+    branch = f"nexus/{hd._repo_slug(task)}"
+    code, _ = _run_git_action(repo, "git", "rev-parse", "--verify", "--quiet", branch)
+    if code != 0:
+        return JSONResponse(status_code=409,
+                            content={"error": f"no task branch ({branch}) — dispatch the task first"})
+    base = _wt.base_branch(repo)
+    code, ahead = _run_git_action(repo, "git", "rev-list", "--count", f"{base}..{branch}")
+    if code == 0 and ahead.strip() == "0":
+        return JSONResponse(status_code=409,
+                            content={"error": f"the task branch has no commits beyond {base}"})
+    code, _ = _run_git_action(repo, "git", "remote", "get-url", "origin")
+    if code != 0:
+        return JSONResponse(status_code=409,
+                            content={"error": "no origin remote — ☁ Publish the project first"})
+    code, out = _run_git_action(repo, "git", "push", "-u", "origin", branch, timeout=180)
+    if code != 0:
+        return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
+    # PR body: brief + review stats + line-comment audit trail pointer
+    stats = ""
+    try:
+        r = review_engine.build_task_review(task)
+        stats = (f"{len(r.get('files') or [])} file(s) changed, "
+                 f"+{r.get('additions', 0)} / −{r.get('deletions', 0)}")
+    except Exception:
+        pass
+    cm = db.query_one(
+        "SELECT COUNT(*) AS n, SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS o "
+        "FROM review_comments WHERE task_id=?", (task_id,))
+    title = (task.get("title") or task_id).strip()[:120]
+    body_lines = [f"## {title}", "", (task.get("description") or "").strip()[:1500], ""]
+    if stats:
+        body_lines.append(f"**Changes:** {stats}")
+    if cm and (cm["n"] or 0) > 0:
+        body_lines.append(f"**Nexus review:** {cm['n']} line comment(s), {cm['o'] or 0} still open")
+    body_lines += ["", "---",
+                   f"Created by Nexus Agent OS · task `{task_id}` · branch `{branch}`"]
+    ws = task.get("workspace_path")
+    bodyfile = os.path.join(ws if ws and os.path.isdir(ws) else "/tmp", "_pr_body.md")
+    with open(bodyfile, "w") as f:
+        f.write("\n".join(body_lines))
+    import shlex
+    template = db.get_setting(
+        "pr.cmd",
+        "gh pr create --head {branch} --base {base} --title {title} --body-file {bodyfile}")
+    # .replace, not .format: task titles may legally contain braces
+    tokens = _resolve_cli([
+        t.replace("{branch}", branch).replace("{base}", base)
+         .replace("{title}", title).replace("{bodyfile}", bodyfile)
+         .replace("{repo}", repo)
+        for t in shlex.split(template)])
+    try:
+        r = _sp.run(tokens, cwd=repo, capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"pr command failed: {str(e)[:200]}"})
+    combined = ((r.stdout or "") + (r.stderr or "")).strip()
+    m = _re.search(r"https://\S+", r.stdout or "")
+    if r.returncode != 0 or not m:
+        if "already exists" in combined:  # PR was opened earlier outside nexus
+            vr = _sp.run(_resolve_cli(["gh", "pr", "view", branch, "--json", "url",
+                                       "-q", ".url"]),
+                         cwd=repo, capture_output=True, text=True, timeout=60)
+            m = _re.search(r"https://\S+", vr.stdout or "")
+        if not m:
+            return JSONResponse(status_code=502,
+                                content={"error": f"PR creation failed: {combined[-400:]}"})
+    url = m.group(0).rstrip(".,)")
+    db.execute("UPDATE tasks SET pr_url=?, updated_at=? WHERE id=?",
+               (url, time.time(), task_id))
+    db.log_activity("info", "system", f"PR opened for task {task_id}: {url}")
+    t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
+    return {"ok": True, "url": url}
 
 
 @app.get("/api/tools")

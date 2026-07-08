@@ -29,7 +29,7 @@
     },
     {
       "path": "memory.provider",
-      "expected": "mem0",
+      "expected": "mem0-client",
       "enforce": true
     },
     {
@@ -181,7 +181,7 @@
     {
       "path": "~/.hermes/scripts/mem0_curate.py",
       "golden": "mem0_curate.py",
-      "sha256": "14b0bdc8e971f4277a201298641ef2768ccfa326b2d7fec0682db25a0805cfa4",
+      "sha256": "9487698799aa7f4a4f6a8089f67baaa84da2da4c1168e8df367c380463bf6330",
       "mode": "755",
       "restore_mode": "whole"
     },

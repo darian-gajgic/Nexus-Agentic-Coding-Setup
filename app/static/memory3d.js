@@ -376,12 +376,13 @@ function animate() {
   M.renderer.render(M.scene, M.camera);
 }
 
-async function mount(container, data) {
+async function mount(container, data, opts) {
   dispose();
   const three = await loadThree();
   if (!three || !container || !container.isConnected) return;
   M.container = container;
   M.data = data;
+  M.onSelect = (opts && opts.onSelect) || null; // SPEC-BLOCK2 R2.1: click a star to edit it
 
   M.scene = new THREE.Scene();
   M.scene.background = new THREE.Color(0x02080a); // deep teal-black space
@@ -412,7 +413,7 @@ async function mount(container, data) {
     return `<span><i style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col};margin-right:5px"></i>${word}</span>`;
   }).join('');
   legend.innerHTML = regionChips +
-    '<span style="opacity:.7">· drag orbit · scroll zoom · hover a star</span>';
+    `<span style="opacity:.7">· drag orbit · scroll zoom · hover a star${M.onSelect ? ' · click to edit' : ''}</span>`;
   container.appendChild(legend);
 
   M.raycaster = new THREE.Raycaster();
@@ -425,6 +426,7 @@ async function mount(container, data) {
   const rect = () => M.canvas.getBoundingClientRect();
   M.canvas.addEventListener('pointerdown', (e) => {
     M.drag = { x: e.clientX, y: e.clientY };
+    M.downAt = { x: e.clientX, y: e.clientY, t: performance.now() };
     M.flyT = -1; // interaction cancels the fly-in
     M.lastInteract = performance.now();
     M.container.style.cursor = 'grabbing';
@@ -443,7 +445,16 @@ async function mount(container, data) {
     }
   });
   const endDrag = () => { M.drag = null; if (M.container) M.container.style.cursor = 'grab'; };
-  M.canvas.addEventListener('pointerup', endDrag);
+  M.canvas.addEventListener('pointerup', (e) => {
+    // a CLICK (not a drag): ≤6px travel, ≤600ms, over a hovered star
+    if (M.onSelect && M.downAt && M.hoverId >= 0 &&
+        Math.hypot(e.clientX - M.downAt.x, e.clientY - M.downAt.y) <= 6 &&
+        performance.now() - M.downAt.t <= 600) {
+      try { M.onSelect(M.data.nodes[M.hoverId]); } catch { /* modal errors stay in the app layer */ }
+    }
+    M.downAt = null;
+    endDrag();
+  });
   M.canvas.addEventListener('pointerleave', () => { endDrag(); M.pointer = null; setHover(-1); });
   M.canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -483,6 +494,7 @@ function dispose() {
     grid: null, data: null, panel: null, hoverId: -1, raycaster: null,
     pointer: null, resizeObs: null, drag: null, container: null,
     glows: null, labels: [], flyT: -1, searchQ: '', matchSet: null,
+    onSelect: null, downAt: null,
   });
 }
 

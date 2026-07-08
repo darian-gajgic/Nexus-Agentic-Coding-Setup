@@ -8,7 +8,7 @@
 
 ## The team
 
-- **Who:** two people. {{FILL: names/roles — who leads what, e.g. "A: dev + music, B: content + shop ops"}}
+- **Who:** {{FILL: who's involved and who leads what — "just me" is a fine answer, or e.g. "A: dev + music, B: content + shop ops"}}
 - **Experience level:** junior in most domains — the AI system carries senior judgment
   (playbooks/rubrics in this repo), we review, decide, and learn.
 - **Weekly capacity for the business:** {{FILL: realistic hours/week each}}
@@ -57,7 +57,7 @@
 ## This quarter's goals (update every quarter)
 
 1. {{FILL: goal + number + date}}
-2. {{FILL}}
-3. {{FILL}}
+2. {{FILL: second goal + number + date}}
+3. {{FILL: third goal + number + date}}
 
 > Priority order when ventures compete for time: {{FILL: e.g. 1. client cash-flow, 2. SaaS, 3. shop, 4. music}}
