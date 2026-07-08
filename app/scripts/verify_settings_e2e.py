@@ -121,6 +121,47 @@ def main():
         r = C.delete("/api/credentials/cred-gate-foreign")
         chk("foreign credential delete = 404", r.status_code == 404)
 
+        # ── 2b. Machine default keys (admin view/rotation — ~/.hermes/.env) ──
+        print("── machine default keys ──")
+        r = C.get("/api/credentials/defaults")
+        chk("defaults endpoint answers (admin)", r.status_code == 200, r.text[:100])
+        defs = {d["provider"]: d for d in r.json().get("defaults", [])}
+        chk("zai default listed with its env var",
+            defs.get("zai", {}).get("env") == "GLM_API_KEY")
+        chk("anthropic default = CLI-managed (not env-editable)",
+            "managed" in defs.get("anthropic", {}))
+        chk("defaults response is masked (hints ≤4 chars, no values)",
+            all(len(d.get("hint") or "") <= 4 for d in defs.values()))
+        r = C.put("/api/credentials/defaults/anthropic", json={"value": "sk-" + "y" * 20})
+        chk("CLI-managed provider not rotatable via env", r.status_code == 400)
+        r = C.put("/api/credentials/defaults/nonsense", json={"value": "sk-" + "x" * 20})
+        chk("unknown default provider rejected", r.status_code == 400)
+        r = C.put("/api/credentials/defaults/zai", json={"value": "short"})
+        chk("too-short default key rejected", r.status_code == 400)
+        # the WRITER is proven on a scratch env file — never the live ~/.hermes/.env
+        import secrets_store as ss
+        scratch_env = Path(os.environ.get("TMPDIR", "/tmp")) / f"gate-env-{probe}"
+        scratch_env.write_text("OTHER=1\n# [disabled by gate] GLM_API_KEY=old\nKEEP=2\n")
+        prev_env_val = os.environ.get("GLM_API_KEY")
+        try:
+            row = ss.set_default_key("zai", "sk-gate-default-12345", env_file=str(scratch_env))
+            txt = scratch_env.read_text()
+            chk("anchored rewrite replaces the (commented) line",
+                "GLM_API_KEY=sk-gate-default-12345" in txt and "old" not in txt, txt)
+            chk("other env lines preserved", "OTHER=1" in txt and "KEEP=2" in txt)
+            chk("env file left 0600", oct(scratch_env.stat().st_mode & 0o777) == "0o600")
+            chk("rotation response masked", row["hint"] == "2345" and "value" not in row)
+            scratch_env.write_text("OTHER=1\n")
+            ss.set_default_key("zai", "sk-gate-append-6789", env_file=str(scratch_env))
+            chk("missing key appended",
+                "GLM_API_KEY=sk-gate-append-6789" in scratch_env.read_text())
+        finally:
+            if prev_env_val is None:
+                os.environ.pop("GLM_API_KEY", None)
+            else:
+                os.environ["GLM_API_KEY"] = prev_env_val
+            scratch_env.unlink(missing_ok=True)
+
         # ── 3. Model registry + purpose routing ──
         print("── model registry ──")
         r = C.get("/api/models")

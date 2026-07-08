@@ -112,6 +112,82 @@ def delete_credential(cred_id: str):
     db.execute("DELETE FROM credentials WHERE id=?", (cred_id,))
 
 
+# ── Machine default keys (~/.hermes/.env) — admin-visible/rotatable ──
+# Fixed provider→env allowlist: the endpoint must never accept arbitrary env
+# var names (that would be an env-injection surface). anthropic is deliberately
+# absent — its default is the Claude CLI's subscription auth, not an env key.
+
+ENV_FILE = os.path.expanduser("~/.hermes/.env")
+
+DEFAULT_PROVIDERS = {
+    "zai": {"env": "GLM_API_KEY",
+            "label": "Z.AI / GLM — tasks, JARVIS, wizards",
+            "restart": "hermes-gateway"},
+    "brave": {"env": "BRAVE_SEARCH_API_KEY",
+              "label": "Brave Search — Hermes web search",
+              "restart": "hermes-gateway"},
+    "langfuse_public": {"env": "HERMES_LANGFUSE_PUBLIC_KEY",
+                        "label": "Langfuse public key — Observability tab",
+                        "restart": None},
+    "langfuse_secret": {"env": "HERMES_LANGFUSE_SECRET_KEY",
+                        "label": "Langfuse secret key — Observability tab",
+                        "restart": None},
+}
+
+
+def default_key_status() -> list[dict]:
+    """Masked view of the machine default keys (set/not-set + hint). Values
+    come from THIS process's environment (main.py loads ~/.hermes/.env at
+    boot and set_default_key updates os.environ live) — the file itself is
+    never echoed anywhere."""
+    out = []
+    for prov, meta in DEFAULT_PROVIDERS.items():
+        val = os.environ.get(meta["env"], "")
+        out.append({"provider": prov, "env": meta["env"], "label": meta["label"],
+                    "set": bool(val), "hint": _hint(val) if val else "",
+                    "restart": meta["restart"]})
+    out.append({"provider": "anthropic", "env": None,
+                "label": "Anthropic — frontier judge (cjudge/cspec/creview)",
+                "set": True, "hint": "",
+                "managed": "Claude CLI subscription auth (rotate via `claude` login); "
+                           "per-user keys above override it for the judge",
+                "restart": None})
+    return out
+
+
+def set_default_key(provider: str, value: str, env_file: str | None = None) -> dict:
+    """Rotate a machine default key: anchored in-place rewrite of ~/.hermes/.env
+    (uncommented or `# [disabled…]`-commented existing line replaced, else
+    appended), atomic 0600 write, live os.environ update. Returns the masked
+    status row. Raises ValueError for unknown providers — the allowlist above
+    is the whole attack surface."""
+    meta = DEFAULT_PROVIDERS.get(provider)
+    if not meta:
+        raise ValueError(f"'{provider}' has no machine default managed here")
+    env, path = meta["env"], (env_file or ENV_FILE)
+    lines: list[str] = []
+    if os.path.isfile(path):
+        with open(path) as f:
+            lines = f.read().splitlines()
+    pat = re.compile(rf"^\s*(#[^=\n]*?)?\b{re.escape(env)}=")
+    replaced = False
+    for i, ln in enumerate(lines):
+        if pat.match(ln):
+            lines[i] = f"{env}={value}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{env}={value}")
+    tmp = f"{path}.tmp-{uuid.uuid4().hex[:6]}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+    os.environ[env] = value  # live for THIS process (hints, langfuse proxy)
+    return {"provider": provider, "env": env, "set": True, "hint": _hint(value),
+            "restart": meta["restart"]}
+
+
 def resolve_key(user_id: str | None, provider: str,
                 credential_id: str | None = None) -> str | None:
     """Plaintext resolution for EXECUTION paths only (never HTTP responses).

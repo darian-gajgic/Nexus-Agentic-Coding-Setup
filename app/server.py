@@ -4553,6 +4553,40 @@ async def credentials_set(body: dict):
     return {"ok": True, "credential": row}
 
 
+@app.get("/api/credentials/defaults")
+async def credentials_defaults():
+    """Masked status of the MACHINE default keys (~/.hermes/.env) — the
+    fallback every user inherits when they set no personal key. Admin-only:
+    this is shared infrastructure, not per-user data."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    return {"defaults": secrets_store.default_key_status()}
+
+
+@app.put("/api/credentials/defaults/{provider}")
+async def credentials_defaults_set(provider: str, body: dict):
+    """Rotate a machine default key in ~/.hermes/.env (fixed provider
+    allowlist — never arbitrary env names). The value is written, never
+    echoed; gateway-read keys apply to new Hermes work after a gateway
+    restart (the response says which)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    value = str(body.get("value") or "")
+    if len(value) < 8 or any(c in value for c in "\n\r"):
+        return JSONResponse(status_code=400, content={"error": "key looks invalid"})
+    try:
+        row = secrets_store.set_default_key(provider.strip().lower(), value)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except OSError as e:
+        return JSONResponse(status_code=500, content={"error": f"env write failed: {e}"})
+    db.log_activity("info", "settings",
+                    f"Machine default key rotated: {row['provider']} ({row['env']})")
+    return {"ok": True, "default": row,
+            "note": (f"Applies to new Hermes work after `systemctl --user restart "
+                     f"{row['restart']}`" if row["restart"] else "Applies immediately")}
+
+
 @app.delete("/api/credentials/{cred_id}")
 async def credentials_delete(cred_id: str):
     row = secrets_store.get_credential(cred_id)
