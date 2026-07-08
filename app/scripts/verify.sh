@@ -35,6 +35,9 @@ for f in *.py; do
   [ "$f" = "__init__.py" ] && continue
   chk "$f syntax" ".venv/bin/python -c 'import py_compile; py_compile.compile(\"$f\", doraise=True)'"
 done
+# Event-loop discipline (stability audit §3.1): async handlers must not call
+# known-blocking helpers/subprocess/copytree directly — threadpool or async twin.
+chk "no blocking calls in async handlers" ".venv/bin/python scripts/check_async_blocking.py"
 
 echo -e "${YELLOW}═══ 3. HTML/CSS REFS ═══${NC}"
 chk "index.html references exist" '

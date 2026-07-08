@@ -535,7 +535,7 @@ async def create_task(body: TaskCreate):
     err = _foreign_refs_error(body.workflow_id, body.depends_on)
     if err:
         return JSONResponse(status_code=404, content={"error": err})
-    if body.repo_path and not _visible_repo_path(body.repo_path):
+    if body.repo_path and not await _visible_repo_path_async(body.repo_path):
         return JSONResponse(status_code=400, content={
             "error": f"repo_path is not one of your git repositories: {body.repo_path}"})
     uid = auth.current_user_id()
@@ -608,7 +608,7 @@ async def update_task(task_id: str, body: TaskUpdate):
         updates["client"] = (body.client or "").strip().lower() or None
     if body.repo_path is not None:
         rp = (body.repo_path or "").strip()
-        if rp and not _visible_repo_path(rp):
+        if rp and not await _visible_repo_path_async(rp):
             return JSONResponse(status_code=400, content={
                 "error": f"repo_path is not one of your git repositories: {rp}"})
         updates["repo_path"] = rp or None
@@ -883,6 +883,24 @@ def get_coremods():
     return out
 
 
+async def _sp_run_async(cmd: list[str], cwd: str | None = None, timeout: int = 120):
+    """subprocess.run(capture_output=True, text=True) twin that never blocks the
+    event loop. Returns (returncode, stdout, stderr); kills the process on
+    timeout (like subprocess.run) and raises TimeoutError."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        proc.kill()
+        await proc.communicate()
+        raise TimeoutError(f"command timed out after {timeout}s: {cmd[0]}")
+    return (proc.returncode,
+            (out or b"").decode(errors="replace"),
+            (err or b"").decode(errors="replace"))
+
+
 @app.post("/api/coremods/decide")
 async def decide_coremod(body: dict):
     """Human decision on a tracked core modification: keep_ours | accept_upstream | reenable.
@@ -891,7 +909,6 @@ async def decide_coremod(body: dict):
     the shared Hermes gateway every user depends on) — global operator control."""
     if not auth.is_admin():
         return JSONResponse(status_code=403, content={"error": "admin only"})
-    import subprocess
     name = body.get("name"); decision = body.get("decision")
     if decision not in ("keep_ours", "accept_upstream", "reenable"):
         return JSONResponse(status_code=400, content={"error": "decision must be keep_ours|accept_upstream|reenable"})
@@ -915,8 +932,8 @@ async def decide_coremod(body: dict):
     gp = os.path.expanduser("~/hermes-guardian/guardian.py")
     ran = False
     try:
-        r = subprocess.run([py, gp], capture_output=True, text=True, timeout=150)
-        ran = r.returncode == 0
+        code, _out, _err = await _sp_run_async([py, gp], timeout=150)
+        ran = code == 0
     except Exception:
         pass
     db.log_activity("info", "system", f"Core-mod '{name}' decision: {decision}")
@@ -1068,7 +1085,8 @@ async def add_specialist_memory(name: str, body: dict):
         return JSONResponse(status_code=400, content={"error": "bad specialist name"})
     if not text:
         return JSONResponse(status_code=400, content={"error": "empty lesson"})
-    res = _run_curate("add", "--agent-id", _specialist_mem0_id(name), "--text", text)
+    res = await run_in_threadpool(
+        _run_curate, "add", "--agent-id", _specialist_mem0_id(name), "--text", text)
     if res.get("ok"):
         db.log_activity("info", "system", f"Taught specialist '{name}' a lesson")
         try:
@@ -1079,7 +1097,7 @@ async def add_specialist_memory(name: str, body: dict):
 
 
 @app.delete("/api/specialists/{name}/memory/{mem_id}")
-async def delete_specialist_memory(name: str, mem_id: str):
+def delete_specialist_memory(name: str, mem_id: str):
     """Forget a specialist's lesson by id. Admin-only (H1): deletes a shared
     specialist memory by raw id — irreversible destruction of operator knowledge."""
     if not auth.is_admin():
@@ -1180,8 +1198,9 @@ async def decide_lesson(lid: str, body: dict):
         return JSONResponse(status_code=404, content={"error": "not found"})
     if action == "approve":
         lesson = (body.get("lesson") or item["lesson"]).strip()
-        res = _run_curate("add", "--agent-id", _specialist_mem0_id(item["specialist"]), "--text", lesson,
-                          "--source", "reflection-approved")
+        res = await run_in_threadpool(
+            _run_curate, "add", "--agent-id", _specialist_mem0_id(item["specialist"]),
+            "--text", lesson, "--source", "reflection-approved")
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error", "write failed")}
     elif action != "reject":
@@ -1214,7 +1233,6 @@ async def save_specialist(body: dict):
     operator's Unix account on the operator's next dispatch (stored prompt injection)."""
     if not auth.is_admin():
         return JSONResponse(status_code=403, content={"error": "admin only"})
-    import subprocess
     import re
     name = (body.get("name") or "").strip()
     content = body.get("content") or ""
@@ -1236,9 +1254,10 @@ async def save_specialist(body: dict):
     with open(os.path.join(base, f"{name}.md"), "w") as f:
         f.write(content)
     try:
-        subprocess.run(["git", "-C", base, "add", f"{name}.md"], capture_output=True, timeout=10)
-        subprocess.run(["git", "-C", base, "-c", "user.name=nexus", "-c", "user.email=noreply@localhost",
-                        "commit", "-m", f"edit specialist {name} via nexus"], capture_output=True, timeout=10)
+        await _sp_run_async(["git", "-C", base, "add", f"{name}.md"], timeout=10)
+        await _sp_run_async(["git", "-C", base, "-c", "user.name=nexus", "-c",
+                             "user.email=noreply@localhost", "commit", "-m",
+                             f"edit specialist {name} via nexus"], timeout=10)
     except Exception:
         pass
     db.log_activity("info", "system", f"Specialist '{name}' edited via nexus")
@@ -1341,7 +1360,7 @@ def get_shared_context():
 
 
 @app.post("/api/shared-context")
-async def add_shared_context(body: dict):
+def add_shared_context(body: dict):
     # Admin-only (H1): writes the `team-shared` scope that EVERY specialist
     # recalls — a member write is a global stored prompt-injection vector.
     if not auth.is_admin():
@@ -1353,7 +1372,7 @@ async def add_shared_context(body: dict):
 
 
 @app.delete("/api/shared-context/{mem_id}")
-async def delete_shared_context(mem_id: str):
+def delete_shared_context(mem_id: str):
     # Admin-only (H1): deletes any shared/global memory point by raw id.
     if not auth.is_admin():
         return JSONResponse(status_code=403, content={"error": "admin only"})
@@ -1474,13 +1493,14 @@ async def _memory_changed(action: str, point_id):
 
 @app.patch("/api/memory/{point_id}")
 async def edit_memory(point_id: str, body: dict):
-    pt, err = _memory_access(point_id)
+    pt, err = await run_in_threadpool(_memory_access, point_id)
     if err:
         return err
     text = str((body or {}).get("text") or "").strip()
     if not text:
         return JSONResponse(status_code=400, content={"error": "text is required"})
-    res = _run_curate("update", "--id", str(point_id), "--text", text[:4000])
+    res = await run_in_threadpool(
+        _run_curate, "update", "--id", str(point_id), "--text", text[:4000])
     if not res.get("ok"):
         return JSONResponse(status_code=500, content=res)
     await _memory_changed("edited", point_id)
@@ -1489,10 +1509,10 @@ async def edit_memory(point_id: str, body: dict):
 
 @app.delete("/api/memory/{point_id}")
 async def delete_memory(point_id: str):
-    pt, err = _memory_access(point_id)
+    pt, err = await run_in_threadpool(_memory_access, point_id)
     if err:
         return err
-    res = _run_curate("delete", "--id", str(point_id))
+    res = await run_in_threadpool(_run_curate, "delete", "--id", str(point_id))
     if not res.get("ok"):
         return JSONResponse(status_code=500, content=res)
     await _memory_changed("deleted", point_id)
@@ -1514,7 +1534,7 @@ async def merge_memory(body: dict):
         return JSONResponse(status_code=400, content={"error": "merged text is required"})
     pts = []
     for pid in ids:
-        pt, err = _memory_access(pid)
+        pt, err = await run_in_threadpool(_memory_access, pid)
         if err:
             return err
         pts.append(pt)
@@ -1529,12 +1549,12 @@ async def merge_memory(body: dict):
     args = ["add", "--text", text[:4000], "--metadata", json.dumps(meta)]
     if len(agent_ids) == 1 and next(iter(agent_ids)):
         args += ["--agent-id", next(iter(agent_ids))]  # e.g. merging one specialist's lessons
-    res = _run_curate(*args)
+    res = await run_in_threadpool(_run_curate, *args)
     if not res.get("ok"):
         return JSONResponse(status_code=500, content=res)
     deleted, failed = [], []
     for pid in ids:
-        r = _run_curate("delete", "--id", pid)
+        r = await run_in_threadpool(_run_curate, "delete", "--id", pid)
         (deleted if r.get("ok") else failed).append(pid)
     await _memory_changed("merged", res.get("id"))
     return {"ok": True, "id": res.get("id"), "deleted": deleted, "failed": failed}
@@ -2834,7 +2854,9 @@ async def decide_approval(approval_id: str, body: dict):
                 db.log_activity("info", "system", f"Deliverable approved — task {task_id} shipped")
             else:
                 # _retry_task falls back to the judge's findings automatically
-                _retry_task(task_id, (body.get("feedback") or "").strip() or None)
+                # (snapshots the workspace — copytree — so off the loop)
+                await run_in_threadpool(
+                    _retry_task, task_id, (body.get("feedback") or "").strip() or None)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
     await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
@@ -2868,7 +2890,7 @@ async def watchdog_config(body: dict):
 # ── 5. Git worktree isolation ──
 
 @app.post("/api/agents/{agent_id}/worktree")
-async def agent_worktree(agent_id: str, body: dict):
+def agent_worktree(agent_id: str, body: dict):
     """Create an isolated git worktree for an agent against a repo path."""
     if not auth.is_admin():  # H3: mutates a shared lane + touches the operator's repo
         return JSONResponse(status_code=403, content={"error": "admin only"})
@@ -3225,7 +3247,7 @@ def _workspace_files(ws: str) -> tuple[list, bool]:
 
 
 @app.get("/api/tasks/{task_id}/files")
-async def task_files(task_id: str):
+def task_files(task_id: str):
     """List the task workspace RECURSIVELY (deliverables are FILES — R6)."""
     task = _owned_task(task_id)
     if not task:
@@ -3273,7 +3295,7 @@ def _task_workspace(task_id: str) -> str | None:
 
 
 @app.get("/api/tasks/{task_id}/app")
-async def task_app_status(task_id: str):
+def task_app_status(task_id: str):
     """Detection + live state of this task's runnable program (if any)."""
     import app_runner as _apps
     ws = _task_workspace(task_id)
@@ -3294,7 +3316,7 @@ async def task_app_start(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/app/stop")
-async def task_app_stop(task_id: str):
+def task_app_stop(task_id: str):
     import app_runner as _apps
     if not _owned_task(task_id):
         return JSONResponse(status_code=404, content={"error": "not found"})
@@ -3302,7 +3324,7 @@ async def task_app_stop(task_id: str):
 
 
 @app.get("/api/tasks/{task_id}/app/log")
-async def task_app_log(task_id: str):
+def task_app_log(task_id: str):
     import app_runner as _apps
     ws = _task_workspace(task_id)
     return {"log": _apps.log_tail(ws) if ws else ""}
@@ -3326,7 +3348,7 @@ def _wf_running_states(wf_id: str) -> list[dict]:
 
 
 @app.get("/api/workflows/{wf_id}/app")
-async def workflow_app_status(wf_id: str):
+def workflow_app_status(wf_id: str):
     """The project's runnable history (git commits / stage checkpoints) plus
     every running preview instance of it."""
     import project_preview as pp
@@ -3366,7 +3388,7 @@ async def workflow_app_start(wf_id: str, body: dict):
 
 
 @app.post("/api/workflows/{wf_id}/app/stop")
-async def workflow_app_stop(wf_id: str, body: dict):
+def workflow_app_stop(wf_id: str, body: dict):
     """Stop one project preview state ({version}) or all of them (empty body)."""
     import app_runner as _apps
     import project_preview as pp
@@ -3381,7 +3403,7 @@ async def workflow_app_stop(wf_id: str, body: dict):
 
 
 @app.get("/api/workflows/{wf_id}/app/log")
-async def workflow_app_log(wf_id: str, version: str = ""):
+def workflow_app_log(wf_id: str, version: str = ""):
     import app_runner as _apps
     import project_preview as pp
     if not _owned_workflow(wf_id):
@@ -3710,7 +3732,8 @@ def _retry_task(task_id: str, feedback: str | None):
 async def retry_task(task_id: str, body: dict):
     if not _owned_task(task_id):
         return JSONResponse(status_code=404, content={"error": "task not found"})
-    task = _retry_task(task_id, (body or {}).get("feedback"))
+    # _retry_task snapshots the whole workspace (copytree) — off the loop.
+    task = await run_in_threadpool(_retry_task, task_id, (body or {}).get("feedback"))
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
@@ -3941,7 +3964,7 @@ async def onboarding_save(body: dict):
 
 
 @app.post("/api/onboarding/apply")
-async def onboarding_apply():
+def onboarding_apply():
     """Write the caller's Business Brain (u_owner -> canonical ~/knowledge,
     everyone else -> their personal overlay). Confirm-gated in the UI."""
     me = auth.current_user_id()
@@ -4513,10 +4536,11 @@ async def task_wizard(body: dict):
     repo_path = (body.get("repo_path") or "").strip()
     repo_block = ""
     # ownership-gated: a foreign repo path adds no context and is never
-    # written onto the planned tasks (same silent drop as an invalid path)
-    valid_repo = _visible_repo_path(repo_path) if repo_path else None
+    # written onto the planned tasks (same silent drop as an invalid path).
+    # Both helpers run git subprocesses / read files — off the loop.
+    valid_repo = await _visible_repo_path_async(repo_path) if repo_path else None
     if valid_repo:
-        repo_block = _wizard_repo_context(valid_repo)
+        repo_block = await run_in_threadpool(_wizard_repo_context, valid_repo)
 
     # The goal is DATA to plan around, never instructions to obey — an
     # imperative goal ('analyze this picture...') otherwise sometimes made
@@ -5059,7 +5083,7 @@ async def replan_dismiss(wf_id: str):
 # ── Deliverables: every agent output in one place (v2.1) ──
 
 @app.get("/api/deliverables")
-async def list_deliverables(limit: int = 100):
+def list_deliverables(limit: int = 100):
     """All tasks that produced output, newest first, with their workspace files."""
     tasks = db.query_all(
         "SELECT * FROM tasks WHERE workspace_path IS NOT NULL AND user_id=? "
@@ -5722,7 +5746,7 @@ _MEM3D_CACHE: dict = {}
 
 
 @app.get("/api/memory3d")
-async def memory3d(force: bool = False):
+def memory3d(force: bool = False):
     """Nodes = mem0 memories at their REAL vector positions (768-dim qdrant
     embeddings PCA-projected to 3D); links = strongest cosine similarities.
     Nothing is invented — distance on screen is semantic distance in mem0."""
@@ -5909,7 +5933,7 @@ import review as review_engine
 
 
 @app.get("/api/tasks/{task_id}/review")
-async def task_review(task_id: str):
+def task_review(task_id: str):
     task = _owned_task(task_id)
     if not task or not task.get("workspace_path"):
         return JSONResponse(status_code=404, content={"error": "task or workspace not found"})
@@ -6017,7 +6041,7 @@ async def delete_review_comment(task_id: str, comment_id: str):
 
 
 @app.get("/api/workflows/{wf_id}/review")
-async def workflow_review(wf_id: str):
+def workflow_review(wf_id: str):
     """Aggregated change review across all member tasks (newest first)."""
     if not _owned_workflow(wf_id):
         return JSONResponse(status_code=404, content={"error": "workflow not found"})
@@ -6080,9 +6104,18 @@ def _project_visible(path: str) -> bool:
 
 def _visible_repo_path(path: str):
     """_valid_repo_path + ownership: same None on failure either way, so a
-    foreign repo is indistinguishable from a nonexistent one."""
+    foreign repo is indistinguishable from a nonexistent one.
+
+    BLOCKING (runs `git rev-parse`, up to 30 s) — safe from a plain `def`
+    handler (threadpooled); an `async def` handler must use
+    `await _visible_repo_path_async(...)` (verify.sh enforces this)."""
     p = _valid_repo_path(path)
     return p if p and _project_owner(p) == auth.current_user_id() else None
+
+
+async def _visible_repo_path_async(path: str):
+    """Loop-safe twin of _visible_repo_path for `async def` handlers."""
+    return await run_in_threadpool(_visible_repo_path, path)
 
 
 def _tag_project_owner(path: str, user_id: str | None = None):
@@ -6096,6 +6129,13 @@ def _run_git_action(cwd: str, *cmd: str, timeout: int = 120):
     import subprocess
     r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
     return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-800:]
+
+
+async def _run_git_action_async(cwd: str, *cmd: str, timeout: int = 120):
+    """_run_git_action for handlers that must stay `async def` (they await
+    something else) — same (code, tail) contract, subprocess off the loop."""
+    code, out, err = await _sp_run_async(list(cmd), cwd=cwd, timeout=timeout)
+    return code, (out + err).strip()[-800:]
 
 
 _SLUG_RE = r"^[a-z0-9][a-z0-9._-]{0,60}$"
@@ -6144,7 +6184,7 @@ def _create_repo(client: str, name: str, publish: bool):
 
 
 @app.post("/api/projects/create-client")
-async def project_create_client(body: dict):
+def project_create_client(body: dict):
     root, note = _create_repo(body.get("client"), body.get("name"),
                               bool(body.get("publish")))
     if root is None:
@@ -6154,7 +6194,7 @@ async def project_create_client(body: dict):
 
 
 @app.post("/api/tasks/{task_id}/promote")
-async def task_promote(task_id: str, body: dict):
+def task_promote(task_id: str, body: dict):
     """Rescue path: lift an app that was born in a task WORKSPACE into a real
     client repository. Copies the code (junk excluded), seeds the repo, and
     commits 'imported from task'. All future rounds then run repo-native."""
@@ -6207,7 +6247,7 @@ async def task_promote(task_id: str, body: dict):
 
 
 @app.get("/api/projects/history")
-async def project_history(path: str):
+def project_history(path: str):
     """Every pipeline and task that ever targeted this project — the work log
     per client project (rounds of improvement, and invoicing evidence)."""
     p = _visible_repo_path(path)
@@ -6231,7 +6271,7 @@ async def project_history(path: str):
 
 
 @app.post("/api/projects/publish")
-async def project_publish(body: dict):
+def project_publish(body: dict):
     """Create a PRIVATE GitHub repo for a local-only repository and push it —
     the offsite backup + future handover vehicle. Explicit button, never auto."""
     import re
@@ -6253,7 +6293,7 @@ async def project_publish(body: dict):
 
 
 @app.post("/api/projects/push")
-async def project_push(body: dict):
+def project_push(body: dict):
     """Push the current branch + tags to origin — the post-merge backup step."""
     p = _visible_repo_path(body.get("path"))
     if not p:
@@ -6271,7 +6311,7 @@ async def project_push(body: dict):
 
 
 @app.post("/api/projects/tag")
-async def project_tag(body: dict):
+def project_tag(body: dict):
     """Annotated release tag + push — marks the exact delivered state
     (invoice ↔ code state, reproducible forever)."""
     import re
@@ -6312,33 +6352,33 @@ async def task_create_pr(task_id: str):
     task = _owned_task(task_id)
     if not task or not task.get("repo_path"):
         return JSONResponse(status_code=404, content={"error": "task not found or not repo-native"})
-    repo = _visible_repo_path(task["repo_path"])
+    repo = await _visible_repo_path_async(task["repo_path"])
     if not repo:
         return JSONResponse(status_code=404, content={"error": "project not found"})
     if task.get("pr_url"):
         return {"ok": True, "url": task["pr_url"], "existing": True}
     import worktree as _wt
     branch = f"nexus/{hd._repo_slug(task)}"
-    code, _ = _run_git_action(repo, "git", "rev-parse", "--verify", "--quiet", branch)
+    code, _ = await _run_git_action_async(repo, "git", "rev-parse", "--verify", "--quiet", branch)
     if code != 0:
         return JSONResponse(status_code=409,
                             content={"error": f"no task branch ({branch}) — dispatch the task first"})
-    base = _wt.base_branch(repo)
-    code, ahead = _run_git_action(repo, "git", "rev-list", "--count", f"{base}..{branch}")
+    base = await run_in_threadpool(_wt.base_branch, repo)
+    code, ahead = await _run_git_action_async(repo, "git", "rev-list", "--count", f"{base}..{branch}")
     if code == 0 and ahead.strip() == "0":
         return JSONResponse(status_code=409,
                             content={"error": f"the task branch has no commits beyond {base}"})
-    code, _ = _run_git_action(repo, "git", "remote", "get-url", "origin")
+    code, _ = await _run_git_action_async(repo, "git", "remote", "get-url", "origin")
     if code != 0:
         return JSONResponse(status_code=409,
                             content={"error": "no origin remote — ☁ Publish the project first"})
-    code, out = _run_git_action(repo, "git", "push", "-u", "origin", branch, timeout=180)
+    code, out = await _run_git_action_async(repo, "git", "push", "-u", "origin", branch, timeout=180)
     if code != 0:
         return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
     # PR body: brief + review stats + line-comment audit trail pointer
     stats = ""
     try:
-        r = review_engine.build_task_review(task)
+        r = await run_in_threadpool(review_engine.build_task_review, task)
         stats = (f"{len(r.get('files') or [])} file(s) changed, "
                  f"+{r.get('additions', 0)} / −{r.get('deletions', 0)}")
     except Exception:
@@ -6369,17 +6409,17 @@ async def task_create_pr(task_id: str):
          .replace("{repo}", repo)
         for t in shlex.split(template)])
     try:
-        r = _sp.run(tokens, cwd=repo, capture_output=True, text=True, timeout=180)
+        rcode, rout, rerr = await _sp_run_async(tokens, cwd=repo, timeout=180)
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": f"pr command failed: {str(e)[:200]}"})
-    combined = ((r.stdout or "") + (r.stderr or "")).strip()
-    m = _re.search(r"https://\S+", r.stdout or "")
-    if r.returncode != 0 or not m:
+    combined = (rout + rerr).strip()
+    m = _re.search(r"https://\S+", rout or "")
+    if rcode != 0 or not m:
         if "already exists" in combined:  # PR was opened earlier outside nexus
-            vr = _sp.run(_resolve_cli(["gh", "pr", "view", branch, "--json", "url",
-                                       "-q", ".url"]),
-                         cwd=repo, capture_output=True, text=True, timeout=60)
-            m = _re.search(r"https://\S+", vr.stdout or "")
+            _vc, vout, _ve = await _sp_run_async(
+                _resolve_cli(["gh", "pr", "view", branch, "--json", "url", "-q", ".url"]),
+                cwd=repo, timeout=60)
+            m = _re.search(r"https://\S+", vout or "")
         if not m:
             return JSONResponse(status_code=502,
                                 content={"error": f"PR creation failed: {combined[-400:]}"})
@@ -6393,13 +6433,13 @@ async def task_create_pr(task_id: str):
 
 
 @app.get("/api/tools")
-async def api_tools():
+def api_tools():
     """Live health-checked registry of all integrated tools."""
     return {"tools": tools_hub.get_tools()}
 
 
 @app.get("/api/tools/{tool_id}")
-async def api_tool_detail(tool_id: str):
+def api_tool_detail(tool_id: str):
     """Detail for a single tool."""
     for t in tools_hub.get_tools():
         if t["id"] == tool_id:
@@ -6408,7 +6448,7 @@ async def api_tool_detail(tool_id: str):
 
 
 @app.get("/api/skills")
-async def api_skills():
+def api_skills():
     """All Hermes skills, grouped by category, with usage stats."""
     cats = tools_hub.get_skills()
     total = sum(c["count"] for c in cats)
@@ -6418,7 +6458,7 @@ async def api_skills():
 
 
 @app.get("/api/projects")
-async def api_projects():
+def api_projects():
     """Project directories under the user's home, with git/language metadata.
     User-scoped (Block 1 gap fix): the scan sees the whole filesystem, but a
     user is only shown projects they own — untagged paths belong to u_owner."""
@@ -6430,13 +6470,13 @@ async def api_projects():
 
 
 @app.get("/api/usage")
-async def api_usage(force: bool = False):
+def api_usage(force: bool = False):
     """Aggregated token usage + cost across GLM, Claude, and Hermes."""
     return tools_hub.get_usage(force=force)
 
 
 @app.post("/api/usage/refresh")
-async def api_usage_refresh():
+def api_usage_refresh():
     """Force-refresh the usage cache (re-parse all transcripts)."""
     return tools_hub.get_usage(force=True)
 
