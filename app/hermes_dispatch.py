@@ -312,8 +312,20 @@ def task_dependencies(task: dict) -> list[dict]:
 
 
 def deps_satisfied(task: dict) -> bool:
-    """A task may only run when every dependency has shipped (status done)."""
-    return all(d.get("status") == "done" for d in task_dependencies(task))
+    """A task may only run when every dependency has shipped (status done).
+    FAIL-CLOSED: a dependency id with no row counts as NOT done — silently
+    dropping unknown ids made such tasks vacuously claimable, and workers
+    picked up gate probes mid-test (zombie dispatches crashed once the gate's
+    cleanup removed the rows). A dangling dep now parks the task instead."""
+    try:
+        dep_ids = json.loads(task.get("depends_on") or "[]")
+    except Exception:
+        dep_ids = []
+    if not dep_ids:
+        return True
+    rows = {d["id"]: d for d in task_dependencies(task)}
+    return all(did in rows and rows[did].get("status") == "done"
+               for did in dep_ids)
 
 
 # ── Dispatch prompt contract (SPEC §2) ──

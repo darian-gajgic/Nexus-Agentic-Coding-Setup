@@ -88,8 +88,13 @@ async def main():
         await browser.close()
 
 async def load_agentic(page):
-    # trigger a tick-like refresh by re-entering the view
-    await page.evaluate("loadAgenticData()")
+    # loadAgenticData() only refreshes state + badges; it does NOT repaint the
+    # DOM. Every product code path that mutates agentic state (decideApproval,
+    # toggleJob, deleteJob, runVerify) follows loadAgenticData() with render().
+    # A helper that skips render() will never see the injected approval, so the
+    # "approval shows in UI" check fails against a correct backend — a classic
+    # contract-drift false negative. Mirror the real call sequence here.
+    await page.evaluate("(async () => { await loadAgenticData(); render(); })()")
     await page.wait_for_timeout(500)
 
 
