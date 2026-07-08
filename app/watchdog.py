@@ -162,6 +162,17 @@ def _once(cfg: dict) -> list[dict]:
             f"Released task '{t['title']}' — claimed by {t['claimed_by']} "
             f"but never dispatched for >{stale_claim_s}s")
         actions.append({"task": t["id"], "action": "released_stranded_claim"})
+
+    # 5. Orphaned dispatches: a task with an ACTIVE dispatch_state but a dead
+    # heartbeat matches neither the worker's resume nor auto-claim query (e.g. a
+    # 'backlog' task stuck at 'streaming' after its worker died / status drifted),
+    # so it — and any workflow waiting on it — strands forever. Re-queue them.
+    try:
+        import hermes_dispatch as _hd
+        for tid in _hd.reconcile_stalled_dispatches(source="watchdog"):
+            actions.append({"task": tid, "action": "reconciled_orphan_dispatch"})
+    except Exception as e:
+        db.log_activity("error", "watchdog", f"Orphan-dispatch reconcile failed: {e}")
     return actions
 
 

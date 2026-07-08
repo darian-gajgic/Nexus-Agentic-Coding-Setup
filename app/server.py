@@ -124,6 +124,19 @@ def startup():
         "ended_at=? WHERE status IN ('running','cancelling')", (time.time(),)).rowcount
     if orphaned:
         db.log_activity("warn", "evals", f"Cleared {orphaned} eval run(s) orphaned by restart")
+    # Dispatch rows stranded in an active state with a dead heartbeat (a worker
+    # died, or a task's kanban status drifted so it matches no lane query) match
+    # neither the resume nor the auto-claim path — they strand the task and any
+    # workflow waiting on it. Reconcile long-stale ones at boot; the watchdog then
+    # sweeps for them periodically. See hermes_dispatch.reconcile_stalled_dispatches.
+    try:
+        import hermes_dispatch as _hd
+        recl = _hd.reconcile_stalled_dispatches(source="system")
+        if recl:
+            db.log_activity("warn", "system",
+                            f"Reconciled {len(recl)} orphaned dispatch(es) at boot")
+    except Exception as _e:
+        print(f"[startup] orphan-dispatch reconcile failed: {_e}", flush=True)
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
