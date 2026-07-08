@@ -1441,6 +1441,23 @@ code, pre, .mono { font-family: var(--font-mono); }
 .review-pane .gh, .review-pane .gu { color:var(--accent-2); font-weight:600; }
 .review-pane .gs { font-weight:700; } .review-pane .ge { font-style:italic; }
 
+/* ═══ Business-Brain onboarding wizard (SPEC-ONBOARDING R4) ═══ */
+.onb-progress { height:6px; border-radius:4px; background:rgba(255,255,255,.07); overflow:hidden; }
+.onb-progress i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-2)); transition:width .25s; }
+.onb-explain {
+  border:1px solid rgba(94,234,212,.28); background:rgba(94,234,212,.06);
+  border-radius:10px; padding:10px 13px; font-size:12.5px; line-height:1.55; margin-bottom:12px;
+}
+.onb-q { border:1px solid var(--border); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
+.onb-q.na { opacity:.5; }
+.onb-q.na textarea { pointer-events:none; }
+.onb-q textarea {
+  width:100%; background:rgba(7,7,13,.8); border:1px solid var(--border); border-radius:8px;
+  color:var(--text); font-size:12.5px; line-height:1.5; padding:7px 9px; resize:vertical; margin-top:6px;
+}
+.onb-q textarea:focus { border-color:var(--accent); outline:none; }
+.onb-hint { font-size:11px; color:var(--text-dim); margin-top:2px; line-height:1.45; }
+
 /* ═══ Galaxy memory editing (SPEC-BLOCK2 R2): merge picker ═══ */
 .mem-merge-list {
   max-height:38vh; overflow-y:auto; display:flex; flex-direction:column; gap:4px;
