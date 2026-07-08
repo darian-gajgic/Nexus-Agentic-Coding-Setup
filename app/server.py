@@ -1551,7 +1551,9 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass  # normal close or bounded graceful-shutdown cancel — not an error
+    finally:
         mgr.disconnect(ws)
 
 
@@ -1942,7 +1944,7 @@ SYSTEM CONTROL — you can drive the user's whole Nexus OS over its local REST A
   Board now: {board}. Running: {running_s}.
   RULES: read back and get an explicit yes BEFORE dispatching, deleting, approving, scheduling, or spending real tokens. Never invent IDs — GET the list first. After acting, state plainly what changed. curl failures: report them, don't pretend success.
 
-VISION: the UI indexes what the camera/screen share sees into your visual memory; when the user asks what you saw or when they showed you something, the UI searches it — you may reference "[JARVIS EYES]" context blocks in the conversation as things you personally saw. Image FILES in the exchange are auto-described into [JARVIS EYES] blocks by your own local vision whenever the user references one — you CAN see and analyze images; never claim you lack vision. If an image the user means has no [JARVIS EYES] block yet, ask them to name the file.{brain_section}
+VISION: your eyes are LOCAL and automatic. Whatever the camera/screen shows, or any image the user references, is described for you by this system and injected as a "[JARVIS EYES …]" text block right in the conversation — that text IS what you see. Read it and answer from it directly; never claim you lack vision. CRITICAL: do NOT call vision_analyze, image_analyze, or ANY image/vision tool — your chat model has no image input, so those tools error out and hang for minutes. You never need them: the [JARVIS EYES] text already contains the description. If the user clearly means an image but there is no [JARVIS EYES] block for it yet, just ask them to name the file (or, for the camera, to make sure the share is on) — do not reach for a tool. Past frames are searchable visual memory you may reference as things you personally saw.{brain_section}
 
 Current date/time: {time.strftime('%A %Y-%m-%d %H:%M')}."""
     return framing, domain
@@ -2025,7 +2027,9 @@ async def jarvis_chat_stream(body: dict):
                 desc = await asyncio.wait_for(
                     _vision_mod.describe_image(raw, user_input[:300]), timeout=185)
                 notes.append(f"[JARVIS EYES — image file '{f.name}' from the file "
-                             f"exchange, seen through your own local vision: {desc}]")
+                             f"exchange, seen through your own local vision (this text IS "
+                             f"your vision; answer from it, do NOT call any vision/image "
+                             f"tool): {desc}]")
             except Exception as e:
                 notes.append(f"[JARVIS EYES — image '{f.name}' could not be analyzed "
                              f"locally right now ({type(e).__name__}: {str(e)[:80]}) — "
@@ -2034,8 +2038,9 @@ async def jarvis_chat_stream(body: dict):
 
     hermes_input = user_input
     if frame_note:
-        hermes_input = (f"[JARVIS EYES — what your camera/screen sees right now: "
-                        f"{frame_note}]\n\n{hermes_input}")
+        hermes_input = (f"[JARVIS EYES — what your camera/screen sees right now "
+                        f"(this text IS your vision; answer from it, do NOT call any "
+                        f"vision/image tool): {frame_note}]\n\n{hermes_input}")
 
     async def event_generator():
         """Stream SSE events from Hermes, re-emit as SSE for the browser.
@@ -2142,15 +2147,13 @@ async def jarvis_chat_stream(body: dict):
                 yield f"event: files\ndata: {json.dumps({'files': fresh})}\n\n"
         except Exception:
             pass
-        # The turn is done; if it used JARVIS's eyes (local VLM), free that VRAM
-        # now instead of letting ollama camp the 6-8GB model for its keep_alive —
-        # the chat model is cloud, so nothing local is needed until the next look.
-        if (frame_b64 or img_targets) and _vision_ok:
-            try:
-                import vision as _vision_mod
-                await _vision_mod.unload_vlm()
-            except Exception:
-                pass
+        # VLM VRAM is freed by the short keep_alive (vision.vlm_keep_alive, ~30s)
+        # — NOT a forced per-turn unload: during an active webcam/vision Q&A the
+        # model must stay warm between consecutive look-turns, or every "what do
+        # you see" pays a multi-second cold reload of the 8-9GB model (and a slow
+        # describe is what pushes the chat model to fall back to the broken
+        # vision_analyze tool). keep_alive frees the card ~30s after the LAST look
+        # — i.e. once it is genuinely no longer needed.
 
     return StreamingResponse(
         event_generator(),
@@ -2545,8 +2548,10 @@ async def jarvis_tts_ws(ws: WebSocket):
                 await ws.send_json({"done": True, "stopped": stop_flag["stop"]})
             except Exception as e:
                 await ws.send_json({"error": str(e)[:200]})
-    except WebSocketDisconnect:
-        pass
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass  # CancelledError = server shutting down (bounded graceful stop):
+              # a clean close, not an error — don't let it surface as an ASGI
+              # traceback that reads like a crash in the journal on every restart
     except Exception:
         pass
     finally:

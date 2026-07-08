@@ -60,7 +60,7 @@ def _vlm_keep_alive() -> str:
     """How long ollama holds the VLM after a describe. Short by default so the
     6-8GB model frees VRAM for other models once JARVIS is done looking; long
     enough that back-to-back describes within one turn reuse the warm model."""
-    return _conf("vision.vlm_keep_alive", "30s")
+    return _conf("vision.vlm_keep_alive", "60s")
 
 _worker: subprocess.Popen | None = None
 _worker_lock = asyncio.Lock()
