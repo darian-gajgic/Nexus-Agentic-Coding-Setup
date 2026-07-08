@@ -33,7 +33,7 @@ Ranked by **impact × how often it actually fires** (runtime evidence from the r
 | SSE chat stream has no client-disconnect handling | Audit §3.2 | the aiohttp mid-request drops both briefs saw | **B2** |
 | JARVIS TTS onclose wedges "speaking"; hardcoded `wss://`; dup sockets | Audit F063/F130 + research | JARVIS "stuck" symptom | **B2** |
 | ~12 more blocking sites (git/gh/qdrant/copytree/mem0) on the loop | Audit F006/F007/F014/F015/F018/F012/F001/F002/F003 + cluster | pervasive lag (invisible to logs) | **B3** |
-| Dispatch: empty-reply→QuotaError stalls the whole fleet; slot cap on wrong model; resume drops the task brief | Audit re-hunt | **189/454 executor-resumes; 30 overload events** | **B4** |
+| Dispatch: empty-reply→QuotaError stalls the whole fleet; slot cap counts the wrong model **on every overload-fallback** (verified — the frequent path, not the narrow NULL-model one); resume drops the task brief | Audit re-hunt | **189/454 executor-resumes; 30 overload events** | **B4** |
 | STT retries CUDA again before CPU; vision OOM guard too narrow; no cross-process GPU lock | Audit §3.6 | **10 CUDA-OOM events, 600 s degradations** | **B5** |
 | Vision worker timeout leaks reader thread + desyncs protocol | Audit F025/F068 | vision "black camera" / hang symptoms | **B5** |
 
@@ -49,7 +49,7 @@ Ranked by **impact × how often it actually fires** (runtime evidence from the r
 | Inline HTML/SVG workspace files → stored XSS | F008/F106 | **B6** |
 | Cron scheduler never executes the job (inert) | F004 | **B6** (decision) |
 | Chat mislabels auth/server errors as "provider overloaded" | F132 | **B6** |
-| Watchdog: no restart circuit-breaker; "stuck" removes lane from monitoring | F073/F074 | **B6** |
+| Watchdog: **no restart circuit-breaker** (F073, real). The "stuck removes lane from monitoring" (F074) only bites if `watchdog.restart_on_stuck=0` — default is on, so a stuck lane is restarted, not parked → F074 is low-priority | F073/F074 | **B6** |
 | Kanban drag breaks after search; first-visit project filter empty; memory3d user always empty | F022/F129/F118 | **B6** |
 | `jarvis_session.json` unlocked read-modify-write race | F010/F036 | **B6** |
 | JARVIS brain: blocking `~/knowledge` reads on loop; ignores per-user overlay | Audit re-hunt | **B4** |
@@ -66,6 +66,8 @@ Ranked by **impact × how often it actually fires** (runtime evidence from the r
 | **Regression guards**: `verify.sh` check rejecting blocking calls in `async def`; per-task dispatch resume-rate metric; "why did the worker die" logging | Merge | **B4 + B7** |
 
 **What we deliberately do NOT chase:** the Z.AI 429 storm itself is *upstream* (provider load-shedding) — B4 fixes the app-side bugs that *amplify* it, but a real cure (rate-budgeting / second provider) is a business decision, not a code fix. And the "33 restarts" both briefs flagged is mostly normal dev-deploy cadence (I checked: 33 stops = 33 starts over 33 commits), not a crash loop — the real signal is the 16 shutdown timeouts, fixed in B2.
+
+**Corrections folded in from a follow-up review (verified against source):** (1) the watchdog "stuck-removes-lane" concern (F074) is **config-gated** — `restart_on_stuck` defaults to on, so it's low-priority; the restart circuit-breaker (F073) is the real watchdog fix. (2) The dispatch slot-accounting mismatch is driven mainly by the **overload-fallback path** (frequent during 429 storms), not the narrow NULL-model case. (3) The Wav2Lip `/talk`+`/lipsync` endpoints are **live + reachable** (not merely dormant) and load GPU, so B7 **disables** them rather than just commenting. Everything else in the plan is unchanged.
 
 ---
 
@@ -164,7 +166,7 @@ cd ~/Nexus-Agentic-Coding-Setup/app
 Browser: open `https://127.0.0.1:8777`, click around the dashboard/kanban — it should no longer stutter every ~3s.
 
 ---
-
+/code-review high/code-review high/code-review high/code-review high/code-review high
 ### BATCH 2 — WebSocket/SSE shutdown + JARVIS voice stability (kills the 16 shutdown timeouts)
 - **Model / effort:** `opus` / `xhigh`  ·  **Review pass:** YES (`/code-review high`)  ·  **Frontend cache-bust:** YES
 
@@ -199,7 +201,7 @@ journalctl --user -u nexus -n 80 --no-pager | grep -c "graceful shutdown exceede
 ```
 Browser: open JARVIS, speak a sentence, then **close the tab mid-reply** — reopen; JARVIS should be idle and responsive, not wedged.
 
----
+
 
 ### BATCH 3 — De-block the rest of the event loop (kills the pervasive lag the logs can't see)
 - **Model / effort:** `opus` / `xhigh` (use `fable` if you want maximum assurance)  ·  **Review pass:** YES  ·  **Frontend cache-bust:** no
@@ -236,17 +238,17 @@ Browser: click the **Projects, Memory, Review, Onboarding** tabs and run a **▶
 
 **Prompt:**
 ```
-Read ~/Nexus-Agentic-Coding-Setup/STABILITY-AUDIT-2026-07-08.md section 3.7, section 4, and the "Dispatch engine & JARVIS brain (deep re-hunt)" section. This is real-money, concurrency-sensitive code — be careful and precise.
+Read ~/Nexus-Agentic-Coding-Setup/STABILITY-AUDIT-2026-07-08.md section 3.7 and section 4 (the dispatch slot/resume/telemetry findings + the JARVIS-brain overlay finding). This is real-money, concurrency-sensitive code — be careful and precise.
 
 Fix in app/hermes_dispatch.py:
-1. slots_in_use() (~line 227): count live dispatches by the EFFECTIVE run-model the session actually uses (resolved/fallback model), not the raw tasks.model column — otherwise the per-model concurrency cap is applied to the wrong pool and can cause more 429s.
+1. slots_in_use() (~line 227): it counts by the raw t.model column, but run_task_dispatch runs on run_model = fallback_model or resolve_task_model(task) (~line 952) and NEVER updates tasks.model on a fallback (~lines 1078-1089). So EVERY overload-fallback dispatch is counted under the ORIGINAL model, not the glm-5-turbo it actually runs on — under-counting the fallback pool so it admits too many and causes MORE 429s during a storm. Fix: count by the effective run-model actually in use (e.g. persist the effective model on the dispatch row and GROUP BY that). The NULL-tasks.model case is the minor sub-case; the fallback case is the frequent one.
 2. Resume path (~line 1034): when a worker died before a session was really established, send the FULL brief (title + description) instead of the bare "continue" stub. Only send "continue" when there is genuine prior session/transcript context.
 3. _finalize_result (~line 796): an empty/short reply with no deliverable.md must NOT be blanket-raised as QuotaError. In repo mode, a non-empty changes.diff = success. Only raise QuotaError on an actual rate-limit signature.
 4. on_event telemetry (~line 746): wrap the streaming db.execute telemetry writes in try/except so a transient SQLite error can't abort the stream.
 5. Add structured logging capturing WHY a worker dies (CUDA OOM / Hermes timeout / QuotaError / other) so "executor died" isn't the only signal.
 
 Fix in app/jarvis_brain.py:
-6. Move the ~/knowledge file reads off the event loop (run_in_threadpool), and honor the per-user knowledge overlay (users/<uid>/...) instead of always the owner's canonical files.
+6. Move the ~/knowledge file reads off the event loop (run_in_threadpool), and honor the per-user knowledge overlay (users/<uid>/...) — jarvis_brain.py:82 always returns the owner's canonical ~/knowledge; mirror what dispatch ALREADY does correctly at hermes_dispatch.py:568-581 (this is a JARVIS-only gap).
 
 HARD RULES:
 - No behavior change beyond these fixes. Do not alter the budget/quota policy numbers.
@@ -303,7 +305,7 @@ Backend (app/server.py + modules):
 - F042 (~2467) + F041 (~2674): scope the JARVIS briefing approval count to the calling user; add the is_admin()/owner check to the ungated shared-fleet READ endpoints.
 - F008 (~3192) + F106 (~2321): serve uploaded/agent-written .html and .svg workspace files as Content-Disposition: attachment / media_type text/plain (never inline text/html) — stored-XSS fix.
 - F033 (app/loop_engine.py ~200): parse the verifier verdict from a structured token, not a naive substring (so "failures"/"passed" can't invert PASS/FAIL).
-- F073/F074 (app/watchdog.py ~120/~144): add a restart circuit-breaker (backoff + max-restarts→retire); stop removing "stuck" lanes from monitoring — heal or retire them explicitly.
+- F073 (app/watchdog.py ~123/~137): add a restart circuit-breaker — restart_count is incremented but never checked against a max, so a hot-crashing lane respawns forever. This is the REAL watchdog fix. (F074 "stuck removes lane from monitoring" is config-gated: with the default watchdog.restart_on_stuck=1 a stuck lane is restarted at ~line 137 and never reaches the status='stuck' dead-end at ~line 144 — just harden that else-branch, don't rewrite the healthy path.)
 - F118 (~5735): fix the memory3d node "user" attribute reading the wrong payload key.
 - F004 (app/scheduler.py ~100) — DECISION NEEDED: right now a scheduled job only writes a label + logs; it never runs. Change _trigger so a fired job actually creates+enqueues a task (so scheduled jobs do real work). If you believe it should stay notify-only, DO NOT change it — tell me and STOP for that item.
 - F010/F036 (~1610-1663): serialize the per-user jarvis_session.json read-modify-write (a lock or atomic replace) so concurrent turns don't lose messages.
@@ -345,7 +347,7 @@ A) P2 one-liners from audit §6 (fix as many as are clearly a ≤10-line change;
 B) Housekeeping (from the recon briefs):
    - Update setup/CLAUDE.md and docs/PROJECT-DOCUMENTATION.md: change "5 core-mods" to "6" and document the session-model-api-server core-mod as the keystone of model routing.
    - Update docs/SPEC.md note about Wav2Lip → Three.js particle avatar; fix the "52 checks" mention to 251.
-   - Mark lipsync.py + the /api/jarvis/talk and /api/jarvis/lipsync endpoints clearly as RETIRED (comment), and remove the dead _tool_glm / _tool_supermemory scanners from tools_hub.py.
+   - Wav2Lip is NOT actually dormant: /api/jarvis/talk + /api/jarvis/lipsync (server.py ~2235-2270) are fully wired and reachable, and hitting them loads Wav2Lip onto the shared 12 GB GPU. Since the frontend no longer calls them, DISABLE the two routes (return 410 Gone, or gate behind an explicit admin-only setting) rather than just commenting lipsync.py — then fix the docs that call them "dormant". Also remove the dead _tool_glm / _tool_supermemory scanners from tools_hub.py.
    - Make ~/.hermes/session-keys.json writes atomic (write to a temp file, then os.replace).
 
 C) Regression guard: add a check to app/scripts/verify.sh that FAILS if `subprocess.run(` or `cpu_percent(interval=<nonzero>)` appears inside an `async def` handler in app/server.py or app/agent_manager.py.
@@ -364,7 +366,9 @@ HARD RULES:
 cd ~/Nexus-Agentic-Coding-Setup
 git rm -r --cached app/.worktrees/nexus-b2probe46fd7af3 2>/dev/null; rm -rf app/.worktrees/nexus-b2probe46fd7af3
 mkdir -p ~/nexus-fix-backups/olddb && mv app/nexus.db.bak-* ~/nexus-fix-backups/olddb/ 2>/dev/null || true
-git add -A && git commit -m "chore: remove stale probe worktree + move db backups out of the tree" || true
+# NOTE: the `git rm --cached` above is already staged — do NOT run `git add -A`
+# (it would sweep the untracked root docs / .serena into this commit).
+git commit -m "chore: remove stale probe worktree from tracking; move db backups out of the tree" || true
 ```
 
 ---
