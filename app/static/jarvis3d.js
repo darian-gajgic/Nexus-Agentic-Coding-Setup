@@ -1,27 +1,26 @@
-/* JARVIS 3D v3 — sculpted particle bust (true 3D form).
+/* JARVIS 3D v6 — sculpted anatomical particle bust.
 
-   v2 sampled the reference PHOTO into a flat relief — it read as a 2D poster
-   of dots (operator feedback 2026-07-08). v3 builds a real 3D bust:
+   Direction from the operator (2026-07-08): stop chasing scan likeness —
+   model a SOLID, believable 3D human first, and adapt only the shape data
+   we trust from his frames: head aspect 0.82, his hair-silhouette curve,
+   beard region. Everything else is canonical human anatomy, sculpted
+   procedurally: cranium ellipsoid + displacement brushes (brow ridge, eye
+   sockets, cheekbones, muzzle, chin, temples, occiput), a real nose wedge,
+   ears, tapering jaw, neck cylinder and trapezius shoulders.
 
-   - GEOMETRY: parametric skull — cranium + jaw ellipsoids, neck cylinder,
-     shoulder capsule — sampled as ~28k surface points with real NORMALS.
-     The silhouette is a smooth sculpted form from every angle.
-   - SHADING: per-point lambert from a virtual key light + rim light on
-     grazing normals (the thing that makes a point cloud read as VOLUME),
-     plus depth dimming. This is computed once at build; the tint crossfade
-     preserves it.
-   - IDENTITY: the reference photo is projected onto the FRONT of the skull
-     (anchored at the eye/mouth lines): luminance + edges modulate point
-     brightness, so brows/eyes/nose/lips/beard appear as his features.
-   - MOTION PARALLAX: slow camera orbit + pointer parallax + a deeper idle
-     head turn — motion parallax is the second half of "looks 3D".
-   - Same lip-sync (mouth-band points driven by setLevel), states, galaxy
-     backdrop from /api/memory3d, and node streams out of the back of the
-     skull. Same public API:
-     window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations }
+   What makes it read SOLID:
+   - an OPAQUE dark occluder mesh of the same surfaces renders underneath
+     the particles, so the far side of the head is hidden (the see-through
+     scatter was the main "not solid" tell);
+   - particles are dense, small and hug the surface;
+   - per-point lighting (key lambert + fill + rim) is baked from real
+     surface normals; hair/beard/brows darken the right regions.
 
-   Lazy CDN import as in nexus3d/memory3d — the string "three" never appears
-   in index.html (verify.sh gate). */
+   Same public API + galaxy + node streams as before:
+   window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations }
+   Lazy CDN three.js import — the string "three" never appears in index.html
+   (verify.sh gate). Lip-sync: mouth-band points (exact by construction)
+   displaced by setLevel; eye-band points blink. */
 
 let THREE = null;
 let threePromise = null;
@@ -37,17 +36,18 @@ function loadThree() {
 
 const J = {
   renderer: null, scene: null, camera: null, raf: null, container: null,
-  head: null, headGeo: null, galaxy: null, streams: [], pulses: [],
-  mouthIdx: [], eyeIdx: [], basePos: null, baseB: null, baseW: null,
-  level: 0, mode: 'idle', t: 0, animOn: true, disposed: false,
-  resizeObs: null, pointer: { x: 0, y: 0 }, pointerHandler: null,
+  head: null, headGroup: null, headGeo: null, occluders: [], galaxy: null, streams: [],
+  pulses: [], glints: [], mouthIdx: [], eyeIdx: [], basePos: null,
+  baseB: null, baseW: null, mouthY: [0, 1], level: 0, mode: 'idle', t: 0,
+  animOn: true, disposed: false, resizeObs: null,
+  pointer: { x: 0, y: 0 }, pointerHandler: null,
 };
 
 const MODE_TINT = {
-  idle:      [0.30, 0.85, 1.00],   // cyan
-  listening: [0.37, 0.92, 0.83],   // teal
-  thinking:  [0.98, 0.75, 0.30],   // amber
-  talking:   [0.45, 0.95, 1.00],   // bright cyan
+  idle:      [0.30, 0.85, 1.00],
+  listening: [0.37, 0.92, 0.83],
+  thinking:  [0.98, 0.75, 0.30],
+  talking:   [0.45, 0.95, 1.00],
 };
 
 let _glowTex = null;
@@ -66,225 +66,274 @@ function glowTexture() {
   return _glowTex;
 }
 
-/* ── photo analysis: subject mask + luminance + edges + depth map.
-   The bust geometry is derived from the OPERATOR'S OWN photo: the
-   background-removed silhouette (hair, jaw, neck, shoulders) is "inflated"
-   into a volume via a chamfer distance transform (distance to the silhouette
-   edge → depth), so the front view IS his shape — not a generic ellipsoid. ── */
-async function loadPhotoModel() {
-  const img = await new Promise((res) => {
-    const i = new Image();
-    i.onload = () => res(i);
-    i.onerror = () => res(null);
-    i.src = '/static/avatar/reference.jpg';
-  });
-  if (!img) return null;
-  const S = 170;
-  const cv = document.createElement('canvas');
-  cv.width = cv.height = S;
-  const g = cv.getContext('2d');
-  g.drawImage(img, 0, 0, S, S);
-  const px = g.getImageData(0, 0, S, S).data;
-  const lum = new Float32Array(S * S);
-  for (let i = 0; i < S * S; i++) {
-    lum[i] = (px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114) / 255;
-  }
-  // subject mask: color-distance from the top-corner (wall) average
-  let br = 0, bgc = 0, bb = 0, bn = 0;
-  for (let y = 0; y < 12; y++) {
-    for (const x0 of [0, S - 12]) {
-      for (let x = x0; x < x0 + 12; x++) {
-        const i = (y * S + x) * 4;
-        br += px[i] / 255; bgc += px[i + 1] / 255; bb += px[i + 2] / 255; bn++;
-      }
-    }
-  }
-  br /= bn; bgc /= bn; bb /= bn;
-  const raw = new Uint8Array(S * S);
-  for (let i = 0; i < S * S; i++) {
-    const d = Math.hypot(px[i * 4] / 255 - br, px[i * 4 + 1] / 255 - bgc, px[i * 4 + 2] / 255 - bb);
-    raw[i] = d > 0.16 ? 1 : 0;
-  }
-  const mask = new Uint8Array(S * S);
-  for (let y = 1; y < S - 1; y++) {
-    for (let x = 1; x < S - 1; x++) {
-      const i = y * S + x;
-      if (!raw[i]) continue;
-      let nb = 0;
-      for (const o of [-S - 1, -S, -S + 1, -1, 1, S - 1, S, S + 1]) nb += raw[i + o];
-      mask[i] = nb >= 3 ? 1 : 0;
-    }
-  }
-  // chamfer distance transform: distance (px) to the silhouette edge
-  const INF = 1e6;
-  const dist = new Float32Array(S * S);
-  for (let i = 0; i < S * S; i++) dist[i] = mask[i] ? INF : 0;
-  for (let y = 1; y < S; y++) {
-    for (let x = 1; x < S - 1; x++) {
-      const i = y * S + x;
-      if (!dist[i]) continue;
-      dist[i] = Math.min(dist[i], dist[i - S] + 1, dist[i - 1] + 1,
-                         dist[i - S - 1] + 1.4, dist[i - S + 1] + 1.4);
-    }
-  }
-  for (let y = S - 2; y >= 0; y--) {
-    for (let x = S - 2; x >= 1; x--) {
-      const i = y * S + x;
-      if (!dist[i]) continue;
-      dist[i] = Math.min(dist[i], dist[i + S] + 1, dist[i + 1] + 1,
-                         dist[i + S - 1] + 1.4, dist[i + S + 1] + 1.4);
-    }
-  }
-  // contrast stretch over the central face window (avoids the bright wall)
-  const tones = [];
-  for (let y = Math.floor(S * 0.28); y < S * 0.72; y++) {
-    for (let x = Math.floor(S * 0.30); x < S * 0.70; x++) tones.push(lum[y * S + x]);
-  }
-  tones.sort((a, b) => a - b);
-  const lo = tones[Math.floor(tones.length * 0.05)] ?? 0;
-  const hi = tones[Math.floor(tones.length * 0.97)] ?? 1;
-  const stretch = (l) => Math.min(1, Math.max(0, (l - lo) / Math.max(0.01, hi - lo)));
-  return { S, mask, dist, lumRaw: lum, stretch };
+/* ═══════════════ sculpted bust geometry ═══════════════ */
+
+const D2R = Math.PI / 180;
+const sm = (a, b, x) => {
+  const s = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return s * s * (3 - 2 * s);
+};
+// operator's measured hair/head silhouette (front view, angle from "up"
+// -90°..+90° in 12° steps, radius / head height) — the one personal shape
+// input we trust; everything else is canonical anatomy.
+const HAIR_RADII = [0.43, 0.406, 0.643, 0.602, 0.559, 0.544, 0.527, 0.523,
+                    0.523, 0.527, 0.54, 0.576, 0.51, 0.452, 0.422, 0.411];
+const HAIR_MIN = 0.406, HAIR_MAX = 0.643;
+
+// displacement brushes: gaussian bumps in (θ from top, φ azimuth; φ=0 front)
+const BRUSHES = [
+  { t: 52, p: 0,    st: 5,  sp: 26, amp: +0.030 },  // brow ridge
+  { t: 58, p: 13,   st: 6.5, sp: 8, amp: -0.075 },  // eye socket R
+  { t: 58, p: -13,  st: 6.5, sp: 8, amp: -0.075 },  // eye socket L
+  { t: 67, p: 27,   st: 8,  sp: 10, amp: +0.035 },  // cheekbone R
+  { t: 67, p: -27,  st: 8,  sp: 10, amp: +0.035 },  // cheekbone L
+  { t: 76, p: 0,    st: 9,  sp: 15, amp: +0.035 },  // muzzle
+  { t: 88, p: 0,    st: 7,  sp: 9,  amp: +0.050 },  // chin boss
+  { t: 55, p: 180,  st: 25, sp: 40, amp: +0.050 },  // occiput fullness
+  { t: 95, p: 180,  st: 12, sp: 50, amp: -0.100 },  // skull base in
+  { t: 50, p: 68,   st: 12, sp: 14, amp: -0.030 },  // temple R
+  { t: 50, p: -68,  st: 12, sp: 14, amp: -0.030 },  // temple L
+  { t: 62, p: 92,   st: 7,  sp: 5,  amp: +0.060 },  // ear R
+  { t: 62, p: -92,  st: 7,  sp: 5,  amp: +0.060 },  // ear L
+  { t: 36, p: 0,    st: 10, sp: 24, amp: -0.015 },  // forehead plane
+  { t: 95, p: 115,  st: 10, sp: 30, amp: -0.120 },  // under-jaw hollow R
+  { t: 95, p: -115, st: 10, sp: 30, amp: -0.120 },  // under-jaw hollow L
+];
+
+const RX = 12.2, RY = 15.0, RZ = 12.9;   // head half axes (aspect ≈ 0.82)
+const HEAD_CY = 13;                       // head center y (world)
+
+function dphi(a, b) {
+  let d = Math.abs(a - b) % (2 * Math.PI);
+  return d > Math.PI ? 2 * Math.PI - d : d;
 }
 
-/* ── bust from the 3D SCAN (built offline from the operator's 360° head-turn
-   video by scripts/build_avatar_pointcloud.py — Depth-Anything per frame +
-   turntable fusion, lighting baked). This is the primary path; the photo
-   inflation below is the fallback when no scan file exists. ── */
-function buildFromScan(cloud) {
-  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
-  const P = cloud.pos, B = cloud.bri;
-  const [my0, my1, mxh] = cloud.mouth || [0, 1, 6];
-  const [ey0, ey1, exh] = cloud.eyes || [0, 1, 8];
-  for (let i = 0; i < B.length; i++) {
-    const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
-    const b = B[i];
-    const n = pos.length / 3;
-    // jitter breaks the voxel-lattice moiré
-    pos.push(x + (Math.random() - .5) * .55,
-             y + (Math.random() - .5) * .55,
-             z + (Math.random() - .5) * .55);
-    const w = b > 0.88 ? Math.min(1, (b - 0.88) / 0.25) * 0.45 : 0;
-    bri.push(b); wmi.push(w);
-    col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
-             b * (MODE_TINT.idle[1] * (1 - w) + w),
-             b * (MODE_TINT.idle[2] * (1 - w) + w));
-    if (z > 2 && y > my0 && y < my1 && Math.abs(x) < mxh) mouthIdx.push(n);
-    if (z > 2 && y > ey0 && y < ey1 && Math.abs(x) > 1.5 && Math.abs(x) < exh) eyeIdx.push(n);
-  }
-  return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY: [my0, my1] };
+function hairAmp(phi) {
+  // map the measured frontal silhouette onto the azimuth; mirror for the back
+  const a = Math.abs(phi) <= Math.PI / 2 ? phi : (Math.PI - Math.abs(phi)) * Math.sign(phi);
+  const idx = ((a / D2R) + 90) / 12;
+  const i0 = Math.max(0, Math.min(HAIR_RADII.length - 1, Math.floor(idx)));
+  const i1 = Math.min(HAIR_RADII.length - 1, i0 + 1);
+  const f = Math.min(1, Math.max(0, idx - i0));
+  const v = HAIR_RADII[i0] * (1 - f) + HAIR_RADII[i1] * f;
+  return (v - HAIR_MIN) / (HAIR_MAX - HAIR_MIN);   // 0..1
 }
 
-/* ── bust from the photo: inflated silhouette, HIS actual shape ── */
-function buildBust(pm) {
-  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
-  if (!pm) return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY: [0, 1] };
-  const { S, mask, dist, lumRaw, stretch } = pm;
-  const KEY = new THREE.Vector3(-0.45, 0.55, 0.8).normalize();
-  const N = new THREE.Vector3();
+function curl(theta, phi) {
+  return Math.sin(phi * 7.3 + 1.7) * Math.sin(theta * 9.1 + 0.6) * 0.5
+       + Math.sin(phi * 12.7) * Math.sin(theta * 5.3 + 2.1) * 0.5;
+}
 
-  const WS = 57;                                  // world size of the photo
-  const X = (u) => (u - 0.5) * WS;
-  const Y = (v) => (0.52 - v) * WS;               // photo v → world y
-  // depth budget per row: full head → thinner neck → shoulders
-  const sm = (a, b, x) => {
-    const s = Math.min(1, Math.max(0, (x - a) / (b - a)));
-    return s * s * (3 - 2 * s);
+// head radius along direction (θ,φ) + region info
+function headRadius(theta, phi) {
+  const dx = Math.sin(theta) * Math.sin(phi);
+  const dy = Math.cos(theta);
+  const dz = Math.sin(theta) * Math.cos(phi);
+  let r = 1 / Math.sqrt((dx * dx) / (RX * RX) + (dy * dy) / (RY * RY) + (dz * dz) / (RZ * RZ));
+  let mul = 1;
+  for (const b of BRUSHES) {
+    const dt = (theta - b.t * D2R) / (b.st * D2R);
+    const dp = dphi(phi, b.p * D2R) / (b.sp * D2R);
+    mul += b.amp * Math.exp(-(dt * dt + dp * dp) / 2);
+  }
+  // jaw taper: the lower face narrows toward the chin, sides pull in
+  const jt = sm(70 * D2R, 110 * D2R, theta) * sm(20 * D2R, 90 * D2R, dphi(phi, 0));
+  mul *= 1 - 0.26 * jt;
+  // hair: above the hairline the operator's silhouette + curls take over
+  const hairline = (34 + 21 * sm(0, Math.PI, dphi(phi, 0))) * D2R;
+  const hf = sm(hairline + 6 * D2R, hairline - 8 * D2R, theta);
+  if (hf > 0) {
+    mul *= 1 + hf * (0.06 + 0.13 * hairAmp(phi) + 0.035 * curl(theta, phi));
+  }
+  return { r: r * mul, hair: hf };
+}
+
+function headPoint(theta, phi) {
+  const { r, hair } = headRadius(theta, phi);
+  return {
+    x: r * Math.sin(theta) * Math.sin(phi),
+    y: HEAD_CY + r * Math.cos(theta),
+    z: r * Math.sin(theta) * Math.cos(phi),
+    hair,
   };
-  const depthScale = (v) => 15 - 8 * sm(0.64, 0.72, v) + 3.5 * sm(0.74, 0.84, v);
-  const DCAP = 14;                                // px distance where depth plateaus
+}
 
-  // depth map: inflate the silhouette — deeper toward the middle, plus a
-  // touch of luminance relief so the face is not a smooth balloon
-  const D = new Float32Array(S * S);
-  for (let y = 0; y < S; y++) {
-    for (let x = 0; x < S; x++) {
-      const i = y * S + x;
-      if (!mask[i]) continue;
-      const v = y / S;
-      D[i] = Math.sqrt(Math.min(1, dist[i] / DCAP)) * depthScale(v)
-        + stretch(lumRaw[i]) * 1.6;
-    }
-  }
+// nose: a wedge grown out of the face (separate surface, s∈[0,1] down the
+// ridge, w∈[-1,1] across); protrudes past the sculpted surface
+function nosePoint(s, w) {
+  const theta = (57 + s * 14) * D2R;
+  const halfw = (0.55 + s * 0.95) * (1 + 0.25 * sm(0.75, 1, s));  // nostril flare
+  const phi = (w * halfw * 2.4) * D2R;
+  const base = headRadius(theta, phi).r;
+  const lift = Math.sin(Math.min(1, s * 1.15) * Math.PI * 0.62) * 1.4 * (1 - Math.abs(w) * 0.72);
+  const r = base + Math.max(0, lift);
+  return {
+    x: r * Math.sin(theta) * Math.sin(phi),
+    y: HEAD_CY + r * Math.cos(theta),
+    z: r * Math.sin(theta) * Math.cos(phi),
+  };
+}
 
-  // photo-space feature bands (exact, measured): eyes v≈0.36, mouth v≈0.556
-  const EYE_V = [0.335, 0.395], EYE_U = 0.20;     // |u-0.5| in 0.05..0.20
-  const MOUTH_V = [0.525, 0.590], MOUTH_U = 0.10;
-  const mouthYs = [];
+// neck: elliptical cylinder from INSIDE the skull base down into the torso
+function neckPoint(u, v) {          // u∈[0,1] around, v∈[0,1] down
+  const a = u * Math.PI * 2;
+  const y = 8 - v * 15;             // starts inside the skull, ends in the torso
+  const rx = 5.2 + v * 1.8, rz = 5.5 + v * 1.4;
+  return { x: Math.sin(a) * rx, y, z: Math.cos(a) * rz + 0.6 - v * 0.4 };
+}
 
-  function addPoint(u, v, front) {
-    const xg = Math.round(u * S), yg = Math.round(v * S);
-    const i = yg * S + xg;
-    const l = stretch(lumRaw[i]);
-    const e = Math.min(1, (Math.abs(lumRaw[i + 1] - lumRaw[i - 1])
-      + Math.abs(lumRaw[i + S] - lumRaw[i - S])) * 4.0);
-    // normals from the depth-map gradient (world-scaled) — HIS silhouette
-    // and brow/nose relief drive the lighting
-    const pxw = WS / S;
-    const dzdx = (D[i + 1] - D[i - 1]) / (2 * pxw);
-    const dzdy = (D[i + S] - D[i - S]) / (2 * pxw);   // photo y grows downward
-    if (front) N.set(-dzdx, dzdy, 1).normalize();
-    else N.set(-dzdx * 0.4, dzdy * 0.4, -1).normalize();
-    const frontness = N.z;
-    const lambert = Math.max(0, N.dot(KEY));
-    const fill = Math.max(0, frontness) * 0.20;
-    let rim = Math.pow(1 - Math.abs(frontness), 1.6) * 0.55;
-    // identity carving on the front: posterized tones, holes for dark
-    // features inside the face oval, edge sparkle
-    let faceMul = 1, faceAdd = 0;
-    if (front) {
-      const inFace = Math.abs(u - 0.5) < 0.20 && v > 0.26 && v < 0.66;
-      if (inFace && l < 0.30 && e < 0.25 && Math.random() < 0.75) return;
-      faceMul = l < 0.22 ? 0.14 : l < 0.42 ? 0.5 : l < 0.68 ? 0.95 : 1.30;
-      faceAdd = e * 0.65;
-      if (inFace) rim *= 0.4;
-    } else {
-      faceMul = 0.4;                              // back shell: dim volume hint
-    }
-    let b = (0.10 + 0.55 * Math.pow(lambert, 1.25) + fill + rim) * faceMul + faceAdd;
-    b = Math.min(1.35, b);
-    const wx = X(u), wy = Y(v);
-    const wz = front ? D[i] : -D[i] * 0.85;
-    const n = pos.length / 3;
-    pos.push(wx + (Math.random() - .5) * .4,
-             wy + (Math.random() - .5) * .4,
-             wz + (Math.random() - .5) * .5);
-    const w = b > 0.88 ? Math.min(1, (b - 0.88) / 0.25) * 0.45 : 0;
+// shoulders/upper torso: superelliptic slab with a trapezius slope
+function shoulderPoint(u, v) {      // u around [0,1), v down [0,1]
+  const a = u * Math.PI * 2;
+  const y = -6 - v * 21;
+  const slope = sm(0, 0.5, v);
+  const halfw = 7.5 + 16 * slope;   // trapezius widening (~2 head-widths)
+  const depth = 6.5 + 3 * slope;
+  const c = Math.cos(a), s = Math.sin(a);
+  const k = 3;                       // superellipse exponent → soft-rect
+  const denom = Math.pow(Math.pow(Math.abs(s / halfw), k) + Math.pow(Math.abs(c / depth), k), 1 / k);
+  const r = 1 / Math.max(1e-4, denom);
+  return { x: s * r, y, z: c * r * 0.92 };
+}
+
+/* numeric normal of any param surface fn(p1,p2)->{x,y,z} */
+function normalOf(fn, a, b, ea, eb) {
+  const p = fn(a, b), pa = fn(a + ea, b), pb = fn(a, b + eb);
+  const ux = pa.x - p.x, uy = pa.y - p.y, uz = pa.z - p.z;
+  const vx = pb.x - p.x, vy = pb.y - p.y, vz = pb.z - p.z;
+  let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+  const l = Math.hypot(nx, ny, nz) || 1;
+  return [nx / l, ny / l, nz / l];
+}
+
+const KEYL = [-0.45, 0.55, 0.8];
+(function () { const l = Math.hypot(...KEYL); KEYL[0] /= l; KEYL[1] /= l; KEYL[2] /= l; })();
+
+function shade(n, opts = {}) {
+  const lam = Math.max(0, n[0] * KEYL[0] + n[1] * KEYL[1] + n[2] * KEYL[2]);
+  const fill = Math.max(0, n[2]) * 0.10;
+  const rim = Math.pow(1 - Math.abs(n[2]), 2.0) * (opts.rim ?? 0.32);
+  return 0.10 + 0.58 * Math.pow(lam, 1.2) + fill + rim;
+}
+
+function buildSculpt() {
+  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
+  const push = (p, n, b) => {
+    const i = pos.length / 3;
+    pos.push(p.x + (Math.random() - .5) * .3,
+             p.y + (Math.random() - .5) * .3,
+             p.z + (Math.random() - .5) * .3);
+    b = Math.min(1.35, Math.max(0.03, b));
+    const w = b > 0.9 ? Math.min(1, (b - 0.9) / 0.25) * 0.4 : 0;
     bri.push(b); wmi.push(w);
     col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
              b * (MODE_TINT.idle[1] * (1 - w) + w),
              b * (MODE_TINT.idle[2] * (1 - w) + w));
-    if (front && v > MOUTH_V[0] && v < MOUTH_V[1] && Math.abs(u - 0.5) < MOUTH_U) {
-      mouthIdx.push(n);
-      mouthYs.push(wy);
+    return i;
+  };
+
+  // ── head skin/hair points ──
+  const NH = 52000;
+  for (let k = 0; k < NH; k++) {
+    const theta = Math.acos(1 - 2 * Math.random());
+    if (theta > 118 * D2R) continue;
+    const phi = Math.random() * 2 * Math.PI - Math.PI;
+    const p = headPoint(theta, phi);
+    const n = normalOf((a, b2) => headPoint(a, b2), theta, phi, 0.01, 0.01);
+    let b = shade(n);
+    const td = theta / D2R, pd = dphi(phi, 0) / D2R;
+    if (p.hair > 0) {                       // hair: darker, curly speckle
+      b *= 0.42 + 0.22 * (curl(theta, phi) * 0.5 + 0.5);
+      b *= 1 - 0.25 * p.hair;
+    } else {
+      // brows
+      const browL = Math.exp(-(((td - 50) / 2.6) ** 2 + ((dphi(phi, 13 * D2R) / D2R) / 6.5) ** 2) / 2);
+      const browR = Math.exp(-(((td - 50) / 2.6) ** 2 + ((dphi(phi, -13 * D2R) / D2R) / 6.5) ** 2) / 2);
+      b *= 1 - 0.62 * Math.min(1, browL + browR);
+      // beard: lower face + jaw darken with speckle (his beard)
+      const beard = sm(70, 78, td) * (1 - sm(96, 106, td)) * (1 - sm(46, 60, pd));
+      if (beard > 0) b *= 1 - beard * (0.45 + 0.18 * Math.abs(curl(theta, phi)));
+      // lips: slightly darker band
+      const lips = Math.exp(-(((td - 77) / 2.2) ** 2 + (pd / 9) ** 2) / 2);
+      b *= 1 - 0.30 * lips;
+      // sockets shadow deepen
+      const sock = Math.exp(-(((td - 58) / 5) ** 2 + ((Math.min(dphi(phi, 13 * D2R), dphi(phi, -13 * D2R)) / D2R) / 7) ** 2) / 2);
+      b *= 1 - 0.35 * sock;
     }
-    if (front && v > EYE_V[0] && v < EYE_V[1]
-        && Math.abs(u - 0.5) > 0.05 && Math.abs(u - 0.5) < EYE_U) eyeIdx.push(n);
+    const i = push(p, n, b);
+    if (td > 74 && td < 80 && pd < 9 && p.z > 0) { mouthIdx.push(i); }
+    if (td > 55 && td < 61 && pd > 6 && pd < 20 && p.z > 0) eyeIdx.push(i);
   }
 
-  // sampling: ~2 front points per subject pixel (extra density in the face
-  // oval so features resolve), ~0.6 back points for the volume
-  for (let yg = 1; yg < S - 1; yg++) {
-    for (let xg = 1; xg < S - 1; xg++) {
-      if (!mask[yg * S + xg]) continue;
-      const u0 = xg / S, v0 = yg / S;
-      const inFace = Math.abs(u0 - 0.5) < 0.22 && v0 > 0.24 && v0 < 0.68;
-      const nFront = inFace ? 3 : 1.4;
-      for (let k = 0; k < nFront; k++) {
-        if (k + 1 > nFront && Math.random() > nFront % 1) break;
-        addPoint(u0 + (Math.random() - .5) / S, v0 + (Math.random() - .5) / S, true);
-      }
-      if (Math.random() < 0.55) {
-        addPoint(u0 + (Math.random() - .5) / S, v0 + (Math.random() - .5) / S, false);
-      }
-    }
+  // ── nose wedge (dim — an over-bright nose reads as a beak) ──
+  for (let k = 0; k < 2400; k++) {
+    const s = Math.random(), w = Math.random() * 2 - 1;
+    const p = nosePoint(s, w);
+    const n = normalOf((a, b2) => nosePoint(a, b2), Math.min(s, 0.98), Math.min(w, 0.98), 0.02, 0.02);
+    push(p, n, shade(n) * 0.5);
   }
-  const mouthY = mouthYs.length
-    ? [Math.min(...mouthYs), Math.max(...mouthYs)] : [0, 1];
+
+  // ── neck ──
+  for (let k = 0; k < 5200; k++) {
+    const u = Math.random(), v = Math.random();
+    const p = neckPoint(u, v);
+    const n = normalOf(neckPoint, u, v, 0.01, 0.02);
+    push(p, n, shade(n) * 0.92);
+  }
+
+  // ── shoulders ──
+  for (let k = 0; k < 15000; k++) {
+    const u = Math.random(), v = Math.random();
+    const p = shoulderPoint(u, v);
+    const n = normalOf(shoulderPoint, u, v, 0.005, 0.01);
+    // dark shirt with cloth-noise
+    push(p, n, shade(n, { rim: 0.42 }) * (0.42 + 0.1 * Math.abs(curl(v * 6, u * 12))));
+  }
+
+  const ys = mouthIdx.map(i => pos[i * 3 + 1]);
+  const mouthY = ys.length ? [Math.min(...ys), Math.max(...ys)] : [0, 1];
   return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY };
 }
 
-/* ── Galaxy backdrop from the user's REAL memory map ── */
+/* occluder meshes: same surfaces, slightly inset, opaque near-black — they
+   hide the far side of the bust, which is what makes it read as SOLID */
+function buildOccluders() {
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x060913, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
+  });
+  const grids = [
+    { fn: (a, b) => headPoint(a * 118 * D2R + 0.001, b * 2 * Math.PI - Math.PI), nu: 72, nv: 96 },
+    { fn: (a, b) => neckPoint(b, a), nu: 12, nv: 28 },
+    { fn: (a, b) => shoulderPoint(b, a), nu: 18, nv: 40 },
+  ];
+  const meshes = [];
+  for (const g of grids) {
+    const positions = [];
+    const indices = [];
+    for (let i = 0; i <= g.nu; i++) {
+      for (let jx = 0; jx <= g.nv; jx++) {
+        const p = g.fn(i / g.nu, jx / g.nv);
+        positions.push(p.x, p.y, p.z);
+      }
+    }
+    for (let i = 0; i < g.nu; i++) {
+      for (let jx = 0; jx < g.nv; jx++) {
+        const a = i * (g.nv + 1) + jx, b = a + 1, c = a + g.nv + 1, d = c + 1;
+        indices.push(a, b, c, b, d, c);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(positions), 3));
+    geo.setIndex(indices);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.scale.setScalar(0.985);
+    mesh.renderOrder = 0;
+    meshes.push(mesh);
+  }
+  return meshes;
+}
+
+/* ═══════════════ galaxy + streams (unchanged aesthetics) ═══════════════ */
 const CYAN_FAMILY = [0x22d3ee, 0x67e8f9, 0x0ea5b7];
 const DISTINCT_HUES = [0xa3e635, 0xf43f5e, 0xf59e0b, 0x8b5cf6, 0xec4899,
                        0x60a5fa, 0x2dd4bf, 0xfb7185, 0xfacc15, 0x34d399];
@@ -313,8 +362,7 @@ function mountGalaxy(data) {
   const nodes = data.nodes || [];
   const pos = new Float32Array(nodes.length * 3);
   const col = new Float32Array(nodes.length * 3);
-  const centers = {};
-  const ccount = {};
+  const centers = {}, ccount = {};
   const color = new THREE.Color();
   nodes.forEach((n, i) => {
     const gx = (n.x || 0) * 1.7, gy = (n.y || 0) * 1.25 + 8, gz = -150 + (n.z || 0) * 1.3;
@@ -332,44 +380,39 @@ function mountGalaxy(data) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  const mat = new THREE.PointsMaterial({
+  J.galaxy = new THREE.Points(geo, new THREE.PointsMaterial({
     size: 3.6, map: glowTexture(), vertexColors: true, transparent: true,
     opacity: 1.0, depthWrite: false, blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
-  });
-  J.galaxy = new THREE.Points(geo, mat);
+  }));
   J.scene.add(J.galaxy);
   return Object.entries(centers).map(([k, s]) => new THREE.Vector3(
     s[0] / ccount[k], s[1] / ccount[k], s[2] / ccount[k]));
 }
 
-/* ── Node streams: back of head → galaxy clusters, with traveling pulses ── */
 function mountStreams(clusterCenters) {
   const targets = clusterCenters.length ? clusterCenters : [new THREE.Vector3(0, 10, -170)];
   const N = Math.min(16, Math.max(8, targets.length * 2));
   for (let i = 0; i < N; i++) {
     const tgt = targets[i % targets.length];
     const a = (i / N) * Math.PI * 2;
-    const start = new THREE.Vector3(Math.cos(a) * 9, 9 + Math.sin(a * 2) * 8, -11 - Math.random() * 5);
-    const mid1 = new THREE.Vector3(start.x * 3.2, start.y * 1.6 + 6, -46 - Math.random() * 22);
+    const start = new THREE.Vector3(Math.cos(a) * 8, 14 + Math.sin(a * 2) * 7, -9 - Math.random() * 4);
+    const mid1 = new THREE.Vector3(start.x * 3.2, start.y * 1.4 + 6, -46 - Math.random() * 22);
     const mid2 = new THREE.Vector3(tgt.x * 0.55 + (Math.random() - .5) * 24,
                                    tgt.y * 0.7 + (Math.random() - .5) * 18, -110);
     const curve = new THREE.CatmullRomCurve3([start, mid1, mid2, tgt]);
-    const pts = curve.getPoints(48);
-    const geo = new THREE.BufferGeometry().setFromPoints(pts);
-    const mat = new THREE.LineBasicMaterial({
+    const geo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(48));
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
       color: 0x22d3ee, transparent: true, opacity: 0.28,
       blending: THREE.AdditiveBlending, depthWrite: false,
-    });
-    const line = new THREE.Line(geo, mat);
+    }));
     J.scene.add(line);
     J.streams.push({ curve, line });
     for (let p = 0; p < 2; p++) {
-      const sm = new THREE.SpriteMaterial({
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
         map: glowTexture(), color: 0x67e8f9, transparent: true,
         opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false,
-      });
-      const sp = new THREE.Sprite(sm);
+      }));
       sp.scale.set(2.6, 2.6, 1);
       J.scene.add(sp);
       J.pulses.push({ sprite: sp, curve, t: Math.random(), speed: 0.04 + Math.random() * 0.05 });
@@ -377,7 +420,7 @@ function mountStreams(clusterCenters) {
   }
 }
 
-/* ── Frame loop ── */
+/* ═══════════════ frame loop ═══════════════ */
 function tick() {
   if (J.disposed) return;
   J.raf = J.animOn ? requestAnimationFrame(tick) : null;
@@ -386,39 +429,36 @@ function tick() {
   const t = J.t;
   const tint = MODE_TINT[J.mode] || MODE_TINT.idle;
 
-  // motion parallax: slow camera orbit + pointer-follow (eased)
   if (J.camera) {
-    const px = J.pointer.x, py = J.pointer.y;
-    const ox = Math.sin(t * 0.13) * 6 + px * 7;
-    const oy = 4 + Math.sin(t * 0.081) * 2.5 - py * 4;
+    const ox = Math.sin(t * 0.13) * 6 + J.pointer.x * 7;
+    const oy = 4 + Math.sin(t * 0.081) * 2.5 - J.pointer.y * 4;
     J.camera.position.x += (ox - J.camera.position.x) * 0.03;
     J.camera.position.y += (oy - J.camera.position.y) * 0.03;
-    J.camera.lookAt(0, 1, 0);
+    J.camera.lookAt(0, 4, 0);
   }
 
-  if (J.head) {
-    const breathe = 1 + Math.sin(t * 1.1) * 0.006;
-    J.head.scale.set(1, breathe, 1);
-    // deeper idle turn: the form reveal is what reads as 3D
-    J.head.rotation.y = Math.sin(t * 0.16) * 0.17 + (J.mode === 'listening' ? 0.05 : 0);
-    J.head.rotation.x = Math.sin(t * 0.11) * 0.035;
+  if (J.head && J.headGroup) {
+    // the whole bust (points + occluders + eye glints) turns as one
+    J.headGroup.rotation.y = Math.sin(t * 0.16) * 0.17 + (J.mode === 'listening' ? 0.05 : 0);
+    J.headGroup.rotation.x = Math.sin(t * 0.11) * 0.035;
+    J.headGroup.scale.y = 1 + Math.sin(t * 1.1) * 0.005;
 
-    // mouth: native-timing lip-sync — band measured from the photo at build
+    // lip-sync: mouth band opens with the real audio level (down + forward
+    // so open lips stay in front of the occluder surface)
     const posAttr = J.headGeo.attributes.position;
-    const open = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.15);
+    const open = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12);
     const mc = (J.mouthY[0] + J.mouthY[1]) / 2;
-    const mh = Math.max(0.8, (J.mouthY[1] - J.mouthY[0]) / 2);
+    const mh = Math.max(0.7, (J.mouthY[1] - J.mouthY[0]) / 2);
     for (let k = 0; k < J.mouthIdx.length; k++) {
       const n = J.mouthIdx[k];
       const by = J.basePos[n * 3 + 1];
       const center = Math.max(0, 1 - Math.abs((by - mc) / mh));
-      posAttr.array[n * 3 + 1] = by - open * 2.8 * center - open * 0.4 * Math.random();
-      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] - open * 0.8 * center;
+      posAttr.array[n * 3 + 1] = by - open * 2.2 * center - open * 0.3 * Math.random();
+      posAttr.array[n * 3 + 2] = J.basePos[n * 3 + 2] + open * 0.7 * center;
     }
     if (J.mouthIdx.length) posAttr.needsUpdate = true;
 
-    // eye blink + mode tint crossfade (full-buffer writes every 4th frame)
-    const blink = (t % 4.7) > 4.55 ? 0.25 : 1;
+    const blink = (t % 4.7) > 4.55 ? 0.2 : 1;
     const colAttr = J.headGeo.attributes.color;
     if ((Math.round(t * 60) & 3) === 0) {
       const mix = 0.14;
@@ -433,18 +473,16 @@ function tick() {
       }
       colAttr.needsUpdate = true;
     }
-    J.head.material.size = 0.85 + Math.min(0.45, J.level * 0.32)
-      + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.06 : 0);
+    J.head.material.size = 0.62 + Math.min(0.3, J.level * 0.22)
+      + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.05 : 0);
   }
 
   if (J.galaxy) J.galaxy.rotation.y = Math.sin(t * 0.05) * 0.12;
-
   const speedMul = J.mode === 'thinking' ? 3.2 : J.mode === 'talking' ? 1.7 : 1;
   for (const p of J.pulses) {
     p.t += p.speed * speedMul * dt * 2.2;
     if (p.t > 1) p.t = 0;
-    const v = p.curve.getPoint(p.t);
-    p.sprite.position.copy(v);
+    p.sprite.position.copy(p.curve.getPoint(p.t));
     p.sprite.material.opacity = 0.25 + 0.65 * Math.sin(p.t * Math.PI);
   }
   for (const s of J.streams) {
@@ -454,7 +492,7 @@ function tick() {
   J.renderer.render(J.scene, J.camera);
 }
 
-/* ── Public API ── */
+/* ═══════════════ public API ═══════════════ */
 async function mount(container) {
   const three = await loadThree();
   if (!three || !container || J.renderer) return;
@@ -464,14 +502,13 @@ async function mount(container) {
   J.scene = new THREE.Scene();
   J.scene.fog = new THREE.FogExp2(0x05050c, 0.0028);
   J.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 600);
-  J.camera.position.set(0, 4, 86);
+  J.camera.position.set(0, 4, 88);
   J.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   J.renderer.setSize(w, h);
   J.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   J.renderer.domElement.className = 'jarvis3d-canvas';
   container.prepend(J.renderer.domElement);
 
-  // pointer parallax (normalized -1..1 over the stage)
   J.pointerHandler = (e) => {
     const r = container.getBoundingClientRect();
     J.pointer.x = ((e.clientX - r.left) / r.width) * 2 - 1;
@@ -479,21 +516,8 @@ async function mount(container) {
   };
   container.addEventListener('pointermove', J.pointerHandler);
 
-  // primary: the offline 3D scan of the operator; fallback: photo inflation
-  let scan = null;
-  try {
-    const r = await fetch('/static/avatar/head_points.json');
-    if (r.ok) scan = await r.json();
-  } catch { }
+  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = buildSculpt();
   if (J.disposed) return;
-  let built;
-  if (scan && scan.pos && scan.pos.length > 9000) {
-    built = buildFromScan(scan);
-  } else {
-    built = buildBust(await loadPhotoModel());
-  }
-  if (J.disposed) return;
-  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = built;
   J.mouthY = mouthY;
   J.basePos = Float32Array.from(pos);
   J.baseB = Float32Array.from(bri);
@@ -504,12 +528,31 @@ async function mount(container) {
   J.headGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
   J.headGeo.setAttribute('color', new THREE.BufferAttribute(Float32Array.from(col), 3));
   J.head = new THREE.Points(J.headGeo, new THREE.PointsMaterial({
-    size: 0.85, map: glowTexture(), vertexColors: true, transparent: true,
-    opacity: 0.95, depthWrite: false, blending: THREE.AdditiveBlending,
+    size: 0.55, map: glowTexture(), vertexColors: true, transparent: true,
+    opacity: 0.62, depthWrite: false, blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
   }));
-  J.head.position.set(0, 1, 0);
-  J.scene.add(J.head);
+  J.head.renderOrder = 1;
+
+  J.headGroup = new THREE.Group();
+  J.headGroup.add(J.head);
+  J.occluders = buildOccluders();
+  for (const m of J.occluders) J.headGroup.add(m);
+
+  // eye glints: two soft sparks in the sockets — the "alive" cue
+  for (const side of [-1, 1]) {
+    const gp = headPoint(58 * D2R, side * 13 * D2R);
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTexture(), color: 0x9df5ff, transparent: true, opacity: 0.85,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    sp.scale.set(1.6, 1.6, 1);
+    sp.position.set(gp.x, gp.y, gp.z + 0.6);
+    sp.renderOrder = 2;
+    J.headGroup.add(sp);
+    J.glints.push(sp);
+  }
+  J.scene.add(J.headGroup);
 
   const centers = mountGalaxy(await buildGalaxyData());
   if (J.disposed) return;
@@ -538,14 +581,14 @@ function dispose() {
     J.pointerHandler = null;
   }
   if (J.renderer) {
-    try {
-      J.renderer.dispose();
-      J.renderer.domElement.remove();
-    } catch { }
+    try { J.renderer.dispose(); J.renderer.domElement.remove(); } catch { }
   }
   for (const k of ['head', 'galaxy']) {
     if (J[k]) { try { J[k].geometry.dispose(); J[k].material.dispose(); } catch { } J[k] = null; }
   }
+  for (const m of J.occluders) { try { m.geometry.dispose(); } catch { } }
+  for (const g of J.glints) { try { g.material.dispose(); } catch { } }
+  J.occluders = []; J.glints = []; J.headGroup = null;
   J.streams = []; J.pulses = []; J.renderer = null; J.scene = null;
   J.headGeo = null; J.basePos = null; J.baseB = null; J.baseW = null;
 }
