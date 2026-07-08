@@ -1471,6 +1471,17 @@ code, pre, .mono { font-family: var(--font-mono); }
 .onb-q textarea:focus { border-color:var(--accent); outline:none; }
 .onb-hint { font-size:11px; color:var(--text-dim); margin-top:2px; line-height:1.45; }
 
+/* ═══ Attachments: drag & drop zone + placement groups ═══ */
+.attach-dz {
+  border:1.5px dashed var(--border-l); border-radius:10px; padding:9px 12px;
+  margin-top:8px; transition:border-color .15s, background .15s;
+}
+.attach-dz.dz-hover { border-color:var(--accent); background:rgba(124,92,255,.10); }
+.attach-group { margin-top:6px; }
+.attach-group-label {
+  font-size:11px; color:var(--text-dim); font-weight:600; letter-spacing:.3px;
+}
+
 /* ═══ Galaxy memory editing (SPEC-BLOCK2 R2): merge picker ═══ */
 .mem-merge-list {
   max-height:38vh; overflow-y:auto; display:flex; flex-direction:column; gap:4px;

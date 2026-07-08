@@ -1363,7 +1363,7 @@ function openTaskDetail(id) {
     </div>
   `);
   loadTaskExtras(t);
-  loadAttachmentsInto('task', t.id, 'td-attach');
+  loadAttachmentsInto('task', t.id, 'td-attach', t.workflow_id);
   loadLoopBadge(t);
 }
 
@@ -1385,48 +1385,138 @@ async function loadLoopBadge(t) {
 // ── Attachments (operator input files on tasks & projects) ──
 const ATTACH_ACCEPT = '.png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.docx,.xlsx,.pptx,.doc,.xls,.ppt,.txt,.md,.csv,.json';
 
-async function loadAttachmentsInto(kind, id, elId) {
-  const el = $(`#${elId}`);
-  if (!el) return;
-  const base = kind === 'task' ? `/api/tasks/${id}` : `/api/workflows/${id}`;
-  let files = [];
-  try { files = (await api('GET', `${base}/attachments`)).attachments || []; } catch { }
-  const dlHref = n => kind === 'task'
+function attachApiBase(kind, id) { return kind === 'task' ? `/api/tasks/${id}` : `/api/workflows/${id}`; }
+function attachDlHref(kind, id, n) {
+  return kind === 'task'
     ? `/api/tasks/${id}/files/attachments/${encodeURIComponent(n)}`
     : `/api/workflows/${id}/attachments/${encodeURIComponent(n)}/download`;
-  el.innerHTML = `
-    ${files.map(f => `<div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-top:2px">
-      📎 <a href="${dlHref(f.name)}" target="_blank" style="color:var(--accent)">${esc(f.name)}</a>
-      <span class="muted" style="font-size:10.5px">${(f.size / 1024).toFixed(0)} KB</span>
-      <button class="btn-sm danger" title="remove" onclick="deleteAttachment('${kind}','${esc(id)}','${esc(f.name)}','${elId}')">✕</button>
-    </div>`).join('') || '<div class="muted" style="font-size:11.5px">No attachments — the agent works from the description alone.</div>'}
-    <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
-      <input type="file" id="${elId}-file" accept="${ATTACH_ACCEPT}" style="font-size:11.5px;max-width:260px">
-      <button class="btn-sm" onclick="uploadAttachment('${kind}','${esc(id)}','${elId}')">⬆ Upload</button>
-      <span class="muted" style="font-size:10.5px">pdf, office, images, text · max 25 MB</span>
+}
+function attachRowHTML(kind, id, f, elId) {
+  return `<div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-top:2px">
+    📎 <a href="${attachDlHref(kind, id, f.name)}" target="_blank" style="color:var(--accent)">${esc(f.name)}</a>
+    <span class="muted" style="font-size:10.5px">${(f.size / 1024).toFixed(0)} KB</span>
+    <button class="btn-sm danger" title="remove" onclick="deleteAttachment('${kind}','${esc(id)}','${esc(f.name)}','${elId}')">✕</button>
+  </div>`;
+}
+function attachUploadHTML(elId) {
+  return `
+    <div class="attach-dz" id="${elId}-dz">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="file" id="${elId}-file" accept="${ATTACH_ACCEPT}" multiple style="font-size:11.5px;max-width:260px">
+        <button class="btn-sm" onclick="attachUploadPicked('${elId}')">⬆ Upload</button>
+      </div>
+      <div class="muted" style="font-size:10.5px;margin-top:4px">…or drag &amp; drop files anywhere in this box · pdf, office, images, text · max 25 MB each</div>
     </div>`;
 }
+// elId → { getTarget, reload }: the target is resolved at drop/upload time so the
+// project block can route by its "Attach to" <select> (whole project vs one task).
+const attachTargets = {};
+function attachWire(elId, getTarget, reload) {
+  attachTargets[elId] = { getTarget, reload };
+  const z = document.getElementById(`${elId}-dz`);
+  if (!z) return;
+  ['dragenter', 'dragover'].forEach(ev => z.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); z.classList.add('dz-hover');
+  }));
+  z.addEventListener('dragleave', e => { e.preventDefault(); z.classList.remove('dz-hover'); });
+  z.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation(); z.classList.remove('dz-hover');
+    const files = [...((e.dataTransfer || {}).files || [])];
+    if (files.length) attachUploadFiles(elId, files);
+  });
+}
+// A file dropped outside a dropzone must not navigate the SPA away.
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => e.preventDefault());
 
-async function uploadAttachment(kind, id, elId) {
-  const inp = $(`#${elId}-file`);
-  if (!inp || !inp.files || !inp.files[0]) { toast('Pick a file first', 'err'); return; }
-  const base = kind === 'task' ? `/api/tasks/${id}` : `/api/workflows/${id}`;
-  const fd = new FormData();
-  fd.append('file', inp.files[0]);
-  try {
-    const r = await fetch(`${base}/attachments`, { method: 'POST', body: fd });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.status);
-    toast(`Attached ${j.name}`, 'ok');
-    loadAttachmentsInto(kind, id, elId);
-  } catch (e) { toast('Upload failed: ' + e.message, 'err'); }
+async function attachUploadPicked(elId) {
+  const inp = document.getElementById(`${elId}-file`);
+  if (!inp || !inp.files || !inp.files.length) { toast('Pick a file first', 'err'); return; }
+  await attachUploadFiles(elId, [...inp.files]);
+}
+async function attachUploadFiles(elId, files) {
+  const t = attachTargets[elId];
+  if (!t) return;
+  const { kind, id } = t.getTarget();
+  let done = 0;
+  for (const f of files) {
+    const fd = new FormData();
+    fd.append('file', f);
+    try {
+      const r = await fetch(`${attachApiBase(kind, id)}/attachments`, { method: 'POST', body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.status);
+      done++;
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+  }
+  if (done) toast(`Attached ${done} file${done > 1 ? 's' : ''} ${kind === 'task' ? 'to the task' : 'project-wide'}`, 'ok');
+  t.reload();
+}
+
+async function loadAttachmentsInto(kind, id, elId, wfId) {
+  const el = $(`#${elId}`);
+  if (!el) return;
+  let files = [];
+  try { files = (await api('GET', `${attachApiBase(kind, id)}/attachments`)).attachments || []; } catch { }
+  let inherited = '';
+  if (kind === 'task' && wfId) {
+    try {
+      const pf = (await api('GET', `/api/workflows/${wfId}/attachments`)).attachments || [];
+      if (pf.length) inherited = `<div class="muted" style="font-size:11px;margin-top:4px">↑ also reads ${pf.length} project-wide file${pf.length > 1 ? 's' : ''}: ${pf.map(x => esc(x.name)).join(', ')} <span style="opacity:.7">(manage in the project window)</span></div>`;
+    } catch { }
+  }
+  el.innerHTML = `<div class="attach-list">
+    ${files.map(f => attachRowHTML(kind, id, f, elId)).join('') || '<div class="muted" style="font-size:11.5px">No attachments — the agent works from the description alone.</div>'}
+    ${inherited}
+  </div>${attachUploadHTML(elId)}`;
+  attachWire(elId, () => ({ kind, id }), () => loadAttachmentsInto(kind, id, elId, wfId));
+}
+
+// Project ("workflow") attachments with TARGETING: upload lands project-wide or
+// on ONE member task, and per-task files are grouped so placement stays visible.
+async function loadProjectAttachments(wfId, elId = 'wf-attach') {
+  const el = $(`#${elId}`);
+  if (!el) return;
+  let w;
+  try { w = await api('GET', `/api/workflows/${wfId}`); }
+  catch { el.innerHTML = '<div class="muted" style="font-size:11.5px">load failed</div>'; return; }
+  const tasks = (w.tasks || []).filter(t => t.status !== 'archived');
+  const results = await Promise.all([
+    api('GET', `/api/workflows/${wfId}/attachments`).then(d => d.attachments || []).catch(() => []),
+    ...tasks.map(t => api('GET', `/api/tasks/${t.id}/attachments`).then(d => d.attachments || []).catch(() => [])),
+  ]);
+  const wfFiles = results[0];
+  const prevTarget = (document.getElementById(`${elId}-target`) || {}).value;
+  const groups = [`<div class="attach-group"><div class="attach-group-label">📌 Project-wide — every task reads these</div>
+    ${wfFiles.map(f => attachRowHTML('workflow', wfId, f, elId)).join('') || '<div class="muted" style="font-size:11.5px">none</div>'}</div>`];
+  tasks.forEach((t, i) => {
+    const fs = results[i + 1];
+    if (fs.length) groups.push(`<div class="attach-group"><div class="attach-group-label">↳ only task ${i + 1} — ${esc(t.title.slice(0, 60))}</div>
+      ${fs.map(f => attachRowHTML('task', t.id, f, elId)).join('')}</div>`);
+  });
+  el.innerHTML = `<div class="attach-list">${groups.join('')}</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+      <label class="form-label" style="margin:0">Attach to</label>
+      <select class="form-select" id="${elId}-target" style="max-width:340px;font-size:12px;padding:5px 8px">
+        <option value="wf:${esc(wfId)}">📎 Whole project — every task reads it</option>
+        ${tasks.map((t, i) => `<option value="task:${esc(t.id)}">only ${i + 1}. ${esc(t.title.slice(0, 55))}</option>`).join('')}
+      </select>
+    </div>
+    ${attachUploadHTML(elId)}`;
+  const sel = document.getElementById(`${elId}-target`);
+  if (sel && prevTarget && [...sel.options].some(o => o.value === prevTarget)) sel.value = prevTarget;
+  attachWire(elId, () => {
+    const v = ((document.getElementById(`${elId}-target`) || {}).value) || `wf:${wfId}`;
+    const kind = v.startsWith('task:') ? 'task' : 'workflow';
+    return { kind, id: v.slice(v.indexOf(':') + 1) };
+  }, () => loadProjectAttachments(wfId, elId));
 }
 
 async function deleteAttachment(kind, id, name, elId) {
-  const base = kind === 'task' ? `/api/tasks/${id}` : `/api/workflows/${id}`;
   try {
-    await api('DELETE', `${base}/attachments/${encodeURIComponent(name)}`);
-    loadAttachmentsInto(kind, id, elId);
+    await api('DELETE', `${attachApiBase(kind, id)}/attachments/${encodeURIComponent(name)}`);
+    const t = attachTargets[elId];
+    if (t) t.reload(); else loadAttachmentsInto(kind, id, elId);
   } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
@@ -7402,7 +7492,7 @@ async function openWorkflowDetail(id) {
     ${rpPanel}
     <div style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto">${taskRows || '<div class="empty">No tasks yet — add the first one.</div>'}</div>
     <div style="margin:8px 0"><button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">🔍 Review results — what every stage changed</button></div>
-    <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Project attachments (input files EVERY task of this project reads)</label>
+    <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Attachments (input files — attach to the whole project or to one task)</label>
       <div id="wf-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
     <div class="form-group"><label class="form-label">🔁 Project looping (automatic improve-and-recheck rounds)</label>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -7440,7 +7530,7 @@ async function openWorkflowDetail(id) {
         <button class="btn-primary" onclick="closeModal()">Close</button>
       </div>
     </div>`);
-  loadAttachmentsInto('workflow', w.id, 'wf-attach');
+  loadProjectAttachments(w.id, 'wf-attach');
   api('GET', '/api/projects').then(d => {
     const sel = document.getElementById('wfd-project');
     if (!sel) return;
