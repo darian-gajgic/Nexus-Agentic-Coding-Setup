@@ -1903,7 +1903,7 @@ function endTour() {
 }
 
 // ═══════════════════ SETTINGS TAB (Settings v2 — registry · models · credentials) ═══════════════════
-const settingsState = { fetched: false, dispatch: {}, model: {}, schema: null, credentials: [] };
+const settingsState = { fetched: false, dispatch: {}, model: {}, schema: null, credentials: [], defaults: null };
 // Model registry (Settings v2): global + own rows, purpose routing, task-model list.
 const modelState = {
   fetched: false, models: [], assignments: {}, sources: {},
@@ -1956,6 +1956,12 @@ async function loadSettingsData() {
     settingsState.model = m.settings || {};
     settingsState.schema = sch;
     settingsState.credentials = creds.credentials || [];
+    // Machine default keys — admin-only endpoint; members simply skip the panel.
+    settingsState.defaults = null;
+    if (sch && sch.is_admin) {
+      try { settingsState.defaults = (await api('GET', '/api/credentials/defaults')).defaults || []; }
+      catch { }
+    }
     modelState.models = mods.models || [];
     modelState.assignments = mods.assignments || {};
     modelState.sources = mods.assignment_sources || {};
@@ -2057,6 +2063,46 @@ function modelsCardHTML() {
     </div></div>`;
 }
 
+// Admin-only: the machine default keys (~/.hermes/.env) every user inherits.
+function machineDefaultsHTML() {
+  const defs = settingsState.defaults;
+  if (!defs) return '';
+  const rows = defs.map(d => {
+    const status = d.managed
+      ? `<span class="muted" style="font-size:11.5px">${esc(d.managed)}</span>`
+      : (d.set ? `••••••••${esc(d.hint)}` : '<span style="color:var(--red,#f87171)">not set</span>');
+    const editor = d.managed ? '<span class="muted">—</span>' : `
+      <div style="display:flex;gap:6px">
+        <input class="form-input" id="def-${esc(d.provider)}" type="password" autocomplete="off"
+          placeholder="new key…" style="min-width:180px">
+        <button class="btn-ghost btn-sm" onclick="saveDefaultKey('${esc(d.provider)}')">Rotate</button>
+      </div>`;
+    return `<tr><td><code>${esc(d.provider)}</code><div class="muted" style="font-size:11px">${esc(d.label)}</div></td>
+      <td class="muted" style="font-size:11.5px">${d.env ? esc(d.env) : 'CLI auth'}</td>
+      <td>${status}</td><td>${editor}</td></tr>`;
+  }).join('');
+  return `
+    <h4 style="margin:16px 0 6px">Machine default keys <span class="muted" style="font-weight:400;font-size:11.5px">(admin — what everyone inherits when they set no personal key)</span></h4>
+    <div class="form-hint" style="margin-bottom:6px">Stored in <code>~/.hermes/.env</code> (0600) — shown masked, never displayed after saving. Keys the Hermes gateway reads (zai, brave) apply to <b>new</b> Hermes work after <code>systemctl --user restart hermes-gateway</code>.</div>
+    <div style="overflow-x:auto"><table class="data-table">
+      <thead><tr><th>Provider</th><th>Env var</th><th>Current</th><th>Rotate</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+}
+
+async function saveDefaultKey(provider) {
+  const el = $(`#def-${CSS.escape(provider)}`);
+  const value = (el || {}).value || '';
+  if (!value) { toast('Paste the new key first', 'err'); return; }
+  if (!confirm(`Rotate the MACHINE default ${provider} key? Every user without a personal key switches to it.`)) return;
+  try {
+    const r = await api('PUT', `/api/credentials/defaults/${provider}`, { value });
+    el.value = '';
+    toast(`Default ${provider} key rotated — ${r.note}`, 'ok', 7000);
+    settingsState.fetched = false;
+    loadSettingsData();
+  } catch (e) { toast('Rotate failed: ' + e.message, 'err'); }
+}
+
 function credentialsCardHTML() {
   const rows = settingsState.credentials.map(c => `
     <tr><td><code>${esc(c.provider)}</code>${c.global ? ' <span class="muted" title="Machine-wide default override (admin-managed)">🌐</span>' : ''}</td>
@@ -2079,6 +2125,7 @@ function credentialsCardHTML() {
         ${modelState.isAdmin ? '<label style="font-size:11.5px;align-self:center;white-space:nowrap"><input type="checkbox" id="credGlobal"> global (all users’ default)</label>' : ''}
         <button class="btn-primary" onclick="saveCredential()" style="align-self:center">Save key</button>
       </div>
+      ${machineDefaultsHTML()}
     </div></div>`;
 }
 

@@ -104,9 +104,10 @@ Key points (current architecture):
   counts, confirm-gated apply → success, Settings entry. 12 checks.
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
-  never leaves the API, per-user isolation), model registry CRUD + purpose-routing validation,
-  task-model validation, session-keys bridge, judge model/env plumbing via stubbed judge.cmd.
-  50 checks, self-cleaning, multi-user-preserving.
+  never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
+  file — never the live .env), model registry CRUD + purpose-routing validation, task-model
+  validation, session-keys bridge, judge model/env plumbing via stubbed judge.cmd.
+  62 checks, self-cleaning, multi-user-preserving.
 - **Per-edit gate:** `.claude/check.sh` (auto-run by Claude Code PostToolUse on Write|Edit).
 - Playwright is installed in `.venv`. Screenshots save to `~/.hermes/cache/screenshots/`.
 
@@ -119,6 +120,12 @@ Key points (current architecture):
 - `secrets_store.py` = first at-rest crypto: per-user + global credentials Fernet-encrypted in
   nexus.db (master key `secret.key`, 0600, gitignored). NO endpoint ever returns a stored
   secret — metadata + 4-char hint only. Missing credential = the machine's env/CLI default key.
+- **Machine default keys** (admin): `GET /api/credentials/defaults` (masked set/hint status) +
+  `PUT /api/credentials/defaults/{provider}` rotate `~/.hermes/.env` in place (fixed
+  provider→env allowlist in `secrets_store.DEFAULT_PROVIDERS` — never arbitrary env names;
+  anchored rewrite incl. `# [disabled…]`-commented lines, atomic 0600, live os.environ update).
+  zai/brave apply to new Hermes work after a gateway restart; anthropic's default is the
+  Claude CLI subscription auth (rotate via `claude` login, not env).
 - **Model registry**: `user_models` (global NULL-user rows + per-user rows) + `model_assignments`
   (purposes: complicated / easy / mechanical / frontier_judge; 'global' scope = inherited
   default). Seeded once (empty-table check): the GLM trio + `anthropic/claude-opus-4-8`
