@@ -15,7 +15,11 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   random tokens (verify.sh enforces this). A lane exits when its agent is retired/stopped.
 - `scripts/migrate_real_agents.py` — one-time migration (ran 2026-07-06): archived sim data,
   retired the SelfHealTest zombie, deleted seed demo agents/tasks, flipped dispatch.enabled=1.
-- `voice.py` — GPU TTS (Piper) and STT (faster-whisper) pipeline
+- `voice.py` — GPU TTS (Piper, incl. streaming synthesize_stream) and STT (faster-whisper)
+- `vision.py` — JARVIS visual memory (SigLIP+OCR frames in qdrant `jarvis_vision`), local
+  VLM describe (ollama qwen3-vl:8b), SDXL-Turbo image generation
+- `vision_worker.py` — persistent ml-env subprocess hosting SigLIP/RapidOCR/SDXL (JSON-lines
+  protocol; killed after 10min idle — process exit is the VRAM guarantee)
 - `static/index.html` — Main dashboard HTML (grouped sidebar, inline SVG icons, toast/drawer roots)
 - `static/app.js` — Frontend JS (vanilla, no build step), view router + all views
 - `static/style.css` — Design system v3: glass panels over aurora backdrop, Inter UI font + JetBrains Mono for data, CSS variables
@@ -30,37 +34,47 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - Live updates: tick() every 3s patches the DOM **in place** for dashboard/agents/monitor and only re-renders kanban/agentic when their data hash changes and no modal/drawer/drag is active (`uiLocked()`); WS events use `softRender()`. Don't reintroduce blind innerHTML rebuilds on tick — they eat clicks and input focus.
 - The JARVIS view is rendered by `renderJarvisView()` in app.js which sets `$('#content').innerHTML`
 
-## JARVIS Voice Flow
-1. Browser captures mic audio via `MediaRecorder` (audio/webm; codecs=opus)
-2. Audio sent to `POST /api/jarvis/stt` as multipart form upload
-3. Transcribed text sent to `POST /api/jarvis/chat/stream` (SSE proxy to Hermes Agent API)
-4. Reply text split into sentences, each sent to `POST /api/jarvis/talk` (ONE call per sentence)
-5. `/talk` returns a single muxed MP4 (TTS audio + Wav2Lip video). The SAME blob plays in a
-   muted `<video>` (face) + persistent `<audio>` (voice). Prefetch pipeline renders sentence
-   N+1 while N plays. **See `docs/JARVIS-VOICE.md` for full details.**
-
-## Avatar Requirements
-The avatar is a NEURAL TALKING-HEAD (Wav2Lip), NOT a 3D mesh or cycling frames.
-**Full implementation docs: `docs/JARVIS-VOICE.md` — READ THIS before editing JARVIS voice/avatar code.**
-Key points (current architecture):
-- Source face: `static/avatar/reference.jpg` (MUST be ≤512×512 JPEG or Wav2Lip face-detector OOMs)
-- The browser calls `/api/jarvis/talk` ONCE per sentence → returns a single muxed MP4 with
-  BOTH audio (TTS voice) + video (lip-synced face). Do NOT fetch /tts and /talk in parallel
-  (causes /talk to 500 under GPU pressure → face delayed 2-3 sentences).
-- The SAME MP4 blob plays in a MUTED `<video id="jAvatarVideo">` (face) + a persistent
-  `<audio>` element (voice). Muted video = autoplay never blocked by Chrome. Persistent audio
-  element = unlocked by user gesture, reused every clip.
-- State-driven: idle, listening, thinking, talking. Avatar resets to idle picture after speaking.
-- Inference runs in `/home/sinep/ml-env` (torch+CUDA). Wav2Lip repo at `/home/sinep/Wav2Lip`.
-- **Idle model unloading:** after 60s with no voice activity, Piper TTS + faster-whisper STT
-  are unloaded from memory (frees VRAM). They reload lazily on next use. Config: `voice.py`
-  `IDLE_TIMEOUT = 60.0`, checked every 15s by a background thread in `server.py`.
-- **Cache-busting:** when editing `app.js`, `style.css` or `nexus3d.js`, bump `?v=N` in
-  `index.html` or the browser serves stale cached code (currently style v=4, app v=8, nexus3d v=1).
+## JARVIS v2 (2026-07-08) — particle avatar, WS TTS, vision, files, control
+**Full docs: `docs/JARVIS-VOICE.md` §0 — READ IT before editing JARVIS code.**
+- **Avatar**: Three.js particle head (`static/jarvis3d.js`) sampled from
+  `static/avatar/reference.jpg` (edge-boosted luminance → density), node streams into the
+  real memory galaxy behind; renders BEHIND the chat. States idle/listening/thinking/talking.
+  FX on/off button freezes the RAF loop. Wav2Lip is RETIRED (lipsync.py dormant; /talk +
+  /lipsync endpoints remain but nothing calls them).
+- **Voice out**: `/ws/jarvis/tts` streams raw PCM per sentence (`voice.synthesize_stream`);
+  the browser schedules chunks gaplessly + drives the avatar mouth from an AnalyserNode on
+  the same graph (native-timing lip-sync). Sentences are spoken WHILE the reply streams.
+  HTTP `/api/jarvis/tts` = fallback. Voice toggle 🔊 in the topbar.
+- **Voice in**: adaptive-noise-floor VAD auto-detects end of speech (1.15s hangover in CONV
+  mode, 2.1s manual) and auto-sends; CONV mode adds a barge-in monitor during playback
+  (echoCancellation'd mic — sustained speech stops TTS and listens).
+- **Vision memory**: `vision.py` + `vision_worker.py` (persistent ml-env subprocess, killed
+  after 10min idle): SigLIP so400m + RapidOCR per frame → qdrant `jarvis_vision`
+  (per-user, deduped). Webcam/screen share buttons index frames every 4-5s; hybrid search
+  (`/api/jarvis/vision/search`) opens a scroll/select/copy popup; "look at this" turns ride
+  a frame described by ollama `qwen3-vl:8b` into the chat as [JARVIS EYES] context.
+  Z.AI has NO vision/image models on this key (1113) — vision is fully local.
+- **Imagine**: `/api/jarvis/imagine` → SDXL-Turbo (sequential CPU offload, ollama VLM evicted
+  first — 12GB card) → PNG in the file exchange.
+- **File exchange**: `workspaces/jarvis/<uid>/files/` — sidebar drag&drop; per-turn framing
+  points Hermes there; post-turn folder diff → SSE `files` event → chips in chat.
+- **System control**: per-turn `system_message` gives Hermes curl access to the Nexus API via
+  the per-boot `auth.INTERNAL_TOKEN` + `x-nexus-user` (user-scoped; readback-confirm rule).
+- **Sessions**: multiple per user (`jarvis_session.json` history) — sidebar switch/forget/title.
+- **Extras**: daily spoken briefing, spoken task completion/failure callbacks (12s polling),
+  `/find` + `/imagine` intents (typed or spoken), per-message copy buttons.
+- **Idle model unloading:** Piper+Whisper unload after `voice.py IDLE_TIMEOUT` (300s) idle;
+  the vision worker is killed after 10min idle — both via the server's 15s unloader thread.
+- **Cache-busting:** when editing `app.js`, `style.css`, `jarvis3d.js` etc., bump `?v=N` in
+  `index.html` or the browser serves stale cached code.
 - TTS voice: Piper "ryan" (male). Backup of old female voice at `models/piper_voice_female_backup.onnx`.
 
 ## Python Environment
 - Venv at `.venv/` (Python 3.14) — the nexus server + Playwright for tests
+- `~/ml-env` (torch+CUDA) additionally needs: transformers sentencepiece protobuf safetensors
+  diffusers accelerate rapidocr-onnxruntime onnxruntime (JARVIS vision worker; installed
+  2026-07-08). Model weights auto-download to `~/.cache/huggingface` on first use
+  (SigLIP so400m ~3.3GB, SDXL-Turbo ~7GB); ollama needs `qwen3-vl:8b` pulled.
 - Start server with `bash start.sh` (sets LD_LIBRARY_PATH for CUDA, then runs main.py)
 - HTTPS: if `cert.pem` + `cert.key` exist, server auto-enables HTTPS (needed for mic on non-localhost)
 - Piper TTS model at `models/piper_voice.onnx`
@@ -77,7 +91,13 @@ Key points (current architecture):
 - **Runtime gate — v3 UI features:** `.venv/bin/python scripts/verify_v3_ui.py` — agent detail drawer (memory/messages/cost tabs + add/delete memory), kanban task create/edit/delete + search filter, memory-hub subtabs, specialists learning pipeline, watchdog config modal, JARVIS still boots. 24 checks.
 - **Screenshot sweep:** `.venv/bin/python scripts/screenshot_all_tabs.py <suffix>` — screenshots all 14 tabs to `~/.hermes/cache/screenshots/nexus-<suffix>/`, fails on any console error.
 - All runtime scripts target **https://127.0.0.1:8777** (self-signed → `verify=False` / `ignore_https_errors=True`).
-- **Runtime gate — JARVIS:** `.venv/bin/python scripts/verify_jarvis_e2e.py` — full Playwright run: page renders, reply streams (SSE), lip-sync video plays, state transitions, returns to idle.
+- **Runtime gate — JARVIS (v2):** `.venv/bin/python scripts/verify_jarvis_e2e.py` — full Playwright
+  run: v2 layout + particle avatar canvas render, live reply streams (SSE), WS TTS engages
+  (SPEAKING state), vision popup from a chat intent, returns to idle. Tolerates Z.AI load-shedding.
+- **Runtime gate — JARVIS v2 backend:** `.venv/bin/python scripts/verify_jarvis_v2_backend.py` —
+  23 checks: frame indexing (SigLIP+OCR, dedup), hybrid search ranking, VLM describe, SDXL
+  imagine, file exchange, sessions v2 (fresh/switch/foreign-404/title), briefing, events,
+  WS TTS streaming + first-chunk latency. Self-cleaning.
 - **Runtime gate — Block 3 (replanning/evals/plan-editor):** `.venv/bin/python scripts/verify_block3_e2e.py` —
   revalidate round-trip, replan detect→dismiss→re-arm→apply (archival, rewiring, loop reset,
   approval expiry), eval run lifecycle on a scratch corpus with stubbed generation+judge,

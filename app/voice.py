@@ -159,6 +159,38 @@ async def synthesize(text: str) -> bytes:
         return await asyncio.to_thread(_synthesize_sync, text)
 
 
+async def synthesize_stream(text: str):
+    """Stream raw PCM (16-bit mono 22050 Hz) chunks as Piper produces them.
+    Piper yields audio incrementally — first chunk lands in ~100-300 ms, which
+    is what makes the WS voice path feel instant vs. the old whole-file WAV.
+    The blocking iterator runs in a thread; chunks cross over via a queue."""
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue(maxsize=8)
+    DONE = object()
+
+    def _produce():
+        try:
+            voice = _get_tts()
+            for chunk in voice.synthesize(text):
+                loop.call_soon_threadsafe(q.put_nowait, chunk.audio_int16_array.tobytes())
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, e)
+        finally:
+            _touch_voice()
+            loop.call_soon_threadsafe(q.put_nowait, DONE)
+
+    async with _tts_lock:
+        t = asyncio.get_running_loop().run_in_executor(None, _produce)
+        while True:
+            item = await q.get()
+            if item is DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+        await t
+
+
 # ── Health check ──
 
 def voice_status() -> dict:

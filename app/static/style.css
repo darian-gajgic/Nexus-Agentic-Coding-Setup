@@ -1471,6 +1471,94 @@ code, pre, .mono { font-family: var(--font-mono); }
 .onb-q textarea:focus { border-color:var(--accent); outline:none; }
 .onb-hint { font-size:11px; color:var(--text-dim); margin-top:2px; line-height:1.45; }
 
+/* ═══ JARVIS v2 — particle avatar behind, chat in front, sessions left ═══ */
+.jv2 { display:flex; gap:14px; height:calc(100vh - 128px); min-height:520px; }
+.jv2-side { flex:0 0 250px; display:flex; flex-direction:column; gap:8px; overflow-y:auto; padding-right:2px; }
+.jv2-panel-title {
+  font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--text-faint); margin-top:10px; display:flex; justify-content:space-between; align-items:center;
+}
+.jv2-sessions { display:flex; flex-direction:column; gap:4px; overflow-y:auto; max-height:36vh; }
+.jv2-session { padding:7px 10px; border-radius:9px; border:1px solid transparent; cursor:pointer; background:rgba(20,20,36,.5); position:relative; }
+.jv2-session-x { position:absolute; top:5px; right:6px; opacity:0; }
+.jv2-session:hover .jv2-session-x { opacity:1; }
+.jv2-session:hover { border-color:rgba(124,92,255,.35); }
+.jv2-session.active { border-color:var(--accent); background:rgba(124,92,255,.12); }
+.jv2-session-title { font-size:12px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.jv2-session-time { font-size:10px; color:var(--text-faint); }
+.jv2-files { display:flex; flex-direction:column; gap:2px; max-height:20vh; overflow-y:auto; }
+.jv2-file { display:flex; align-items:center; gap:6px; font-size:11.5px; padding:2px 4px; }
+.jv2-file a { color:var(--accent-2); text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+.jv2-dz { cursor:pointer; text-align:center; margin-top:4px; }
+.jv2-mini-btn {
+  background:none; border:1px solid var(--border); color:var(--text-dim);
+  border-radius:6px; font-size:10px; cursor:pointer; padding:1px 6px;
+}
+.jv2-mini-btn:hover { color:var(--text); border-color:var(--accent); }
+.jv2-stage {
+  flex:1; position:relative; border-radius:18px; overflow:hidden; min-width:0;
+  border:1px solid var(--border);
+  background:radial-gradient(ellipse at 50% 30%, #0a0a18, #05050c 72%);
+  display:flex; flex-direction:column;
+}
+.jarvis3d-canvas { position:absolute; inset:0; z-index:0; width:100%; height:100%; }
+.jv2-topbar { position:relative; z-index:3; display:flex; gap:8px; align-items:center; padding:10px 14px; flex-wrap:wrap; }
+.jv2-chip {
+  font-family:var(--font-mono); font-size:10.5px; padding:3px 9px; border-radius:12px;
+  border:1px solid var(--border); background:rgba(10,10,22,.55); backdrop-filter:blur(6px);
+  color:var(--text-dim); display:inline-flex; gap:6px; align-items:center;
+}
+.jv2-chip.mode-listening { color:var(--accent-2); border-color:var(--accent-2); }
+.jv2-chip.mode-thinking { color:#fbbf24; border-color:#fbbf24; }
+.jv2-chip.mode-talking { color:#9df5ff; border-color:#22d3ee; }
+.jv2-btn {
+  font-size:11px; padding:4px 10px; border-radius:12px; border:1px solid var(--border);
+  background:rgba(10,10,22,.55); color:var(--text-dim); cursor:pointer;
+  backdrop-filter:blur(6px); transition:all .15s;
+}
+.jv2-btn:hover { color:var(--text); border-color:var(--accent); }
+.jv2-btn.active { color:var(--accent-2); border-color:var(--accent-2); box-shadow:0 0 10px rgba(94,234,212,.3); }
+.jv2-chat { position:relative; z-index:2; margin-top:auto; display:flex; flex-direction:column; padding:0 14px 14px; max-height:74%; }
+.jv2-feed { overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:10px 4px; user-select:text; }
+.jv2-feed .j-msg { position:relative; background:rgba(10,10,20,.74); backdrop-filter:blur(9px); max-width:72%; }
+.jv2-feed .j-msg.you { align-self:flex-end; }
+.jv2-copy {
+  position:absolute; top:4px; right:6px; background:none; border:none; cursor:pointer;
+  color:var(--text-faint); font-size:12px; opacity:0; transition:opacity .15s;
+}
+.j-msg:hover .jv2-copy { opacity:1; }
+.jv2-inputrow { display:flex; gap:8px; margin-top:8px; }
+.jv2-inputrow .jarvis-chat-input { backdrop-filter:blur(8px); background:rgba(10,10,22,.7); }
+.jv2-mic {
+  width:42px; height:42px; border-radius:50%; border:1px solid var(--border-l);
+  background:rgba(14,14,28,.75); cursor:pointer; font-size:17px; backdrop-filter:blur(8px);
+  flex-shrink:0; transition:all .15s;
+}
+.jv2-mic:hover { border-color:var(--accent-2); }
+.jv2-mic.rec { border-color:#f87171; box-shadow:0 0 14px rgba(248,113,113,.5); animation:jvPulse 1.2s infinite; }
+@keyframes jvPulse { 50% { box-shadow:0 0 26px rgba(248,113,113,.8); } }
+.jv2-cap-preview {
+  position:absolute; right:14px; bottom:88px; width:180px; border-radius:10px;
+  border:1px solid var(--accent-2); z-index:3; opacity:.92;
+}
+.jv2-msg-img { max-width:280px; max-height:280px; border-radius:10px; display:block; margin-top:6px; }
+.jv2-filerow { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+.jv2-filechip {
+  font-size:11px; padding:2px 8px; border:1px solid var(--border-l); border-radius:10px;
+  color:var(--accent-2); text-decoration:none; background:rgba(10,10,20,.5);
+}
+/* vision-memory search popup: scroll / select / copy */
+.jvs-results { display:flex; flex-direction:column; gap:10px; max-height:56vh; overflow-y:auto; user-select:text; }
+.jvs-hit { display:flex; gap:12px; border:1px solid var(--border); border-radius:12px; padding:8px; }
+.jvs-hit img { width:150px; border-radius:8px; display:block; }
+.jvs-meta { flex:1; font-size:12px; min-width:0; }
+.jvs-ocr {
+  font-family:var(--font-mono); font-size:10.5px; color:var(--text-dim);
+  margin-top:4px; max-height:60px; overflow-y:auto;
+}
+.jvs-note { color:var(--accent-2); font-size:11px; margin-top:2px; }
+.modal.modal-fs .jvs-results { max-height:calc(100dvh - 320px); }
+
 /* ═══ Attachments: drag & drop zone + placement groups ═══ */
 .attach-dz {
   border:1.5px dashed var(--border-l); border-radius:10px; padding:9px 12px;
@@ -1552,6 +1640,9 @@ code, pre, .mono { font-family: var(--font-mono); }
   .stat-grid { grid-template-columns:1fr 1fr; }
   .dash-row, .monitor-grid, .agent-grid, .agentic-grid, .spec-grid { grid-template-columns:1fr !important; }
   .modal { min-width:0 !important; width:96vw !important; max-width:96vw !important; max-height:92vh; overflow-y:auto; }
+  .jv2 { flex-direction:column; height:auto; }
+  .jv2-side { flex:none; max-height:32vh; }
+  .jv2-stage { min-height:70vh; }
   .drawer { width:100vw; max-width:100vw; }
   .kanban-board { height:calc(100dvh - 220px); }
   .kanban-col { min-width:78vw; }
