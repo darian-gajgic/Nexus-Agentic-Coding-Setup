@@ -11,7 +11,15 @@ The Wav2Lip talking-head is **RETIRED from the pipeline** (endpoints `/talk`
 and `/lipsync` still exist for compat but nothing calls them; lipsync.py is
 dormant). The v2 stack:
 
-- **Avatar** = `static/jarvis3d.js`: a Three.js POINT-CLOUD HEAD sampled from
+- **Avatar (v8, 2026-07-08)** = generic male particle bust from a REAL head
+  scan: "Head (Lee Perry-Smith)" by Lee Perry-Smith / Infinite-Realities
+  (ir-ltd.net), **CC Attribution 3.0 Unported**, self-hosted at
+  static/avatar/male_head.glb. `scripts/build_avatar_from_glb.py` samples it
+  (+ procedural torso) into static/avatar/head_points.json incl. opaque
+  occluder meshes; jarvis3d.js loads that (procedural sculpt = fallback).
+  NOTE: the GLB faces +z as authored — do NOT "fix" its orientation.
+  Historical (superseded) approach below:
+- ~~Avatar~~ = `static/jarvis3d.js`: a Three.js POINT-CLOUD HEAD sampled from
   `static/avatar/reference.jpg` (contrast-stretched luminance + edge boost →
   particle density/brightness; ellipsoid relief), with node streams flowing
   from the back of the skull into the user's REAL memory galaxy
