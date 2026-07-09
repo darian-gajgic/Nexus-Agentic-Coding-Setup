@@ -3,6 +3,7 @@
 GPU-accelerated STT (faster-whisper) and TTS (Piper) running locally.
 No cloud calls, no API keys, zero cost.
 """
+import gc
 import io
 import os
 import wave
@@ -13,6 +14,8 @@ import traceback
 import numpy as np
 from pathlib import Path
 from typing import Optional
+
+import gpu_lock
 
 # ── CUDA preload (must happen before ctranslate2 import) ──
 import ctypes, glob
@@ -73,8 +76,11 @@ def _touch_voice():
 
 def _drop_stt():
     global _stt_model, _stt_loaded_key
+    dropped = _stt_model is not None
     _stt_model = None
     _stt_loaded_key = None
+    if dropped:
+        gc.collect()  # break any lingering cycles so VRAM is returned promptly
 
 
 def unload_voice_models():
@@ -88,6 +94,7 @@ def unload_voice_models():
             pass
         _tts_voice = None
         _tts_loaded_path = None
+        gc.collect()
 
 
 def _stt_target() -> tuple:
@@ -188,13 +195,27 @@ def _detect_format(audio_bytes: bytes) -> str:
     return '.webm'  # default assumption for MediaRecorder output
 
 
+def _is_gpu_failure(e: Exception) -> bool:
+    """CUDA-side failure (OOM / cudaErrorInvalidDevice / cuBLAS / cuDNN /
+    alloc) — the class of errors where retrying CUDA under VRAM contention
+    just fails again, so the right move is straight to CPU."""
+    s = str(e).lower()
+    return any(sig in s for sig in (
+        "out of memory", "cuda", "cublas", "cudnn", "failed to allocate"))
+
+
 def _run_transcribe(tmp_path: str) -> str:
-    model = _get_stt()
-    lang = _conf("voice.stt_language", "en") or None  # empty = autodetect
-    if lang and _stt_loaded_key and _stt_loaded_key[0].endswith(".en"):
-        lang = "en"  # english-only checkpoints reject other language hints
-    segments, _info = model.transcribe(tmp_path, language=lang, beam_size=3, vad_filter=True)
-    text = " ".join(s.text.strip() for s in segments).strip()
+    # Heavy GPU section (model load + decode) — serialize with SigLIP/SDXL/VLM
+    # on the shared 12GB card so concurrent bursts stop OOMing each other.
+    # CPU loads skip the lock entirely (a fallback must not queue behind GPU work).
+    with gpu_lock.gpu_section("stt", timeout=20.0,
+                              enabled=_stt_target()[1] == "cuda"):
+        model = _get_stt()
+        lang = _conf("voice.stt_language", "en") or None  # empty = autodetect
+        if lang and _stt_loaded_key and _stt_loaded_key[0].endswith(".en"):
+            lang = "en"  # english-only checkpoints reject other language hints
+        segments, _info = model.transcribe(tmp_path, language=lang, beam_size=3, vad_filter=True)
+        text = " ".join(s.text.strip() for s in segments).strip()
     _touch_voice()  # completion counts as use — long turns aged out mid-flight
     return text
 
@@ -202,11 +223,11 @@ def _run_transcribe(tmp_path: str) -> str:
 def _transcribe_sync(audio_bytes: bytes) -> str:
     """Transcribe audio bytes (webm, wav, mp3 — any ffmpeg-supported format).
 
-    Self-healing: a CUDA hiccup (OOM / cudaErrorInvalidDevice under VRAM
-    contention with the vision worker or ollama) used to surface as a silent
-    500 to the browser. Now: log it, drop + reload the model and retry once;
-    if that also fails, block the GPU for GPU_RETRY_COOLDOWN and answer from
-    a CPU int8 model — STT degrades instead of dying.
+    Self-healing: a CUDA failure (OOM / cudaErrorInvalidDevice / cuBLAS under
+    VRAM contention with the vision worker or ollama) goes STRAIGHT to the CPU
+    int8 model — the GPU block is set on the FIRST failure, because retrying
+    CUDA under contention just OOMs a second time (audit §3.6). Non-GPU
+    hiccups keep the drop-model-and-retry-once path.
     """
     ext = _detect_format(audio_bytes)
 
@@ -220,10 +241,17 @@ def _transcribe_sync(audio_bytes: bytes) -> str:
         try:
             return _run_transcribe(tmp_path)
         except Exception as e:
-            print(f"[voice] STT failed ({e!r}) — dropping model and retrying", flush=True)
-            traceback.print_exc()
             # loaded_key is None when the LOAD itself failed — judge by target
             was_cuda = (_stt_loaded_key or _stt_target())[1] == "cuda"
+            if was_cuda and _is_gpu_failure(e):
+                print(f"[voice] STT CUDA failure ({e!r}) — CPU fallback for "
+                      f"{GPU_RETRY_COOLDOWN:.0f}s", flush=True)
+                traceback.print_exc()
+                _stt_gpu_block_until = _time.time() + GPU_RETRY_COOLDOWN
+                _drop_stt()
+                return _run_transcribe(tmp_path)  # target is now CPU
+            print(f"[voice] STT failed ({e!r}) — dropping model and retrying", flush=True)
+            traceback.print_exc()
             _drop_stt()
             try:
                 return _run_transcribe(tmp_path)
