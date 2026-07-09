@@ -132,6 +132,13 @@ async function api(method, path, body) {
 // auth_required=false and boot goes straight to init() as before.
 let authState = { required: false, user: null };
 
+// F103: client-side gate for admin-only panels. Reliable from the first
+// render — bootAuth awaits /api/auth/state before init(); a machine with
+// login OFF is the single operator, i.e. the admin.
+function isAdminUser() {
+  return !authState.required || !!(authState.user && authState.user.role === 'admin');
+}
+
 async function bootAuth() {
   try {
     const st = await api('GET', '/api/auth/state');
@@ -196,6 +203,7 @@ async function doLogin(e) {
 }
 
 async function doLogout() {
+  try { jarvisHardStop(); } catch { }   // stop any live JARVIS turn/audio before the reload
   try { await api('POST', '/api/auth/logout'); } catch { }
   location.reload();
 }
@@ -314,8 +322,8 @@ async function handleWSMessage(msg) {
     updateApprovalBadge();
     if (msg.type === 'approval_created') toast('New approval request pending', 'info');
   }
-  if (msg.type === 'job_created' || msg.type === 'job_updated' || msg.type === 'job_deleted') {
-    const jobs = await api('GET', '/api/scheduler');
+  if (isAdminUser() && (msg.type === 'job_created' || msg.type === 'job_updated' || msg.type === 'job_deleted')) {
+    const jobs = await api('GET', '/api/scheduler');   // admin-gated — members skip (F103)
     state.schedulerJobs = jobs.jobs || [];
   }
   if (msg.type === 'lesson_decided' || msg.type === 'specialist_memory_added' || msg.type === 'specialist_saved') {
@@ -377,11 +385,16 @@ async function loadAll() {
 // Fetch all agentic subsystem data (called on init and when entering the Agentic view)
 async function loadAgenticData() {
   try {
+    // Verify runs, scheduler and watchdog are admin-gated (Batch 6) — for
+    // members don't even ask, or every load fires three 403s (F103). This also
+    // keeps the member-visible fetches (approvals/health/quota) from being
+    // dragged down by a rejected Promise.all.
+    const admin = isAdminUser();
     const [runs, appr, jobs, wd, health, quota] = await Promise.all([
-      api('GET', '/api/verify/runs?limit=10'),
+      admin ? api('GET', '/api/verify/runs?limit=10') : { runs: [] },
       api('GET', '/api/approvals?status=pending'),
-      api('GET', '/api/scheduler'),
-      api('GET', '/api/watchdog/status'),
+      admin ? api('GET', '/api/scheduler') : { jobs: [] },
+      admin ? api('GET', '/api/watchdog/status') : {},
       api('GET', '/api/health/full'),
       api('GET', '/api/quota'),
     ]);
@@ -510,7 +523,7 @@ function switchView(view) {
     window.Memory3D.dispose();
   }
   if (currentView === 'jarvis' && view !== 'jarvis') {
-    jarvisTeardown();
+    jarvisViewDetach();   // visual-only: the live turn + TTS keep running (Option C)
   }
   currentView = view;
   agentsBuilt = false;
@@ -3814,6 +3827,10 @@ async function renderDrawerTab() {
   try {
     if (drawerState.tab === 'overview') body.innerHTML = drawerOverviewHTML(a);
     else if (drawerState.tab === 'memory') {
+      if (!isAdminUser()) {   // admin-gated endpoints — a member gets a note, not a 403 (F103)
+        body.innerHTML = '<div class="empty"><span class="e-ico">🔒</span>Agent memory is admin-only.</div>';
+        return;
+      }
       body.innerHTML = '<div class="loading">Loading memory…</div>';
       const [mem, ctxBlob] = await Promise.all([
         api('GET', `/api/agents/${id}/memory?limit=100`),
@@ -3823,6 +3840,10 @@ async function renderDrawerTab() {
       drawerState.cache.context = ctxBlob;
       body.innerHTML = drawerMemoryHTML(a);
     } else if (drawerState.tab === 'messages') {
+      if (!isAdminUser()) {
+        body.innerHTML = '<div class="empty"><span class="e-ico">🔒</span>Agent messages are admin-only.</div>';
+        return;
+      }
       body.innerHTML = '<div class="loading">Loading messages…</div>';
       const msgs = await api('GET', `/api/agents/${id}/messages?limit=50`);
       drawerState.cache.messages = msgs.messages || [];
@@ -5163,6 +5184,7 @@ function memSemanticHTML() {
 }
 
 function memAgentHTML() {
+  if (!isAdminUser()) return '<div class="empty"><span class="e-ico">🔒</span>Per-agent memory is admin-only.</div>';
   const agents = state.agents || [];
   if (!agents.length) return '<div class="empty"><span class="e-ico">◉</span>No agents to inspect.</div>';
   const sel = memoryState.agentSel || agents[0].id;
@@ -5263,7 +5285,7 @@ function viewMemory() {
 async function loadAgentMemoryTab() {
   memoryState.agentMem = null;
   const id = memoryState.agentSel;
-  if (!id) return;
+  if (!id || !isAdminUser()) return;  // admin-gated — the tab shows a 🔒 note instead (F103)
   try {
     const r = await api('GET', `/api/agents/${id}/memory?limit=100`);
     memoryState.agentMem = r.memory || [];
@@ -5718,12 +5740,10 @@ function viewAgentic() {
     </div>`;
   }).join('');
 
-  return `
-    <div class="agentic-grid">
-      <div class="agentic-card span2">
-        <div class="card-head"><h3>⏵ Approval Gates</h3><span class="badge-pill">${appr.length}</span></div>
-        <div class="card-body">${apprHtml}</div>
-      </div>
+  const admin = isAdminUser();
+  // F103: watchdog / verify runs / scheduler are admin-gated server-side —
+  // members get one quiet note instead of three cards full of 403s.
+  const adminCards = admin ? `
       <div class="agentic-card">
         <div class="card-head"><h3>🛡 Self-Healing Watchdog</h3><button class="btn-sm" onclick="showWatchdogModal()">⚙ Configure</button></div>
         <div class="card-body">
@@ -5743,7 +5763,19 @@ function viewAgentic() {
       <div class="agentic-card">
         <div class="card-head"><h3>⚙ Cron Scheduler</h3><button class="btn-primary sm" onclick="showJobModal()">+ Job</button></div>
         <div class="card-body" style="max-height:230px;overflow-y:auto">${jobsHtml}</div>
+      </div>` : `
+      <div class="agentic-card">
+        <div class="card-head"><h3>🔒 Admin tools</h3></div>
+        <div class="card-body"><div class="empty"><span class="e-ico">🔒</span>The watchdog, verify runs and the scheduler are managed by the admin.</div></div>
+      </div>`;
+
+  return `
+    <div class="agentic-grid">
+      <div class="agentic-card span2">
+        <div class="card-head"><h3>⏵ Approval Gates</h3><span class="badge-pill">${appr.length}</span></div>
+        <div class="card-body">${apprHtml}</div>
       </div>
+      ${adminCards}
       <div class="agentic-card span3">
         <div class="card-head"><h3>$ Cost Guardrails</h3><button class="btn-sm" onclick="dispatchSettingsUI()">⚙ Budgets & limits</button><span style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">@ \$2/1M tok · bar = share of top spender</span></div>
         <div class="card-body" style="max-height:180px;overflow-y:auto">${costRows || '<div class="empty">No agents</div>'}</div>
@@ -5758,6 +5790,7 @@ function viewAgentic() {
       </div>
     </div>
 
+    ${admin ? `
     <div class="modal-overlay" id="verifyModal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
       <div class="modal" style="max-width:480px;min-width:420px">
         <h3 style="margin-bottom:14px">Run Verification</h3>
@@ -5775,7 +5808,7 @@ function viewAgentic() {
         <input id="jbAction" class="modal-input" placeholder="action" style="width:100%;margin-bottom:8px">
         <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn-primary" onclick="createJob()">Create</button></div>
       </div>
-    </div>
+    </div>` : ''}
   `;
 }
 
@@ -5981,6 +6014,7 @@ let jarvisState = {
   fxOn: localStorage.getItem('jvFxOn') !== '0',
   deckOpen: localStorage.getItem('jvDeckOpen') === '1',
   domain: null,
+  domainLabel: null,   // kept so the 📚 chip survives a view detach/re-attach
   abortController: null,
   ttsAnimating: false,  // true while the WS audio pipeline is speaking
   statusGen: 0,
@@ -6171,6 +6205,7 @@ function jarvisStopTTS() {
 }
 
 function jarvisTtsLevelLoop() {
+  if (currentView !== 'jarvis') return;  // detached — renderJarvisView restarts the loop
   if (!jarvisState.ttsAnimating || !jTTS.analyser) {
     if (window.Jarvis3D && !jarvisState.recording) window.Jarvis3D.setLevel(0);
     return;
@@ -6263,11 +6298,32 @@ function renderJarvisView() {
     window.Jarvis3D.setAnimations(jarvisState.fxOn);
   }
   if (jarvisState.messages.length) jarvisRenderFeed();
+  // Option C re-attach: a turn/speech may have kept running while the view was
+  // away — restore the busy controls, wake the audio clock, and restart the
+  // mouth loop + barge monitor that jarvisViewDetach shed.
+  if (jarvisState.streaming) {
+    const sb = $('#jSendBtn'), stb = $('#jStopBtn');
+    if (sb) sb.disabled = true;
+    if (stb) stb.style.display = 'block';
+  }
+  if (jarvisState.domain) jarvisSetDomain(jarvisState.domain, jarvisState.domainLabel);
+  if (jarvisState.audioContext && jarvisState.audioContext.state === 'suspended') {
+    jarvisState.audioContext.resume().catch(() => { });
+  }
+  if (jarvisState.ttsAnimating) {
+    jarvisTtsLevelLoop();
+    jarvisBargeMonitorStart();
+  }
   jarvisSetMode(jarvisState.streaming ? 'thinking' : jarvisState.ttsAnimating ? 'talking' : 'idle');
   jarvisMaybeBrief();
 }
 
-function jarvisTeardown() {
+// Leaving the JARVIS view (Batch 8 "Option C"): shed only what is DOM- or
+// presence-bound — avatar, mic capture, webcam/screen share, barge monitor,
+// view-scoped pollers. The in-flight chat stream, the TTS WebSocket and the
+// AudioContext deliberately SURVIVE, so JARVIS keeps streaming AND speaking
+// while another view is open; renderJarvisView re-attaches on return.
+function jarvisViewDetach() {
   try {
     if (jarvisState.mediaRecorder && jarvisState.recording) {
       jarvisState.mediaRecorder.onstop = null;
@@ -6277,15 +6333,19 @@ function jarvisTeardown() {
   } catch { }
   jarvisState.recording = false;
   jarvisState.micAnalyser = null;
-  try { jarvisStopTTS(); } catch { }
-  try { jarvisStopStreaming(); } catch { }
   jarvisCaptureStop('webcam');
   jarvisCaptureStop('screen');
   jarvisBargeMonitorStop();
-  if (jTTS.ws) { try { jTTS.ws.close(); } catch { } jTTS.ws = null; }
   jarvisState.statusGen++;
   jarvisState.eventsGen++;
   if (window.Jarvis3D) window.Jarvis3D.dispose();
+}
+
+// The FULL stop — abort the turn, silence TTS, drop the audio socket. Only an
+// explicit user Stop or logout comes through here; a view switch must not.
+function jarvisHardStop() {
+  try { jarvisStopStreaming(); } catch { }
+  if (jTTS.ws) { try { jTTS.ws.close(); } catch { } jTTS.ws = null; }
 }
 
 function jarvisBindControls() {
@@ -6293,7 +6353,7 @@ function jarvisBindControls() {
   $('#jInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); jarvisSendText(); }
   });
-  $('#jStopBtn').addEventListener('click', () => jarvisStopStreaming());
+  $('#jStopBtn').addEventListener('click', () => jarvisHardStop());
   $('#jMicBtn').addEventListener('click', () => {
     if (jarvisState.recording) { jarvisStopRecording(); return; }
     if (jarvisState.ttsAnimating) jarvisStopTTS();   // click barge-in
@@ -6504,6 +6564,7 @@ function jarvisAddMessage(role, text, extra) {
 // ── domain chip (Business Brain) ──
 function jarvisSetDomain(domain, label) {
   jarvisState.domain = domain || null;
+  jarvisState.domainLabel = label || null;
   const chip = $('#jDomainChip');
   if (!chip) return;
   if (domain) {
@@ -7000,6 +7061,7 @@ function jarvisMicLevelLoop() {
 //    the user's voice (echoCancellation strips JARVIS's own output) and cuts
 //    playback so he immediately listens. ──
 async function jarvisBargeMonitorStart() {
+  if (currentView !== 'jarvis') return;  // never open the mic while detached (Option C)
   if (!jarvisState.conversationMode || jarvisState._barge || jarvisState.recording) return;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
