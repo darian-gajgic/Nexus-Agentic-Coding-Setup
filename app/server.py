@@ -2211,15 +2211,15 @@ async def jarvis_chat_stream(request: Request, body: dict):
         # — i.e. once it is genuinely no longer needed.
 
     async def event_generator():
-        # Stop pulling from Hermes the moment the browser goes away (tab closed
-        # mid-stream): check disconnect at every yield boundary so we don't keep
-        # generating (and billing) to a dead client, and emit a terminal [DONE]
-        # once the turn finishes on its own. (F011 SSE)
+        # Batch 8 "Option C": no request.is_disconnected() probe here — the
+        # Batch-2 token-saver aborted the whole Hermes run on any transient
+        # client blip, which cut JARVIS off mid-sentence on a view/tab switch.
+        # The turn now runs to completion; a genuine client death still cancels
+        # this generator at a yield boundary (Starlette), which the finally
+        # guard below absorbs without emitting into a dead pipe.
         normal_end = False
         try:
             async for _ev in _stream_body():
-                if await request.is_disconnected():
-                    return
                 yield _ev
             normal_end = True
         finally:
