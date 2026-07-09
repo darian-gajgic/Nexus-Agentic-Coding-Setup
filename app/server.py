@@ -2029,6 +2029,13 @@ async def jarvis_chat_stream(request: Request, body: dict):
             import vision as _vision_mod
             raw = base64.b64decode(frame_b64.split(",")[-1])
             frame_note = await _vision_mod.describe_image(raw, user_input)
+            try:
+                # Pin the EXACT described bytes (ingest below dedups + renames,
+                # so its output can't serve as "the frame JARVIS saw") — the
+                # edit-camera-frame skill prefers this pin over max(mtime).
+                _vision_mod.pin_looked_frame(uid, raw)
+            except Exception:
+                pass    # a pin failure must never break the turn
             asyncio.create_task(_vision_mod.ingest_frame(
                 uid, raw, body.get("frame_kind") or "webcam",
                 note=user_input[:200]))

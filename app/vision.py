@@ -186,6 +186,22 @@ def _frames_dir(user_id: str) -> Path:
     return d
 
 
+def pin_looked_frame(user_id: str, jpeg: bytes) -> Path:
+    """Pin the exact frame JARVIS just described to a stable per-user path.
+
+    describe_image sees the turn's raw bytes, but ingest_frame is
+    fire-and-forget AND dedups — the described frame may never land on disk
+    under a timestamp name, and by edit time max(mtime) points at a LATER
+    capture. The edit skill prefers this pin so "edit what you just saw"
+    operates on the described frame, not the newest one.
+    """
+    path = _frames_dir(user_id) / ".last-looked.jpg"
+    tmp = path.with_name(".last-looked.jpg.tmp")
+    tmp.write_bytes(jpeg)
+    os.replace(tmp, path)   # atomic — a reader never sees a half-written pin
+    return path
+
+
 async def ingest_frame(user_id: str, jpeg: bytes, kind: str, note: str = "") -> dict:
     """Store + index one webcam/screen/upload frame for this user.
     Near-duplicates of the PREVIOUS indexed frame (per user+kind) are skipped —
