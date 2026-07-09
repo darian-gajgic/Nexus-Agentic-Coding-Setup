@@ -30,6 +30,8 @@ from pathlib import Path
 
 import httpx
 
+import gpu_lock
+
 PROJECT = Path(__file__).parent
 FRAMES_ROOT = PROJECT / "workspaces" / "jarvis"
 ML_PY = os.path.expanduser("~/ml-env/bin/python")
@@ -101,10 +103,33 @@ def _ask_worker_sync(req: dict, timeout: float = 180.0) -> dict:
     return resp
 
 
+def _kill_and_respawn_worker(reason: str):
+    """After a request timeout the abandoned reader thread is still blocked on
+    stdout.readline() and the JSON-lines protocol is desynced (the late reply
+    would answer the NEXT request). Kill the worker — pipe EOF unblocks the
+    reader — and respawn fresh so the next request starts on a clean pipe."""
+    global _worker
+    w, _worker = _worker, None
+    if w is not None:
+        try:
+            w.kill()
+            w.wait(timeout=5)
+        except Exception:
+            pass
+    print(f"[vision] worker killed + respawned: {reason}", flush=True)
+    _worker = _spawn_worker()
+
+
 async def _ask_worker(req: dict, timeout: float = 180.0) -> dict:
     async with _worker_lock:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_ask_worker_sync, req, timeout), timeout)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_ask_worker_sync, req, timeout), timeout)
+        except TimeoutError:
+            await asyncio.to_thread(
+                _kill_and_respawn_worker,
+                f"{req.get('op')} timed out after {timeout:.0f}s")
+            raise
 
 
 def check_and_unload_idle():
@@ -273,9 +298,12 @@ async def warm_vlm() -> None:
     same short keep_alive as describe — so a dropped-but-never-asked image can't
     camp 6-8GB of VRAM."""
     try:
-        async with httpx.AsyncClient(timeout=240) as client:
-            await client.post(f"{OLLAMA_URL}/api/generate",
-                              json={"model": VLM_MODEL, "keep_alive": _vlm_keep_alive()})
+        # opportunistic prewarm: hold the cross-process GPU lock while ollama
+        # loads the 6-8GB model so it doesn't collide with STT/SigLIP/SDXL
+        async with gpu_lock.gpu_section_async("vlm-warm", timeout=10.0):
+            async with httpx.AsyncClient(timeout=240) as client:
+                await client.post(f"{OLLAMA_URL}/api/generate",
+                                  json={"model": VLM_MODEL, "keep_alive": _vlm_keep_alive()})
     except Exception:
         pass
 
@@ -302,16 +330,19 @@ async def describe_image(jpeg: bytes, prompt: str = "") -> str:
     # and allow the slow path to finish instead of ReadTimeout-ing at 120s.
     # keep_alive is short so the model frees VRAM soon after the turn; the chat
     # endpoint also evicts it explicitly once the turn ends (unload_vlm).
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(f"{OLLAMA_URL}/api/chat", json={
-            "model": VLM_MODEL, "stream": False,
-            "keep_alive": _vlm_keep_alive(),
-            "messages": [{"role": "user", "content": q,
-                          "images": [base64.b64encode(jpeg).decode()]}],
-            "options": {"num_predict": 256},
-        })
-        r.raise_for_status()
-        return (r.json().get("message") or {}).get("content", "").strip()
+    # The load + generation is the heaviest burst on the shared card — hold the
+    # cross-process GPU lock so STT/SigLIP/SDXL don't OOM into it.
+    async with gpu_lock.gpu_section_async("vlm-describe", timeout=60.0):
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(f"{OLLAMA_URL}/api/chat", json={
+                "model": VLM_MODEL, "stream": False,
+                "keep_alive": _vlm_keep_alive(),
+                "messages": [{"role": "user", "content": q,
+                              "images": [base64.b64encode(jpeg).decode()]}],
+                "options": {"num_predict": 256},
+            })
+            r.raise_for_status()
+            return (r.json().get("message") or {}).get("content", "").strip()
 
 
 # ── creation: SDXL-Turbo via the worker ─────────────────────────────────────

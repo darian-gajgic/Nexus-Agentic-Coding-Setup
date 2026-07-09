@@ -27,6 +27,8 @@ import traceback
 import torch
 from PIL import Image
 
+import gpu_lock  # sys.path[0] is this script's dir — the app tree
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SIGLIP_ID = "google/siglip-so400m-patch14-384"
 SDXL_ID = "stabilityai/sdxl-turbo"
@@ -67,8 +69,16 @@ def _drop_siglip():
 
 
 def _is_oom(e: Exception) -> bool:
-    return isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ())) \
-        or "out of memory" in str(e).lower()
+    """Any CUDA-side failure that means 'the GPU can't serve this right now' —
+    classic OOM, cudaErrorInvalidDevice (contended/lost device), cuBLAS/cuDNN
+    errors, generic CUDA alloc failures. All warrant the CPU fallback."""
+    if isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ())):
+        return True
+    s = str(e).lower()
+    return any(sig in s for sig in (
+        "out of memory", "cudaerrorinvaliddevice", "invalid device",
+        "cublas", "cudnn", "cuda error", "cuda failed",
+        "failed to allocate", "unable to allocate"))
 
 
 def _siglip_op_with_fallback(fn, req):
@@ -77,7 +87,11 @@ def _siglip_op_with_fallback(fn, req):
     self-heal so a contended GPU degrades 'seeing' instead of breaking it."""
     global _siglip_device
     try:
-        return fn(req)
+        # serialize the GPU section (load + forward) with STT/SDXL/VLM on the
+        # shared card; the CPU path skips the lock (must not queue behind GPU)
+        with gpu_lock.gpu_section("siglip", timeout=30.0,
+                                  enabled=_siglip_device == "cuda"):
+            return fn(req)
     except Exception as e:
         if _siglip_device == "cuda" and _is_oom(e):
             _siglip_device = "cpu"
@@ -148,13 +162,16 @@ def op_embed_text(req):
 
 
 def op_generate(req):
-    pipe = _get_sdxl()
     size = int(req.get("size", 768))
     steps = int(req.get("steps", 2))
-    img = pipe(prompt=req["prompt"][:800], num_inference_steps=steps,
-               guidance_scale=0.0, width=size, height=size).images[0]
-    img.save(req["out"])
-    torch.cuda.empty_cache()
+    # SDXL's offloaded layers stream through VRAM for the whole run — hold the
+    # cross-process lock so STT/SigLIP/VLM bursts don't collide with it
+    with gpu_lock.gpu_section("sdxl", timeout=120.0, enabled=DEVICE == "cuda"):
+        pipe = _get_sdxl()
+        img = pipe(prompt=req["prompt"][:800], num_inference_steps=steps,
+                   guidance_scale=0.0, width=size, height=size).images[0]
+        img.save(req["out"])
+        torch.cuda.empty_cache()
     return {"ok": True, "out": req["out"]}
 
 
