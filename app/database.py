@@ -183,7 +183,8 @@ def init_db():
         tokens_in INTEGER DEFAULT 0,
         tokens_out INTEGER DEFAULT 0,
         error TEXT,
-        heartbeat_at REAL
+        heartbeat_at REAL,
+        model TEXT
     );
 
     -- ===== Multi-user tables (Block 1, additive — docs/SPEC-MULTIUSER.md) =====
@@ -326,6 +327,11 @@ def init_db():
     existing_disp_cols = {r[1] for r in conn.execute("PRAGMA table_info(dispatches)").fetchall()}
     if "heartbeat_at" not in existing_disp_cols:
         conn.execute("ALTER TABLE dispatches ADD COLUMN heartbeat_at REAL")
+    if "model" not in existing_disp_cols:
+        # The EFFECTIVE run model of this dispatch (fallback included) — the
+        # per-model slot accounting groups by it; tasks.model is only the
+        # pre-fallback intent and under-counts the fallback pool.
+        conn.execute("ALTER TABLE dispatches ADD COLUMN model TEXT")
 
     # ===== Multi-user migration (Block 1, additive — docs/SPEC-MULTIUSER.md) =====
     # user_id on the per-user tables; NULL on activity = system-wide row.

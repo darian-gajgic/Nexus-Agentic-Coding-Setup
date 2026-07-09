@@ -1964,7 +1964,7 @@ def _jarvis_framing(uid: str, user_input: str = "") -> tuple[str, str | None]:
     brain_block, domain = "", None
     try:
         import jarvis_brain as _jb
-        brain_block, domain = _jb.brain_framing(user_input)
+        brain_block, domain = _jb.brain_framing(user_input, uid)
     except Exception:
         brain_block, domain = "", None
     brain_section = ("\n\n" + brain_block) if brain_block else ""
@@ -2106,7 +2106,9 @@ async def jarvis_chat_stream(request: Request, body: dict):
             if notes:
                 hermes_input = "\n".join(notes) + "\n\n" + hermes_input
         url = f"{HERMES_API_BASE}/api/sessions/{session_id}/chat/stream"
-        _framing, _domain = _jarvis_framing(uid, user_input)
+        # Framing build reads ~/knowledge files + runs board queries — keep it
+        # off the event loop (this generator runs inside the SSE stream).
+        _framing, _domain = await run_in_threadpool(_jarvis_framing, uid, user_input)
         if _domain:
             import jarvis_brain as _jb
             yield ("event: domain\n"

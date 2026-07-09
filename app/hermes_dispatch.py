@@ -69,6 +69,28 @@ def is_quota_error(text: str) -> bool:
     return any(sig in t for sig in QUOTA_SIGNATURES)
 
 
+def classify_failure(err) -> str:
+    """Coarse, greppable taxonomy of WHY a dispatch/worker died — logged as
+    [cause=…] in the activity feed so failure storms can be diagnosed from the
+    logs instead of guessed at (CUDA OOM vs Hermes timeout vs quota vs other)."""
+    t = str(err or "").lower()
+    if not t:
+        return "unknown"
+    if ("cuda" in t and ("out of memory" in t or "oom" in t)) \
+            or "cudaerrormemoryallocation" in t or "cublas" in t:
+        return "cuda-oom"
+    if is_quota_error(t):
+        return "quota"
+    if "timeout" in t or "timed out" in t or "exceeded max_seconds" in t:
+        return "hermes-timeout"
+    if "gateway did not respond" in t or "connecterror" in t or "connection refused" in t \
+            or "connection reset" in t or "all connection attempts failed" in t:
+        return "gateway-unreachable"
+    if "database is locked" in t or "sqlite" in t:
+        return "sqlite"
+    return "other"
+
+
 # ── Thin API wrappers ──
 
 def api_health(timeout: float = 3.0) -> dict:
@@ -221,10 +243,16 @@ SLOT_HEARTBEAT_FRESH_S = 120  # a dispatch silent this long holds no upstream sl
 
 
 def slots_in_use() -> dict:
-    """Live in-flight dispatch counts per model (fresh executor heartbeats only)."""
+    """Live in-flight dispatch counts per EFFECTIVE run model (fresh executor
+    heartbeats only). Each dispatch persists the model it actually runs on
+    (dispatches.model — overload fallback included); tasks.model is only the
+    pre-fallback intent, so counting by it booked every fallback dispatch under
+    the original model and over-admitted the fallback pool. tasks.model remains
+    the fallback for legacy rows still in flight across the upgrade."""
     cutoff = time.time() - SLOT_HEARTBEAT_FRESH_S
     rows = db.query_all(
-        "SELECT t.model AS model FROM dispatches d LEFT JOIN tasks t ON t.id = d.task_id "
+        "SELECT COALESCE(d.model, t.model) AS model "
+        "FROM dispatches d LEFT JOIN tasks t ON t.id = d.task_id "
         "WHERE d.state IN ('dispatching','streaming') "
         "AND COALESCE(d.heartbeat_at, d.started_at) > ?", (cutoff,))
     counts: dict = {}
@@ -265,16 +293,32 @@ def slot_available(model: str | None) -> bool:
 # clean, re-claimable state so a lane picks it up fresh.
 RECONCILE_STALE_S = 600  # a dispatch silent this long (>> the 30s keepalive and the
                          # worker's own 90s resume window) has no live executor
+RECONCILE_LANE_FRESH_S = 120  # an agent heartbeating within this window has a live
+                              # worker process (the lane loop beats every ~2s)
 
 
 def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watchdog") -> list[str]:
     """Re-queue tasks stranded in an active dispatch_state with a dead heartbeat.
 
-    Returns the reset task ids. Mirrors _retry_task's reset shape (session_id=NULL
-    forces a FRESH dispatch — never a 'continue' into a half-briefed/broken
-    session). Safe by construction: a live dispatch heartbeats at least every ~30s
-    (SSE keepalive, even mid-tool-call), so the default threshold never catches
-    running work; tune via setting dispatch.reconcile_stale_s.
+    Scope: ONLY dispatches no live executor will ever pick up again. Two guards
+    keep it from clobbering healthy work:
+      - a task claimed by an agent whose worker still heartbeats, with
+        status='in_progress' (so it matches that lane's own work query), is
+        merely PARKED — e.g. waiting for a free per-model concurrency slot, or
+        inside the lane's own 90s resume window. The lane handles it; skip.
+      - a task whose orphaned Hermes run is still executing ('active') or
+        already finished ('finished') keeps its session_id: the re-queued task
+        flows into the resume path (harvest the finished result for free, or
+        wait out / continue the live run) instead of abandoning that work in a
+        fresh dispatch. This also makes the BOOT-time reconcile defer to
+        resume after a long outage. Gateway unreachable → defer the decision
+        to the next sweep rather than guessing.
+
+    Returns the reset task ids. Otherwise mirrors _retry_task's reset shape
+    (session_id=NULL forces a FRESH dispatch — never a 'continue' into a
+    half-briefed/broken session). A live dispatch heartbeats at least every
+    ~30s (SSE keepalive, even mid-tool-call), so the default threshold never
+    catches running work; tune via setting dispatch.reconcile_stale_s.
     """
     if stale_s is None:
         try:
@@ -287,9 +331,10 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
     active = ("queued", "dispatching", "streaming", "finalizing")
     placeholders = ",".join("?" * len(active))
     reset: list[str] = []
+    gateway_ok: bool | None = None  # probed lazily, once per sweep
     for t in db.query_all(
-            "SELECT id, user_id, tokens_used, budget_tokens FROM tasks "
-            f"WHERE dispatch_state IN ({placeholders})", active):
+            "SELECT id, user_id, status, claimed_by, session_id, tokens_used, "
+            f"budget_tokens FROM tasks WHERE dispatch_state IN ({placeholders})", active):
         tid = t["id"]
         hb = db.query_one(
             "SELECT MAX(COALESCE(heartbeat_at, started_at, 0)) AS ts FROM dispatches "
@@ -297,6 +342,18 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
         ts = (hb or {}).get("ts") or 0
         if ts > cutoff:
             continue  # a live (or recently-live) executor is on it — leave it
+        if t.get("claimed_by") and t.get("status") == "in_progress":
+            ag = db.query_one("SELECT last_heartbeat FROM agents WHERE id=?",
+                              (t["claimed_by"],))
+            if ag and float(ag.get("last_heartbeat") or 0) > now - RECONCILE_LANE_FRESH_S:
+                continue  # a live lane owns this claim (slot-parked, not dead)
+        keep_session = False
+        if t.get("session_id"):
+            if gateway_ok is None:
+                gateway_ok = bool(api_health().get("connected"))
+            if not gateway_ok:
+                continue  # can't judge the session (gateway down, e.g. early boot) — next sweep
+            keep_session = orphan_run_state(t) in ("finished", "active")
         # 1) close the orphaned in-flight rows so they can't be resumed or miscounted
         db.execute(
             "UPDATE dispatches SET state='failed', ended_at=?, "
@@ -307,11 +364,18 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
         if used > 0:
             db.execute("UPDATE tasks SET budget_tokens=? WHERE id=?",
                        (used + int(t.get("budget_tokens") or default_budget), tid))
-        # 3) reset to a clean, claimable state — session_id=NULL => fresh dispatch
-        db.execute(
-            "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
-            "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, updated_at=? WHERE id=?",
-            (now, tid))
+        # 3) reset to a clean, claimable state. session kept => the next lane
+        #    RESUMES (harvest/continue); session_id=NULL => fresh dispatch.
+        if keep_session:
+            db.execute(
+                "UPDATE tasks SET status='todo', dispatch_state='none', "
+                "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, updated_at=? WHERE id=?",
+                (now, tid))
+        else:
+            db.execute(
+                "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
+                "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, updated_at=? WHERE id=?",
+                (now, tid))
         # 4) expire the now-superseded deliverable approval, if any (parity with _retry_task)
         db.execute(
             "UPDATE approvals SET status='expired', decided_at=?, decided_by='reconciled: task reset' "
@@ -319,7 +383,9 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
             (now, f'%"task_id": "{tid}"%'))
         db.log_activity("warn", source,
                         f"Task {tid}: reconciled orphaned dispatch (no heartbeat for "
-                        f"{int((now - ts) / 60)}m) — re-queued for a fresh attempt",
+                        f"{int((now - ts) / 60)}m) — re-queued "
+                        + ("to resume its live/harvestable session" if keep_session
+                           else "for a fresh attempt"),
                         user_id=t.get("user_id"))
         reset.append(tid)
     return reset
@@ -796,6 +862,19 @@ def notify_desktop(title: str, body: str):
         pass
 
 
+def _repo_diff_present(workspace: Path) -> bool:
+    """Repo mode: a non-empty branch diff captured at finalize = real work
+    shipped on the branch, whatever the chat reply looks like."""
+    p = workspace / "changes.diff"
+    try:
+        if not p.is_file():
+            return False
+        d = p.read_text().strip()
+        return bool(d) and not d.startswith("(no changes")
+    except Exception:
+        return False
+
+
 def _set_task(task_id: str, **fields):
     sets = ", ".join(f"{k}=?" for k in fields)
     db.execute(f"UPDATE tasks SET {sets}, updated_at=? WHERE id=?",
@@ -813,25 +892,31 @@ def _make_on_event(dispatch_id: str, task_id: str, agent_id: str):
     preview = {"buf": "", "last_write": 0.0}
 
     def on_event(name, data):
+        # Telemetry only: a transient SQLite error (locked/busy under load)
+        # must never abort the live SSE stream it decorates — the next event
+        # retries the same writes anyway.
         now = time.time()
-        if now - preview["last_write"] > 2.0:
-            db.execute("UPDATE agents SET last_heartbeat=? WHERE id=?", (now, agent_id))
-            db.execute("UPDATE dispatches SET heartbeat_at=? WHERE id=?", (now, dispatch_id))
-            preview["last_write"] = now
-        if name == "_line" or data is None:
-            return
-        if name == "assistant.delta":
-            preview["buf"] = (preview["buf"] + (data.get("delta") or ""))[-200:]
-            tail = " ".join(preview["buf"].split())[-70:]
-            db.execute("UPDATE agents SET current_task=? WHERE id=?",
-                       (f"{task_id}: …{tail}", agent_id))
-        elif name == "tool.completed":
-            db.log_activity("info", agent_id,
-                            f"[{task_id}] tool {data.get('tool_name') or data.get('tool') or '?'} done",
-                            user_id=_task_user(task_id))
-        elif name == "run.started":
-            db.log_activity("info", agent_id, f"[{task_id}] Hermes run started",
-                            user_id=_task_user(task_id))
+        try:
+            if now - preview["last_write"] > 2.0:
+                db.execute("UPDATE agents SET last_heartbeat=? WHERE id=?", (now, agent_id))
+                db.execute("UPDATE dispatches SET heartbeat_at=? WHERE id=?", (now, dispatch_id))
+                preview["last_write"] = now
+            if name == "_line" or data is None:
+                return
+            if name == "assistant.delta":
+                preview["buf"] = (preview["buf"] + (data.get("delta") or ""))[-200:]
+                tail = " ".join(preview["buf"].split())[-70:]
+                db.execute("UPDATE agents SET current_task=? WHERE id=?",
+                           (f"{task_id}: …{tail}", agent_id))
+            elif name == "tool.completed":
+                db.log_activity("info", agent_id,
+                                f"[{task_id}] tool {data.get('tool_name') or data.get('tool') or '?'} done",
+                                user_id=_task_user(task_id))
+            elif name == "run.started":
+                db.log_activity("info", agent_id, f"[{task_id}] Hermes run started",
+                                user_id=_task_user(task_id))
+        except Exception:
+            pass
 
     return on_event
 
@@ -861,13 +946,19 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     # content or the raw error string AS the reply ("API call failed after
     # 3 retries: HTTP 429: …") — no error event, no exception (both shapes
     # verified 2026-07-08 against the live gateway; fresh first turns raise
-    # instead). Neither is a success when no deliverable file exists either —
-    # route them into the quota machinery (fallback retry, then backoff)
-    # instead of completing the task with nothing / with an error string.
+    # instead). But an empty/short reply is NOT proof of a quota hit: in repo
+    # mode the branch diff is the real deliverable (a terse reply with a
+    # non-empty changes.diff is a SUCCESS), and QuotaError pauses EVERY lane
+    # via note_quota_hit. So: only an actual rate-limit signature in the reply
+    # enters the quota machinery (fallback retry, then backoff); a
+    # signature-less empty run fails THIS task only.
     stripped = (content or "").strip()
     if not err_text and not harvested and not (workspace / "deliverable.md").exists() \
-            and (not stripped or (len(stripped) < 300 and is_quota_error(stripped))):
-        raise QuotaError(stripped or "empty run result — upstream produced no content (load-shed)")
+            and not _repo_diff_present(workspace):
+        if stripped and len(stripped) < 300 and is_quota_error(stripped):
+            raise QuotaError(stripped)
+        if not stripped:
+            err_text = "empty run result — upstream produced no content"
 
     tin = int(usage.get("input_tokens") or 0)
     tout = int(usage.get("output_tokens") or 0)
@@ -887,8 +978,9 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
         _set_dispatch(dispatch_id, state="failed", ended_at=time.time(),
                       tokens_in=tin, tokens_out=tout, error=err_text)
         db.execute("UPDATE agents SET tasks_failed=tasks_failed+1 WHERE id=?", (agent_id,))
-        db.log_activity("error", agent_id, f"Task {task_id} dispatch failed: {err_text[:120]}",
-                        user_id=task.get("user_id"))
+        db.log_activity("error", agent_id,
+                        f"Task {task_id} dispatch failed [cause={classify_failure(err_text)}]: "
+                        f"{err_text[:120]}", user_id=task.get("user_id"))
         notify_desktop("Nexus: task failed", f"{task['title']} — {err_text[:120]}")
         return
 
@@ -1022,6 +1114,16 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
     run_model = fallback_model or resolve_task_model(task)
+    if resume and not fallback_model and task.get("session_id"):
+        # A resumed session may run on a DIFFERENT model than the task row says
+        # (an overload fallback creates its session on the fallback model but
+        # never updates tasks.model). The dispatch that created the session
+        # recorded the EFFECTIVE model — resume on (and slot-count) that one.
+        prev = db.query_one(
+            "SELECT model FROM dispatches WHERE session_id=? AND model IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 1", (task["session_id"],))
+        if prev and prev.get("model"):
+            run_model = prev["model"]
     workspace = WORKSPACES / task_id
     workspace.mkdir(parents=True, exist_ok=True)
     db.execute("UPDATE agents SET status='busy', current_task=? WHERE id=?",
@@ -1029,6 +1131,7 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
     _set_task(task_id, workspace_path=str(workspace))
     on_event = _make_on_event(dispatch_id, task_id, agent_id)
 
+    resume_with_context = False  # the session's transcript actually heard the brief
     try:
         # Free recovery first: the orphaned run may already be complete (R3.3).
         if resume:
@@ -1040,23 +1143,36 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                     _finalize_result(dispatch_id, task_id, agent_id, workspace,
                                      harvested["content"], harvested["usage"], None, harvested=True)
                     return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
+                # unharvestable final reply (failure string) — the transcript
+                # still holds the full brief, so a continue-turn is safe
+                resume_with_context = True
             elif state == "active":
                 # The orphaned run is STILL EXECUTING on the Hermes side — a
                 # continue-turn now would open a second concurrent run on the
                 # same session. Refresh the heartbeat and wait; the lane's
                 # stale check re-enters here until it finishes or goes quiet.
                 _set_dispatch(dispatch_id, session_id=task.get("session_id"),
-                              state="streaming", heartbeat_at=time.time())
+                              state="streaming", heartbeat_at=time.time(), model=run_model)
                 _set_task(task_id, dispatch_state="streaming")
                 db.log_activity("info", agent_id,
                                 f"Task {task_id}: orphaned run still active — waiting, not resuming")
                 return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
+            elif state == "dead" and task.get("session_id"):
+                # 'dead' covers BOTH a quiet transcript and an EMPTY one (the
+                # previous worker died before its first turn went out). A bare
+                # "continue" into a session that never heard the brief strands
+                # the agent with half a task — only continue on real context.
+                try:
+                    resume_with_context = bool(get_messages(task["session_id"]))
+                except Exception:
+                    resume_with_context = False
             if task.get("session_id") and get_session(task["session_id"]) is None:
                 # Session unusable → fall back to a fresh re-dispatch (R3.4).
                 db.log_activity("warn", agent_id,
                                 f"Task {task_id}: session {task['session_id']} gone — fresh re-dispatch")
                 _set_task(task_id, session_id=None)
                 task["session_id"] = None
+                resume_with_context = False
 
         # Test-only fault injection for the quota gate (SPEC R7.3) — off by default.
         if db.get_setting("dispatch.force_429") == "1":
@@ -1086,7 +1202,7 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         # at finalize.
         publish_session_key(session_id, task.get("user_id"), run_model)
         _set_dispatch(dispatch_id, session_id=session_id, state="streaming",
-                      heartbeat_at=time.time())
+                      heartbeat_at=time.time(), model=run_model)
         _set_task(task_id, dispatch_state="streaming", dispatch_error=None)
         db.log_activity("info", agent_id,
                         f"{'Resuming' if resume else 'Dispatched'} task {task_id} "
@@ -1103,12 +1219,14 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                             f"Task {task_id}: could not create worktree in {task.get('repo_path')}")
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
         framing = build_framing(task, workspace, repo_ctx)
-        if resume:
+        if resume and resume_with_context:
             input_text = (f"You were interrupted mid-task. Continue task {task_id} now and "
                           "finish it. The original instructions still apply: write the final "
                           f"deliverable to {workspace}/deliverable.md and reply with the "
                           "complete final deliverable text.")
         else:
+            # Fresh dispatch, OR a "resume" whose session never heard the brief
+            # (worker died before/at the first turn) — send the FULL brief.
             input_text = f"{task['title']}\n\n{task.get('description') or ''}".strip()
         result = stream_turn(session_id, input_text, system_message=framing, on_event=on_event,
                              max_seconds=int(db.get_setting("dispatch.max_turn_seconds",
@@ -1168,7 +1286,9 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         _set_task(task_id, dispatch_state="failed", dispatch_error=str(e)[:300])
         _set_dispatch(dispatch_id, state="failed", ended_at=time.time(), error=str(e)[:300])
         db.execute("UPDATE agents SET tasks_failed=tasks_failed+1 WHERE id=?", (agent_id,))
-        db.log_activity("error", agent_id, f"Task {task_id} dispatch crashed: {str(e)[:120]}",
+        db.log_activity("error", agent_id,
+                        f"Task {task_id} dispatch crashed [cause={classify_failure(e)}] "
+                        f"({type(e).__name__}): {str(e)[:120]}",
                         user_id=_task_user(task_id))
     finally:
         # A lane with a live worker is always 'running' (never 'idle') — the
