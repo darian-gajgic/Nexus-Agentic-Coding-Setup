@@ -38,6 +38,17 @@ WORKSPACES = Path(__file__).parent / "workspaces" / "evals"
 MAX_CASES_PER_RUN = 8
 GEN_MAX_SECONDS = 1500  # single-deliverable briefs; well under the 45-min task cap
 
+# Super Result (SUPER-RESULT-PLAN-2026-07-09.md §6 Step 4): grounded critic.
+CRITIC_SANDBOXES = Path(__file__).parent / "workspaces" / "_critic"
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+CRITIC_JSON_BEGIN = "NEXUS_CRITIC_JSON_BEGIN"
+CRITIC_JSON_END = "NEXUS_CRITIC_JSON_END"
+DELIVERABLE_TYPES = ("analysis", "code_change", "content", "research")
+
+
+def knowledge_root() -> str:
+    return os.path.expanduser(db.get_setting("onboarding.root", "") or KNOWLEDGE_DIR)
+
 
 def corpus_root() -> str:
     return db.get_setting("evals.corpus_root", "") or os.path.join(KNOWLEDGE_DIR, "domains")
@@ -69,12 +80,15 @@ def _case_from_file(fp: str) -> dict | None:
     if not body.strip():
         return None
     cid = os.path.basename(fp)[:-3]
+    dtype = (fm.get("deliverable_type") or "").strip()
     return {
         "id": cid,
         "title": (fm.get("title") or cid.replace("-", " ")).strip()[:200],
         "specialist": (fm.get("specialist") or "").strip() or None,
         "model": (fm.get("model") or "").strip() or None,
         "notes": (fm.get("notes") or "").strip()[:300],
+        # optional (N1): lets an eval case opt into the type rubric
+        "deliverable_type": dtype if dtype in DELIVERABLE_TYPES else None,
         "brief": body.strip(),
     }
 
@@ -123,6 +137,13 @@ def fingerprint(domain: str, specialists: list) -> dict:
     }
     for s in sorted({s for s in specialists if s}):
         files[f"specialist:{s}"] = os.path.expanduser(f"~/.hermes/agents/{s}.md")
+    # Type rubrics influence judging (N1) — editing INVESTIGATION.md must not
+    # shift scores under an "unchanged" fingerprint.
+    rdir = os.path.join(knowledge_root(), "rubrics")
+    if os.path.isdir(rdir):
+        for fn in sorted(os.listdir(rdir)):
+            if fn.endswith(".md"):
+                files[f"type_rubric:{fn}"] = os.path.join(rdir, fn)
     out = {}
     for key, fp in files.items():
         try:
@@ -150,7 +171,7 @@ def judge_model_for(user_id: str | None) -> tuple[str | None, str | None]:
 
 
 def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
-                  api_key: str | None = None) -> str:
+                  api_key: str | None = None, type_rubric: str | None = None) -> str:
     """Run the frontier judge command on a file (shared with the task judge).
     Template lives in settings judge.cmd so gates can stub it (R4.3).
 
@@ -181,6 +202,7 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
     # removes the shell layer entirely (defense in depth for judge.cmd).
     tokens = [t.replace("{file}", judged_path).replace("{domain}", domain)
                .replace("{model}", model or "")
+               .replace("{type_rubric}", type_rubric or "")
               for t in shlex.split(db.get_setting("judge.cmd", "cjudge {file} {domain}"))]
     tokens = [t for t in tokens if t != ""]  # a {model} token with no model vanishes
     # Under the systemd unit PATH may lack ~/.local/bin (where cjudge lives).
@@ -193,6 +215,11 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         env["JUDGE_MODEL"] = model
     if api_key:
         env["JUDGE_ANTHROPIC_API_KEY"] = api_key
+    if type_rubric:
+        # N1: type-aware judging — cjudge grades against BOTH rubrics when set.
+        # Optional parameter: absent = exactly today's behavior (eval runner
+        # passes it only when the case opts in via frontmatter).
+        env["JUDGE_TYPE_RUBRIC"] = type_rubric
     try:
         r = sp.run(tokens, capture_output=True, text=True, timeout=900,
                    cwd=KNOWLEDGE_DIR, env=env)
@@ -250,6 +277,335 @@ def parse_judge_metrics(text: str) -> dict:
         gates_failed += len(re.findall(r"\bFAIL(?:ED)?\b", line))
     return {"verdict": verdict, "score": score, "score_max": score_max,
             "gates_passed": gates_passed, "gates_failed": gates_failed}
+
+
+# ─────────────────────────── Grounded critic (Super Result) ───────────────────────────
+# SUPER-RESULT-PLAN-2026-07-09.md §6 Step 4. The critic re-verifies a
+# deliverable with FULL tool access inside a DISPOSABLE sandbox copy of the
+# evidence (workspace + local repo clone). Sandbox lifecycle is owned HERE
+# (locked decision §4.2): sp.run(timeout=…) kills the child and the finally:
+# block removes the sandbox — cverify only consumes a prepared sandbox.
+
+_SECRET_ENV_RE = re.compile(r"(?i)(api_key|apikey|token|secret|passw|credential)")
+
+
+def detect_deliverable_type(task: dict) -> str:
+    """analysis | code_change | content | research. Explicit column wins;
+    then structural signals; then a title/description keyword match."""
+    explicit = (task.get("deliverable_type") or "").strip()
+    if explicit in DELIVERABLE_TYPES:
+        return explicit
+    spec = (task.get("specialist") or "").strip()
+    domain = (task.get("domain") or "").strip()
+    if task.get("repo_path") or domain == "software-engineering" or spec in (
+            "code-implementer", "tech-lead-orchestrator", "code-reviewer",
+            "acceptance-verifier"):
+        return "code_change"
+    if spec in ("web-researcher", "market-researcher") or domain == "research-learning":
+        return "research"
+    if re.search(r"\b(audit|analy[sz]|investigat|reconcil|diagnos|assess|verif)",
+                 f"{task.get('title') or ''} {task.get('description') or ''}", re.I):
+        return "analysis"
+    return "content"
+
+
+def type_rubric_path(dtype: str | None) -> str | None:
+    """Deliverable-type rubric file, or None. Extensible: add entries as more
+    type rubrics exist (code_change/content have none yet)."""
+    names = {"analysis": "INVESTIGATION.md", "research": "INVESTIGATION.md"}
+    name = names.get(dtype or "")
+    if not name:
+        return None
+    fp = os.path.join(knowledge_root(), "rubrics", name)
+    return fp if os.path.isfile(fp) else None
+
+
+def _scrubbed_env() -> dict:
+    """Subprocess env with every secret-looking var dropped (§4.3c). The one
+    exception, JUDGE_ANTHROPIC_API_KEY, is re-added by run_critic_cmd when the
+    owner has a per-user judge credential."""
+    return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
+
+
+def build_critic_sandbox(task: dict, round_no: int = 1):
+    """Disposable evidence copy → (sandbox_root: Path, deliverable_rel: str).
+    Isolation (§4.3a): workspace copytree (heavy build dirs excluded; _history/,
+    deliverable.v*.md and attachments/ INCLUDED — they are evidence); repo tasks
+    get `git clone --local` + `git remote remove origin` (NOT a worktree —
+    worktrees share the object store and remotes with the live repo)."""
+    import shutil
+    import subprocess as sp
+    CRITIC_SANDBOXES.mkdir(parents=True, exist_ok=True)
+    # backstop (§4.2): sweep crash leftovers older than 24 h
+    cutoff = time.time() - 24 * 3600
+    for d in CRITIC_SANDBOXES.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+    ws = task.get("workspace_path") or ""
+    if not os.path.isdir(ws):
+        raise ValueError(f"task {task.get('id')} has no workspace directory to sandbox")
+    sandbox = CRITIC_SANDBOXES / f"{task['id']}-r{round_no}-{uuid.uuid4().hex[:6]}"
+    shutil.copytree(
+        ws, sandbox / "workspace",
+        ignore=shutil.ignore_patterns("_critic*", "node_modules", ".venv*",
+                                      ".next", "dist", "build", "__pycache__"),
+        ignore_dangling_symlinks=True)
+
+    repo_root = repo_branch = repo_base = repo_note = None
+    rp = (task.get("repo_path") or "").strip()
+    if rp:
+        try:
+            r = sp.run(["git", "clone", "--local", rp, str(sandbox / "repo")],
+                       capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or "clone failed")[-300:])
+            rr = str(sandbox / "repo")
+            b = sp.run(["git", "-C", rr, "symbolic-ref", "--short", "HEAD"],
+                       capture_output=True, text=True)
+            repo_base = (b.stdout or "").strip() or None
+            import hermes_dispatch as _hd  # lazy: avoid import cycle at module load
+            branch = f"nexus/{_hd._repo_slug(task)}"
+            chk = sp.run(["git", "-C", rr, "rev-parse", "--verify", branch],
+                         capture_output=True, text=True)
+            if chk.returncode == 0:
+                sp.run(["git", "-C", rr, "checkout", branch],
+                       capture_output=True, text=True)
+                repo_branch = branch
+            # push has nowhere to go now (belt: cverify also denies git push)
+            sp.run(["git", "-C", rr, "remote", "remove", "origin"],
+                   capture_output=True, text=True)
+            repo_root = "repo/"
+        except Exception as e:
+            repo_note = str(e)[:300]
+            shutil.rmtree(sandbox / "repo", ignore_errors=True)
+
+    ctx_dir = sandbox / "_critic_context"
+    ctx_dir.mkdir(exist_ok=True)
+    rubrics = {}
+    domain = (task.get("domain") or "").strip()
+    if domain:
+        dr = os.path.join(corpus_root(), domain, "RUBRIC.md")
+        if os.path.isfile(dr):
+            shutil.copy2(dr, ctx_dir / "RUBRIC.md")
+            rubrics["domain"] = "_critic_context/RUBRIC.md"
+    dtype = detect_deliverable_type(task)
+    tr = type_rubric_path(dtype)
+    if tr:
+        shutil.copy2(tr, ctx_dir / os.path.basename(tr))
+        rubrics["type"] = f"_critic_context/{os.path.basename(tr)}"
+    business = None
+    bc = os.path.join(knowledge_root(), "BUSINESS-CONTEXT.md")
+    if os.path.isfile(bc):
+        shutil.copy2(bc, ctx_dir / "BUSINESS-CONTEXT.md")
+        business = "_critic_context/BUSINESS-CONTEXT.md"
+
+    # Sibling reports: each DONE predecessor's deliverable — this is how the
+    # N investigator reports reach the reconciler's critic for cross-checking.
+    siblings = []
+    try:
+        import hermes_dispatch as _hd
+        for d in _hd.task_dependencies(task):
+            if d.get("status") != "done":
+                continue
+            fp = os.path.join(d.get("workspace_path") or "", "deliverable.md")
+            if os.path.isfile(fp):
+                (ctx_dir / "siblings").mkdir(exist_ok=True)
+                shutil.copy2(fp, ctx_dir / "siblings" / f"{d['id']}.md")
+                siblings.append({"task_id": d["id"],
+                                 "title": (d.get("title") or "")[:200],
+                                 "path": f"_critic_context/siblings/{d['id']}.md"})
+    except Exception:
+        pass
+
+    prev = None
+    versions = [int(m.group(1)) for f in os.listdir(sandbox / "workspace")
+                if (m := re.match(r"deliverable\.v(\d+)\.md$", f))]
+    if versions:
+        prev = f"workspace/deliverable.v{max(versions)}.md"
+
+    open_comments = [{"file_path": c["file_path"], "line_no": c.get("line_no"),
+                      "body": (c.get("body") or "")[:300]}
+                     for c in db.query_all(
+                         "SELECT file_path, line_no, body FROM review_comments "
+                         "WHERE task_id=? AND status='open' ORDER BY created_at",
+                         (task["id"],))][:50]
+
+    import settings_registry as sreg
+    ctx = {
+        "task_id": task["id"], "title": (task.get("title") or "")[:200],
+        "round": round_no,
+        "brief": (task.get("description") or "")[:4000],
+        "retry_feedback_last": task.get("retry_feedback") or "",
+        "deliverable": "workspace/deliverable.md",
+        "deliverable_type": dtype,
+        "workspace_root": "workspace/",
+        "repo_root": repo_root, "repo_branch": repo_branch, "repo_base": repo_base,
+        "previous_version": prev,
+        "sibling_reports": siblings,
+        "rubrics": rubrics,
+        "business_context": business,
+        "max_findings": int(sreg.conf("super.max_findings", "25") or 25),
+        "open_comments": open_comments,
+    }
+    if repo_note:
+        ctx["repo_note"] = repo_note
+    (ctx_dir / "context.json").write_text(json.dumps(ctx, indent=2))
+    return sandbox, "workspace/deliverable.md"
+
+
+def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
+                   api_key: str | None = None, round_no: int = 1) -> str:
+    """Build the sandbox, run the critic command (settings super.critic_cmd —
+    gates stub it, same contract as judge.cmd), tear the sandbox down.
+    Mirrors run_judge_cmd; the timeout is owned HERE (§4.2)."""
+    import shlex
+    import shutil
+    import subprocess as sp
+    import settings_registry as sreg
+    sandbox, deliv_rel = build_critic_sandbox(task, round_no)
+    try:
+        tokens = [t.replace("{file}", str(sandbox / deliv_rel))
+                   .replace("{domain}", domain or "-")
+                   .replace("{sandbox}", str(sandbox))
+                   .replace("{model}", model or "")
+                  for t in shlex.split(
+                      sreg.conf("super.critic_cmd", "cverify {file} {domain} {sandbox}"))]
+        tokens = [t for t in tokens if t != ""]
+        # Under the systemd unit PATH may lack ~/.local/bin (where cverify lives).
+        if tokens and not shutil.which(tokens[0]):
+            candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+            if os.path.isfile(candidate):
+                tokens[0] = candidate
+        env = _scrubbed_env()
+        if model:
+            env["JUDGE_MODEL"] = model
+        if api_key:
+            env["JUDGE_ANTHROPIC_API_KEY"] = api_key
+        env["SUPER_MAX_FINDINGS"] = sreg.conf("super.max_findings", "25")
+        timeout_s = int(sreg.conf("super.timeout_s", "1500") or 1500)
+        try:
+            r = sp.run(tokens, capture_output=True, text=True, timeout=timeout_s,
+                       cwd=str(sandbox), env=env)
+            out = (r.stdout or "")
+            if r.returncode != 0:
+                out += f"\n[critic exited {r.returncode}] {(r.stderr or '')[-1000:]}"
+        except sp.TimeoutExpired:
+            out = f"[critic timed out after {timeout_s}s]"
+        except Exception as e:
+            out = f"[critic failed to run: {e}]"
+        return out
+    finally:
+        if sreg.conf("super.keep_sandbox", "0") != "1":
+            shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def _clip(v, n: int) -> str:
+    return str(v).strip()[:n] if v is not None else ""
+
+
+def parse_critic_json(text: str, repo_task: bool = False) -> dict:
+    """Extract + validate the critic's sentinel-fenced JSON. Raises ValueError
+    on unusable output (caller stores verdict='error' and escalates)."""
+    t = text or ""
+    raw = None
+    b = t.rfind(CRITIC_JSON_BEGIN)  # last occurrence — narration may quote it
+    if b != -1:
+        e = t.find(CRITIC_JSON_END, b)
+        if e != -1:
+            raw = t[b + len(CRITIC_JSON_BEGIN):e].strip()
+    if raw is None:
+        # fallback: last balanced {…} block in the output
+        end = t.rfind("}")
+        if end != -1:
+            depth = 0
+            for i in range(end, -1, -1):
+                if t[i] == "}":
+                    depth += 1
+                elif t[i] == "{":
+                    depth -= 1
+                    if depth == 0:
+                        raw = t[i:end + 1]
+                        break
+    if not raw:
+        raise ValueError("no critic JSON found in output")
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"critic JSON did not parse: {e}")
+    if not isinstance(data, dict):
+        raise ValueError("critic JSON is not an object")
+    verdict = str(data.get("verdict") or "").strip().upper()
+    if verdict not in ("SHIP", "REVISE", "REWRITE"):
+        raise ValueError(f"critic verdict missing/invalid: {verdict!r}")
+    try:
+        confidence = max(0.0, min(1.0, float(data.get("confidence"))))
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    import settings_registry as sreg
+    findings = []
+    for f in (data.get("findings") or []):
+        if not isinstance(f, dict):
+            continue
+        sev = str(f.get("severity") or "").strip().lower()
+        if sev not in SEVERITY_ORDER:
+            sev = "medium"
+        fp = str(f.get("file_path") or "").strip().lstrip("/")
+        if ".." in fp:
+            fp = ""  # reject traversal: drop the anchor, keep the finding
+        if fp.startswith("workspace/"):
+            fp = fp[len("workspace/"):]
+        elif repo_task and fp.startswith("repo/"):
+            fp = fp[len("repo/"):]  # review paths are repo-relative
+        if not fp:
+            fp = "deliverable.md"
+        try:
+            line_no = int(f["line_no"]) if f.get("line_no") is not None else None
+        except (TypeError, ValueError):
+            line_no = None
+        findings.append({
+            "severity": sev, "file_path": fp[:500], "side": "new",
+            "line_no": line_no,
+            "line_text": _clip(f.get("line_text"), 200),
+            "claim": _clip(f.get("claim"), 300),
+            "evidence": _clip(f.get("evidence"), 400),
+            "problem": _clip(f.get("problem"), 300),
+            "suggested_fix": _clip(f.get("suggested_fix"), 300),
+        })
+    # severity-ordered so a truncation (here or at the comment cap) always
+    # drops the LEAST severe findings (§4.8)
+    findings.sort(key=lambda x: SEVERITY_ORDER[x["severity"]])
+    findings = findings[:int(sreg.conf("super.max_findings", "25") or 25)]
+
+    contradictions = [{"with": _clip(c.get("with"), 100) or "internal",
+                       "a": _clip(c.get("a"), 300), "b": _clip(c.get("b"), 300),
+                       "resolution_hint": _clip(c.get("resolution_hint"), 300)}
+                      for c in (data.get("contradictions") or [])[:10]
+                      if isinstance(c, dict)]
+    missing = [{"what": _clip(m.get("what"), 300),
+                "why_it_matters": _clip(m.get("why_it_matters"), 300)}
+               for m in (data.get("missing") or [])[:10] if isinstance(m, dict)]
+
+    parsed = {
+        "verdict": verdict,
+        "confidence": confidence,
+        "summary": _clip(data.get("summary"), 600),
+        "findings": findings,
+        "contradictions": contradictions,
+        "missing": missing,
+        "revision_brief": _clip(data.get("revision_brief"), 2500),
+        "learning_note": _clip(data.get("learning_note"), 300) or None,  # B6
+    }
+    # stable per-finding keys drive the no-new-findings convergence check
+    parsed["_keys"] = [
+        hashlib.sha1(f"{f['file_path']}|{f['severity']}|"
+                     f"{(f['claim'] or f['problem'])[:120].lower()}".encode()
+                     ).hexdigest()[:12]
+        for f in findings]
+    return parsed
 
 
 # ─────────────────────────── Runner ───────────────────────────
@@ -347,7 +703,12 @@ def _run_thread(run_id: str, domain: str, uid: str | None):
                 "tokens_used=?, gen_seconds=? WHERE id=?",
                 (gen["path"], gen["tokens"], gen["seconds"], row["id"]))
             jmodel, jkey = judge_model_for(uid)
-            out = run_judge_cmd(gen["path"], domain, model=jmodel, api_key=jkey)
+            # N1 eval-corpus compatibility: the type rubric applies ONLY when
+            # the case opts in via frontmatter — default stays today's behavior.
+            trubric = type_rubric_path(case["deliverable_type"]) \
+                if case.get("deliverable_type") else None
+            out = run_judge_cmd(gen["path"], domain, model=jmodel, api_key=jkey,
+                                type_rubric=trubric)
             m = parse_judge_metrics(out)
             db.execute(
                 "UPDATE eval_results SET status='scored', verdict=?, score=?, score_max=?, "
