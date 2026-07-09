@@ -74,6 +74,22 @@ if [ -d "$REPO/bin" ]; then
   command -v claude >/dev/null 2>&1 || warn "the 'claude' CLI is not installed — cjudge/cspec/creview need it (npm i -g @anthropic-ai/claude-code, then 'claude' to log in)"
 fi
 
+# 5c. Business Brain (knowledge base) ---------------------------------------
+# The judge (cjudge) grades against ~/knowledge/domains/<d>/RUBRIC.md and the
+# Super Result critic/judge use ~/knowledge/rubrics/*.md type rubrics — a
+# fresh box without them can never judge. Never clobbers an existing brain:
+# full copy only when ~/knowledge is missing; otherwise only files that do
+# not exist yet are added (e.g. new type rubrics).
+if [ -d "$REPO/knowledge" ]; then
+  if [ ! -d "$HOME/knowledge" ]; then
+    say "Installing the Business Brain into ~/knowledge"
+    cp -a "$REPO/knowledge" "$HOME/knowledge"
+  else
+    say "Refreshing ~/knowledge additively (existing files untouched)"
+    rsync -a --ignore-existing "$REPO/knowledge/" "$HOME/knowledge/"
+  fi
+fi
+
 # 6. Apply the Hermes core-mods (via the guardian) --------------------------
 say "Applying core-mod patches to the Hermes source (guardian reconcile)"
 PY="$HERMES_HOME/hermes-agent/venv/bin/python"
