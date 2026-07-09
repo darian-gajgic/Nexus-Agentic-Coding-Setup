@@ -29,6 +29,7 @@ import re
 import sys
 import time
 import threading
+import uuid
 
 import httpx
 
@@ -71,6 +72,27 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
         f"“{title[:80]}” with the ‘{'maximum quality' if q else 'speed / token efficiency'}’ "
         "preference you picked.")
 
+    if meta.get("super_result"):
+        rounds = int(db.get_setting("super.max_rounds", "3") or 3)
+        triggers.append({
+            "id": "super_result", "enabled": True,
+            "label": "Super Result — grounded critic → auto-comments → rework",
+            "action": "critic_comment_retry",
+            "max_rounds": rounds, "used": 0,
+            "explain": (
+                "A sandboxed frontier critic independently verifies every claim "
+                "against the real files, files line comments, and re-runs the work "
+                "automatically. Stops on SHIP, on convergence (no new findings), or "
+                "escalates to you at the round cap."),
+        })
+        reasoning.append(
+            "SUPER RESULT is ON: a grounded critic — a frontier model with full "
+            "tool access inside a disposable sandbox copy of the evidence — "
+            "re-verifies every claim, auto-fills the per-line review comments, "
+            "and drives the rework rounds. It REPLACES the document-only judge "
+            "loop (the judge scores plausibility; the critic checks evidence), "
+            "so the judge triggers are omitted.")
+
     if kind == "workflow" and has_verifier:
         rounds = 2 if q else 1
         triggers.append({
@@ -102,7 +124,7 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
                 "Note: no dedicated fix task exists, so the findings go back "
                 "to the task that produced the result.")
 
-    if judge_ok and (high_stakes or kind == "task"):
+    if judge_ok and (high_stakes or kind == "task") and not meta.get("super_result"):
         rounds = 2 if q else 1
         triggers.append({
             "id": "judge_revise", "enabled": True,
@@ -123,7 +145,8 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
             "a second model family catches blind spots the working model "
             "cannot see about itself.")
 
-    auto_judge = bool(q and judge_ok and high_stakes and mode == "closed")
+    auto_judge = bool(q and judge_ok and high_stakes and mode == "closed"
+                      and not meta.get("super_result"))
     if auto_judge:
         reasoning.append(
             "Because you chose quality and this is high-stakes, the judge is "
@@ -312,6 +335,11 @@ def _sweep_task_loops(actions_left: int) -> int:
             break
         if not cfg or not cfg.get("enabled") or cfg.get("mode") != "closed":
             continue
+        # Belt-and-braces (§4.5): a config carrying a super_result trigger is
+        # driven by _sweep_super_result — the judge loops must not double-fire.
+        if any(x.get("id") == "super_result" and x.get("enabled")
+               for x in (cfg.get("triggers") or [])):
+            continue
         verdict = t.get("judge_verdict")
         judged_this_version = bool(t.get("judge_ts")) and \
             (t.get("judge_ts") or 0) >= (t.get("completed_at") or t.get("updated_at") or 0)
@@ -342,6 +370,237 @@ def _sweep_task_loops(actions_left: int) -> int:
                                 + (" (project loop)" if per_task else ""))
                 actions_left -= 1
     return actions_left
+
+
+# ── Super Result sweep (SUPER-RESULT-PLAN-2026-07-09.md §6 Step 6b) ──
+
+def _super_state(trig: dict, task_id: str | None):
+    """Terminal/handled state for this task's critique — per-task when the
+    loop is inherited from a workflow (mirrors used_tasks)."""
+    if task_id is not None:
+        return (trig.get("state_tasks") or {}).get(task_id)
+    return trig.get("state")
+
+
+def _set_super_state(trig: dict, task_id: str | None, state):
+    if task_id is not None:
+        st = trig.setdefault("state_tasks", {})
+        if state is None:
+            st.pop(task_id, None)
+        else:
+            st[task_id] = state
+    elif state is None:
+        trig.pop("state", None)
+    else:
+        trig["state"] = state
+
+
+def _escalate_super(t: dict, trig: dict, per_task: str | None,
+                    reason: str | None) -> bool:
+    """Open a human checkpoint (approvals row, action_type='super_result') for
+    this critique — once per version; a pending checkpoint is never doubled.
+    reason=None is the plain open-mode round checkpoint. Returns True when the
+    trigger state changed (caller persists the cfg)."""
+    tid = t["id"]
+    _set_super_state(trig, per_task,
+                     {"kind": "escalated", "handled_ts": t.get("critic_ts")})
+    pending = db.query_one(
+        "SELECT id FROM approvals WHERE status='pending' AND action_type='super_result' "
+        "AND payload LIKE ?", (f'%"task_id": "{tid}"%',))
+    if pending:
+        return True
+    try:
+        parsed = json.loads(t.get("critic_json") or "{}") or {}
+    except Exception:
+        parsed = {}
+    k = len(parsed.get("findings") or [])
+    rnd = int(t.get("critic_round") or 0)
+    desc = (f"Super Result round {rnd}: {k} findings — review/edit the "
+            "auto-comments, then Retry or Approve"
+            + (f" ({reason})" if reason else ""))
+    payload = {"task_id": tid, "round": rnd, "findings": k,
+               "verdict": t.get("critic_verdict")}
+    if reason:
+        payload["reason"] = reason
+    db.execute(
+        "INSERT INTO approvals (id, agent_id, action_type, description, payload, "
+        "status, risk_level, requested_at, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
+        (f"appr-{uuid.uuid4().hex[:10]}", "loop-engine", "super_result", desc,
+         json.dumps(payload), "pending", "high", time.time(), t.get("user_id")))
+    db.log_activity("warn", "loop",
+                    f"Super Result checkpoint on '{(t.get('title') or '')[:50]}': "
+                    f"{reason or f'round {rnd} awaits your review'}",
+                    user_id=t.get("user_id"))
+    try:
+        import hermes_dispatch as _hd
+        _hd.notify_desktop("Nexus: Super Result checkpoint ⚠",
+                           f"{(t.get('title') or '')[:60]}: "
+                           f"{reason or f'round {rnd} awaits review'}")
+    except Exception:
+        pass
+    return True
+
+
+def _sweep_super_result(actions_left: int) -> int:
+    """Grounded-critic loop: critique every fresh deliverable of a Super Result
+    task, then act on the verdict — SHIP=stop; REVISE/REWRITE=auto-retry with
+    the revision brief (closed) or human checkpoint (open); convergence
+    (no new findings), round cap, or critic error=escalate. The critic itself
+    runs in BOTH modes — only the rework differs. B8: candidate queries repeat
+    _sweep_task_loops' state filters (review/done + dispatch completed), so
+    archived / blocked_quota / blocked_budget / mid-dispatch tasks are never
+    touched."""
+    own = db.query_all(
+        "SELECT * FROM tasks WHERE loop_config IS NOT NULL AND super_result=1 "
+        "AND status IN ('review','done') AND dispatch_state='completed'")
+    inherited = db.query_all(
+        "SELECT t.*, w.loop_config AS _wf_cfg, w.id AS _wf_id FROM tasks t "
+        "JOIN workflows w ON w.id = t.workflow_id "
+        "WHERE t.loop_config IS NULL AND w.loop_config IS NOT NULL "
+        "AND t.super_result=1 "
+        "AND t.status IN ('review','done') AND t.dispatch_state='completed'")
+    candidates = [(t, _cfg(t), "task", t["id"], None) for t in own] + \
+                 [(t, _cfg({"loop_config": t.get("_wf_cfg")}), "workflow",
+                   t.get("_wf_id"), t["id"]) for t in inherited]
+    for t, cfg, owner_kind, owner_id, per_task in candidates:
+        if actions_left <= 0:
+            break
+        if not cfg or not cfg.get("enabled"):  # open mode acts here too
+            continue
+        trig = next((x for x in (cfg.get("triggers") or [])
+                     if x.get("id") == "super_result" and x.get("enabled")), None)
+        if not trig:
+            continue
+        verdict = t.get("critic_verdict")
+        if verdict == "running":
+            continue
+        tid = t["id"]
+        critiqued_this_version = bool(t.get("critic_ts")) and \
+            (t.get("critic_ts") or 0) >= (t.get("completed_at") or t.get("updated_at") or 0)
+        if not critiqued_this_version:
+            ws = t.get("workspace_path") or ""
+            if not ws or not os.path.isfile(os.path.join(ws, "deliverable.md")):
+                continue  # nothing to critique yet
+            if _api("POST", f"/api/tasks/{tid}/critic", {}, user_id=t.get("user_id")):
+                db.log_activity("info", "loop",
+                                "Super Result: critic dispatched on "
+                                f"'{(t.get('title') or '')[:50]}'"
+                                + (" (project loop)" if per_task else ""))
+                actions_left -= 1
+            continue
+        state = _super_state(trig, per_task) or {}
+        if state.get("handled_ts") == t.get("critic_ts"):
+            continue  # this critique was already acted on (idempotence)
+        used = _trigger_rounds(trig, per_task)
+        max_rounds = int(trig.get("max_rounds") or 0)
+        if verdict == "SHIP":
+            _set_super_state(trig, per_task,
+                             {"kind": "done", "handled_ts": t.get("critic_ts")})
+            _save_cfg(owner_kind, owner_id, cfg)
+            db.log_activity("info", "loop",
+                            "Super Result converged: SHIP after round "
+                            f"{int(t.get('critic_round') or 0)} on "
+                            f"'{(t.get('title') or '')[:50]}'")
+            continue
+        if verdict == "error":
+            if _escalate_super(t, trig, per_task,
+                               "critic run failed — check the critic output"):
+                _save_cfg(owner_kind, owner_id, cfg)
+            continue
+        if verdict not in ("REVISE", "REWRITE"):
+            continue
+        try:
+            ck = json.loads(t.get("critic_keys") or "{}") or {}
+        except Exception:
+            ck = {}
+        keys, prev = ck.get("keys") or [], ck.get("prev") or []
+        # keys ⊆ prev also catches "critic repeats itself because the executor
+        # failed to fix it" — correct behavior is a human checkpoint (§7).
+        if int(t.get("critic_round") or 0) > 1 and keys and set(keys) <= set(prev):
+            if _escalate_super(t, trig, per_task,
+                               "no new findings — the rework did not resolve them; "
+                               "human judgment needed"):
+                _save_cfg(owner_kind, owner_id, cfg)
+            continue
+        if used >= max_rounds:
+            if _escalate_super(t, trig, per_task,
+                               f"round cap reached ({used}/{max_rounds})"):
+                _save_cfg(owner_kind, owner_id, cfg)
+            continue
+        if cfg.get("mode") == "open":
+            if _escalate_super(t, trig, per_task, None):
+                _save_cfg(owner_kind, owner_id, cfg)
+            continue
+        # closed mode → automatic rework with the critic's revision brief;
+        # _retry_task drains the critic comments into the prompt automatically
+        brief = ""
+        try:
+            brief = (json.loads(t.get("critic_json") or "{}") or {}).get("revision_brief") or ""
+        except Exception:
+            pass
+        fb = (f"SUPER RESULT round {used + 1}/{max_rounds}: grounded critic "
+              f"verdict {verdict}.\n" + brief[:2500])
+        if _api("POST", f"/api/tasks/{tid}/retry", {"feedback": fb},
+                user_id=t.get("user_id")):
+            _bump_rounds(trig, per_task)
+            _set_super_state(trig, per_task,
+                             {"kind": "retried", "handled_ts": t.get("critic_ts")})
+            _save_cfg(owner_kind, owner_id, cfg)
+            db.log_activity("warn", "loop",
+                            f"SUPER RESULT round {used + 1}/{max_rounds}: critic said "
+                            f"{verdict} on '{(t.get('title') or '')[:50]}' — re-queued "
+                            "with the revision brief"
+                            + (" (project loop)" if per_task else ""))
+            actions_left -= 1
+    return actions_left
+
+
+def _locate_super_cfg(task_id: str):
+    """(owner_kind, owner_id, cfg, trig, per_task) for the task's EFFECTIVE
+    loop config (own beats inherited), or None when no super_result trigger."""
+    t = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not t:
+        return None
+    if t.get("loop_config"):
+        cfg, owner_kind, owner_id, per_task = _cfg(t), "task", task_id, None
+    elif t.get("workflow_id"):
+        w = db.query_one("SELECT * FROM workflows WHERE id=?", (t["workflow_id"],))
+        if not w or not w.get("loop_config"):
+            return None
+        cfg, owner_kind, owner_id, per_task = _cfg(w), "workflow", w["id"], task_id
+    else:
+        return None
+    if not cfg:
+        return None
+    trig = next((x for x in (cfg.get("triggers") or [])
+                 if x.get("id") == "super_result" and x.get("enabled")), None)
+    if not trig:
+        return None
+    return owner_kind, owner_id, cfg, trig, per_task
+
+
+def bump_super_round(task_id: str):
+    """Checkpoint REJECTED → the human-triggered rework consumes a round and
+    re-arms the state so the NEXT version is handled fresh."""
+    loc = _locate_super_cfg(task_id)
+    if not loc:
+        return
+    owner_kind, owner_id, cfg, trig, per_task = loc
+    _bump_rounds(trig, per_task)
+    _set_super_state(trig, per_task, None)
+    _save_cfg(owner_kind, owner_id, cfg)
+
+
+def mark_super_done(task_id: str):
+    """Checkpoint APPROVED → accept this version, end the loop for it."""
+    loc = _locate_super_cfg(task_id)
+    if not loc:
+        return
+    owner_kind, owner_id, cfg, trig, per_task = loc
+    t = db.query_one("SELECT critic_ts FROM tasks WHERE id=?", (task_id,))
+    _set_super_state(trig, per_task,
+                     {"kind": "done", "handled_ts": (t or {}).get("critic_ts")})
+    _save_cfg(owner_kind, owner_id, cfg)
 
 
 def _parse_replan(wf) -> dict | None:
@@ -414,7 +673,8 @@ def loop_sweep():
     if db.get_setting("dispatch.enabled", "0") != "1":
         return
     _sweep_replan_detection()
-    left = _sweep_workflow_loops(MAX_ACTIONS_PER_SWEEP)
+    left = _sweep_super_result(MAX_ACTIONS_PER_SWEEP)
+    left = _sweep_workflow_loops(left)
     _sweep_task_loops(left)
 
 
