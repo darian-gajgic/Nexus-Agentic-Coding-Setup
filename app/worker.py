@@ -181,7 +181,9 @@ def main():
             if task and dispatch_on:
                 _execute(task, mode, agent_id)
         except Exception as e:
-            db.log_activity("error", agent_id, f"worker loop error: {str(e)[:150]}")
+            db.log_activity("error", agent_id,
+                            f"worker loop error [cause={hd.classify_failure(e)}] "
+                            f"({type(e).__name__}): {str(e)[:150]}")
         time.sleep(POLL_S)
 
 
@@ -190,3 +192,13 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
+    except Exception as e:
+        # The lane is dying — leave a structured WHY in the activity feed (the
+        # watchdog only reports THAT it died before respawning it).
+        try:
+            db.log_activity("error", sys.argv[1] if len(sys.argv) > 1 else "worker",
+                            f"worker process died [cause={hd.classify_failure(e)}] "
+                            f"({type(e).__name__}): {str(e)[:150]}")
+        except Exception:
+            pass
+        raise

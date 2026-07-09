@@ -89,6 +89,23 @@ def knowledge_root() -> str:
     return root or os.path.expanduser("~/knowledge")
 
 
+def _context_style_paths(uid: str | None) -> tuple[str, str]:
+    """SPEC-ONBOARDING R2.3 (parity with hermes_dispatch._knowledge_paths): a
+    non-owner user with a completed personal onboarding gets their overlay
+    BUSINESS-CONTEXT/STYLE-VOICE; everyone else (and the owner) the canonical
+    files. PLAYBOOK/RUBRIC stay shared (craft, not identity)."""
+    root = knowledge_root()
+    u = (uid or "").strip()
+    if u and u != "u_owner":
+        d = os.path.join(root, "users", u)
+        ctx = os.path.join(d, "BUSINESS-CONTEXT.md")
+        style = os.path.join(d, "STYLE-VOICE.md")
+        if os.path.isfile(ctx) and os.path.isfile(style):
+            return ctx, style
+    return (os.path.join(root, "BUSINESS-CONTEXT.md"),
+            os.path.join(root, "STYLE-VOICE.md"))
+
+
 def _read(path: str) -> str:
     """mtime-cached file read (edits in ~/knowledge apply without a restart)."""
     try:
@@ -134,10 +151,10 @@ def domain_label(dom: str | None) -> str:
     return dom
 
 
-def _business_facts() -> str:
+def _business_facts(path: str) -> str:
     """BUSINESS-CONTEXT trimmed to KNOWN facts — drop instruction blockquotes and
     still-{{FILL}} placeholder lines so we inject signal, not a blank template."""
-    raw = _read(os.path.join(knowledge_root(), "BUSINESS-CONTEXT.md"))
+    raw = _read(path)
     if not raw:
         return ""
     out, section = [], None
@@ -163,10 +180,10 @@ def _business_facts() -> str:
     return " · ".join(out[:10])
 
 
-def _kill_list() -> str:
+def _kill_list(path: str) -> str:
     """The AI-slop kill list from STYLE-VOICE — the single most useful voice
     guardrail. Returns the backtick-quoted forbidden phrases, condensed."""
-    raw = _read(os.path.join(knowledge_root(), "STYLE-VOICE.md"))
+    raw = _read(path)
     if not raw:
         return ""
     m = re.search(r"kill list[^\n]*\)\s*\n(.*?)(?:\n#|\Z)", raw, re.I | re.S)
@@ -231,17 +248,20 @@ def domain_pack(dom: str, deep: bool) -> str:
     return "\n".join(lines)
 
 
-def brain_framing(text: str) -> tuple[str, str | None]:
+def brain_framing(text: str, uid: str | None = None) -> tuple[str, str | None]:
     """(framing_block, detected_domain). The block folds into the JARVIS system
-    message. Empty string when the knowledge base is absent."""
+    message. uid selects the per-user knowledge overlay (members with a
+    completed onboarding get THEIR business context/voice, not the owner's).
+    Empty string when the knowledge base is absent."""
     if not os.path.isdir(knowledge_root()):
         return "", None
     parts = []
-    facts = _business_facts()
+    ctx_path, style_path = _context_style_paths(uid)
+    facts = _business_facts(ctx_path)
     if facts:
         parts.append("BUSINESS CONTEXT (our ventures — treat unknowns as marked "
                      "assumptions, never invent): " + facts)
-    kill = _kill_list()
+    kill = _kill_list(style_path)
     if kill:
         parts.append("VOICE: write like one sharp human to another — direct, "
                      "concrete, honest, active voice, one idea per line. NEVER use "
