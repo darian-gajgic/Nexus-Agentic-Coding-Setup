@@ -22,7 +22,7 @@ function encPath(p) {
   return String(p).split('/').map(encodeURIComponent).join('/');
 }
 const kanbanFilters = { q: '', assignee: '', priority: '', tag: '', workflow: '' };
-const kanbanDrag = { active: false };
+const kanbanDrag = { active: false, id: null };
 
 // ===== HELPERS =====
 const $ = (s, el = document) => el.querySelector(s);
@@ -1114,11 +1114,19 @@ function taskMatchesFilters(t) {
   return true;
 }
 
+// Options for the project filter — also used by loadWorkflows() to fill the
+// select in place when the async fetch lands after the first kanban paint.
+function kanbanWorkflowOptions() {
+  const cur = kanbanFilters.workflow;
+  return `<option value="">All projects</option>
+        <option value="__none__" ${cur === '__none__' ? 'selected' : ''}>— No project —</option>
+        ${(wfState.list || []).map(w => `<option value="${esc(w.id)}" ${cur === w.id ? 'selected' : ''}>⚑ ${esc(w.name)}</option>`).join('')}`;
+}
+
 function viewKanban() {
-  if (!wfState.fetched) loadWorkflows(); // project names for the filter (re-renders when loaded)
+  if (!wfState.fetched) loadWorkflows(); // project names for the filter (fills it when loaded)
   const agentOpts = (state.agents || []).map(a => `<option value="${esc(a.id)}" ${kanbanFilters.assignee === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
   const tagOpts = kanbanTagUniverse().map(t => `<option value="${esc(t)}" ${kanbanFilters.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('');
-  const wfOpts = (wfState.list || []).map(w => `<option value="${esc(w.id)}" ${kanbanFilters.workflow === w.id ? 'selected' : ''}>⚑ ${esc(w.name)}</option>`).join('');
   const filtered = (state.tasks || []).filter(taskMatchesFilters);
   const hasFilter = kanbanFilters.q || kanbanFilters.assignee || kanbanFilters.priority !== '' && kanbanFilters.priority !== '' || kanbanFilters.tag || kanbanFilters.workflow;
 
@@ -1126,9 +1134,7 @@ function viewKanban() {
     <div class="kanban-toolbar">
       <input class="k-search" id="kSearch" type="search" placeholder="Search tasks…" value="${esc(kanbanFilters.q)}">
       <select class="k-filter" id="kWorkflow" title="Show only one project's tasks">
-        <option value="">All projects</option>
-        <option value="__none__" ${kanbanFilters.workflow === '__none__' ? 'selected' : ''}>— No project —</option>
-        ${wfOpts}</select>
+        ${kanbanWorkflowOptions()}</select>
       <select class="k-filter" id="kAssignee"><option value="">All assignees</option>${agentOpts}</select>
       <select class="k-filter" id="kPriority">
         <option value="">All priorities</option>
@@ -1199,18 +1205,22 @@ function taskCard(t) {
   `;
 }
 
-function bindKanban() {
-  let dragId = null;
-
+// Card handlers live in shared kanbanDrag state (not a bindKanban closure) so
+// cards rebuilt by refreshKanbanBoard keep feeding the columns' drop handlers.
+function bindKanbanCards() {
   $$('.task-card').forEach(card => {
     card.addEventListener('dragstart', () => {
-      dragId = card.dataset.id;
+      kanbanDrag.id = card.dataset.id;
       kanbanDrag.active = true;
       card.classList.add('dragging');
     });
     card.addEventListener('dragend', () => { kanbanDrag.active = false; card.classList.remove('dragging'); });
     card.addEventListener('click', () => { if (!kanbanDrag.active) openTaskDetail(card.dataset.id); });
   });
+}
+
+function bindKanban() {
+  bindKanbanCards();
 
   $$('.col-body').forEach(col => {
     col.addEventListener('dragover', (e) => {
@@ -1224,6 +1234,8 @@ function bindKanban() {
       e.preventDefault();
       col.closest('.kanban-col').classList.remove('drag-over');
       kanbanDrag.active = false;
+      const dragId = kanbanDrag.id; // capture: renders below rebuild the cards
+      kanbanDrag.id = null;
       if (!dragId) return;
       const newStatus = col.dataset.col;
       const t = (state.tasks || []).find(x => x.id === dragId);
@@ -1234,7 +1246,6 @@ function bindKanban() {
         state.tasks = await api('GET', '/api/tasks');
         render();
       }
-      dragId = null;
     });
   });
 
@@ -1259,12 +1270,9 @@ function refreshKanbanBoard() {
     if (body) body.innerHTML = tasks.map(t => taskCard(t)).join('') || `<div class="col-empty">Drop tasks here</div>`;
     if (head) head.textContent = tasks.length;
   });
-  // rebind cards only
-  $$('.task-card').forEach(card => {
-    card.addEventListener('dragstart', () => { kanbanDrag.active = true; card.classList.add('dragging'); });
-    card.addEventListener('dragend', () => { kanbanDrag.active = false; card.classList.remove('dragging'); });
-    card.addEventListener('click', () => openTaskDetail(card.dataset.id));
-  });
+  // rebind cards only — same handlers as the full render, so drag still
+  // feeds kanbanDrag.id to the columns' (still-bound) drop handlers
+  bindKanbanCards();
 }
 
 function openTaskDetail(id) {
@@ -4513,7 +4521,6 @@ async function submitTask() {
   const created = await api('POST', '/api/tasks', {
     loop_config: loopCfg,
     repo_path: $('#m-task-repo') ? ($('#m-task-repo').value || null) : null,
-    workflow_id: focusCtx.workflow ? focusCtx.workflow.id : null,
     title,
     description: $('#m-task-desc').value,
     status: $('#m-task-status').value,
@@ -4526,7 +4533,10 @@ async function submitTask() {
     high_stakes: $('#m-task-highstakes') ? $('#m-task-highstakes').checked : false,
     budget_tokens: $('#m-task-budget') && $('#m-task-budget').value ? parseInt($('#m-task-budget').value) : null,
     model: $('#m-task-model') ? ($('#m-task-model').value || null) : null,
-    workflow_id: taskCreateContext ? taskCreateContext.workflow_id || null : null,
+    // exactly once (a duplicate key silently overwrote the focused project
+    // with null): explicit create-context wins, else the focused project
+    workflow_id: (taskCreateContext && taskCreateContext.workflow_id)
+      || (focusCtx.workflow ? focusCtx.workflow.id : null),
     depends_on: taskCreateContext && (taskCreateContext.depends_on || []).length
       ? taskCreateContext.depends_on : null,
   });
@@ -6674,6 +6684,17 @@ async function jarvisStreamChat(text) {
       signal: jarvisState.abortController.signal,
     });
 
+    if (!resp.ok) {
+      // a non-2xx (expired session → 401, server error → 500) is NOT an
+      // overload — surface the real status instead of the generic message
+      let detail = '';
+      try {
+        const raw = await resp.text();
+        try { detail = JSON.parse(raw).error || raw; } catch { detail = raw; }
+      } catch { /* unreadable body — status alone will have to do */ }
+      throw new Error(`HTTP ${resp.status}${detail ? ` — ${String(detail).slice(0, 180)}` : ''}`);
+    }
+
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -7923,6 +7944,12 @@ async function loadWorkflows() {
   catch { wfState.list = []; }
   wfState.fetched = true;
   if (currentView === 'workflows') render();
+  else if (currentView === 'kanban') {
+    // first kanban visit kicks this fetch off mid-paint — fill the project
+    // filter in place (a full render would eat the user's search keystrokes)
+    const sw = $('#kWorkflow');
+    if (sw) sw.innerHTML = kanbanWorkflowOptions();
+  }
 }
 
 // ── Mid-run replanning (R2): checkpoint state parsed off the workflow row ──
