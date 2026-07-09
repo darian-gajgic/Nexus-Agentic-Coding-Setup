@@ -106,6 +106,16 @@ def startup():
         "WHERE judge_verdict='running'").rowcount
     if stuck:
         db.log_activity("warn", "judge", f"Cleared {stuck} judge run(s) orphaned by restart")
+    # B1: same for the grounded critic — a restart mid-critique would leave
+    # 'running' forever, and the Super Result sweep skips running tasks (it
+    # would neither re-run nor escalate). 'error' makes the sweep escalate.
+    stuck_critic = db.execute(
+        "UPDATE tasks SET critic_verdict='error', "
+        "critic_output=COALESCE(critic_output,'')||' [orphaned by restart]' "
+        "WHERE critic_verdict='running'").rowcount
+    if stuck_critic:
+        db.log_activity("warn", "critic",
+                        f"Cleared {stuck_critic} critic run(s) orphaned by restart")
     # Same for replan drafts (R2.2) — a restart mid-draft would 409 forever.
     for w in db.query_all("SELECT id, replan FROM workflows WHERE replan IS NOT NULL"):
         try:
@@ -246,6 +256,12 @@ class TaskCreate(BaseModel):
     loop_config: Optional[dict] = None
     repo_path: Optional[str] = None
     client: Optional[str] = None
+    # Super Result (SUPER-RESULT-PLAN-2026-07-09.md)
+    super_result: bool = False
+    deliverable_type: Optional[str] = None
+
+
+_DELIVERABLE_TYPES = ("analysis", "code_change", "content", "research")
 
 
 def _derive_client(client, repo_path):
@@ -280,6 +296,8 @@ class TaskUpdate(BaseModel):
     loop_config: Optional[dict] = None
     repo_path: Optional[str] = None
     client: Optional[str] = None
+    super_result: Optional[bool] = None
+    deliverable_type: Optional[str] = None
 
 
 class ProgramCreate(BaseModel):
@@ -542,20 +560,28 @@ async def create_task(body: TaskCreate):
     if body.model and body.model not in db.task_models_for(uid):
         return JSONResponse(status_code=400, content={
             "error": f"model '{body.model}' is not in your model registry (Settings → Models)"})
+    if body.deliverable_type and body.deliverable_type not in _DELIVERABLE_TYPES:
+        return JSONResponse(status_code=400, content={
+            "error": f"deliverable_type must be one of {list(_DELIVERABLE_TYPES)}"})
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
-         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id,
+         super_result, deliverable_type)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tid, body.title, body.description, body.status, body.priority,
          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
          body.domain, body.specialist, 1 if body.high_stakes else 0, body.budget_tokens, body.model,
          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
          json.dumps(body.loop_config) if body.loop_config else None,
-         (body.repo_path or None), (_derive_client(body.client, body.repo_path)), uid))
+         (body.repo_path or None), (_derive_client(body.client, body.repo_path)), uid,
+         1 if body.super_result else 0, body.deliverable_type or None))
     db.log_activity("info", "system", f"Task created: '{body.title}'", user_id=uid)
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
+    if body.super_result:
+        _sync_super_result_loop("task", task)
+        task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     await mgr.broadcast({"type": "task_created", "data": task}, user_id=uid)
     return task
 
@@ -612,6 +638,16 @@ async def update_task(task_id: str, body: TaskUpdate):
             return JSONResponse(status_code=400, content={
                 "error": f"repo_path is not one of your git repositories: {rp}"})
         updates["repo_path"] = rp or None
+    if body.deliverable_type is not None:
+        dt = (body.deliverable_type or "").strip()
+        if dt and dt not in _DELIVERABLE_TYPES:
+            return JSONResponse(status_code=400, content={
+                "error": f"deliverable_type must be one of {list(_DELIVERABLE_TYPES)}"})
+        updates["deliverable_type"] = dt or None
+    super_flipped = False
+    if body.super_result is not None:
+        updates["super_result"] = 1 if body.super_result else 0
+        super_flipped = True
     updates["updated_at"] = time.time()
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -619,6 +655,9 @@ async def update_task(task_id: str, body: TaskUpdate):
     db.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
 
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if super_flipped:
+        _sync_super_result_loop("task", task)
+        task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return task
 
@@ -2867,6 +2906,27 @@ async def decide_approval(approval_id: str, body: dict):
                     _retry_task, task_id, (body.get("feedback") or "").strip() or None)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
+    # Super Result checkpoint (open mode / escalation): approve = accept the
+    # current version and end the loop; reject = drain the (possibly edited)
+    # critic comments + feedback into a rework round.
+    elif ap.get("action_type") == "super_result":
+        import loop_engine as _loop
+        try:
+            task_id = (json.loads(ap.get("payload") or "{}") or {}).get("task_id")
+        except Exception:
+            task_id = None
+        task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,)) if task_id else None
+        if task:
+            if decision == "approved":
+                _loop.mark_super_done(task_id)
+                db.log_activity("info", "system",
+                                f"Super Result checkpoint approved — task {task_id} accepted")
+            else:
+                await run_in_threadpool(
+                    _retry_task, task_id, (body.get("feedback") or "").strip() or None)
+                _loop.bump_super_round(task_id)
+            t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
     await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
     return ap
 
@@ -3581,12 +3641,30 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     purpose assignment — resolved here, inside the thread, from the task row
     (never the request contextvar, which doesn't reach threads)."""
     import evals as _ev
-    owner = (db.query_one("SELECT user_id FROM tasks WHERE id=?", (task_id,)) or {}).get("user_id")
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    owner = (task or {}).get("user_id")
     jmodel, jkey = _ev.judge_model_for(owner)
-    out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey)
+    # N1: type-aware judging — the deliverable also faces its TYPE rubric
+    # (e.g. INVESTIGATION.md's verified-not-inferred gate for analysis work).
+    trubric = _ev.type_rubric_path(_ev.detect_deliverable_type(task)) if task else None
+    out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey,
+                            type_rubric=trubric)
     verdict, learning = _parse_judge_output(out)
     db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=? WHERE id=?",
                (verdict or "error", out[-30000:], time.time(), task_id))
+    # N3: when the (upgraded) judge emitted structured findings, auto-fill the
+    # side-by-side review — ungrounded but free, human-editable, drained by
+    # the existing retry. Best-effort: old-format judge output has none.
+    try:
+        m = _ev.parse_judge_metrics(out)
+        if task and m.get("findings"):
+            n = _insert_critic_comments(task, {"findings": m["findings"]}, source="judge")
+            if n:
+                db.log_activity("info", "judge",
+                                f"Judge posted {n} auto-comment(s) on {task_id}",
+                                user_id=owner)
+    except Exception:
+        pass
     db.log_activity("info" if verdict else "error", "judge",
                     f"Frontier judge on {task_id}: {verdict or 'no verdict parsed'}"
                     + (f" — {learning}" if learning else ""))
@@ -3626,6 +3704,230 @@ async def judge_status(task_id: str):
         return JSONResponse(status_code=404, content={"error": "task not found"})
     return {"verdict": task.get("judge_verdict"), "output": task.get("judge_output"),
             "ts": task.get("judge_ts"), "running": task.get("judge_verdict") == "running"}
+
+
+# ── Super Result: grounded critic (SUPER-RESULT-PLAN-2026-07-09.md §6 Step 5) ──
+
+def _insert_critic_comments(task: dict, parsed: dict, source: str = "critic") -> int:
+    """Auto-file findings as line-anchored review comments — internal, direct
+    DB (§4.4: the HTTP endpoint enforces user-comment semantics). Each fresh
+    critique SUPERSEDES its own stale open comments; user comments are never
+    touched. Findings arrive severity-ordered, so the open-comment cap drops
+    the least severe. Returns the number inserted."""
+    task_id = task["id"]
+    db.execute("DELETE FROM review_comments WHERE task_id=? AND status='open' AND source=?",
+               (task_id, source))
+    ws = task.get("workspace_path") or ""
+    ws_real = os.path.realpath(ws) if ws else ""
+    n_open = db.query_one(
+        "SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? AND status='open'",
+        (task_id,))["n"]
+    inserted = 0
+    now = time.time()
+    for f in parsed.get("findings") or []:
+        if n_open + inserted >= _COMMENT_MAX_OPEN:
+            break
+        fp = (str(f.get("file_path") or "").strip() or "deliverable.md")[:500]
+        line_no = f.get("line_no")
+        line_text = (f.get("line_text") or "").strip()
+        # Anchor validation: when the path resolves to a real file INSIDE the
+        # workspace, the quoted line must exist there (accept ±2 drift, take
+        # line_text from the REAL file) or the line anchor is dropped. Repo
+        # findings keep their repo-relative anchor as-is (nothing to resolve).
+        cand = os.path.realpath(os.path.join(ws, fp)) if ws else ""
+        if ws and cand.startswith(ws_real + os.sep) and os.path.isfile(cand):
+            if line_no is not None:
+                try:
+                    with open(cand, errors="replace") as fh:
+                        lines = fh.read().splitlines()
+                except Exception:
+                    lines = []
+                match = None
+                if lines and line_text:
+                    lo, hi = max(1, int(line_no) - 2), min(len(lines), int(line_no) + 2)
+                    for ln in range(lo, hi + 1):
+                        if lines[ln - 1].strip() == line_text:
+                            match = ln
+                            break
+                if match is None and lines and not line_text \
+                        and 1 <= int(line_no) <= len(lines):
+                    match = int(line_no)  # no quote given — trust the number
+                if match is not None:
+                    line_no = match
+                    line_text = lines[match - 1]
+                else:
+                    line_no = None  # keep the file anchor, drop the line
+        sev = (f.get("severity") or "medium").upper()
+        body = f"[{sev}] {f.get('problem') or ''}"
+        if f.get("claim"):
+            body += f" — claim: {f['claim']}."
+        if f.get("evidence"):
+            body += f" Evidence: {f['evidence']}."
+        fix = f.get("suggested_fix") or f.get("fix")
+        if fix:
+            body += f" Fix: {fix}"
+        db.execute(
+            "INSERT INTO review_comments (id, task_id, user_id, file_path, side, "
+            "line_no, line_text, body, status, consumed_at, created_at, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"rc-{uuid.uuid4().hex[:12]}", task_id, task.get("user_id"), fp, "new",
+             line_no, line_text[:500], body[:500], "open", None, now, source))
+        inserted += 1
+    return inserted
+
+
+def _critic_thread(task_id: str):
+    """Run the grounded critic (minutes: sandbox build + tool-using frontier
+    run) and persist verdict/findings/auto-comments. Blocking work stays in
+    this thread (B7's no-block-in-async rule)."""
+    import evals as _ev
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        return
+    round_no = int(task.get("critic_round") or 0) + 1
+    owner = task.get("user_id")
+    jmodel, jkey = _ev.judge_model_for(owner)
+    domain = (task.get("domain") or "").strip() or None
+    try:
+        out = _ev.run_critic_cmd(task, domain, model=jmodel, api_key=jkey,
+                                 round_no=round_no)
+    except Exception as e:
+        out = f"[critic failed to run: {e}]"
+    try:
+        parsed = _ev.parse_critic_json(out, repo_task=bool(task.get("repo_path")))
+    except ValueError as e:
+        # unusable output → 'error' verdict; the loop sweep escalates on it
+        db.execute("UPDATE tasks SET critic_verdict='error', critic_output=?, "
+                   "critic_ts=?, critic_round=? WHERE id=?",
+                   ((out or "")[-30000:], time.time(), round_no, task_id))
+        db.log_activity("error", "critic",
+                        f"Super Result critic on {task_id}: unusable output "
+                        f"({str(e)[:120]})", user_id=owner)
+        return
+    # Convergence bookkeeping: this round's finding keys + last round's, so
+    # the sweep can detect "no NEW findings" (keys ⊆ prev) without re-parsing.
+    try:
+        old = json.loads(task.get("critic_keys") or "null") or {}
+    except Exception:
+        old = {}
+    critic_keys = json.dumps({"round": round_no, "keys": parsed["_keys"],
+                              "prev": old.get("keys") or []})
+    n = _insert_critic_comments(task, parsed, source="critic")
+    db.execute(
+        "UPDATE tasks SET critic_verdict=?, critic_output=?, critic_json=?, "
+        "critic_ts=?, critic_round=?, critic_keys=? WHERE id=?",
+        (parsed["verdict"], (out or "")[-30000:], json.dumps(parsed)[:60000],
+         time.time(), round_no, critic_keys, task_id))
+    db.log_activity("info", "critic",
+                    f"Super Result round {round_no} on {task_id}: {parsed['verdict']} — "
+                    f"{len(parsed['findings'])} finding(s), {n} comment(s) posted",
+                    user_id=owner)
+    try:
+        hd.notify_desktop("Nexus: Super Result",
+                          f"{parsed['verdict']} — {len(parsed['findings'])} finding(s) "
+                          f"on '{(task.get('title') or '')[:60]}'")
+    except Exception:
+        pass
+
+
+@app.post("/api/tasks/{task_id}/critic")
+async def run_critic(task_id: str):
+    """Run the grounded critic — async; poll GET /api/tasks/{id}/critic.
+    Unlike the judge, no domain is required (the critic runs rubric-less)."""
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    deliv = os.path.join(task.get("workspace_path") or "", "deliverable.md")
+    if not task.get("workspace_path") or not os.path.isfile(deliv):
+        return JSONResponse(status_code=400, content={"error": "no deliverable.md to critique yet"})
+    if task.get("critic_verdict") == "running":
+        return JSONResponse(status_code=409, content={"error": "critic already running"})
+    round_no = int(task.get("critic_round") or 0) + 1
+    db.execute("UPDATE tasks SET critic_verdict='running', critic_output=NULL, critic_ts=? "
+               "WHERE id=?", (time.time(), task_id))
+    threading.Thread(target=_critic_thread, args=(task_id,), daemon=True).start()
+    db.log_activity("info", "critic", f"Super Result critic started on {task_id} "
+                    f"(round {round_no})", user_id=task.get("user_id"))
+    return {"ok": True, "status": "running", "round": round_no}
+
+
+@app.get("/api/tasks/{task_id}/critic")
+async def critic_status(task_id: str):
+    task = db.query_one(
+        "SELECT critic_verdict, critic_output, critic_json, critic_ts, critic_round "
+        "FROM tasks WHERE id=? AND user_id=?", (task_id, auth.current_user_id()))
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    try:
+        parsed = json.loads(task.get("critic_json") or "null")
+    except Exception:
+        parsed = None
+    n_open = db.query_one(
+        "SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? AND status='open' "
+        "AND source='critic'", (task_id,))["n"]
+    return {"verdict": task.get("critic_verdict"), "output": task.get("critic_output"),
+            "parsed": parsed, "ts": task.get("critic_ts"),
+            "round": int(task.get("critic_round") or 0),
+            "running": task.get("critic_verdict") == "running",
+            "open_critic_comments": n_open}
+
+
+def _sync_super_result_loop(kind: str, row: dict):
+    """Keep the loop_config's super_result trigger in lockstep with the flag:
+    flag ON + no trigger → regenerate the design (preserving used counts of
+    surviving triggers); flag OFF → strip the trigger, leave the rest."""
+    import loop_engine as _loop
+    flag = bool(row.get("super_result"))
+    try:
+        cfg = json.loads(row.get("loop_config") or "null")
+    except Exception:
+        cfg = None
+    cfg = cfg if isinstance(cfg, dict) else None
+    has_trigger = bool(cfg and any((t.get("id") == "super_result")
+                                   for t in cfg.get("triggers") or []))
+    table = "tasks" if kind == "task" else "workflows"
+    if flag and not has_trigger:
+        if kind == "task":
+            meta = {"title": row.get("title"), "domain": row.get("domain"),
+                    "high_stakes": bool(row.get("high_stakes")),
+                    "specialist": row.get("specialist"), "super_result": True}
+        else:
+            specs = [r["specialist"] for r in db.query_all(
+                "SELECT specialist FROM tasks WHERE workflow_id=?", (row["id"],))
+                if r.get("specialist")]
+            hs = db.query_one(
+                "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND high_stakes=1",
+                (row["id"],))
+            meta = {"title": row.get("name"), "domain": row.get("domain"),
+                    "specialists": specs, "super_result": True,
+                    "high_stakes": bool(row.get("high_stakes") or (hs or {}).get("c"))}
+        newcfg = _loop.design_loop(kind, meta,
+                                   preference=(cfg or {}).get("preference", "quality"),
+                                   mode=(cfg or {}).get("mode", "closed"))
+        if cfg:  # keep round accounting of triggers that survived the redesign
+            old = {t.get("id"): t for t in cfg.get("triggers") or []}
+            for t in newcfg.get("triggers") or []:
+                o = old.get(t.get("id"))
+                if o:
+                    t["used"] = int(o.get("used") or 0)
+                    for k in ("used_tasks", "state_tasks"):
+                        if o.get(k):
+                            t[k] = o[k]
+        db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?",
+                   (json.dumps(newcfg), row["id"]))
+        db.log_activity("info", "loop",
+                        "Super Result loop enabled on "
+                        f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
+                        user_id=row.get("user_id"))
+    elif not flag and has_trigger:
+        cfg["triggers"] = [t for t in cfg.get("triggers") or []
+                           if t.get("id") != "super_result"]
+        db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?",
+                   (json.dumps(cfg), row["id"]))
+        db.log_activity("info", "loop",
+                        "Super Result trigger removed from "
+                        f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
+                        user_id=row.get("user_id"))
 
 
 @app.post("/api/tasks/{task_id}/feedback")
@@ -3692,8 +3994,16 @@ def _retry_task(task_id: str, feedback: str | None):
         return None
     fb = (feedback or task.get("retry_feedback") or "").strip()
     if not fb and task.get("judge_verdict") in ("REVISE", "REWRITE") and task.get("judge_output"):
+        # N4: prefer the judge's structured revision_brief (a textual gradient)
+        # over prose scrapings; old-format output falls back to the raw tail.
+        brief = None
+        try:
+            import evals as _ev
+            brief = _ev.parse_judge_metrics(task["judge_output"]).get("revision_brief")
+        except Exception:
+            brief = None
         fb = ("Frontier judge findings (attached automatically — fix every blocker):\n"
-              + task["judge_output"][-3000:])
+              + (brief or task["judge_output"][-3000:]))
     # Review v2 (SPEC-BLOCK2 R1.5): OPEN per-line comments ride every retry —
     # operator retry, approval-reject and loop-engine rounds all pass through
     # here, so line feedback can never be lost on the way to the agent.
@@ -3706,7 +4016,9 @@ def _retry_task(task_id: str, feedback: str | None):
             loc = f"{c['file_path']}:{c['line_no']}" if c.get("line_no") else c["file_path"]
             excerpt = (c.get("line_text") or "").strip()
             quoted = f' "{excerpt[:160]}"' if excerpt else ""
-            notes.append(f"- {loc} [{c.get('side') or 'new'}]{quoted} → {c['body']}")
+            src = c.get("source") or "user"
+            tag = "CRITIC" if src == "critic" else ("JUDGE" if src == "judge" else "REVIEWER")
+            notes.append(f"- [{tag}] {loc} [{c.get('side') or 'new'}]{quoted} → {c['body']}")
         fb = ((fb + "\n\n") if fb else "") + \
             "Reviewer LINE COMMENTS (address EVERY one):\n" + "\n".join(notes)
         db.execute(
@@ -3743,12 +4055,13 @@ def _retry_task(task_id: str, feedback: str | None):
         "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
         "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, retry_feedback=?, "
         "updated_at=? WHERE id=?",
-        (fb[:8000] or None, now, task_id))  # 8000: line comments ride along (SPEC-BLOCK2 R1.5)
+        (fb[:16000] or None, now, task_id))  # 16000 (§4.8): 25 critic findings ≈ 12.5k+ chars
     # The old deliverable's pending approval is now moot — expire it so the
-    # Agentic tab never offers a decision on superseded work.
+    # Agentic tab never offers a decision on superseded work. Super Result
+    # checkpoints are versioned the same way.
     db.execute(
         "UPDATE approvals SET status='expired', decided_at=?, decided_by='superseded by retry' "
-        "WHERE status='pending' AND action_type='deliverable' AND payload LIKE ?",
+        "WHERE status='pending' AND action_type IN ('deliverable','super_result') AND payload LIKE ?",
         (now, f'%"task_id": "{task_id}"%'))
     db.log_activity("info", "system", f"Task {task_id} queued for retry with feedback")
     return db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -4471,6 +4784,7 @@ async def loop_design(body: dict):
         if t:
             meta = {"title": t.get("title"), "domain": t.get("domain"),
                     "high_stakes": bool(t.get("high_stakes")),
+                    "super_result": bool(t.get("super_result")),
                     "specialist": t.get("specialist"), **meta}
     elif oid and kind == "workflow":
         w = _owned_workflow(oid)
@@ -4480,7 +4794,8 @@ async def loop_design(body: dict):
             hs = db.query_one(
                 "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND high_stakes=1", (oid,))
             meta = {"title": w.get("name"), "domain": w.get("domain"),
-                    "specialists": specs, "high_stakes": bool((hs or {}).get("c")), **meta}
+                    "specialists": specs, "high_stakes": bool((hs or {}).get("c")),
+                    "super_result": bool(w.get("super_result")), **meta}
     cfg = _loop.design_loop(kind, meta,
                             preference=body.get("preference") or "quality",
                             mode=body.get("mode") or "closed")
@@ -4761,14 +5076,18 @@ async def create_workflow(body: dict):
     now = time.time()
     uid = auth.current_user_id()
     lc = body.get("loop_config")
-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path, user_id) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path, user_id, super_result) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
                 json.dumps(lc) if isinstance(lc, dict) else None,
                 1 if body.get("high_stakes") else 0,
                 _derive_client(body.get("client"), body.get("project_path")),
-                ((body.get("project_path") or "").strip() or None), uid))
+                ((body.get("project_path") or "").strip() or None), uid,
+                1 if body.get("super_result") else 0))
     db.log_activity("info", "system", f"Workflow created: '{name}'", user_id=uid)
+    if body.get("super_result"):
+        _sync_super_result_loop("workflow",
+                                db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     await mgr.broadcast({"type": "workflow_created", "data": w}, user_id=uid)
     return w
@@ -4838,6 +5157,18 @@ async def update_workflow(wf_id: str, body: dict):
         db.execute("UPDATE tasks SET high_stakes=? WHERE workflow_id=?", (hs, wf_id))
         db.log_activity("info", "system",
                         f"Workflow {wf_id}: high_stakes={'on' if hs else 'off'} applied to all member tasks")
+    if "super_result" in body:
+        # cascade mirrors high_stakes: the flag names the PROJECT's quality
+        # contract, member tasks inherit it (the loop trigger lives on the
+        # workflow's own loop_config — members use inherited-cfg sweep rules)
+        sr = 1 if body["super_result"] else 0
+        db.execute("UPDATE workflows SET super_result=?, updated_at=? WHERE id=?",
+                   (sr, time.time(), wf_id))
+        db.execute("UPDATE tasks SET super_result=? WHERE workflow_id=?", (sr, wf_id))
+        db.log_activity("info", "system",
+                        f"Workflow {wf_id}: super_result={'on' if sr else 'off'} applied to all member tasks")
+        _sync_super_result_loop("workflow",
+                                db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
 
 
@@ -5056,7 +5387,10 @@ async def replan_apply(wf_id: str, body: dict):
             budget_tokens=t.get("budget_tokens"), model=t.get("model"),
             tags=t.get("tags") or [], workflow_id=wf_id,
             repo_path=(w.get("project_path") if t.get("specialist") in _DEV_SPECIALISTS else None),
-            client=w.get("client"), depends_on=deps))
+            client=w.get("client"), depends_on=deps,
+            super_result=bool(t.get("super_result")) or bool(w.get("super_result")),
+            deliverable_type=(t.get("deliverable_type")
+                              if t.get("deliverable_type") in _DELIVERABLE_TYPES else None)))
         if isinstance(created, JSONResponse):
             # foreign-ref/validation error — roll back the partial batch so the
             # apply is atomic (nothing archived yet, no half-created plan left),
@@ -6038,14 +6372,15 @@ async def create_review_comment(task_id: str, body: dict):
         "status": "open",
         "consumed_at": None,
         "created_at": time.time(),
+        "source": "user",  # this endpoint IS the human path (critic/judge insert directly)
     }
     db.execute(
         "INSERT INTO review_comments (id, task_id, user_id, file_path, side, "
-        "line_no, line_text, body, status, consumed_at, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "line_no, line_text, body, status, consumed_at, created_at, source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (row["id"], row["task_id"], row["user_id"], row["file_path"], row["side"],
          row["line_no"], row["line_text"], row["body"], row["status"],
-         row["consumed_at"], row["created_at"]))
+         row["consumed_at"], row["created_at"], row["source"]))
     return {"ok": True, "comment": row}
 
 

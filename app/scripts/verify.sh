@@ -230,7 +230,7 @@ chk "review_comments table"          "grep -q 'CREATE TABLE IF NOT EXISTS review
 chk "comment endpoints (CRUD)"       "grep -q 'review/comments\"' server.py && grep -q 'review/comments/{comment_id}' server.py"
 chk "comments feed _retry_task"      "grep -q 'Reviewer LINE COMMENTS (address EVERY one)' server.py"
 chk "comments consumed, not deleted" "grep -q \"SET status='consumed', consumed_at=\" server.py"
-chk "retry feedback cap raised"      "grep -q 'fb\[:8000\]' server.py"
+chk "retry feedback cap raised"      "grep -q 'fb\[:16000\]' server.py"
 chk "memory mutation endpoints"      "grep -q '@app.patch(\"/api/memory/{point_id}\")' server.py && grep -q '\"/api/memory/merge\"' server.py"
 chk "memory ownership fail-closed"   "grep -q 'def _memory_access' server.py && grep -q 'auth.is_admin()' server.py"
 chk "mutations clear galaxy cache"   "grep -q '_MEM3D_CACHE.clear()' server.py"

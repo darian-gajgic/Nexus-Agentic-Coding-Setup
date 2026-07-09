@@ -43,6 +43,8 @@ CRITIC_SANDBOXES = Path(__file__).parent / "workspaces" / "_critic"
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 CRITIC_JSON_BEGIN = "NEXUS_CRITIC_JSON_BEGIN"
 CRITIC_JSON_END = "NEXUS_CRITIC_JSON_END"
+JUDGE_JSON_BEGIN = "NEXUS_JUDGE_JSON_BEGIN"  # N2: cjudge's structured tail
+JUDGE_JSON_END = "NEXUS_JUDGE_JSON_END"
 DELIVERABLE_TYPES = ("analysis", "code_change", "content", "research")
 
 
@@ -275,8 +277,52 @@ def parse_judge_metrics(text: str) -> dict:
             continue
         gates_passed += len(re.findall(r"\bPASS\b", line))
         gates_failed += len(re.findall(r"\bFAIL(?:ED)?\b", line))
-    return {"verdict": verdict, "score": score, "score_max": score_max,
-            "gates_passed": gates_passed, "gates_failed": gates_failed}
+    out = {"verdict": verdict, "score": score, "score_max": score_max,
+           "gates_passed": gates_passed, "gates_failed": gates_failed}
+
+    # N2 (strictly additive): the upgraded cjudge ends with a sentinel-fenced
+    # JSON tail {verdict, findings:[{file_path,line_no,line_text,problem,fix}],
+    # revision_brief}. Old-format output simply has no block — nothing changes.
+    b = (text or "").rfind(JUDGE_JSON_BEGIN)
+    if b != -1:
+        e = text.find(JUDGE_JSON_END, b)
+        if e != -1:
+            try:
+                data = json.loads(text[b + len(JUDGE_JSON_BEGIN):e])
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                jv = str(data.get("verdict") or "").strip().upper()
+                if not out["verdict"] and jv in ("SHIP", "REVISE", "REWRITE"):
+                    out["verdict"] = jv
+                findings = []
+                for f in (data.get("findings") or [])[:25]:
+                    if not isinstance(f, dict):
+                        continue
+                    sev = str(f.get("severity") or "medium").strip().lower()
+                    fp = str(f.get("file_path") or "").strip().lstrip("/")
+                    if not fp or ".." in fp:
+                        fp = "deliverable.md"
+                    try:
+                        ln = int(f["line_no"]) if f.get("line_no") is not None else None
+                    except (TypeError, ValueError):
+                        ln = None
+                    findings.append({
+                        "severity": sev if sev in SEVERITY_ORDER else "medium",
+                        "file_path": fp[:500], "side": "new", "line_no": ln,
+                        "line_text": _clip(f.get("line_text"), 200),
+                        "claim": _clip(f.get("claim"), 300),
+                        "evidence": _clip(f.get("evidence"), 400),
+                        "problem": _clip(f.get("problem"), 300),
+                        "suggested_fix": _clip(f.get("fix") or f.get("suggested_fix"), 300),
+                    })
+                if findings:
+                    findings.sort(key=lambda x: SEVERITY_ORDER[x["severity"]])
+                    out["findings"] = findings
+                rb = _clip(data.get("revision_brief"), 2500)
+                if rb:
+                    out["revision_brief"] = rb
+    return out
 
 
 # ─────────────────────────── Grounded critic (Super Result) ───────────────────────────
