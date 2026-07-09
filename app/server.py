@@ -4398,7 +4398,47 @@ _WIZARD_ROLE_LOCK = (
 )
 
 
-def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None) -> str:
+def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
+                         super_result: bool = False, fanout: bool = False,
+                         fanout_n: int = 3) -> str:
+    # Super Result fan-out (SUPER-RESULT-PLAN §6 Step 7b): planning-time shape,
+    # per goal family — independent perspectives cross-check, then reconcile.
+    sr_block = ""
+    if super_result and fanout:
+        sr_block = (
+            "SUPER RESULT FAN-OUT — this project runs under Super Result (a grounded "
+            "frontier critic re-verifies deliverables and drives rework rounds). Where "
+            "the goal is parallelizable, fan the work out so independent perspectives "
+            "cross-check each other, then reconcile:\n"
+            f"- ANALYSIS / AUDIT / INVESTIGATION goals: {fanout_n} investigator tasks, "
+            "parallel (depends_on []), each description carrying an explicit DISTINCT "
+            "LENS paragraph — lens 1: verify-the-facts against primary evidence; lens 2: "
+            "gaps, risks, what's missing; lens 3: alternative explanations / steelman the "
+            "opposite conclusion — plus ONE reconciler task depending on ALL "
+            "investigators: union of findings, adversarially verify each against primary "
+            "evidence, resolve every contradiction explicitly (name which investigator "
+            'was wrong and why), final report. Tags: investigators '
+            '["investigation","fanout"], reconciler ["reconciler"]; the reconciler gets '
+            'super_result: true and deliverable_type "analysis".\n'
+            "- CODING goals: NEVER parallel implementations. Keep the 5-stage pipeline, "
+            "but replace the single review with TWO parallel independent code-review "
+            "tasks with distinct lenses (A: correctness/security/failure-modes — "
+            "actively try to break it; B: spec-coverage/regression/test-integrity — "
+            "every requirement covered, no weakened or deleted tests), both depending on "
+            'the implementation, tags ["review","quality-gate","fanout"]; the fix task '
+            "depends on the implementation and BOTH reviews; the verifier stays the "
+            "final sink with super_result: true.\n"
+            "- CONTENT / RESEARCH goals: 2 independent draft tasks with distinct "
+            'angle/lens prompts, parallel, tags ["draft","fanout"], plus ONE synthesis '
+            "reconciler depending on both: pick the strongest elements, adversarially "
+            "fact-check every claim it keeps, produce the final; super_result: true, "
+            'tag ["reconciler"].\n'
+            "≤7 tasks total. When the goal is NOT parallelizable (trivial one-liner, "
+            "single mechanical artifact), fall back to the normal templates — Super "
+            "Result still critiques the single result.\n\n")
+    elif super_result:
+        sr_block = ("SUPER RESULT is ON for this goal (fan-out disabled): use the "
+                    "normal templates; the FINAL task carries super_result: true.\n\n")
     base = (
         "You are the project-planning assistant for the Nexus agent control plane. The operator "
         "describes a goal in plain words (German or English); you turn it into a properly "
@@ -4429,6 +4469,8 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None) -
         "- high_stakes: true when the output goes to real customers/public/money "
         "(ads, listings, prices, mass emails, homepage) — it then pauses for human approval "
         "+ frontier judge\n"
+        "- deliverable_type: one of analysis|code_change|content|research — the kind of "
+        "artifact the task produces (drives type-aware quality gates)\n"
         + _model_guidance(uid) +
         "- priority: 0 critical, 1 high, 2 normal, 3 low (one value for a whole project)\n"
         "- budget_tokens: null for default (1M); set lower (e.g. 200000) for small tasks\n"
@@ -4484,13 +4526,15 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None) -
         "MUSIC-DJ: single task (dj-set-curator or music-producer).\n"
         "EVERYTHING ELSE: single task is the default. Propose a workflow only when steps "
         "truly feed each other's outputs.\n\n"
+        + sr_block +
         "NEVER:\n"
         "- invent specialist names, domains or models\n"
         "- emit 'documentation', 'ship', 'commit' or 'deploy' tasks (shipping is the human's gate)\n"
         "- create two code-implementer tasks without a dependency between them (no parallel writers)\n"
         "- let a review/verify task instruct fixing, or an implement task sign off its own work\n"
         "- split content work into outline/draft/edit micro-tasks\n"
-        "- exceed 5 tasks; blanket high_stakes; raise budgets above the stage defaults\n\n"
+        f"- exceed {7 if (super_result and fanout) else 5} tasks; blanket high_stakes; "
+        "raise budgets above the stage defaults\n\n"
         "SPECIALIST ROSTER:\n" + _specialist_roster()
     )
     if allow_questions:
@@ -4538,6 +4582,10 @@ def _clamp_wizard_task(t: dict, repairs: list | None = None,
         "priority": t.get("priority") if t.get("priority") in (0, 1, 2, 3) else 2,
         "budget_tokens": int(t["budget_tokens"]) if str(t.get("budget_tokens") or "").isdigit() else None,
         "tags": [str(x)[:24] for x in (t.get("tags") or [])][:3],
+        # Super Result passthrough (§7c) — survives the edit → revalidate loop
+        "super_result": bool(t.get("super_result")),
+        "deliverable_type": (t.get("deliverable_type")
+                             if t.get("deliverable_type") in _DELIVERABLE_TYPES else None),
     }
     if out["model"] == default_model:
         out["model"] = None  # default — keep the column clean (resolved at dispatch)
@@ -4572,6 +4620,28 @@ def _review_gate_task(goal: str) -> dict:
         "domain": "software-engineering", "specialist": "code-reviewer",
         "high_stakes": False, "model": None, "priority": 2,
         "budget_tokens": 3000000, "tags": ["review", "quality-gate"],
+    }
+
+
+def _reconciler_gate_task(goal: str) -> dict:
+    """Super Result fan-out (§7d): the reconciler that unions + adversarially
+    verifies the parallel investigators' findings. Appended when a fan-out
+    plan is missing one — a fan-out without a reconciler never converges."""
+    return {
+        "title": f"Reconcile & verify findings: {goal}"[:200],
+        "description": (
+            "Reconciliation gate for the parallel investigation. Take EVERY sibling "
+            "report from the INPUT deliverables and produce the final report: "
+            "(1) UNION of findings — nothing silently dropped; (2) adversarially "
+            "VERIFY every claim you keep against primary evidence (read the actual "
+            "files, re-run the quoted commands — a sibling's assertion is never "
+            "evidence); (3) resolve every contradiction explicitly, naming which "
+            "investigator was wrong and why; (4) an honest 'What was NOT checked' "
+            "section. The final report must stand alone."),
+        "domain": "general", "specialist": None,
+        "high_stakes": False, "model": None, "priority": 2,
+        "budget_tokens": 3000000, "tags": ["reconciler", "quality-gate"],
+        "super_result": True, "deliverable_type": "analysis",
     }
 
 
@@ -4698,14 +4768,19 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
             impl = [i for i, t in enumerate(tasks) if t["specialist"] == "code-implementer"]
             spec_i = next((i for i, t in enumerate(tasks)
                            if t["specialist"] == "tech-lead-orchestrator"), None)
-            rev_i = next((i for i, t in enumerate(tasks)
-                          if t["specialist"] == "code-reviewer"), None)
+            # Super Result fan-out (§7d): plans may carry TWO parallel lens
+            # reviewers — every reviewer gets the dep repair, the fix task
+            # waits for all of them, the verifier gates on all of them.
+            rev_is = [i for i, t in enumerate(tasks)
+                      if t["specialist"] == "code-reviewer"]
+            rev_i = rev_is[0] if rev_is else None
             if rev_i is None:
                 gate = _review_gate_task(wf_name)
                 gate["depends_on_idx"] = sorted(set(impl)
                                                 | ({spec_i} if spec_i is not None else set()))
                 tasks.append(gate)
                 rev_i = len(tasks) - 1
+                rev_is = [rev_i]
                 repairs.append("inserted mandatory code-review stage")
                 if len(tasks) < 6:
                     # The model forgot the review stage, so it forgot the fix
@@ -4729,13 +4804,24 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
                     tasks.append(fix)
                     repairs.append("inserted fix-review-findings stage")
             else:
-                want = (set(i for i in impl if i < rev_i)
-                        | ({spec_i} if spec_i is not None and spec_i < rev_i else set()))
-                missing = want - set(tasks[rev_i]["depends_on_idx"])
-                if missing:
-                    tasks[rev_i]["depends_on_idx"] = sorted(
-                        set(tasks[rev_i]["depends_on_idx"]) | missing)
-                    repairs.append("code review now waits for every implementation task")
+                for ri in rev_is:
+                    want = (set(i for i in impl if i < ri)
+                            | ({spec_i} if spec_i is not None and spec_i < ri else set()))
+                    missing = want - set(tasks[ri]["depends_on_idx"])
+                    if missing:
+                        tasks[ri]["depends_on_idx"] = sorted(
+                            set(tasks[ri]["depends_on_idx"]) | missing)
+                        repairs.append("code review now waits for every implementation task")
+                # the fix task (an implementer placed after a reviewer) must
+                # consume the implementation AND every parallel review
+                for fi in [i for i in impl if any(ri < i for ri in rev_is)]:
+                    want = (set(j for j in impl if j < fi)
+                            | set(ri for ri in rev_is if ri < fi))
+                    missing = want - set(tasks[fi]["depends_on_idx"])
+                    if missing:
+                        tasks[fi]["depends_on_idx"] = sorted(
+                            set(tasks[fi]["depends_on_idx"]) | missing)
+                        repairs.append("fix task now waits for every review")
             # Re-append the verifier as the unique final gate.
             incoming = {d for t in tasks for d in t["depends_on_idx"]}
             sinks = {i for i in range(len(tasks)) if i not in incoming}
@@ -4746,10 +4832,35 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
                 ver_task["high_stakes"] = True
                 repairs.append("acceptance verification marked high-stakes (human + judge gate)")
             ver_task["depends_on_idx"] = sorted(
-                sinks | {rev_i} | ({spec_i} if spec_i is not None else set()))
+                sinks | set(rev_is) | ({spec_i} if spec_i is not None else set()))
             if ver_deps_before is not None and ver_task["depends_on_idx"] != ver_deps_before:
                 repairs.append("acceptance verification now gates on review + every open task")
             tasks.append(ver_task)
+        # Reconciler enforcement (§7d): a Super Result fan-out (≥2 parallel
+        # investigators/drafts, no coding pipeline) needs exactly one
+        # reconciler depending on ALL of them — append or complete it.
+        if not impl:
+            fanout_is = [i for i, t in enumerate(tasks)
+                         if {"fanout", "investigation", "draft"} & set(t.get("tags") or [])]
+            if len(fanout_is) >= 2:
+                rec_i = next(
+                    (i for i, t in enumerate(tasks) if i not in fanout_is
+                     and ("reconciler" in (t.get("tags") or [])
+                          or set(fanout_is) <= set(t.get("depends_on_idx") or []))),
+                    None)
+                if rec_i is None:
+                    rec = _reconciler_gate_task(wf_name)
+                    rec["depends_on_idx"] = sorted(fanout_is)
+                    tasks.append(rec)
+                    repairs.append("appended missing reconciler stage "
+                                   "(fan-out needs a verifying union)")
+                else:
+                    missing = set(fanout_is) - set(tasks[rec_i]["depends_on_idx"])
+                    missing.discard(rec_i)
+                    if missing:
+                        tasks[rec_i]["depends_on_idx"] = sorted(
+                            set(tasks[rec_i]["depends_on_idx"]) | missing)
+                        repairs.append("reconciler now depends on every investigator/draft")
         if len(tasks) > 1:
             if all(not t["depends_on_idx"] for t in tasks):
                 for i in range(1, len(tasks)):
@@ -4851,6 +4962,14 @@ async def task_wizard(body: dict):
         return JSONResponse(status_code=400, content={"error": "describe what you want done"})
     answers = body.get("answers") if isinstance(body.get("answers"), list) else None
 
+    # Super Result (§6 Step 7a): flag + fan-out shape the planning framing.
+    super_result = bool(body.get("super_result"))
+    fanout = body.get("fanout")
+    if fanout is None:
+        fanout = sreg.conf("super.fanout_default", "1") == "1"
+    fanout = bool(fanout) and super_result
+    fanout_n = int(sreg.conf("super.fanout_n", "3") or 3)
+
     # Phase 2: fold the closed question round into the goal description.
     goal_text = instruction
     skipped_assumptions = []
@@ -4902,7 +5021,9 @@ async def task_wizard(body: dict):
     wizard_uid = auth.current_user_id()
 
     async def _call(allow_questions: bool) -> dict:
-        framing = _task_wizard_framing(allow_questions, uid=wizard_uid)
+        framing = _task_wizard_framing(allow_questions, uid=wizard_uid,
+                                       super_result=super_result, fanout=fanout,
+                                       fanout_n=fanout_n)
 
         def _run():
             # Session-level system prompt = persistent role lock (stronger
@@ -4988,13 +5109,22 @@ async def task_wizard(body: dict):
     if data.get("type") == "workflow" and isinstance(data.get("workflow"), dict):
         wf = data["workflow"]
         name = str(wf.get("name") or "").strip()[:120] or "New project"
-        tasks, repairs = _repair_workflow(wf.get("tasks") or [], name, uid=wizard_uid)
+        tasks, repairs = _repair_workflow(wf.get("tasks") or [], name,
+                                          max_raw=(7 if fanout else 5), uid=wizard_uid)
         if tasks and assumptions:
             tasks[0]["description"] = _with_assumptions(tasks[0]["description"])
+        # Deterministic post-step (§7a — not the LLM's job): the project and
+        # every sink task carry the flag, so the loop covers the final results.
+        if super_result:
+            incoming = {d for t in tasks for d in (t.get("depends_on_idx") or [])}
+            for i, t in enumerate(tasks):
+                if i not in incoming:
+                    t["super_result"] = True
         out = {"type": "workflow", "workflow": {
             "name": name,
             "goal": str(wf.get("goal") or "").strip()[:500],
             "domain": wf.get("domain") if wf.get("domain") in _TASK_DOMAINS else None,
+            "super_result": super_result,
             "tasks": tasks},
             "assumptions": assumptions, "repairs": repairs}
         for r in repairs:
@@ -5004,6 +5134,8 @@ async def task_wizard(body: dict):
         t = _clamp_wizard_task(data.get("task") or data, repairs, _specialist_names(),
                                uid=wizard_uid)
         t["description"] = _with_assumptions(t["description"])
+        if super_result:
+            t["super_result"] = True
         out = {"type": "task", "task": t, "assumptions": assumptions, "repairs": repairs}
     if valid_repo:
         out["repo_path"] = valid_repo  # proposal modal preselects it
