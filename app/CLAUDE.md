@@ -171,6 +171,12 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - **Runtime gate — Onboarding UI (Playwright):** `.venv/bin/python scripts/verify_onboarding_ui.py` —
   CTA banner, welcome step, section explanations, auto-save on Next, n/a toggle, review
   counts, confirm-gated apply → success, Settings entry. 12 checks.
+- **Runtime gate — Super Result:** `.venv/bin/python scripts/verify_super_result_e2e.py` —
+  stubbed-critic e2e against the LIVE sweep (takes minutes): critic run → source/anchor
+  validated auto-comments → retry drain → closed auto-round → convergence + round-cap
+  escalations → SHIP quiet-stop → open-mode checkpoint + approve/reject → workflow cascade
+  → revalidate reconciler/multi-review repair. ~27 checks, self-cleaning, restores
+  super.critic_cmd.
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
@@ -358,6 +364,34 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   modal shows stages (parallel tasks grouped), assumptions, auto-repairs, and lets the
   operator untick optional tasks (quality gates are locked; skipped tasks are spliced out
   of the DAG so dependents inherit their dependencies).
+
+### Super Result (2026-07-10, SUPER-RESULT-PLAN-2026-07-09.md is source of truth)
+- **Grounded quality loop**: flag `super_result` on a task/workflow (wizard ✨ toggle, task
+  create/detail, project modal, or API) and every fresh deliverable is re-verified by a
+  GROUNDED CRITIC — the frontier-judge model running `cverify` (~/.local/bin, vendored
+  setup/bin/) with FULL tool access inside a DISPOSABLE sandbox copy of the evidence
+  (`workspaces/_critic/<task>-r<N>-<hex>`: workspace copytree + `git clone --local` with
+  origin removed for repo tasks; secrets-scrubbed env; deny rules for push/remote/gh/sudo).
+  The critic re-reads sources, re-runs quoted commands, and emits sentinel-fenced JSON
+  (verdict/findings/contradictions/missing/revision_brief/learning_note).
+- **Auto-comments → rework**: findings land as line-anchored `review_comments`
+  (`source='critic'`, supersede-then-insert per round, anchors validated ±2 against the
+  real file); `_retry_task` drains them (tags [CRITIC]/[JUDGE]/[REVIEWER], fb cap 16k) with
+  the revision brief. The loop engine (`_sweep_super_result`, 20s) runs critic → closed
+  auto-retry / open checkpoint → SHIP quiet-stop | convergence (`keys ⊆ prev`) | round cap
+  | error → `super_result` approvals (reject=rework+round bump, approve=accept). The
+  `super_result` trigger REPLACES judge_revise/auto_judge in the loop design (§4.5).
+- **Fan-out (planning-time)**: wizard body `super_result:true` (+`fanout`, defaults
+  `super.fanout_default`) shapes the plan per goal family — analysis: N lens-investigators
+  + reconciler; coding: 2 parallel lens reviewers (never parallel impls); content/research:
+  2 drafts + synthesis. `_repair_workflow` enforces the reconciler + multi-review wiring.
+- **State**: `tasks.critic_*` columns (separate from `judge_*` BY DESIGN — §4.1),
+  `tasks/workflows.super_result`, `deliverable_type` (analysis|code_change|content|research
+  — drives the type rubric `~/knowledge/rubrics/INVESTIGATION.md` for the judge too, N1).
+  Settings section `super.*` (critic_cmd is the gate stub hook, max_rounds, timeout_s,
+  max_findings, fanout_*, keep_sandbox). Critic runs bill the Claude CLI subscription, NOT
+  the GLM budget counters (B7 note) — Usage under-reports SR cost by design.
+- **Cost**: ~5–10× a single pass. Default OFF; per-task/workflow opt-in.
 
 ### Block 3 (2026-07-08, docs/SPEC-BLOCK3.md is source of truth)
 - **Plan editor in the proposal modal (R1)**: every wizard-proposed task is editable in place
