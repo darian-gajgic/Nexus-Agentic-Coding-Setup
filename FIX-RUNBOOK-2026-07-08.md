@@ -434,7 +434,7 @@ Code anchors (verified 2026-07-09): the streamed reply accumulates into a plain 
 
 **Prompt:**
 ```
-This is Batch 8 of the Nexus stabilization. TWO fixes, mostly frontend (app/static/app.js). Read app/CLAUDE.md's "Live updates" + JARVIS v2 notes first. Study the real code before editing — anchors below are from 2026-07-09; verify them.
+Read ~/Nexus-Agentic-Coding-Setup/FIX-RUNBOOK-2026-07-08.md section 8 (the "Batch 8" entry — the mechanism, code anchors, and scope note for BOTH fixes live there; neither is in STABILITY-AUDIT). Also read app/CLAUDE.md's "Live updates" + JARVIS v2 notes. This is Batch 8 of the Nexus stabilization: TWO fixes, mostly frontend (app/static/app.js). Study the real code before editing — anchors below are from 2026-07-09; verify them.
 
 === FIX 1 — "Option C": JARVIS must KEEP TALKING across a view/tab switch (regression from Batch 2) ===
 BUG: switching away from the JARVIS view mid-reply cuts JARVIS off mid-sentence ("Today sits [stopped]"). Traced: switchView() (~505) calls jarvisTeardown() (~6270) on leaving jarvis; teardown calls jarvisStopStreaming() → jarvisState.abortController.abort() and closes jTTS.ws — the aborted fetch closes Nexus's SSE → Nexus closes its httpx stream to Hermes → Hermes aborts. KEY FACT (verify): the streamed reply text accumulates into a plain JS object `liveMsg` in jarvisState.messages (jarvisStreamChat ~6647, reader loop ~6710 via jarvisHandleSSE) — NOT DOM-bound; only jarvisRenderFeed() paints it. So the turn CAN keep running in the background; the abort is the only thing stopping it.
