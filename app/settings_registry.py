@@ -71,6 +71,37 @@ SECTIONS = [
         ],
     },
     {
+        "id": "super", "title": "Super Result (grounded critic loop)",
+        "desc": "A frontier critic with evidence access re-verifies each deliverable in a disposable "
+                "sandbox, files line-anchored findings as review comments, and loops the work until "
+                "SHIP, convergence, or the round cap. Model = the 'frontier judge' purpose.",
+        "items": [
+            {"key": "super.critic_cmd", "label": "Critic command template", "type": "command",
+             "default": "cverify {file} {domain} {sandbox}",
+             "help": "Tokens: {file} {domain} {sandbox} and optional {model}. Gates stub this — "
+                     "restore after testing."},
+            {"key": "super.max_rounds", "label": "Max automatic rounds", "type": "int",
+             "default": "3", "min": 1, "max": 6,
+             "help": "Critic → rework rounds before the loop escalates to you."},
+            {"key": "super.timeout_s", "label": "Critic timeout (s)", "type": "int",
+             "default": "1500", "min": 120, "max": 3600,
+             "help": "Hard cap on one critic run (sandboxed, with tool use — minutes are normal)."},
+            {"key": "super.max_findings", "label": "Max findings per round", "type": "int",
+             "default": "25", "min": 3, "max": 40,
+             "help": "Findings beyond this are dropped least-severe-first."},
+            {"key": "super.fanout_default", "label": "Wizard fan-out by default", "type": "bool",
+             "default": "1",
+             "help": "Super Result projects plan independent parallel perspectives + a reconciler "
+                     "where the goal allows it."},
+            {"key": "super.fanout_n", "label": "Fan-out width", "type": "int",
+             "default": "3", "min": 2, "max": 4,
+             "help": "Parallel investigators/drafts the wizard plans for analysis/content goals."},
+            {"key": "super.keep_sandbox", "label": "Keep critic sandboxes (debug)", "type": "bool",
+             "default": "0",
+             "help": "Leave app/workspaces/_critic/<id> in place after a run — debugging only."},
+        ],
+    },
+    {
         "id": "integrations", "title": "Services & integrations",
         "desc": "Where Nexus finds its companion services. Values apply after a service restart.",
         "items": [
