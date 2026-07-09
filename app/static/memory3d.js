@@ -212,8 +212,10 @@ function buildScene(data) {
   M.group.add(M.linkLines);
 
   // ── electrical pulses that travel along links ──
+  // no links (no similarity above threshold yet): zero pulses — indexing
+  // links[NaN] here threw and blanked the whole galaxy
   const pulseGeo = new THREE.SphereGeometry(0.55, 8, 8);
-  const nPulses = Math.min(46, Math.max(10, Math.floor(links.length / 4)));
+  const nPulses = links.length ? Math.min(46, Math.max(10, Math.floor(links.length / 4))) : 0;
   for (let i = 0; i < nPulses; i++) {
     const mat = new THREE.MeshBasicMaterial({
       color: 0x9df5ff, transparent: true, opacity: 0.9,

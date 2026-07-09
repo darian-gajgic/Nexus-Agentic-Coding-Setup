@@ -194,17 +194,21 @@ def _trigger(cfg: dict, tid: str) -> dict | None:
     return None
 
 
+# An explicit labelled verdict wins; otherwise the first STANDALONE uppercase
+# token. Word boundaries + case sensitivity keep prose like "all tests passed"
+# or "failures: 0" from inverting the verdict (they did, as bare substrings).
+_VERDICT_LABELLED = re.compile(r"VERDICT\s*[:\-]?\s*\**\s*(PASS|FAIL)\b", re.I)
+_VERDICT_TOKEN = re.compile(r"\b(PASS|FAIL)\b")
+
+
 def _verdict_from_summary(summary: str | None) -> str | None:
     """The acceptance-verifier's contract is an explicit PASS or FAIL."""
-    head = (summary or "")[:600].upper()
-    p, f = head.find("PASS"), head.find("FAIL")
-    if p == -1 and f == -1:
-        return None
-    if p == -1:
-        return "FAIL"
-    if f == -1:
-        return "PASS"
-    return "PASS" if p < f else "FAIL"
+    head = (summary or "")[:600]
+    m = _VERDICT_LABELLED.search(head)
+    if m:
+        return m.group(1).upper()
+    m = _VERDICT_TOKEN.search(head)
+    return m.group(1) if m else None
 
 
 def _api(method: str, path: str, body: dict | None = None,

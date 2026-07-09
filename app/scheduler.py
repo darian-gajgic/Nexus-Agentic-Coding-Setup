@@ -7,10 +7,13 @@ would never fire is rejected at creation instead of silently sleeping forever.
 A scheduler thread fires jobs whose next_run has passed.
 """
 import sys
+import json
 import time
+import uuid
 import threading
 import datetime as dt
 
+import auth
 import database as db
 
 
@@ -94,13 +97,27 @@ def next_run(cron_expr: str, after: float | None = None) -> float:
 
 
 def _trigger(job: dict):
-    """Fire a scheduled job: set the target agent's current_task + log."""
+    """Fire a scheduled job: create a REAL task on the board so the normal
+    claim/dispatch flow executes it. (Before, firing only wrote a cosmetic
+    agent label + log line — run_count grew but no work ever ran.) Jobs are
+    admin-created and global, so the task belongs to the owner; status 'todo'
+    is what worker lanes auto-claim, and agent_id pins the assignee."""
     try:
+        tid = f"task-{uuid.uuid4().hex[:8]}"
+        now = time.time()
+        db.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, "
+            "assignee_id, created_at, updated_at, tags, position, user_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, f"[scheduled] {job['name']}", job["action"], "todo", 2,
+             job.get("agent_id") or None, now, now, json.dumps(["scheduled"]), 0,
+             auth.DEFAULT_USER_ID))
         if job.get("agent_id"):
             db.execute("UPDATE agents SET current_task = ? WHERE id = ?",
                        (f"[scheduled] {job['name']}: {job['action']}", job["agent_id"]))
         db.log_activity("info", "scheduler",
-                        f"Job '{job['name']}' fired: {job['action']}")
+                        f"Job '{job['name']}' fired: task {tid} created — {job['action']}",
+                        user_id=auth.DEFAULT_USER_ID)
         status = "ok"
     except Exception as e:
         db.log_activity("error", "scheduler", f"Job '{job['name']}' failed: {e}")

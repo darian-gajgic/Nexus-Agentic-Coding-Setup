@@ -1616,6 +1616,10 @@ except Exception as _e:
 HERMES_API_BASE = sreg.conf("hermes.api_base")  # setting → env → default; restart applies
 HERMES_API_KEY = os.environ.get("API_SERVER_KEY", "")
 JARVIS_SESSION_FILE = Path(__file__).parent / "jarvis_session.json"
+# Serializes every read-modify-write of jarvis_session.json: concurrent turns
+# (or barge-in + new turn) used to interleave load→mutate→save and lose the
+# other's session pointer/history. Never hold this across an await.
+_JARVIS_SESSION_LOCK = threading.Lock()
 
 
 def _hermes_headers() -> dict:
@@ -1647,7 +1651,10 @@ def _load_jarvis_session() -> dict:
 
 
 def _save_jarvis_session(data: dict):
-    JARVIS_SESSION_FILE.write_text(json.dumps(data))
+    # Atomic replace: a reader (or a crash mid-write) never sees a torn file.
+    tmp = JARVIS_SESSION_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, JARVIS_SESSION_FILE)
 
 
 def _jarvis_sid_for(user_id: str) -> str | None:
@@ -1661,8 +1668,7 @@ async def _get_or_create_jarvis_session(force_new: bool = False) -> str:
     so mem0 memories extracted from them are stamped with this user."""
     user = auth.current_user()
     uid = user["id"] if user else auth.DEFAULT_USER_ID
-    state = _load_jarvis_session()
-    sid = None if force_new else (state.get("sessions") or {}).get(uid)
+    sid = None if force_new else _jarvis_sid_for(uid)
     if sid:
         # Verify session still exists
         async with httpx.AsyncClient() as client:
@@ -1700,10 +1706,14 @@ async def _get_or_create_jarvis_session(force_new: bool = False) -> str:
         r.raise_for_status()
         data = r.json()
         sid = (data.get("session") or data).get("id")
-    state.setdefault("sessions", {})[uid] = sid
-    state.setdefault("history", {}).setdefault(uid, []).append(
-        {"id": sid, "title": "New conversation", "ts": time.time()})
-    _save_jarvis_session(state)
+    with _JARVIS_SESSION_LOCK:
+        # Re-load INSIDE the lock: the state read before the Hermes round-trips
+        # is stale — writing it back would drop concurrent turns' updates.
+        state = _load_jarvis_session()
+        state.setdefault("sessions", {})[uid] = sid
+        state.setdefault("history", {}).setdefault(uid, []).append(
+            {"id": sid, "title": "New conversation", "ts": time.time()})
+        _save_jarvis_session(state)
     _publish_jarvis_user_scope(sid, uid)
     db.log_activity("info", "jarvis", f"JARVIS session created: {sid}", user_id=uid)
     return sid
@@ -1767,12 +1777,13 @@ async def jarvis_switch_session(body: dict):
     """Go back to one of YOUR previous conversations."""
     uid = auth.current_user_id()
     sid = (body.get("id") or "").strip()
-    state = _load_jarvis_session()
-    hist = (state.get("history") or {}).get(uid, [])
-    if not any(h.get("id") == sid for h in hist):
-        return JSONResponse(status_code=404, content={"error": "not your session"})
-    state["sessions"][uid] = sid
-    _save_jarvis_session(state)
+    with _JARVIS_SESSION_LOCK:
+        state = _load_jarvis_session()
+        hist = (state.get("history") or {}).get(uid, [])
+        if not any(h.get("id") == sid for h in hist):
+            return JSONResponse(status_code=404, content={"error": "not your session"})
+        state["sessions"][uid] = sid
+        _save_jarvis_session(state)
     _publish_jarvis_user_scope(sid, uid)
     return {"ok": True, "session_id": sid}
 
@@ -1784,15 +1795,16 @@ async def jarvis_forget_session(body: dict):
     the most recent remaining conversation."""
     uid = auth.current_user_id()
     sid = (body.get("id") or "").strip()
-    state = _load_jarvis_session()
-    hist = (state.get("history") or {}).get(uid, [])
-    if not any(h.get("id") == sid for h in hist):
-        return JSONResponse(status_code=404, content={"error": "not your session"})
-    state["history"][uid] = [h for h in hist if h.get("id") != sid]
-    if (state.get("sessions") or {}).get(uid) == sid:
-        rest = state["history"][uid]
-        state["sessions"][uid] = rest[-1]["id"] if rest else None
-    _save_jarvis_session(state)
+    with _JARVIS_SESSION_LOCK:
+        state = _load_jarvis_session()
+        hist = (state.get("history") or {}).get(uid, [])
+        if not any(h.get("id") == sid for h in hist):
+            return JSONResponse(status_code=404, content={"error": "not your session"})
+        state["history"][uid] = [h for h in hist if h.get("id") != sid]
+        if (state.get("sessions") or {}).get(uid) == sid:
+            rest = state["history"][uid]
+            state["sessions"][uid] = rest[-1]["id"] if rest else None
+        _save_jarvis_session(state)
     try:
         async with httpx.AsyncClient() as client:
             await client.delete(f"{HERMES_API_BASE}/api/sessions/{sid}",
@@ -1809,13 +1821,14 @@ async def jarvis_session_title(body: dict):
     sid, title = (body.get("id") or "").strip(), (body.get("title") or "").strip()[:80]
     if not sid or not title:
         return JSONResponse(status_code=400, content={"error": "id and title required"})
-    state = _load_jarvis_session()
-    for h in (state.get("history") or {}).get(uid, []):
-        if h.get("id") == sid:
-            if h.get("title") in ("New conversation", "Conversation", ""):
-                h["title"] = title
-                _save_jarvis_session(state)
-            return {"ok": True}
+    with _JARVIS_SESSION_LOCK:
+        state = _load_jarvis_session()
+        for h in (state.get("history") or {}).get(uid, []):
+            if h.get("id") == sid:
+                if h.get("title") in ("New conversation", "Conversation", ""):
+                    h["title"] = title
+                    _save_jarvis_session(state)
+                return {"ok": True}
     return JSONResponse(status_code=404, content={"error": "not your session"})
 
 
@@ -2381,6 +2394,11 @@ async def jarvis_file_download(name: str):
     uid = auth.current_user_id()
     if not safe or not (_jarvis_files_dir(uid) / safe).is_file():
         return JSONResponse(status_code=404, content={"error": "not found"})
+    if safe.lower().endswith((".html", ".svg")):
+        # Script-capable exchange files must never render inline on the app
+        # origin (stored XSS) — force download + neutralized media type.
+        return FileResponse(str(_jarvis_files_dir(uid) / safe), media_type="text/plain",
+                            headers={"Content-Disposition": f'attachment; filename="{safe}"'})
     return FileResponse(str(_jarvis_files_dir(uid) / safe),
                         headers={"Content-Disposition": f'inline; filename="{safe}"'})
 
@@ -2527,7 +2545,8 @@ async def jarvis_briefing():
         "SELECT title FROM tasks WHERE user_id=? AND dispatch_state='failed' "
         "AND updated_at>=? LIMIT 5", (uid, cutoff))
     approvals = db.query_one(
-        "SELECT COUNT(*) n FROM approvals WHERE status='pending'")["n"]
+        "SELECT COUNT(*) n FROM approvals WHERE status='pending' AND user_id=?",
+        (uid,))["n"]
     parts = [f"Good {'morning' if time.localtime().tm_hour < 12 else 'afternoon' if time.localtime().tm_hour < 18 else 'evening'}."]
     if done:
         parts.append(f"Since yesterday, {len(done)} task{'s' if len(done) > 1 else ''} finished: "
@@ -2760,6 +2779,9 @@ async def verify_run(body: dict):
 
 @app.get("/api/verify/runs")
 async def verify_runs(limit: int = 20, task_id: Optional[str] = None, agent_id: Optional[str] = None):
+    # Admin-only (C1 read side): runs carry admin verify-command output
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     q = "SELECT * FROM verify_runs WHERE 1=1"
     params = []
     if task_id:
@@ -2869,6 +2891,8 @@ async def decide_approval(approval_id: str, body: dict):
 
 @app.get("/api/watchdog/status")
 async def watchdog_status():
+    if not auth.is_admin():  # H2 read side: fleet-wide self-healing state
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     import watchdog as _wd
     return {
         "config": _wd.get_config(),
@@ -2922,6 +2946,9 @@ class MemoryCreate(BaseModel):
 
 @app.get("/api/agents/{agent_id}/memory")
 async def agent_memory(agent_id: str, scope: Optional[str] = None, limit: int = 100):
+    # Admin-only (sweep, read side): shared-fleet memory spans every user's work
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     q = "SELECT * FROM memory WHERE agent_id = ?"
     params = [agent_id]
     if scope:
@@ -2960,6 +2987,8 @@ async def del_memory(agent_id: str, mid: str):
 @app.get("/api/agents/{agent_id}/memory/context")
 async def memory_context(agent_id: str):
     """Condensed context blob: LTS summary + recent experience (SuperAGI-style)."""
+    if not auth.is_admin():  # sweep, read side: shared-fleet memory
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     lts = db.query_all(
         "SELECT content FROM memory WHERE agent_id=? AND scope='lts' ORDER BY created_at DESC LIMIT 5",
         (agent_id,),
@@ -2983,6 +3012,8 @@ import scheduler as _sched_mod
 
 @app.get("/api/scheduler")
 async def scheduler_list():
+    if not auth.is_admin():  # sweep, read side: global scheduled_jobs table
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     return {"jobs": db.query_all("SELECT * FROM scheduled_jobs ORDER BY created_at DESC")}
 
 
@@ -3099,6 +3130,9 @@ async def send_message(agent_id: str, body: MessageCreate):
 
 @app.get("/api/agents/{agent_id}/messages")
 async def agent_messages(agent_id: str, direction: Optional[str] = None, limit: int = 50):
+    # Admin-only (sweep, read side): global messages table spans every user
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
     q = "SELECT * FROM messages WHERE from_agent = ? OR to_agent = ?"
     params = [agent_id, agent_id]
     if direction == "sent":
@@ -3274,16 +3308,20 @@ async def task_file_download(task_id: str, name: str):
         return JSONResponse(status_code=403, content={"error": "path escapes workspace"})
     if not p.is_file():
         return JSONResponse(status_code=404, content={"error": "file not found"})
-    # SVG (and anything else script-capable) must never render inline from
-    # this origin — force download for non-image/pdf/text types.
+    # Script-capable types (HTML, SVG) must never render inline from this
+    # origin — an uploaded/agent-written file would run script with the app's
+    # session (stored XSS). Force download AND neutralize the media type;
+    # everything else non-image/pdf/text is download-only too.
     import mimetypes
     mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
     inline_ok = mime.startswith(("image/", "text/")) or mime == "application/pdf"
-    if mime == "image/svg+xml":
+    media_type = None
+    if mime in ("text/html", "application/xhtml+xml", "image/svg+xml"):
         inline_ok = False
+        media_type = "text/plain"
     headers = {} if inline_ok else {
         "Content-Disposition": f'attachment; filename="{p.name}"'}
-    return FileResponse(str(p), headers=headers)
+    return FileResponse(str(p), headers=headers, media_type=media_type)
 
 
 # ── App preview: ▶ Test a task's program output live (v3.3) ──
@@ -5010,18 +5048,13 @@ async def replan_apply(wf_id: str, body: dict):
     done_ids = [t["id"] for t in db.query_all(
         "SELECT id FROM tasks WHERE workflow_id=? AND status='done' ORDER BY created_at",
         (wf_id,))]
-    # Archive the superseded remainder: released from claims, out of rollups/
-    # board/loop-engine, kept in the DB + project detail for audit.
+    # Snapshot the superseded remainder BEFORE creating anything (the new
+    # backlog tasks must not match this query), but archive only after every
+    # recovery task exists: a mid-loop create failure used to leave the
+    # workflow archived-but-not-recreated (tasks lost).
     superseded = db.query_all(
         "SELECT id FROM tasks WHERE workflow_id=? AND status NOT IN ('done','archived')",
         (wf_id,))
-    for t in superseded:
-        db.execute("UPDATE tasks SET status='archived', claimed_by=NULL, claimed_at=NULL, "
-                   "updated_at=? WHERE id=?", (now, t["id"]))
-        # a pending approval on superseded work must never be decidable
-        db.execute(
-            "UPDATE approvals SET status='expired', decided_at=?, decided_by='superseded by replan' "
-            "WHERE status='pending' AND payload LIKE ?", (now, f'%"task_id": "{t["id"]}"%'))
     # Create the recovery tasks; roots inherit every DONE task as dependency so
     # their deliverables inject as INPUT (same mechanism as normal pipelines).
     ids: list = []
@@ -5039,8 +5072,27 @@ async def replan_apply(wf_id: str, body: dict):
             repo_path=(w.get("project_path") if t.get("specialist") in _DEV_SPECIALISTS else None),
             client=w.get("client"), depends_on=deps))
         if isinstance(created, JSONResponse):
-            return created  # foreign-ref/validation error — surface it verbatim
+            # foreign-ref/validation error — roll back the partial batch so the
+            # apply is atomic (nothing archived yet, no half-created plan left),
+            # then surface it verbatim.
+            for tid in ids:
+                db.execute("DELETE FROM tasks WHERE id=?", (tid,))
+            db.log_activity("error", "system",
+                            f"Replan apply on '{w['name']}' aborted: a recovery task was "
+                            f"rejected — {len(ids)} already-created task(s) rolled back, "
+                            "nothing archived", user_id=uid)
+            return created
         ids.append(created["id"])
+    # All recovery tasks exist — NOW archive the superseded remainder: released
+    # from claims, out of rollups/board/loop-engine, kept in the DB + project
+    # detail for audit.
+    for t in superseded:
+        db.execute("UPDATE tasks SET status='archived', claimed_by=NULL, claimed_at=NULL, "
+                   "updated_at=? WHERE id=?", (now, t["id"]))
+        # a pending approval on superseded work must never be decidable
+        db.execute(
+            "UPDATE approvals SET status='expired', decided_at=?, decided_by='superseded by replan' "
+            "WHERE status='pending' AND payload LIKE ?", (now, f'%"task_id": "{t["id"]}"%'))
     # A new plan earns fresh automatic-fix rounds.
     cfg = None
     try:
@@ -5825,7 +5877,9 @@ def memory3d(force: bool = False):
                 "z": round(float(coords[i][2]), 2),
                 "text": str(pl.get("data") or "")[:400],
                 "agent": pl.get("agent_id") or "",
-                "user": pl.get("user_id") or "",
+                # same payload key the isolation filter above reads — the mem0
+                # provider stamps "user", not "user_id"
+                "user": pl.get("user") or "",
                 "channel": pl.get("channel") or "",
                 "by": pl.get("attributed_to") or "",
                 "client": pl.get("client") or "",

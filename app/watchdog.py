@@ -31,6 +31,10 @@ DEFAULTS = {
     "stale_threshold_s": 150,
     "restart_on_stuck": True,
     "restart_on_dead": True,
+    # Circuit breaker: a lane restarted this many times total is retired
+    # instead of respawned (a hot-crashing worker otherwise respawns forever —
+    # the SelfHealTest zombie hit 10,954). 0 disables the breaker.
+    "max_restarts": 20,
 }
 
 
@@ -52,6 +56,7 @@ def get_config() -> dict:
         "stale_threshold_s": _setting("watchdog.stale_threshold_s", int, DEFAULTS["stale_threshold_s"]),
         "restart_on_stuck": _setting("watchdog.restart_on_stuck", lambda v: v == "1", DEFAULTS["restart_on_stuck"]),
         "restart_on_dead": _setting("watchdog.restart_on_dead", lambda v: v == "1", DEFAULTS["restart_on_dead"]),
+        "max_restarts": _setting("watchdog.max_restarts", int, DEFAULTS["max_restarts"]),
     }
 
 
@@ -98,8 +103,11 @@ def _once(cfg: dict) -> list[dict]:
         return []  # never respawn workers while the service is stopping
     actions = []
     now = time.time()
-    # Include 'crashed' so agents marked dead by the metrics loop get healed.
-    agents = db.query_all("SELECT * FROM agents WHERE status IN ('running','busy','crashed')")
+    # Include 'crashed' so agents marked dead by the metrics loop get healed,
+    # and 'stuck' so a lane marked stuck (restart_on_stuck=0) stays monitored
+    # (cost caps + dead detection) instead of dropping out of healing forever.
+    agents = db.query_all(
+        "SELECT * FROM agents WHERE status IN ('running','busy','crashed','stuck')")
     for a in agents:
         pid = a.get("pid")
         alive = _is_alive(pid, a["id"])
@@ -116,7 +124,28 @@ def _once(cfg: dict) -> list[dict]:
             actions.append({"agent": a["id"], "action": "cost_capped", "tokens": total_tokens})
             continue  # do not restart a cost-capped agent
 
-        # 2. Dead agent -> restart
+        # 2. Restart circuit-breaker: restart_count was incremented but never
+        # checked, so a hot-crashing lane respawned forever. Past the cap the
+        # lane is RETIRED (terminal — releases its claims, watchdog never
+        # touches it again); the operator investigates and spawns a fresh lane.
+        max_restarts = cfg.get("max_restarts") or 0
+        would_restart = (not alive and cfg["restart_on_dead"] and pid) or \
+            (alive and hb_age > cfg["stale_threshold_s"] and cfg["restart_on_stuck"])
+        if max_restarts and would_restart and (a.get("restart_count") or 0) >= max_restarts:
+            try:
+                am.retire_agent(a["id"])
+                db.log_activity("error", "watchdog",
+                    f"Agent '{a['name']}' hit the restart circuit-breaker "
+                    f"({a.get('restart_count')} restarts >= max {max_restarts}) — retired "
+                    "instead of respawned; investigate, then spawn a fresh lane")
+                actions.append({"agent": a["id"], "action": "circuit_breaker_retired",
+                                "restarts": a.get("restart_count") or 0})
+            except Exception as e:
+                db.log_activity("error", "watchdog",
+                    f"Circuit-breaker retire of '{a['name']}' failed: {e}")
+            continue
+
+        # 3. Dead agent -> restart
         if not alive and cfg["restart_on_dead"] and pid:
             try:
                 am.restart_agent(a["id"])
@@ -129,7 +158,7 @@ def _once(cfg: dict) -> list[dict]:
                 actions.append({"agent": a["id"], "action": "restart_failed", "error": str(e)})
             continue
 
-        # 3. Stuck agent -> mark stuck + maybe restart
+        # 4. Stuck agent -> mark stuck + maybe restart
         if alive and hb_age > cfg["stale_threshold_s"]:
             if cfg["restart_on_stuck"]:
                 try:
@@ -140,13 +169,13 @@ def _once(cfg: dict) -> list[dict]:
                     actions.append({"agent": a["id"], "action": "restarted_stuck", "hb_age": int(hb_age)})
                 except Exception as e:
                     db.log_activity("error", "watchdog", f"Stuck-restart of '{a['name']}' failed: {e}")
-            else:
+            elif a.get("status") != "stuck":  # already-marked: stay quiet, keep monitoring
                 db.execute("UPDATE agents SET status = 'stuck' WHERE id = ?", (a["id"],))
                 db.log_activity("warn", "watchdog",
                     f"Agent '{a['name']}' stuck (no heartbeat {int(hb_age)}s)")
                 actions.append({"agent": a["id"], "action": "marked_stuck", "hb_age": int(hb_age)})
 
-    # 4. Stranded claims: a task claimed but never dispatched (worker died in
+    # 5. Stranded claims: a task claimed but never dispatched (worker died in
     # the claim→dispatch window, or the claiming agent's row was deleted) is
     # invisible to every lane's _find_work forever. Release stale ones.
     stale_claim_s = _setting("watchdog.stale_claim_s", int, 3600)
@@ -163,7 +192,7 @@ def _once(cfg: dict) -> list[dict]:
             f"but never dispatched for >{stale_claim_s}s")
         actions.append({"task": t["id"], "action": "released_stranded_claim"})
 
-    # 5. Orphaned dispatches: a task with an ACTIVE dispatch_state but a dead
+    # 6. Orphaned dispatches: a task with an ACTIVE dispatch_state but a dead
     # heartbeat matches neither the worker's resume nor auto-claim query (e.g. a
     # 'backlog' task stuck at 'streaming' after its worker died / status drifted),
     # so it — and any workflow waiting on it — strands forever. Re-queue them.
