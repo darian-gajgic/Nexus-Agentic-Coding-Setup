@@ -170,12 +170,18 @@ def set_default_key(provider: str, value: str, env_file: str | None = None) -> d
         with open(path) as f:
             lines = f.read().splitlines()
     pat = re.compile(rf"^\s*(#[^=\n]*?)?\b{re.escape(env)}=")
+    out: list[str] = []
     replaced = False
-    for i, ln in enumerate(lines):
-        if pat.match(ln):
-            lines[i] = f"{env}={value}"
+    for ln in lines:
+        if not pat.match(ln):
+            out.append(ln)
+        elif not replaced:
+            out.append(f"{env}={value}")
             replaced = True
-            break
+        elif ln.lstrip().startswith("#"):
+            out.append(ln)  # extra commented copies are inert — keep them
+        # else: drop duplicate ACTIVE lines — dotenv last-wins would revert the rotation
+    lines = out
     if not replaced:
         lines.append(f"{env}={value}")
     tmp = f"{path}.tmp-{uuid.uuid4().hex[:6]}"

@@ -39,8 +39,9 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - **Avatar**: Three.js particle head (`static/jarvis3d.js`) sampled from
   `static/avatar/reference.jpg` (edge-boosted luminance → density), node streams into the
   real memory galaxy behind; renders BEHIND the chat. States idle/listening/thinking/talking.
-  FX on/off button freezes the RAF loop. Wav2Lip is RETIRED (lipsync.py dormant; /talk +
-  /lipsync endpoints remain but nothing calls them).
+  FX on/off button freezes the RAF loop. Wav2Lip is RETIRED (/talk + /lipsync return
+  410 Gone since 2026-07-09 — they were live and loaded Wav2Lip onto the shared GPU;
+  lipsync.py stays on disk but nothing reaches it).
 - **Voice out**: `/ws/jarvis/tts` streams raw PCM per sentence (`voice.synthesize_stream`);
   the browser schedules chunks gaplessly + drives the avatar mouth from an AnalyserNode on
   the same graph (native-timing lip-sync). Sentences are spoken WHILE the reply streams.
@@ -129,7 +130,7 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - faster-whisper (medium.en, CUDA) uses CUDA libs from `/usr/local/lib/ollama/cuda_v12/`
 
 ## Test / Verify (canonical commands)
-- **Static gate (fast, every edit):** `bash scripts/verify.sh` — JS/Python syntax, no debug leftovers, function integrity, Agentic capabilities integrity, + real-dispatch/judge/health integrity incl. sim-is-dead negatives (the gate prints its own count — 107 checks as of v2.2). Must pass before commit; the git pre-commit hook enforces it.
+- **Static gate (fast, every edit):** `bash scripts/verify.sh` — JS/Python syntax, no debug leftovers, function integrity, Agentic capabilities integrity, + real-dispatch/judge/health integrity incl. sim-is-dead negatives (the gate prints its own count — 256 checks as of 2026-07-09). Must pass before commit; the git pre-commit hook enforces it.
 - **The server runs as a systemd user unit:** `systemctl --user restart nexus` is THE way to
   restart it (unit: ~/.config/systemd/user/nexus.service → start.sh). Don't nohup start.sh
   manually — a stray instance blocks port 8777 and bypasses the unit.

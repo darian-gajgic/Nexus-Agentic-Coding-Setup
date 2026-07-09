@@ -4136,6 +4136,11 @@ async function bindMonitorCharts() {
   monBuilt = true;
   monitorHistory = { cpu: [], mem: [], labels: [] };
 
+  // destroy last visit's instances — Chart.js keeps RAF/ResizeObserver alive otherwise
+  for (const k of ['cpu', 'mem', 'agents']) {
+    if (charts[k]) { try { charts[k].destroy(); } catch { /* gone */ } delete charts[k]; }
+  }
+
   const cpuCanvas = $('#monCpu');
   const memCanvas = $('#monMem');
   const agentsCanvas = $('#monAgents');

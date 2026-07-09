@@ -132,13 +132,15 @@ Tasks with `repo_path` run INSIDE an existing repository:
 
 ## 5. JARVIS voice stack
 Browser mic → `/api/jarvis/stt` (faster-whisper, CUDA) → `/chat/stream`
-(SSE proxy to Hermes) → sentence-split → `/api/jarvis/talk` per sentence
-(Piper TTS + Wav2Lip lip-sync, muxed MP4) → muted `<video>` (face) +
-persistent `<audio>` (voice), 2-deep prefetch pipeline. Holographic stage
-(`static/jarvis3d.js`) reacts to real mic/speech amplitude via WebAudio
-analysers. Hardened 2026-07-07: JSON errors on all endpoints, 120s render
-timeout (lock can't wedge), temp/fd leak fixes, idle-unload 300s (> chat
-ceiling), teardown on view switch, barge-in, silence-VAD conversation mode.
+(SSE proxy to Hermes) → sentence-split → `/ws/jarvis/tts` streams raw PCM
+per sentence (Piper `synthesize_stream`); the browser schedules chunks
+gaplessly and drives the Three.js particle avatar (`static/jarvis3d.js`)
+mouth from an AnalyserNode on the same audio graph. Wav2Lip is RETIRED —
+`/api/jarvis/talk` + `/api/jarvis/lipsync` return **410 Gone** (2026-07-09;
+they used to load Wav2Lip onto the shared 12 GB GPU). Hardened 2026-07-07/08:
+JSON errors on all endpoints, temp/fd leak fixes, idle-unload 300s, teardown
+on view switch, barge-in, silence-VAD conversation mode. Full detail:
+`docs/JARVIS-VOICE.md` §0.
 
 ## 6. Frontend conventions
 No build step; vanilla JS. All server data through `esc()`. Views render via
@@ -205,8 +207,11 @@ Remote access: **Tailscale only, never public** — see docs/TAILSCALE.md
 - No command allowlist auto-approval (removed — guardian-enforced absence);
   approval gates for sensitive actions; tirith pre-exec security hook
   fail-closed.
-- Guardian pins every customization (5 core-mod patches, plugins, goldens)
+- Guardian pins every customization (6 core-mod patches, plugins, goldens)
   by SHA-256; drift is flagged/repaired; `hermes update` is survivable.
+  `session-model-api-server` is the keystone of model routing: upstream's
+  api_server ignores per-session models, so without it every session turn
+  runs config.yaml's default and per-task/JARVIS model choices are cosmetic.
 - XSS: all interpolation escaped (JARVIS feed fixed 2026-07-07).
 
 ## 9. Repository map

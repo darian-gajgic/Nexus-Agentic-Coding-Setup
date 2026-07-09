@@ -2309,41 +2309,18 @@ async def jarvis_lipsync_status():
 
 
 @app.post("/api/jarvis/lipsync")
-async def jarvis_lipsync(file: UploadFile = File(...)):
-    """Neural lip-sync: receive a WAV audio file, return an MP4 video of the
-    avatar face lip-synced to that audio. Used per-sentence for live feel."""
-    if not _lipsync_ready or _lipsync is None:
-        return JSONResponse(status_code=503, content={"error": "lip-sync pipeline not available"})
-    audio_bytes = await file.read()
-    try:
-        mp4_bytes = await _lipsync.render_bytes(audio_bytes)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"lip-sync render failed: {e}"})
-    return RawResponse(content=mp4_bytes, media_type="video/mp4")
+async def jarvis_lipsync():
+    """410: Wav2Lip is retired — the avatar is Three.js particles + WS TTS.
+    A render here would load Wav2Lip onto the shared 12 GB GPU for nothing."""
+    return JSONResponse(status_code=410, content={
+        "error": "gone — Wav2Lip retired; the avatar is Three.js particles (use /ws/jarvis/tts)"})
 
 
 @app.post("/api/jarvis/talk")
 async def jarvis_talk(body: dict):
-    """Combined TTS + lip-sync in one call: text → synced MP4.
-
-    Returns a single MP4 where the audio track (TTS voice) and the video track
-    (lip-synced face) are already muxed together by ffmpeg inside Wav2Lip. The
-    frontend plays this UNMUTED as the single source of truth — no separate
-    audio element, so voice and avatar can never drift apart.
-    """
-    if not _voice_ready:
-        return JSONResponse(status_code=503, content={"error": "voice pipeline not available"})
-    if not _lipsync_ready or _lipsync is None:
-        return JSONResponse(status_code=503, content={"error": "lip-sync pipeline not available"})
-    text = body.get("text", "").strip()
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "empty text"})
-    try:
-        wav_bytes = await _voice.synthesize(text)
-        mp4_bytes = await _lipsync.render_bytes(wav_bytes)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"talk render failed: {e}"})
-    return RawResponse(content=mp4_bytes, media_type="video/mp4")
+    """410: Wav2Lip TTS+lip-sync is retired — voice is /ws/jarvis/tts now."""
+    return JSONResponse(status_code=410, content={
+        "error": "gone — Wav2Lip retired; the avatar is Three.js particles (use /ws/jarvis/tts)"})
 
 
 # ===== JARVIS v2 — file exchange, visual memory, vision, imagine, briefing =====
@@ -2518,7 +2495,7 @@ async def jarvis_imagine(body: dict):
     if not prompt:
         return JSONResponse(status_code=400, content={"error": "empty prompt"})
     uid = auth.current_user_id()
-    name = f"imagine-{int(time.time())}.png"
+    name = f"imagine-{int(time.time())}-{uuid.uuid4().hex[:6]}.png"
     try:
         await _vision.generate_image(prompt, _jarvis_files_dir(uid) / name)
     except Exception as e:
@@ -3514,10 +3491,12 @@ async def _save_attachment(kind: str, oid: str, file: UploadFile):
     d = _attachments_dir(kind, oid, create=True)
     if d is None:
         return JSONResponse(status_code=404, content={"error": f"{kind} not found"})
-    data = await file.read()
-    if len(data) > _ATTACH_MAX_BYTES:
-        return JSONResponse(status_code=413, content={"error": "max 25 MB per file"})
-    (d / name).write_bytes(data)
+    data = bytearray()
+    while chunk := await file.read(1 << 20):
+        data.extend(chunk)
+        if len(data) > _ATTACH_MAX_BYTES:
+            return JSONResponse(status_code=413, content={"error": "max 25 MB per file"})
+    (d / name).write_bytes(bytes(data))
     db.log_activity("info", "system", f"Attachment '{name}' added to {kind} {oid}")
     return {"ok": True, "name": name, "size": len(data)}
 
@@ -6309,11 +6288,12 @@ def project_history(path: str):
     p = _visible_repo_path(path)
     if not p:
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
+    like_p = p.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
     tasks = db.query_all(
         "SELECT id, title, status, workflow_id, created_at, completed_at, client "
-        "FROM tasks WHERE (repo_path = ? OR repo_path LIKE ?) AND user_id = ? "
+        "FROM tasks WHERE (repo_path = ? OR repo_path LIKE ? ESCAPE '\\') AND user_id = ? "
         "ORDER BY created_at DESC LIMIT 200",
-        (p, p + "/%", auth.current_user_id()))
+        (p, like_p + "/%", auth.current_user_id()))
     wf_ids = sorted({t["workflow_id"] for t in tasks if t.get("workflow_id")})
     wfs = []
     for wid in wf_ids:
