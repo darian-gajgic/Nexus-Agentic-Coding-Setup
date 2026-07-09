@@ -311,6 +311,20 @@ async function handleWSMessage(msg) {
     agentsBuilt = false; // force rebuild on structural change
   }
   if (msg.type === 'task_created' || msg.type === 'task_updated' || msg.type === 'task_deleted') {
+    // Super Result: surface critic verdict transitions as a toast (B9 — the
+    // open review modal is never force-refreshed under the user's cursor).
+    if (msg.type === 'task_updated' && msg.data && msg.data.critic_verdict) {
+      const old = (state.tasks || []).find(t => t.id === msg.data.id);
+      const nv = msg.data.critic_verdict;
+      if (old && old.critic_verdict !== nv && nv !== 'running') {
+        let k = 0;
+        try { k = (((JSON.parse(msg.data.critic_json || '{}')) || {}).findings || []).length; } catch { /* raw */ }
+        toast(nv === 'SHIP'
+          ? `✨ Super Result: critic verified "${(msg.data.title || '').slice(0, 40)}" — SHIP`
+          : `✨ Super Result round ${msg.data.critic_round || '?'}: ${k} finding(s) posted${uiLocked() ? ' — reopen the review to see them' : ''}`,
+          nv === 'SHIP' ? 'ok' : 'info');
+      }
+    }
     state.tasks = await api('GET', '/api/tasks');
   }
   if (msg.type === 'program_created') {
@@ -1192,6 +1206,28 @@ function dispatchChip(t) {
   return `<span class="chip ${m[ds] || ''}" title="dispatch: ${esc(ds)}"><i></i>${esc(label)}</span>`;
 }
 
+// Super Result chip: round + state of the grounded-critic loop (✨SR).
+function superChip(t) {
+  if (!t.super_result) return '';
+  const cfg = parseLoopCfg(t.loop_config);
+  const trig = cfg && (cfg.triggers || []).find(x => x.id === 'super_result');
+  const max = (trig && trig.max_rounds) || 3;
+  const r = t.critic_round || 0;
+  const v = t.critic_verdict;
+  let label = '✨SR', cls = 'c-accent';
+  if (v === 'running') { label = `✨SR r${r + 1}/${max} · critiquing`; cls = 'c-blue'; }
+  else if (v === 'SHIP') { label = '✨SR · converged'; cls = 'c-green'; }
+  else if (v === 'error') { label = `✨SR r${r}/${max} · escalated`; cls = 'c-red'; }
+  else if (v === 'REVISE' || v === 'REWRITE') {
+    let k = 0;
+    try { k = (((JSON.parse(t.critic_json || '{}')) || {}).findings || []).length; } catch { /* raw */ }
+    const esc2 = trig && trig.state && trig.state.kind === 'escalated';
+    label = `✨SR r${r}/${max} · ${esc2 ? 'escalated' : `${k} finding${k === 1 ? '' : 's'}`}`;
+    cls = esc2 ? 'c-red' : 'c-orange';
+  }
+  return `<span class="chip ${cls}" title="Super Result — grounded critic loop (round ${r}/${max}${v ? ', ' + v : ''})">${esc(label)}</span>`;
+}
+
 function taskCard(t) {
   const tags = (() => { try { return JSON.parse(t.tags || '[]'); } catch { return []; } })();
   const assignee = (state.agents || []).find(a => a.id === t.assignee_id);
@@ -1210,6 +1246,7 @@ function taskCard(t) {
         ${claimer ? `<span class="chip c-yellow" title="claimed by ${esc(claimer.name)}">⚑ ${esc(claimer.name)}</span>` : ''}
         ${t.model ? `<span class="chip c-blue" title="AI model for this task">${esc(t.model)}</span>` : ''}
         ${dispatchChip(t)}
+        ${superChip(t)}
         ${judgeChip ? `<span class="chip ${judgeChip}" title="frontier judge verdict">${esc(t.judge_verdict)}</span>` : ''}
         ${vsChip ? `<span class="chip ${vsChip}"><i></i>${esc(vs)}</span>` : ''}
         <span class="task-age">${fmtAgo(t.updated_at || t.created_at)}</span>
@@ -1330,6 +1367,8 @@ function openTaskDetail(id) {
       <div class="form-group"><label class="form-label" style="display:flex;align-items:center;gap:8px;margin-top:26px">
         <input type="checkbox" id="td-highstakes" ${t.high_stakes ? 'checked' : ''}> ⚖ High-stakes (pause for approval before shipping)</label></div>
     </div>
+    <div class="form-group"><label class="form-label" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="td-super" ${t.super_result ? 'checked' : ''}> ✨ Super Result (grounded critic re-verifies each version — ~5–10× tokens)</label></div>
     <div class="form-group">
       <label class="form-label">AI model</label>
       <select class="form-select" id="td-model">${taskModelOptions(t.model)}</select>
@@ -1373,6 +1412,7 @@ function openTaskDetail(id) {
         <button class="btn-sm" onclick="loopViewerModal('task','${esc(t.id)}','${esc(t.title).slice(0, 60)}')">🔁 View / edit loop</button>
       </div></div>
     <div id="td-judge">${judgeSectionHTML(t)}</div>
+    <div id="td-critic">${criticSectionHTML(t)}</div>
     <div id="td-extras"></div>
     <div style="font-size:11px;color:var(--text-faint);font-family:var(--font-mono)">created ${fmtAgo(t.created_at)} · updated ${fmtAgo(t.updated_at)}${t.completed_at ? ` · completed ${fmtAgo(t.completed_at)}` : ''}</div>
     <div class="modal-actions" style="justify-content:space-between">
@@ -1993,6 +2033,7 @@ Object.assign(TOURS, {
     { sel: '#wf-repo', title: '🧬 Your code repository', body: 'For coding projects: pick a repo here and every coding stage works INSIDE it on an isolated branch — following the repo\'s house rules and tests — instead of building from scratch. You review the diff and merge it yourself.' },
     { sel: '#wf-client', title: '🏢 Client scope', body: 'Working for a client? Type their name and everything agents learn in this project goes into that client\'s private memory — invisible to other clients and to your personal chats. Generalized craft lessons still improve your specialists globally.' },
     { sel: '#wf-highstakes', title: '⚖ High stakes', body: 'Check this and every task of the project becomes eligible for the frontier judge — a stronger AI grading each deliverable against your quality rubric. Combined with a quality loop, judging happens automatically per version.' },
+    { sel: '#wf-super', title: '✨ Super Result', body: 'A grounded frontier critic re-verifies each final deliverable with real tool access in a disposable sandbox — it re-reads sources, re-runs commands, files line comments, and loops the work until it verifies. Independent verification costs ~5–10× tokens; use it for work worth being right.' },
     { sel: '#wf-loop', title: '🔁 The improvement loop', body: 'On = failed checks and judge verdicts automatically send work back with the findings attached, then re-check. Quality mode allows more rounds and arms the auto-judge; speed mode keeps rounds minimal.' },
     { sel: '.modal-actions .btn-primary', title: 'Approve', body: 'Creates all tasks with their dependencies. Stages start on their own as their inputs become ready — watch progress on the board or the project page.' },
   ],
@@ -2751,6 +2792,7 @@ function renderReviewModal() {
       </span>
       <span class="review-stat" style="margin-left:auto"><span class="rf-add">+${r.additions || 0}</span> <span class="rf-del">−${r.deletions || 0}</span> · ${files.length} file(s)</span></h2>
     <div class="view-intro" style="margin-bottom:10px">${esc(r.source || '')}${r.note ? ' — ' + esc(r.note) : ''}. 🟢 added · 🟡 changed · 🔴 removed — click a file to inspect it, hover a line and hit ＋ to comment.</div>
+    <div id="rvCritic"></div>
     ${files.length ? `
     <div class="review-layout">
       <div class="review-files">
@@ -2771,6 +2813,33 @@ function renderReviewModal() {
       </div>
     </div>`);
   if (files.length) renderReviewFilePane();
+  rvLoadCritic();
+}
+
+// Super Result: collapsible critic panel in the review modal — summary,
+// contradictions, missing list, and the revision brief the next retry rides.
+async function rvLoadCritic() {
+  const box = $('#rvCritic');
+  if (!box || !_review || !_review.taskId) return;
+  let c;
+  try { c = await api('GET', `/api/tasks/${_review.taskId}/critic`); } catch { return; }
+  if (!box.isConnected || !c || !c.verdict || c.verdict === 'running') return;
+  const p = c.parsed || {};
+  const cls = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[c.verdict] || 'c-red';
+  const li = (arr, f) => (arr || []).map(x => `<li style="margin:2px 0">${f(x)}</li>`).join('');
+  box.innerHTML = `
+    <details style="margin-bottom:10px;border:1px solid rgba(124,92,255,.3);border-radius:8px;padding:6px 10px">
+      <summary style="cursor:pointer;font-size:12.5px">🤖 Critic — round ${c.round || 0}
+        <span class="chip ${cls}" style="margin-left:6px">${esc(c.verdict)}</span>
+        ${c.open_critic_comments ? `<span class="chip c-accent">💬 ${c.open_critic_comments} auto-comment(s) below</span>` : ''}</summary>
+      <div style="font-size:12px;margin-top:6px;display:flex;flex-direction:column;gap:6px">
+        ${p.summary ? `<div>${esc(p.summary)}</div>` : ''}
+        ${(p.contradictions || []).length ? `<div><strong>Contradictions</strong><ul style="margin:2px 0 0 16px">${li(p.contradictions, x => `<em>${esc(x.with || '')}</em>: ${esc(x.a || '')} ⟂ ${esc(x.b || '')}${x.resolution_hint ? ' — ' + esc(x.resolution_hint) : ''}`)}</ul></div>` : ''}
+        ${(p.missing || []).length ? `<div><strong>Missing</strong><ul style="margin:2px 0 0 16px">${li(p.missing, x => `${esc(x.what || '')}${x.why_it_matters ? ' — ' + esc(x.why_it_matters) : ''}`)}</ul></div>` : ''}
+        ${p.revision_brief ? `<div><strong>Revision brief (rides the next retry)</strong><div style="white-space:pre-wrap;color:var(--text-dim);margin-top:2px">${esc(p.revision_brief)}</div></div>` : ''}
+        ${p.learning_note ? `<div style="color:var(--text-dim)">📖 ${esc(p.learning_note)}</div>` : ''}
+      </div>
+    </details>`;
 }
 
 function setReviewMode(m) {
@@ -2784,9 +2853,14 @@ function rcThreadHTML(f, l) {
   const list = (_review.comments || []).filter(c =>
     c.file_path === f.path && c.side === a.side && c.line_no === a.line);
   if (!list.length) return '';
+  const srcChip = c => c.source === 'critic'
+    ? '<span class="chip c-accent" style="padding:1px 7px;font-size:10px">🤖 AI critic</span> '
+    : c.source === 'judge'
+      ? '<span class="chip c-blue" style="padding:1px 7px;font-size:10px">⚖ judge</span> ' : '';
   return `<div class="rc-thread">` + list.map(c => `
-    <div class="rc-comment ${esc(c.status)}">
-      <div>${esc(c.body)}</div>
+    <div class="rc-comment ${esc(c.status)}"${c.source === 'critic' || c.source === 'judge'
+      ? ' style="border-left:2px solid var(--accent)"' : ''}>
+      <div>${srcChip(c)}${esc(c.body)}</div>
       <div class="rc-meta">${c.status === 'open'
       ? `<span>open — attaches to the next retry</span>
          <button class="btn-icon" title="Edit" onclick="rcEdit('${esc(c.id)}')">✏️</button>
@@ -3448,6 +3522,71 @@ async function pollJudge(id) {
   } catch { setTimeout(() => pollJudge(id), 8000); }
 }
 
+// ── Super Result: grounded critic section (follows the judge pattern) ──
+function criticSectionHTML(t) {
+  if (!t.result_summary && !t.critic_verdict && !t.super_result) return '';
+  const v = t.critic_verdict;
+  if (v === 'running') {
+    setTimeout(() => pollCritic(t.id), 4000);
+    return `<div class="form-group"><label class="form-label">🤖 Grounded critic (Super Result)</label>
+      <div class="chip c-blue">⏳ critiquing in a sandbox… (takes minutes — it re-runs the evidence)</div></div>`;
+  }
+  if (v && v !== 'error') {
+    const cls = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[v] || '';
+    let p = {};
+    try { p = JSON.parse(t.critic_json || '{}') || {}; } catch { /* raw */ }
+    const k = (p.findings || []).length;
+    return `<div class="form-group"><label class="form-label">🤖 Grounded critic (Super Result) — round ${t.critic_round || 0}</label>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div><span class="chip ${cls}" style="font-size:13px;font-weight:700">${esc(v)}</span>
+          ${k ? `<span class="chip c-accent">${k} finding${k === 1 ? '' : 's'} → review comments</span>` : ''}</div>
+        ${p.summary ? `<div style="font-size:12.5px;color:var(--text-dim)">${esc(p.summary)}</div>` : ''}
+        ${p.learning_note ? `<div style="font-size:12px;color:var(--text-dim)">📖 ${esc(p.learning_note)}</div>` : ''}
+        ${k ? `<details><summary style="cursor:pointer;font-size:12px;color:var(--text-dim)">findings</summary>
+          <div style="max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:6px">
+          ${p.findings.map(f => `<div style="font-size:11.5px;border-left:2px solid var(--accent);padding-left:8px">
+            <strong>[${esc((f.severity || '').toUpperCase())}]</strong> ${esc(f.file_path || '')}${f.line_no ? ':' + f.line_no : ''} — ${esc(f.problem || '')}
+            ${f.evidence ? `<div style="color:var(--text-faint)">evidence: ${esc(f.evidence)}</div>` : ''}
+            ${f.suggested_fix ? `<div style="color:var(--text-dim)">fix: ${esc(f.suggested_fix)}</div>` : ''}</div>`).join('')}
+          </div></details>` : ''}
+        <div><button class="btn-ghost" onclick="runCriticUI('${esc(t.id)}')">🤖 Run critic again</button></div>
+      </div></div>`;
+  }
+  return `<div class="form-group"><label class="form-label">🤖 Grounded critic (Super Result)</label>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn-ghost" onclick="runCriticUI('${esc(t.id)}')">🤖 Run critic</button>
+      ${v === 'error' ? `<span class="chip c-red">last run failed — see activity</span>` : ''}
+      <span class="muted" style="font-size:11.5px">frontier model re-verifies every claim with tools in a disposable sandbox</span>
+    </div></div>`;
+}
+
+async function runCriticUI(id) {
+  try {
+    await api('POST', `/api/tasks/${id}/critic`);
+    toast('Grounded critic started — it re-verifies the evidence in a sandbox (minutes)', 'ok');
+    const t = (state.tasks || []).find(x => x.id === id);
+    if (t) { t.critic_verdict = 'running'; }
+    const cb = $('#td-critic');
+    if (cb && t) cb.innerHTML = criticSectionHTML(t);
+  } catch (e) { toast('Critic failed to start: ' + e.message, 'err'); }
+}
+
+async function pollCritic(id) {
+  const cb = $('#td-critic');
+  if (!cb || !cb.isConnected) return; // modal closed — stop polling
+  try {
+    const r = await api('GET', `/api/tasks/${id}/critic`);
+    if (r.running) { setTimeout(() => pollCritic(id), 5000); return; }
+    state.tasks = await api('GET', '/api/tasks');
+    const t = (state.tasks || []).find(x => x.id === id);
+    if (t && cb.isConnected) {
+      cb.innerHTML = criticSectionHTML(t);
+      toast(`Critic verdict: ${r.verdict}${r.open_critic_comments ? ` — ${r.open_critic_comments} comment(s) filed` : ''}`,
+        r.verdict === 'SHIP' ? 'ok' : 'err');
+    }
+  } catch { setTimeout(() => pollCritic(id), 8000); }
+}
+
 async function dispatchTaskUI(id) {
   const t = (state.tasks || []).find(x => x.id === id);
   const lanes = (state.agents || []).filter(a => a.pid && !['retired', 'stopped'].includes(a.status));
@@ -3533,6 +3672,7 @@ async function saveTaskDetail(id) {
     domain: $('#td-domain') ? $('#td-domain').value : null,
     specialist: $('#td-specialist') ? ($('#td-specialist').value || '') : null,
     high_stakes: $('#td-highstakes') ? $('#td-highstakes').checked : null,
+    super_result: $('#td-super') ? $('#td-super').checked : null,
     budget_tokens: $('#td-budget') && $('#td-budget').value ? parseInt($('#td-budget').value) : null,
     model: $('#td-model') ? ($('#td-model').value || '') : null,
     depends_on: $('#td-depends')
@@ -4422,6 +4562,13 @@ function showTaskModal(status) {
       </div>
     </div>
     <div class="form-group">
+      <label class="form-label" style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="m-task-super"> ✨ Super Result</label>
+      <div class="form-hint">A grounded frontier critic re-verifies every version of the deliverable
+        with full tool access in a disposable sandbox, files line comments, and loops the work until
+        it verifies. ~5–10× tokens — for work worth being right.</div>
+    </div>
+    <div class="form-group">
       <label class="form-label">Tags (comma-separated)</label>
       <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
     </div>
@@ -4539,6 +4686,7 @@ async function submitTask() {
           domain: $('#m-task-domain') ? $('#m-task-domain').value : null,
           specialist: $('#m-task-specialist') ? ($('#m-task-specialist').value || null) : null,
           high_stakes: $('#m-task-highstakes') ? $('#m-task-highstakes').checked : false,
+          super_result: $('#m-task-super') ? $('#m-task-super').checked : false,
         },
       });
     } catch (e) { toast('Loop design failed (task created without loop): ' + e.message, 'err'); }
@@ -4557,6 +4705,7 @@ async function submitTask() {
     domain: $('#m-task-domain') ? $('#m-task-domain').value : null,
     specialist: $('#m-task-specialist') ? ($('#m-task-specialist').value || null) : null,
     high_stakes: $('#m-task-highstakes') ? $('#m-task-highstakes').checked : false,
+    super_result: $('#m-task-super') ? $('#m-task-super').checked : false,
     budget_tokens: $('#m-task-budget') && $('#m-task-budget').value ? parseInt($('#m-task-budget').value) : null,
     model: $('#m-task-model') ? ($('#m-task-model').value || null) : null,
     // exactly once (a duplicate key silently overwrote the focused project
@@ -5687,16 +5836,25 @@ function viewAgentic() {
   const agents = state.agents || [];
 
   const apprHtml = appr.length ? appr.map(a => {
-    let taskId = null;
-    try { taskId = (JSON.parse(a.payload || '{}') || {}).task_id; } catch { /* generic approval */ }
+    let payload = {};
+    try { payload = JSON.parse(a.payload || '{}') || {}; } catch { /* generic approval */ }
+    const taskId = payload.task_id || null;
     const task = taskId ? (state.tasks || []).find(t => t.id === taskId) : null;
     const judgeChip = task && { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[task.judge_verdict];
+    const isSR = a.action_type === 'super_result';
+    const srChips = isSR ? `
+        <span class="chip c-accent">✨ round ${payload.round || '?'}</span>
+        <span class="chip c-orange">${payload.findings ?? '?'} finding(s)</span>
+        ${payload.verdict ? `<span class="chip ${{ SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[payload.verdict] || 'c-red'}">${esc(payload.verdict)}</span>` : ''}` : '';
     return `
     <div class="agentic-row">
-      <div><strong>${esc(a.action_type)}</strong> <span style="color:var(--text-dim)">— ${esc(a.description || '')}</span>
+      <div><strong>${isSR ? '✨ Super Result checkpoint' : esc(a.action_type)}</strong> <span style="color:var(--text-dim)">— ${esc(a.description || '')}</span>
+        ${srChips}
         ${judgeChip ? `<span class="chip ${judgeChip}" title="frontier judge verdict">${esc(task.judge_verdict)}</span>` : ''}</div>
       <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">${esc(a.agent_id || 'system')} · risk: ${esc(a.risk_level)} · ${fmtAgo(a.requested_at)}</div>
-      ${taskId ? `<div style="font-size:11.5px;color:var(--text-dim)">Check it first: deliverable files, self-score, judge report → <strong>Open deliverable</strong>. Then decide here.</div>` : ''}
+      ${taskId ? `<div style="font-size:11.5px;color:var(--text-dim)">${isSR
+        ? 'Review/edit the 🤖 critic comments in the task\'s review first — <strong>Reject</strong> reworks with them, <strong>Approve</strong> accepts this version.'
+        : 'Check it first: deliverable files, self-score, judge report → <strong>Open deliverable</strong>. Then decide here.'}</div>` : ''}
       <div class="row-actions">
         ${taskId ? `<button class="btn-sm" onclick="openApprovalTask('${esc(taskId)}')">📄 Open deliverable</button>` : ''}
         <button class="btn-primary sm" onclick="decideApproval('${esc(a.id)}','approved')">Approve</button>
@@ -6625,7 +6783,7 @@ async function jarvisLoadDeck() {
     const open = (d.files && d.files.length)
       ? `<a class="jv2-mini-btn" href="/api/tasks/${esc(d.task_id)}/files/${encodeURIComponent(d.files[0].name || d.files[0])}" target="_blank" title="open first output file">📄</a>` : '';
     return `<div class="jv2-deck-row">
-      <div class="jv2-deck-row-t" title="${esc(d.title)}">${esc(d.title)} ${vBadge(d.judge_verdict)}</div>
+      <div class="jv2-deck-row-t" title="${esc(d.title)}">${esc(d.title)} ${vBadge(d.judge_verdict)}${d.critic_verdict && d.critic_verdict !== 'running' ? ' ' + vBadge('✨' + d.critic_verdict) : ''}</div>
       <div class="jv2-deck-row-a">${test}${open}</div>
     </div>`;
   }).join('') : '<div class="muted" style="font-size:11px">No output yet.</div>';
@@ -6638,7 +6796,7 @@ async function jarvisLoadDeck() {
   // pending approvals
   const apRows = approvals.length ? approvals.slice(0, 6).map(a => `
     <div class="jv2-deck-row">
-      <div class="jv2-deck-row-t" title="${esc(a.reason || a.action || '')}">${esc(a.action || a.reason || 'request')}</div>
+      <div class="jv2-deck-row-t" title="${esc(a.description || a.reason || a.action || '')}">${a.action_type === 'super_result' ? '✨ ' : ''}${esc(a.description || a.action || a.reason || a.action_type || 'request')}</div>
       <div class="jv2-deck-row-a">
         <button class="jv2-mini-btn ok" title="approve" onclick="decideApproval('${esc(a.id)}','approved').then(jarvisLoadDeck)">✓</button>
         <button class="jv2-mini-btn warn" title="reject" onclick="decideApproval('${esc(a.id)}','rejected').then(jarvisLoadDeck)">✕</button>
@@ -7376,9 +7534,11 @@ async function jarvisPollEvents(gen) {
     for (const ev of (r.events || [])) {
       const line = ev.kind === 'completed'
         ? `✅ Task "${ev.title}" just finished.`
-        : `❌ Task "${ev.title}" failed — want me to look into it?`;
+        : ev.kind === 'super_result'
+          ? `✨ ${ev.title}`
+          : `❌ Task "${ev.title}" failed — want me to look into it?`;
       jarvisAddMessage('tool', line);
-      if (!jarvisState.ttsAnimating) jarvisSpeak(line.replace(/^[✅❌] /, ''));
+      if (!jarvisState.ttsAnimating) jarvisSpeak(line.replace(/^[✅❌✨] /, ''));
     }
   } catch { }
   setTimeout(() => jarvisPollEvents(gen), 12000);
@@ -8134,6 +8294,7 @@ async function openWorkflowDetail(id) {
       <div><span class="muted" style="font-family:var(--font-mono)">${i + 1}.</span> <strong>${esc(t.title)}</strong>
         <span class="chip ${{ done: 'c-green', in_progress: 'c-cyan', review: 'c-orange' }[t.status] || ''}">${t.status === 'archived' ? 'superseded' : esc(t.status)}</span>
         ${dispatchChip(t)}
+        ${superChip(t)}
         ${t.high_stakes ? '<span title="pauses for approval">⚖</span>' : ''}
         ${t.model ? `<span class="chip c-blue">${esc(t.model)}</span>` : ''}</div>
       ${depNames(t).length ? `<div style="font-size:11px;color:var(--text-faint)">⛓ waits for: ${depNames(t).map(esc).join(' · ')}</div>` : ''}
@@ -8383,11 +8544,13 @@ function viewDeliverables() {
     .filter(d => !q || (d.title + ' ' + (d.domain || '') + ' ' + (d.workflow || '')).toLowerCase().includes(q))
     .map(d => {
       const judgeChip = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[d.judge_verdict];
+      const criticChip = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red', running: 'c-blue', error: 'c-red' }[d.critic_verdict];
       return `
       <div class="agentic-row">
         <div><strong>${esc(d.title)}</strong>
           <span class="chip ${{ done: 'c-green', review: 'c-orange' }[d.status] || ''}">${esc(d.status)}</span>
           ${judgeChip ? `<span class="chip ${judgeChip}">${esc(d.judge_verdict)}</span>` : ''}
+          ${criticChip ? `<span class="chip ${criticChip}" title="Super Result grounded critic (round ${d.critic_round || 0})">✨ ${esc(d.critic_verdict)} r${d.critic_round || 0}</span>` : ''}
           ${d.workflow ? `<span class="task-tag" title="project">⚑ ${esc(d.workflow)}</span>` : ''}
           ${d.domain ? `<span class="task-tag">${esc(d.domain)}</span>` : ''}</div>
         <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
@@ -8441,6 +8604,18 @@ function describeTaskUI() {
       <select class="form-select" id="twRepo"><option value="">— No: something new —</option></select>
       <div class="form-hint">Pick the project and the AI plans an <strong>improvement round on the real thing</strong>: it reads the project's contents, skips questions the project already answers, and writes briefs that reference the existing work. Bug fixes and new features on client projects always go through here.</div>
     </div>
+    <div class="form-group" style="margin-top:8px">
+      <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="twSuper"
+        onchange="const o=$('#twSuperOpts'); if(o) o.style.display=this.checked?'block':'none'">
+        ✨ Super Result</label>
+      <div class="form-hint">A grounded frontier critic independently re-verifies every deliverable
+        (full tool access in a disposable sandbox), files line comments, and loops the work until it
+        verifies. ~5–10× tokens: independent verification rounds + fan-out.</div>
+      <div id="twSuperOpts" style="display:none;margin-top:6px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px"><input type="checkbox" id="twFanout" checked>
+          Fan out where parallelizable (independent perspectives cross-check each other, then a reconciler unifies)</label>
+      </div>
+    </div>
     <div class="form-hint" style="margin-top:6px">💡 This wizard only <strong>plans</strong> — the actual work happens later, inside the task it creates. Describe the goal and desired outcome (e.g. "a summary of what is on a picture"); if the work needs files, 📎 attach them to the created task afterwards.</div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
@@ -8464,10 +8639,13 @@ function describeTaskUI() {
     const instruction = ($('#twAsk') || {}).value || '';
     if (!instruction.trim()) { toast('Describe it first', 'err'); return; }
     wizardCtx.repo_path = ($('#twRepo') || {}).value || null;
+    wizardCtx.super_result = !!($('#twSuper') && $('#twSuper').checked);
+    wizardCtx.fanout = wizardCtx.super_result ? !!($('#twFanout') && $('#twFanout').checked) : null;
     b.disabled = true; b.textContent = '✨ Planning… (up to ~3 min under load)';
     try {
       const r = await api('POST', '/api/tasks/wizard',
-        { instruction: instruction.trim(), repo_path: wizardCtx.repo_path });
+        { instruction: instruction.trim(), repo_path: wizardCtx.repo_path,
+          super_result: wizardCtx.super_result, fanout: wizardCtx.fanout });
       handleWizardPlan(instruction.trim(), r);
     } catch (e) {
       toast('Wizard failed: ' + e.message, 'err');
@@ -8476,7 +8654,7 @@ function describeTaskUI() {
   };
 }
 
-const wizardCtx = { repo_path: null };
+const wizardCtx = { repo_path: null, super_result: false, fanout: null };
 
 // Route a wizard response: one question round, or straight to the plan preview.
 function handleWizardPlan(instruction, r) {
@@ -8522,7 +8700,8 @@ function wizardQuestionsModal(instruction, r) {
   const submit = async (answers, btn) => {
     btn.disabled = true; btn.textContent = '✨ Planning… (up to ~3 min under load)';
     try {
-      const r2 = await api('POST', '/api/tasks/wizard', { instruction, answers, repo_path: wizardCtx.repo_path });
+      const r2 = await api('POST', '/api/tasks/wizard', { instruction, answers, repo_path: wizardCtx.repo_path,
+        super_result: wizardCtx.super_result, fanout: wizardCtx.fanout });
       handleWizardPlan(instruction, r2);
     } catch (e) {
       toast('Wizard failed: ' + e.message, 'err');
@@ -8556,6 +8735,7 @@ function applyWizardTask(t, meta) {
     if ($('#m-task-desc')) $('#m-task-desc').value = t.description || '';
     if ($('#m-task-domain')) $('#m-task-domain').value = t.domain || 'general';
     if ($('#m-task-highstakes')) $('#m-task-highstakes').checked = !!t.high_stakes;
+    if ($('#m-task-super')) $('#m-task-super').checked = !!t.super_result;
     if ($('#m-task-model')) $('#m-task-model').value = t.model || '';
     if ($('#m-task-priority')) $('#m-task-priority').value = String(t.priority ?? 2);
     if ($('#m-task-budget') && t.budget_tokens) $('#m-task-budget').value = t.budget_tokens;
@@ -8623,6 +8803,8 @@ function planEdRowHTML(t, i) {
         <span class="muted" style="font-family:var(--font-mono)">${i + 1}.</span> <strong>${esc(t.title || '(untitled task)')}</strong>
         ${t.specialist ? `<span class="chip c-cyan">${esc(t.specialist)}</span>` : ''}
         ${t.high_stakes ? '<span title="pauses for approval">⚖</span>' : ''}
+        ${t.super_result ? '<span class="chip c-accent" title="Super Result — grounded critic loop">✨SR</span>' : ''}
+        ${t.deliverable_type ? `<span class="task-tag" title="deliverable type">${esc(t.deliverable_type)}</span>` : ''}
         ${t.model ? `<span class="chip c-blue">${esc(t.model)}</span>` : ''}
         <span class="task-tag">${esc(t.domain || 'general')}</span>
         ${locked ? '<span class="chip" title="quality gate — required">🔒 gate</span>' : ''}
@@ -8659,6 +8841,11 @@ function planEdEditorHTML(t, i) {
         <select class="form-select" id="pe-model" style="max-width:230px">${taskModelOptions(t.model)}</select>
         <input class="form-input" id="pe-budget" type="number" min="0" step="100000" value="${t.budget_tokens || ''}" placeholder="token budget (default)" style="max-width:190px">
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px"><input type="checkbox" id="pe-hs" ${t.high_stakes ? 'checked' : ''}> ⚖ high-stakes</label>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px" title="grounded critic loop on this task's deliverable (~5–10× tokens)"><input type="checkbox" id="pe-super" ${t.super_result ? 'checked' : ''}> ✨ Super Result</label>
+        <select class="form-select" id="pe-dtype" style="max-width:170px" title="deliverable type (drives type-aware quality gates)">
+          <option value="">type: auto</option>
+          ${['analysis', 'code_change', 'content', 'research'].map(d => `<option value="${d}" ${t.deliverable_type === d ? 'selected' : ''}>${d}</option>`).join('')}
+        </select>
       </div>
       <div style="margin-top:8px"><span style="font-size:11.5px;color:var(--text-faint)">⛓ waits for:</span><br>${depBoxes}</div>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
@@ -8726,6 +8913,8 @@ function planEdBindStages() {
     t.domain = ($('#pe-domain') || {}).value || 'general';
     t.model = ($('#pe-model') || {}).value || null;
     t.high_stakes = !!($('#pe-hs') || {}).checked;
+    t.super_result = !!($('#pe-super') || {}).checked;
+    t.deliverable_type = ($('#pe-dtype') || {}).value || null;
     const bud = parseInt(($('#pe-budget') || {}).value);
     t.budget_tokens = Number.isFinite(bud) && bud > 0 ? bud : null;
     t.depends_on_idx = $$('.pe-dep').filter(x => x.checked).map(x => +x.dataset.d).sort((a, b2) => a - b2);
@@ -8741,7 +8930,8 @@ function planEdAddTask() {
   const last = planEd.tasks.length - 1;
   planEd.tasks.push({
     title: '', description: '', domain: planEd.domain || 'general', specialist: null,
-    high_stakes: false, model: null, priority: 2, budget_tokens: null, tags: [],
+    high_stakes: false, super_result: false, deliverable_type: null,
+    model: null, priority: 2, budget_tokens: null, tags: [],
     depends_on_idx: last >= 0 ? [last] : [], _added: true,
   });
   planEd.keep.push(true);
@@ -8827,6 +9017,13 @@ function proposeWorkflowModal(wf, meta) {
       <div class="form-hint">Marks every task as high-stakes: each deliverable becomes eligible for the frontier judge (a stronger AI grading against your quality rubric). The judge only runs automatically when the loop below is on quality + closed — otherwise it stays a button.</div>
     </div>
     <div class="form-group" style="margin-top:8px">
+      <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-super" ${(wf.super_result || tasks.some(t => t.super_result)) ? 'checked' : ''}>
+        ✨ Super Result</label>
+      <div class="form-hint">A grounded frontier critic re-verifies each final deliverable with full tool access in a
+        disposable sandbox, auto-fills the per-line review comments, and loops the work until it verifies.
+        ~5–10× tokens: independent verification rounds + fan-out. ${tasks.some(t => t.super_result) ? 'This plan already fans out with a reconciler where useful.' : ''}</div>
+    </div>
+    <div class="form-group" style="margin-top:8px">
       <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
       <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-loop" ${isCoding ? 'checked' : ''}
@@ -8899,6 +9096,15 @@ function proposeWorkflowModal(wf, meta) {
     }
     b.disabled = true; b.textContent = 'Creating…';
     const projHigh = !!($('#wf-highstakes') && $('#wf-highstakes').checked);
+    const projSuper = !!($('#wf-super') && $('#wf-super').checked);
+    // Ticked at the proposal stage on a plan the wizard made WITHOUT the flag:
+    // flag the sink tasks (final results), same deterministic rule the wizard
+    // applies server-side (§7a).
+    if (projSuper && !finalTasks.some(t => t.super_result)) {
+      const incoming = new Set(finalTasks.flatMap(t => t.depends_on_idx || []));
+      finalTasks.forEach((t, i) => { if (!incoming.has(i)) t.super_result = true; });
+    }
+    if (!projSuper) finalTasks.forEach(t => { t.super_result = false; });
     const projClient = $('#wf-client') ? ($('#wf-client').value.trim().toLowerCase() || null) : null;
     const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
     const DEV_SPECIALISTS = new Set(['code-implementer', 'tech-lead-orchestrator',
@@ -8913,6 +9119,7 @@ function proposeWorkflowModal(wf, meta) {
             title: wf.name, domain: wf.domain,
             specialists: finalTasks.map(t => t.specialist).filter(Boolean),
             high_stakes: projHigh || finalTasks.some(t => t.high_stakes),
+            super_result: projSuper,
           },
         });
       } catch (e) { toast('Loop design failed (project created without loop): ' + e.message, 'err'); }
@@ -8920,7 +9127,7 @@ function proposeWorkflowModal(wf, meta) {
     try {
       const w = await api('POST', '/api/workflows',
         { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop,
-          high_stakes: projHigh, client: projClient,
+          high_stakes: projHigh, client: projClient, super_result: projSuper,
           project_path: repo || (focusCtx.project && focusCtx.project.path) || null });
       const ids = [];
       for (const t of finalTasks) {
@@ -8928,6 +9135,8 @@ function proposeWorkflowModal(wf, meta) {
           title: t.title, description: t.description, status: 'backlog',
           priority: t.priority ?? 2, domain: t.domain, specialist: t.specialist,
           high_stakes: projHigh || !!t.high_stakes, model: t.model || null,
+          super_result: !!t.super_result,
+          deliverable_type: t.deliverable_type || null,
           budget_tokens: t.budget_tokens || null, tags: t.tags || [],
           workflow_id: w.id,
           // repo-native: coding stages work inside the chosen repo (they

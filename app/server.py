@@ -2028,10 +2028,11 @@ FILE EXCHANGE: the operator's shared folder with you is {files_dir} — files th
 SYSTEM CONTROL — you can drive the user's whole Nexus OS over its local REST API (curl, always -sk):
   curl -sk -H "x-nexus-internal: {auth.INTERNAL_TOKEN}" -H "x-nexus-user: {uid}" https://127.0.0.1:8777/api/...
   BOARD: GET /api/tasks · POST /api/tasks {{"title","description","status":"todo"}} · PATCH /api/tasks/ID {{"status"|"title"|...}} · DELETE /api/tasks/ID · POST /api/tasks/ID/dispatch (run it NOW on a real agent lane) · GET /api/tasks/ID/transcript (live agent output)
-  PLAN WELL: for anything non-trivial prefer POST /api/tasks/wizard {{"instruction":"…"}} — it returns a best-practice multi-stage plan (spec→build→review→verify for code; research→create for content) with the right specialist, model and quality gates; then create the returned tasks. This beats a bare one-line task.
+  PLAN WELL: for anything non-trivial prefer POST /api/tasks/wizard {{"instruction":"…","super_result":true?}} — it returns a best-practice multi-stage plan (spec→build→review→verify for code; research→create for content) with the right specialist, model and quality gates; then create the returned tasks. This beats a bare one-line task.
   PROJECTS: GET /api/workflows · POST /api/workflows {{"name","goal"}} · GET /api/workflows/ID · GET /api/deliverables (finished output files across all tasks)
   TEST OUTPUT: POST /api/tasks/ID/app/start then GET /api/tasks/ID/app/log — runs the task's produced app/site on a local port so the user can try it live (the UI's ▶ Test app).
   QUALITY: POST /api/tasks/ID/judge (frontier-judge a deliverable) · POST /api/verify {{"task_id","command"}} (run a check) · GET /api/tasks/ID/review (diff review)
+  SUPER RESULT: the flag "super_result":true on task/workflow create+PATCH turns on the grounded critic loop — a frontier critic re-verifies each deliverable with tools in a sandbox, files line comments, auto-reworks until it verifies. COSTS ~5-10x tokens: confirm with the user before enabling. POST /api/tasks/ID/critic runs the critic once; GET /api/tasks/ID/critic returns verdict/findings/round. Escalations arrive as approvals with action_type "super_result" (round, findings count and verdict in the payload) — rejecting one reworks the task with the critic's comments, approving accepts the version.
   OPS: GET /api/approvals?status=pending · PATCH /api/approvals/ID {{"decision":"approved"}} · GET/POST /api/scheduler (cron: {{"name","cron","action"}}) · GET /api/agents · GET /api/quota
   Board now: {board}. Running: {running_s}.
   RULES: read back and get an explicit yes BEFORE dispatching, deleting, approving, scheduling, or spending real tokens. Never invent IDs — GET the list first. After acting, state plainly what changed. curl failures: report them, don't pretend success.
@@ -2570,6 +2571,9 @@ async def jarvis_briefing():
     approvals = db.query_one(
         "SELECT COUNT(*) n FROM approvals WHERE status='pending' AND user_id=?",
         (uid,))["n"]
+    sr_checkpoints = db.query_one(
+        "SELECT COUNT(*) n FROM approvals WHERE status='pending' "
+        "AND action_type='super_result' AND user_id=?", (uid,))["n"]
     parts = [f"Good {'morning' if time.localtime().tm_hour < 12 else 'afternoon' if time.localtime().tm_hour < 18 else 'evening'}."]
     if done:
         parts.append(f"Since yesterday, {len(done)} task{'s' if len(done) > 1 else ''} finished: "
@@ -2581,7 +2585,9 @@ async def jarvis_briefing():
     todo = by.get("todo", 0) + by.get("backlog", 0)
     parts.append(f"The board has {active} running and {todo} waiting.")
     if approvals:
-        parts.append(f"{approvals} approval{'s' if approvals > 1 else ''} awaiting your decision.")
+        parts.append(f"{approvals} approval{'s' if approvals > 1 else ''} awaiting your decision"
+                     + (f", including {sr_checkpoints} Super Result checkpoint"
+                        f"{'s' if sr_checkpoints > 1 else ''}" if sr_checkpoints else "") + ".")
     if not done and not failed and not active:
         parts.append("All quiet.")
     return {"text": " ".join(parts)}
@@ -2604,6 +2610,18 @@ async def jarvis_events(since: float = 0):
         evs.append({"task_id": r["id"], "title": r["title"],
                     "kind": "completed" if r.get("completed_at") and r["completed_at"] > since else "failed",
                     "ts": r.get("completed_at") or r.get("updated_at")})
+    # B2: Super Result escalations are first-class spoken callbacks — the
+    # description already reads naturally ("Super Result round 2: 4 findings…").
+    for a in db.query_all(
+            "SELECT id, description, payload, requested_at FROM approvals "
+            "WHERE user_id=? AND status='pending' AND action_type='super_result' "
+            "AND requested_at>? LIMIT 5", (uid, since)):
+        try:
+            tid = (json.loads(a.get("payload") or "{}") or {}).get("task_id")
+        except Exception:
+            tid = None
+        evs.append({"task_id": tid, "title": (a.get("description") or "")[:160],
+                    "kind": "super_result", "ts": a.get("requested_at")})
     return {"events": evs, "now": time.time()}
 
 
@@ -5615,6 +5633,8 @@ def list_deliverables(limit: int = 100):
             "task_id": t["id"], "title": t["title"], "status": t["status"],
             "domain": t.get("domain"), "model": t.get("model"),
             "judge_verdict": t.get("judge_verdict"),
+            "critic_verdict": t.get("critic_verdict"),
+            "critic_round": t.get("critic_round"),
             "rubric_score": t.get("rubric_score"),
             "tokens_used": t.get("tokens_used"),
             "completed_at": t.get("completed_at") or t.get("updated_at"),
