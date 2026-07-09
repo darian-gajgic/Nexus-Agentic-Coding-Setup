@@ -5,7 +5,7 @@
 #
 # knowledge/  <- ~/knowledge          (playbooks, rubrics, exemplars, MANUAL, evals;
 #                                      BUSINESS-CONTEXT holds team data — repo must stay private)
-# bin/        <- ~/.local/bin         (cspec, creview, cjudge — frontier bridge scripts)
+# bin/        <- ~/.local/bin         (cspec, creview, cjudge, cverify — frontier bridge scripts)
 # claude-glm/ <- ~/.claude-glm        (GLM Claude Code config; its key lives in
 #                                      ~/.glm-agent/key.env and is NEVER copied)
 #
@@ -22,7 +22,7 @@ rsync -a --exclude='.git' "$H/knowledge/" "$REPO_DIR/knowledge/"
 
 # ── frontier bridge scripts ──
 mkdir -p "$REPO_DIR/bin"
-for f in cspec creview cjudge; do
+for f in cspec creview cjudge cverify; do
   cp "$H/.local/bin/$f" "$REPO_DIR/bin/$f"
 done
 
@@ -38,7 +38,7 @@ done
 
 # ── provenance ──
 {
-  echo "source: ~/knowledge + ~/.local/bin/{cspec,creview,cjudge} + ~/.claude-glm (local)"
+  echo "source: ~/knowledge + ~/.local/bin/{cspec,creview,cjudge,cverify} + ~/.claude-glm (local)"
   echo "knowledge-files: $(find "$REPO_DIR/knowledge" -name '*.md' | wc -l) markdown"
   echo "exported-at: $(date -Is)"
 } > "$REPO_DIR/knowledge/.snapshot-provenance"

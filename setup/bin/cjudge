@@ -18,16 +18,33 @@ FILE="$(realpath "$FILE")"
 RUBRIC="$KNOW/domains/$DOMAIN/RUBRIC.md"
 [ -f "$RUBRIC" ] || { echo "cjudge: unknown domain '$DOMAIN'. Available:" >&2; ls "$KNOW/domains" >&2; exit 1; }
 
-PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC.
+# N1 (Super Result): optional deliverable-TYPE rubric — when Nexus resolves one
+# (e.g. rubrics/INVESTIGATION.md for analysis work) the judge grades against
+# BOTH rubrics; every must-pass gate binds regardless of which rubric owns it.
+TYPE_RUBRIC_BLOCK=""
+if [ -n "${JUDGE_TYPE_RUBRIC:-}" ] && [ -f "${JUDGE_TYPE_RUBRIC:-}" ]; then
+  TYPE_RUBRIC_BLOCK="Additionally read the deliverable-TYPE rubric at $JUDGE_TYPE_RUBRIC and grade against BOTH rubrics — its must-pass gates (e.g. verified-not-inferred) bind exactly like the domain rubric's."
+fi
+
+PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC. $TYPE_RUBRIC_BLOCK
+
+Stance: REFUTE BY DEFAULT. The deliverable's own assertions and self-scores are never evidence. You cannot run its commands, so judge the EVIDENCE ON THE PAGE: a load-bearing conclusion must rest on cited primary evidence (exact file:line, command + quoted output, source + date). A conclusion resting on a proxy inference ('tests pass' therefore 'code healthy') or on unlocated hand-waving FAILS the gate that covers it, no matter how plausible it reads.
 
 Steps:
-1. Read $FILE, $RUBRIC, $KNOW/BUSINESS-CONTEXT.md, and $KNOW/STYLE-VOICE.md.
-2. Must-pass gates: list each gate PASS/FAIL, one-line reason for every FAIL.
+1. Read $FILE, $RUBRIC, $KNOW/BUSINESS-CONTEXT.md, and $KNOW/STYLE-VOICE.md (plus the type rubric if named above).
+2. Must-pass gates: render ONE binary table covering every gate of every rubric read — | gate | PASS/FAIL | one-line reason |. No partial credit, no 'mostly'.
 3. Scored dimensions: score each 0-4 with a one-line justification.
 4. Kill-list scan: quote any hits verbatim.
 5. Top 3 highest-leverage improvements — concrete edits (quote the before, give the after), not vibes.
-6. VERDICT: SHIP | REVISE (list exactly what blocks) | REWRITE (why salvaging is worse than restarting).
-7. End with one 'Learning note:' line for the junior humans — the single most instructive gap between this and professional work.
+6. VERDICT: SHIP | REVISE (list exactly what blocks) | REWRITE (why salvaging is worse than restarting). SHIP requires every gate PASS.
+7. One 'Learning note:' line for the junior humans — the single most instructive gap between this and professional work.
+8. END the reply with exactly one JSON object between these sentinel lines, nothing after the closing sentinel:
+NEXUS_JUDGE_JSON_BEGIN
+{\"verdict\": \"SHIP|REVISE|REWRITE\",
+ \"findings\": [{\"severity\": \"critical|high|medium|low\", \"file_path\": \"deliverable.md\", \"line_no\": 12, \"line_text\": \"verbatim quote of that line (<=200)\", \"problem\": \"what is wrong (<=300)\", \"fix\": \"concrete edit (<=300)\"}],
+ \"revision_brief\": \"<=2500 chars — the exact instruction the reworking agent needs\"}
+NEXUS_JUDGE_JSON_END
+Findings most severe first, at most 15; line_no/line_text must quote a real line of the deliverable or be null.
 
 Be adversarial and specific. Do NOT rewrite the whole deliverable. Do NOT modify any files."
 

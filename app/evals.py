@@ -146,6 +146,10 @@ def fingerprint(domain: str, specialists: list) -> dict:
         for fn in sorted(os.listdir(rdir)):
             if fn.endswith(".md"):
                 files[f"type_rubric:{fn}"] = os.path.join(rdir, fn)
+    # N2 era boundary: the refute-by-default cjudge is harsher — hashing the
+    # judge script keeps "scores comparable within a fingerprint" true across
+    # judge upgrades.
+    files["judge_script"] = os.path.expanduser("~/.local/bin/cjudge")
     out = {}
     for key, fp in files.items():
         try:
