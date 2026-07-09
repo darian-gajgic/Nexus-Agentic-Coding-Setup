@@ -30,6 +30,7 @@ REGISTRY = WORKSPACES / ".preview-apps.json"
 _PORT_RANGE = range(8790, 8821)
 _TTL_S = 30 * 60          # auto-stop a forgotten preview after 30 min
 _MAX_APPS = 3             # concurrent previews (each dev server is heavy)
+_LOG_MAX_BYTES = 5 * 1024 * 1024  # cap _preview.log (chatty dev servers write unbounded)
 _SKIP_DIRS = {"node_modules", ".next", ".git", "__pycache__", "attachments",
               "dist", "build", ".venv", "venv"}
 
@@ -278,5 +279,12 @@ def reaper_thread(stop_event: threading.Event):
                     reg.pop(tid, None)
                     db.log_activity("info", "preview",
                                     f"Preview for {tid} auto-stopped (30 min TTL)")
+                else:
+                    try:  # the child's O_APPEND fd continues at the new end
+                        lp = Path(a.get("workspace") or "") / "_preview.log"
+                        if lp.is_file() and lp.stat().st_size > _LOG_MAX_BYTES:
+                            os.truncate(lp, 0)
+                    except Exception:
+                        pass
             _save(reg)
         stop_event.wait(60)

@@ -64,6 +64,10 @@ def _slot_ok(task: dict, agent_id: str) -> bool:
         return True
     now = time.time()
     if now - _slot_wait_logged.get(task["id"], 0) > 60:
+        if len(_slot_wait_logged) > 512:  # bound: finished tasks' ids never leave otherwise
+            for k, ts in list(_slot_wait_logged.items()):
+                if now - ts > 600:
+                    _slot_wait_logged.pop(k, None)
         _slot_wait_logged[task["id"]] = now
         db.log_activity("info", agent_id,
                         f"Task {task['id']} waiting for a free {run_model or hd.DEFAULT_MODEL} "

@@ -23,6 +23,20 @@ BLOCKING_ATTRS = {
 }
 
 
+def _blocking_cpu_percent(node: ast.Call) -> bool:
+    """psutil cpu_percent(interval=<nonzero>) SLEEPS for the whole interval.
+    interval=None / 0 returns immediately (delta since last call) — allowed."""
+    f = node.func
+    name = f.attr if isinstance(f, ast.Attribute) else (
+        f.id if isinstance(f, ast.Name) else "")
+    if name != "cpu_percent":
+        return False
+    # first positional arg IS interval; non-Constant values flag conservatively
+    vals = list(node.args[:1]) + [kw.value for kw in node.keywords
+                                  if kw.arg == "interval"]
+    return any(not (isinstance(v, ast.Constant) and not v.value) for v in vals)
+
+
 def check(path: str) -> list:
     tree = ast.parse(open(path).read(), filename=path)
     bad = set()
@@ -41,12 +55,15 @@ def check(path: str) -> list:
                 elif (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
                       and (f.value.id, f.attr) in BLOCKING_ATTRS):
                     bad.add((node.lineno, top.name, f"{f.value.id}.{f.attr}"))
+                elif _blocking_cpu_percent(node):
+                    bad.add((node.lineno, top.name, "cpu_percent(interval!=0)"))
             stack.extend(ast.iter_child_nodes(node))
     return sorted(bad)
 
 
 if __name__ == "__main__":
-    findings = check("server.py")
-    for lineno, fn, call in findings:
-        print(f"server.py:{lineno} async def {fn}(): blocking {call}() on the event loop")
+    findings = [(path, *f) for path in ("server.py", "agent_manager.py")
+                for f in check(path)]
+    for path, lineno, fn, call in findings:
+        print(f"{path}:{lineno} async def {fn}(): blocking {call}() on the event loop")
     sys.exit(1 if findings else 0)

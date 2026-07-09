@@ -33,8 +33,9 @@ Additive; the pipeline below is unchanged. New:
 ## 0. ARCHITECTURE v2 (2026-07-08) — READ THIS FIRST
 
 The Wav2Lip talking-head is **RETIRED from the pipeline** (endpoints `/talk`
-and `/lipsync` still exist for compat but nothing calls them; lipsync.py is
-dormant). The v2 stack:
+and `/lipsync` return **410 Gone** since 2026-07-09 — they were still live and
+loaded Wav2Lip onto the shared 12 GB GPU when hit; lipsync.py stays on disk
+but nothing reaches it). The v2 stack:
 
 - **Avatar (v9, 2026-07-08)** = generic male particle bust from a REAL head
   scan: "Head (Lee Perry-Smith)" by Lee Perry-Smith / Infinite-Realities

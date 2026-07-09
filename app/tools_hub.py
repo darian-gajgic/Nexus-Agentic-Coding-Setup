@@ -89,27 +89,6 @@ def _tool_hermes():
     }
 
 
-def _tool_glm():
-    """GLM-5.2 via Z.AI — primary coding model."""
-    glm_dir = HOME / ".claude-glm"
-    transcripts = len(glob.glob(str(glm_dir / "projects/*/*.jsonl")))
-    bin_path = HOME / ".local/bin/glm"
-    # status: is Z.AI reachable? probe the endpoint host
-    status = "online" if transcripts > 0 else "offline"
-    key_env = HOME / ".glm-agent/key.env"
-    detail = f"{transcripts} sessions logged"
-    if not key_env.exists():
-        status = "offline"
-        detail = "no API key configured"
-    return {
-        "id": "glm", "name": "GLM-5.2 (Z.AI)", "category": "Coding",
-        "status": status, "detail": detail, "model": "glm-5.2",
-        "transcripts": transcripts, "primary": True,
-        "config_path": str(glm_dir / "settings.json"),
-        "icon": "⌨", "accent": "var(--accent-2)",
-    }
-
-
 def _tool_claude():
     """Claude Code (Anthropic) — secondary coding path."""
     claude_dir = HOME / ".claude"
@@ -164,23 +143,6 @@ def _tool_paperclip():
     }
 
 
-def _tool_supermemory():
-    """Hermes long-term memory provider."""
-    count = 0
-    # count via the supermemory_search if hermes is up — fallback: estimate from store dir
-    store_dir = HERMES_DIR / "supermemory"
-    if store_dir.exists():
-        count = sum(1 for _ in store_dir.rglob("*") if _.is_file())
-    status = "online" if _probe_port("127.0.0.1", 8642) else "offline"
-    return {
-        "id": "supermemory", "name": "Supermemory", "category": "Memory",
-        "status": status, "detail": f"{count} stored memories (via Hermes)",
-        "config": {"provider": "supermemory"},
-        "config_path": str(HERMES_DIR / "config.yaml"),
-        "icon": "🧠", "accent": "var(--accent)",
-    }
-
-
 def _tool_wav2lip():
     """Neural talking-head avatar for JARVIS."""
     install = HOME / "Wav2Lip"
@@ -214,8 +176,8 @@ def _tool_piper():
 
 def get_tools() -> list:
     """Live health-check all integrated tools."""
-    scanners = [_tool_hermes, _tool_glm, _tool_claude, _tool_ollama,
-                _tool_paperclip, _tool_supermemory, _tool_wav2lip, _tool_piper]
+    scanners = [_tool_hermes, _tool_claude, _tool_ollama,
+                _tool_paperclip, _tool_wav2lip, _tool_piper]
     tools = []
     for s in scanners:
         try:
@@ -247,6 +209,8 @@ def _parse_frontmatter(text: str) -> tuple:
 def get_skills() -> list:
     """Scan ~/.hermes/skills/ for SKILL.md files, grouped by category."""
     skills_root = HERMES_DIR / "skills"
+    if not skills_root.is_dir():
+        return []  # fresh machine before install.sh — empty hub, not a 500
     # load usage stats
     usage = {}
     upath = HERMES_DIR / "skills/.usage.json"

@@ -1,5 +1,10 @@
 # SPEC — JARVIS Neural Talking-Head Avatar (v2)
 
+> ⚠️ HISTORICAL (superseded 2026-07-08): the Wav2Lip avatar this spec describes
+> was retired. The live avatar is the Three.js particle head (`static/jarvis3d.js`)
+> driven by WS TTS (`/ws/jarvis/tts`); `/api/jarvis/talk` + `/api/jarvis/lipsync`
+> return 410 Gone. See `docs/JARVIS-VOICE.md` §0 for the current stack.
+
 > Spec-driven build, 2026-07-03. Treat as a client deliverable.
 > Source of truth. The implementation must satisfy every numbered requirement.
 

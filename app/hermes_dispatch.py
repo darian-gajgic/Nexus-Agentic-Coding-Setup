@@ -590,9 +590,11 @@ def _rewrite_session_keys(mutate):
         now = time.time()
         sessions = {sid: e for sid, e in sessions.items()
                     if (e.get("ts") or now) > now - _SESSION_KEYS_MAX_AGE_S}
-        fd = os.open(_SESSION_KEYS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp = f"{_SESSION_KEYS_FILE}.tmp-{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump({"sessions": sessions, "updated_at": now}, f, indent=1)
+        os.replace(tmp, _SESSION_KEYS_FILE)  # atomic — a crash can't half-write all keys
     except Exception as e:
         db.log_activity("warn", "system", f"session-keys bridge write failed: {str(e)[:80]}")
 
