@@ -238,7 +238,7 @@ Browser: click the **Projects, Memory, Review, Onboarding** tabs and run a **▶
 
 **Prompt:**
 ```
-Read ~/Nexus-Agentic-Coding-Setup/STABILITY-AUDIT-2026-07-08.md section 3.7 and section 4 (the dispatch slot/resume/telemetry findings + the JARVIS-brain overlay finding). This is real-money, concurrency-sensitive code — be careful and precise.
+Read ~/Nexus-Agentic-Coding-Setup/STABILITY-AUDIT-2026-07-08.md section 3.7 and section 4 (the dispatch slot/resume/telemetry findings + the JARVIS-brain overlay finding). This is real-money, concurrency-sensitive code — be careful and precise. NOTE: items 6-7 are NOT in the audit — they were surfaced by the Batch 1-3 review passes; locate them by reading the orphan-dispatch reconciler (grep "reconcil" in app/hermes_dispatch.py) and the boot-reconcile in app/server.py startup.
 
 Fix in app/hermes_dispatch.py:
 1. slots_in_use() (~line 227): it counts by the raw t.model column, but run_task_dispatch runs on run_model = fallback_model or resolve_task_model(task) (~line 952) and NEVER updates tasks.model on a fallback (~lines 1078-1089). So EVERY overload-fallback dispatch is counted under the ORIGINAL model, not the glm-5-turbo it actually runs on — under-counting the fallback pool so it admits too many and causes MORE 429s during a storm. Fix: count by the effective run-model actually in use (e.g. persist the effective model on the dispatch row and GROUP BY that). The NULL-tasks.model case is the minor sub-case; the fallback case is the frequent one.
@@ -246,9 +246,11 @@ Fix in app/hermes_dispatch.py:
 3. _finalize_result (~line 796): an empty/short reply with no deliverable.md must NOT be blanket-raised as QuotaError. In repo mode, a non-empty changes.diff = success. Only raise QuotaError on an actual rate-limit signature.
 4. on_event telemetry (~line 746): wrap the streaming db.execute telemetry writes in try/except so a transient SQLite error can't abort the stream.
 5. Add structured logging capturing WHY a worker dies (CUDA OOM / Hermes timeout / QuotaError / other) so "executor died" isn't the only signal.
+6. The orphan-dispatch reconciler wrongly RESETS tasks that are merely WAITING FOR A CONCURRENCY SLOT (not dead) — treating a slot-parked task as orphaned and resetting/re-dispatching it. Scope the reconciler so it only reclaims genuinely dead/orphaned dispatches, never ones parked waiting on the slot gate. (Surfaced by the Batch 1-3 review passes.)
+7. The boot-time reconcile PREEMPTS the session-resume path — a task that should resume its existing Hermes session (harvest-or-continue) instead gets reset/re-dispatched at boot. Make boot reconcile defer to resume: if a live/harvestable session exists, resume it rather than reset. (Surfaced by the Batch 1-3 review passes; directly reduces the 189-resume churn.)
 
 Fix in app/jarvis_brain.py:
-6. Move the ~/knowledge file reads off the event loop (run_in_threadpool), and honor the per-user knowledge overlay (users/<uid>/...) — jarvis_brain.py:82 always returns the owner's canonical ~/knowledge; mirror what dispatch ALREADY does correctly at hermes_dispatch.py:568-581 (this is a JARVIS-only gap).
+8. Move the ~/knowledge file reads off the event loop (run_in_threadpool), and honor the per-user knowledge overlay (users/<uid>/...) — jarvis_brain.py:82 always returns the owner's canonical ~/knowledge; mirror what dispatch ALREADY does correctly at hermes_dispatch.py:568-581 (this is a JARVIS-only gap).
 
 HARD RULES:
 - No behavior change beyond these fixes. Do not alter the budget/quota policy numbers.
@@ -256,7 +258,7 @@ HARD RULES:
 - Run: cd ~/Nexus-Agentic-Coding-Setup/app && bash scripts/verify.sh — must print ALL CHECKS PASSED.
 - Show me the FULL diff + one-line summary per item, then STOP. Do not commit until I say "commit".
 ```
-**Commit message:** `fix(dispatch): correct slot accounting, resume brief, quota misclassification + why-died logging`
+**Commit message:** `fix(dispatch): slot accounting, resume brief, quota misclassification, reconciler slot-wait/resume preemption + why-died logging`
 **Smoke test (after restart):**
 ```bash
 cd ~/Nexus-Agentic-Coding-Setup/app
@@ -316,6 +318,7 @@ Frontend (app/static/):
 - F132 (app.js ~6635): in jarvisStreamChat, check res.ok/status and surface the real error instead of always "provider overloaded".
 - F022 (app.js ~1254): re-set the drag handlers (dragId) after the kanban search re-render.
 - F129 (app.js ~1108): re-render the project filter after loadWorkflows() on first kanban visit.
+- Dead JARVIS command-deck ▶ Test button (surfaced by the Batch 1-3 review passes): the deck's ▶ Test control is a no-op — wire it to the same testAppUI/preview path the Deliverables ▶ Test uses, or remove it if redundant. grep the command-deck render in app.js for the deck's Test handler.
 
 HARD RULES:
 - Bump ?v=N in app/static/index.html (you edit app.js). No unrelated changes.
