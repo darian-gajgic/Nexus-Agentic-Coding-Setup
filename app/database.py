@@ -255,6 +255,18 @@ def init_db():
         ("client", "TEXT"),
         ("user_id", "TEXT"),
         ("pr_url", "TEXT"),
+        # Super Result (SUPER-RESULT-PLAN-2026-07-09.md §6 Step 1): grounded
+        # critic state — separate from judge_* by design (§4.1: overloading
+        # judge_ts/judge_verdict would double-fire the existing loop triggers
+        # and leak raw critic JSON into executor prompts via _retry_task).
+        ("super_result", "INTEGER DEFAULT 0"),
+        ("deliverable_type", "TEXT"),            # analysis|code_change|content|research|NULL
+        ("critic_verdict", "TEXT"),              # running|SHIP|REVISE|REWRITE|error
+        ("critic_output", "TEXT"),               # raw cverify stdout tail (≤30000)
+        ("critic_json", "TEXT"),                 # validated parsed findings JSON (≤60000)
+        ("critic_ts", "REAL"),
+        ("critic_round", "INTEGER DEFAULT 0"),
+        ("critic_keys", "TEXT"),                 # {"round":N,"keys":[...],"prev":[...]} convergence state
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -296,6 +308,12 @@ def init_db():
         consumed_at REAL,
         created_at REAL
     )""")
+    # Super Result: who filed the comment — 'user' (the human, historical
+    # default), 'critic' (grounded critic auto-comments, superseded per round),
+    # or 'judge' (normal-mode judge findings, N3). Retry drains all sources.
+    rc_cols = {r[1] for r in conn.execute("PRAGMA table_info(review_comments)").fetchall()}
+    if "source" not in rc_cols:
+        conn.execute("ALTER TABLE review_comments ADD COLUMN source TEXT NOT NULL DEFAULT 'user'")
 
     # Migrate workflows columns (looping v3.2)
     existing_wf_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)").fetchall()}
@@ -312,6 +330,9 @@ def init_db():
     # Block 3: mid-run replanning checkpoint state (JSON; NULL = nothing pending)
     if "replan" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN replan TEXT")
+    # Super Result: project-level flag cascades to member tasks (like high_stakes)
+    if "super_result" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN super_result INTEGER DEFAULT 0")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (
@@ -503,6 +524,7 @@ def init_db():
         ("dispatch.max_concurrent_per_model", "8"),
         ("dispatch.max_concurrent_total", "8"),
         ("judge.cmd", "cjudge {file} {domain}"),
+        ("super.critic_cmd", "cverify {file} {domain} {sandbox}"),
     ]
     for k, v in dispatch_defaults:
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
