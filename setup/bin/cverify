@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# cverify — GROUNDED CRITIC: frontier Claude re-verifies a deliverable with
+# FULL tool access inside a disposable sandbox copy of the evidence.
+# Part of Nexus Super Result (SUPER-RESULT-PLAN-2026-07-09.md §6 Step 3).
+#
+# Usage: cverify <file> <domain|-> <sandbox>
+#   <file>    absolute path of the deliverable copy INSIDE the sandbox
+#   <domain>  domain slug (for the domain rubric) or '-' for none — unlike
+#             cjudge, the critic runs fine without a rubric
+#   <sandbox> sandbox root prepared by evals.build_critic_sandbox — must
+#             contain _critic_context/context.json
+#
+# The CALLER (evals.run_critic_cmd) owns the timeout and sandbox teardown;
+# this script only consumes a prepared sandbox, so it is hand-testable.
+#
+# HONESTY NOTE: the sandbox + deny rules are an ACCIDENT boundary, not an
+# adversary boundary — $HOME stays visible so the claude CLI can auth, and a
+# determined prompt-injected model could reach outside. The isolation goal is
+# "a confused critic can't damage the real workspace/repo", nothing stronger.
+set -euo pipefail
+
+FILE="${1:-}"; DOMAIN="${2:-}"; SANDBOX="${3:-}"
+
+usage() {
+  echo "usage: cverify <file> <domain|-> <sandbox>" >&2
+  echo "  <sandbox> must contain _critic_context/context.json" >&2
+  exit 1
+}
+
+[ -n "$FILE" ] && [ -n "$DOMAIN" ] && [ -n "$SANDBOX" ] || usage
+FILE="$(realpath "$FILE")"
+[ -f "$FILE" ] || { echo "cverify: no such file: $FILE" >&2; exit 1; }
+SANDBOX="$(realpath "$SANDBOX")"
+[ -d "$SANDBOX" ] || { echo "cverify: no such sandbox: $SANDBOX" >&2; exit 1; }
+[ -f "$SANDBOX/_critic_context/context.json" ] || {
+  echo "cverify: $SANDBOX/_critic_context/context.json missing — not a prepared sandbox" >&2
+  usage
+}
+
+MAXF="${SUPER_MAX_FINDINGS:-25}"
+DOMAIN_LINE="No domain rubric was provided."
+if [ "$DOMAIN" != "-" ] && [ -f "$SANDBOX/_critic_context/RUBRIC.md" ]; then
+  DOMAIN_LINE="The domain is '$DOMAIN'; its rubric is at _critic_context/RUBRIC.md."
+fi
+
+PROMPT="You are the GROUNDED CRITIC — a second, stronger model that independently re-verifies work produced by a weaker one. You are inside a DISPOSABLE, ISOLATED sandbox copy of the evidence ($SANDBOX). You may read, edit, run tests, install dependencies — nothing here is the real workspace. Never operate on paths outside $SANDBOX. Never push, never use gh.
+
+FIRST read _critic_context/context.json — it names the task brief, round number, deliverable type, the previous version, sibling reports, rubrics, and existing open review comments (do not duplicate those). $DOMAIN_LINE
+
+The deliverable under critique is: $FILE
+
+METHOD, in this order:
+(a) CLAIM LEDGER — extract every load-bearing claim in the deliverable: facts, numbers, file:line references, 'tests pass' statements, causal conclusions.
+(b) VERIFY, refute-by-default — a claim stays UNVERIFIED until confirmed against primary evidence: read the actual files, re-run the exact commands whose output the deliverable quotes, re-derive numbers yourself. The deliverable's own assertions and self-scores are never evidence. A proxy inference ('tests pass' therefore 'code correct') is NOT verification.
+(c) CONTRADICTIONS — diff the deliverable against the previous version (path in context.json), against each sibling report (_critic_context/siblings/), and against itself. Every contradiction is a finding or an entry in 'contradictions'.
+(d) COMPLETENESS — what is missing versus the brief and versus every rubric dimension.
+(e) Score the must-pass gates of BOTH rubrics (domain + type, whichever exist in _critic_context/) briefly.
+
+OUTPUT CONTRACT: narrate your verification as you go if you wish, but your reply MUST END with exactly one JSON object between these sentinel lines, nothing after the closing sentinel:
+NEXUS_CRITIC_JSON_BEGIN
+{ ... }
+NEXUS_CRITIC_JSON_END
+
+The JSON schema (respect every length limit):
+{
+  \"verdict\": \"SHIP|REVISE|REWRITE\",
+  \"confidence\": 0.0-1.0,
+  \"summary\": \"<=600 chars\",
+  \"findings\": [{
+     \"severity\": \"critical|high|medium|low\",
+     \"file_path\": \"workspace-relative, e.g. workspace/deliverable.md or repo/src/x.py\",
+     \"side\": \"new\",
+     \"line_no\": 12,
+     \"line_text\": \"verbatim quote of that exact line (<=200)\",
+     \"claim\": \"what the deliverable asserts (<=300)\",
+     \"evidence\": \"what you actually found and WHERE — file:line or command + real output (<=400)\",
+     \"problem\": \"why the claim fails (<=300)\",
+     \"suggested_fix\": \"concrete edit (<=300)\"
+  }],
+  \"contradictions\": [{\"with\": \"previous_version|sibling:<task-id>|internal\", \"a\": \"...\", \"b\": \"...\", \"resolution_hint\": \"...\"}],
+  \"missing\": [{\"what\": \"...\", \"why_it_matters\": \"...\"}],
+  \"revision_brief\": \"<=2500 chars — the exact instruction the reworking agent needs\",
+  \"learning_note\": \"<=300 chars, optional — the single most instructive gap for the junior humans\"
+}
+
+RULES:
+- At most $MAXF findings, most severe first.
+- Every finding must cite verifiable evidence (a file:line you read, a command you ran with its real output). No evidence, no finding.
+- line_no/line_text must reference a real existing line of file_path, or be null.
+- SHIP only when there are zero critical/high findings AND all rubric must-pass gates pass.
+- revision_brief must be actionable on its own: what to fix, in what order, with the evidence locations."
+
+# Nexus Settings v2 hooks (both optional, absent = original behavior):
+#   JUDGE_MODEL              — explicit critic model → claude --model
+#   JUDGE_ANTHROPIC_API_KEY  — per-user Anthropic key; when set, the call runs
+#                              key-authed instead of the CLI's subscription auth
+MODEL_ARGS=()
+if [ -n "${JUDGE_MODEL:-}" ]; then MODEL_ARGS=(--model "$JUDGE_MODEL"); fi
+
+KEY_ENV=(-u ANTHROPIC_API_KEY)
+if [ -n "${JUDGE_ANTHROPIC_API_KEY:-}" ]; then
+  KEY_ENV=(ANTHROPIC_API_KEY="$JUDGE_ANTHROPIC_API_KEY")
+fi
+
+cd "$SANDBOX"
+
+# NOTE: env requires -u options BEFORE NAME=VALUE assignments — KEY_ENV
+# (either `-u ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY=…`) must come last.
+# Deny rules beat allow rules; acceptEdits (NOT bypassPermissions) keeps the
+# deny list enforceable.
+exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES -u ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
+  -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_SUBAGENT_MODEL -u CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY \
+  -u CLAUDE_CODE_EFFORT_LEVEL -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u CLAUDE_CODE_WORKFLOWS \
+  -u CLAUDE_CODE_ALWAYS_ENABLE_EFFORT -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC -u API_TIMEOUT_MS \
+  -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+  "${KEY_ENV[@]}" \
+  claude "${MODEL_ARGS[@]}" \
+    --permission-mode acceptEdits \
+    --allowedTools "Bash" "Read" "Edit" "Write" "Grep" "Glob" "WebSearch" "WebFetch" \
+    --disallowedTools "Bash(git push:*)" "Bash(git remote:*)" "Bash(gh:*)" "Bash(sudo:*)" \
+    -p "$PROMPT"
