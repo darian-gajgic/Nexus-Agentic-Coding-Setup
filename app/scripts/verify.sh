@@ -400,6 +400,7 @@ chk "rule2 risk hard floor"          "grep -q 'risk hard floor' loop_engine.py &
 chk "rule4 budget multiplier"        "grep -q 'def _autopilot_fields' server.py && grep -q 'budget_mult' autopilot.py"
 chk "rule5 pipeline depth"           "grep -q 'pipeline_depth' server.py && grep -q 'eco_collapse' server.py"
 chk "rule6 smart cap 3"              "grep -q 'round_cap = 3' autopilot.py"
+chk "rule8 early-exit not a dead flag" "! grep -q 'early_exit' autopilot.py && grep -q 'rule 8 early-exit' server.py && grep -q 'Stops on SHIP' loop_engine.py"
 chk "P2 staged forward-deps"         "grep -q 'def _feature_present' autopilot.py && grep -q 'staged' autopilot.py"
 chk "Q7a create/patch plumbing"      "grep -q 'ap_inv, ap_spend' server.py && grep -q '_regen_loop_for_profile' server.py"
 chk "Q7a workflow cascade"           "grep -q 'UPDATE tasks SET autopilot=? WHERE workflow_id=?' server.py && grep -q 'UPDATE tasks SET spend_profile=? WHERE workflow_id=?' server.py"

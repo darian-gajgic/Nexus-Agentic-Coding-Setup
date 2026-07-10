@@ -16,7 +16,9 @@ the binding guardrail rules (QUALITY-AUTOPILOT-PLAN Part 2 §Q7a):
   rule 4  budget × 0.5 / 1 / 2
   rule 5  spend shapes pipeline DEPTH (eco collapse / optimal std / smart full)
   rule 6  smart round cap = 3
-  rule 8  adaptive early-exit inside optimal (P6: prompt-level, not DAG surgery)
+  rule 8  adaptive early-exit inside optimal (P6: prompt-level, not DAG surgery) —
+          realized by the SHIP quiet-stop + the reconciler framing, NOT a derived
+          flag; derive() emits no early-exit field (see the rule-8 note below)
   P2      plan.recommend / escalation / model-floor are forward-deps → 'staged'
 """
 INVOLVEMENTS = ("full_auto", "assisted", "manual")
@@ -104,10 +106,17 @@ def derive(involvement, spend, *, high_stakes: bool = False,
     # rule 5 — spend shapes pipeline DEPTH (consumed by the wizard).
     pipeline_depth = {"eco": "collapsed", "optimal": "standard", "smart": "full"}[sp]
 
-    # rule 8 / P6 — adaptive early-exit is enabled inside optimal (and smart):
-    # empty-findings high-confidence critique skips the residual round (an
-    # existing loop knob), and the reconciler verifies disagreements first.
-    early_exit = sp in ("optimal", "smart")
+    # rule 8 / P6 — adaptive early-exit is NOT a derived preset flag. A boolean
+    # consumed nowhere would be theatre; instead early-exit is realized
+    # UNCONDITIONALLY (for Optimal/Smart fan-out + SR alike) by two mechanisms
+    # that live where the work actually runs:
+    #   P6(a) SHIP quiet-stop — loop_engine._sweep_super_result ends the SR loop
+    #         on a SHIP verdict, skipping the residual polish round;
+    #   P6(b) reconciler framing — server._reconciler_gate_task instructs the
+    #         reconciler to compute agreement FIRST and adversarially re-verify
+    #         only the DISAGREEMENTS ("rule 8 early-exit").
+    # So derive() emits no early-exit field (the old boolean was removed after the
+    # 2nd judge pass — it was dead). design_loop surfaces P6(a) as "Stops on SHIP".
 
     out = {
         "involvement": inv,
@@ -122,7 +131,7 @@ def derive(involvement, spend, *, high_stakes: bool = False,
         "budget": budget,                  # rule 4
         "budget_mult": budget_mult,
         "pipeline_depth": pipeline_depth,  # rule 5
-        "early_exit": early_exit,          # rule 8/P6
+        # rule 8/P6 early-exit is realized elsewhere (see the note above) — no field
         "checkpoints_only_at": (
             ["plan approval", "final deliverable", "escalations", "irreversible actions"]
             if inv == "full_auto" else None),
