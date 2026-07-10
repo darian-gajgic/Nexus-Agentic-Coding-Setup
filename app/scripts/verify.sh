@@ -478,6 +478,7 @@ chk "replan seeds original spec"     "grep -q 'def _workflow_spec_md' server.py 
 # Step 3/5 — UI
 chk "deep plan UI"                   "grep -q 'function startDeepPlan' static/app.js && grep -q 'function deepPlanModal' static/app.js && grep -q 'function deepPlanRunCritique' static/app.js && grep -q 'function deepPlanRecommendModal' static/app.js"
 chk "premortem annotations in editor" "grep -q 'planEd.annotations' static/app.js && grep -q 'planEd.planSessionId' static/app.js"
+chk "Step7 re-run premortem + diff flags" "grep -q 'wfRerunCritique' static/app.js && grep -q 'function planEdComputeDiff' static/app.js && grep -q 'planEd.diff' static/app.js"
 # Step 9 — JARVIS framing (rule 12)
 chk "JARVIS knows Deep Plan (+attach)" "grep -q 'DEEP PLAN:' server.py && grep -q '/api/plan/sessions' server.py && grep -q 'sessions/ID/attach' server.py"
 # Step 10 — gates

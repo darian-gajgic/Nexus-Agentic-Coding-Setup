@@ -110,6 +110,9 @@ async def main():
             await page.wait_for_timeout(1500)
             body2 = await page.locator("#wfStages").inner_text()
             ok("premortem annotation renders on a task card", "⚠" in body2)
+            # Step 7: the re-run premortem button is available for a Deep-Plan proposal
+            ok("Step 7 re-run premortem button renders",
+               await page.locator("#wfRerunCritique").count() == 1)
 
             ok("no console errors", not console_errors, str(console_errors[:2]))
             await browser.close()

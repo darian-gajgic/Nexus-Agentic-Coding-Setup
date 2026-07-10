@@ -9286,6 +9286,8 @@ function planEdRowHTML(t, i) {
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
         <input type="checkbox" id="wfKeep${i}" ${planEd.keep[i] ? 'checked' : ''} ${locked ? 'disabled title="quality gate — required"' : ''}>
         <span class="muted" style="font-family:var(--font-mono)">${i + 1}.</span> <strong>${esc(t.title || '(untitled task)')}</strong>
+        ${(planEd.diff && planEd.diff.added.has(i)) ? '<span class="chip c-cyan" title="added by the plan checker">＋ added</span>' : ''}
+        ${(planEd.diff && planEd.diff.changed.has(i)) ? '<span class="chip c-accent" title="changed by the plan checker">✎ changed</span>' : ''}
         ${t.specialist ? `<span class="chip c-cyan">${esc(t.specialist)}</span>` : ''}
         ${t.high_stakes ? '<span title="pauses for approval">⚖</span>' : ''}
         ${t.super_result ? '<span class="chip c-accent" title="Super Result — grounded critic loop">✨SR</span>' : ''}
@@ -9365,8 +9367,12 @@ function planEdRender() {
   if (b) b.textContent = (planEd.mode === 'replan' ? 'Apply replan' : 'Create project')
     + ` (${planEd.keep.filter(Boolean).length} tasks)`;
   const rb = $('#wfRepairs');
-  if (rb) rb.innerHTML = (planEd.repairs || []).length
-    ? `🔧 wizard auto-fixed: ${planEd.repairs.map(esc).join(' · ')}` : '';
+  if (rb) {
+    const bits = [];
+    if ((planEd.repairs || []).length) bits.push(`🔧 wizard auto-fixed: ${planEd.repairs.map(esc).join(' · ')}`);
+    if (planEd.diff && planEd.diff.removed) bits.push(`➖ plan checker removed ${planEd.diff.removed} task(s)`);
+    rb.innerHTML = bits.join('<br>');
+  }
   const sw = $('#dpSpecWarnings');
   if (sw) sw.innerHTML = (planEd.specWarnings || []).length
     ? (planEd.specWarnings || []).map(w => `<div style="font-size:11px;color:var(--warn,#eab308)">${esc(w)}</div>`).join('') : '';
@@ -9464,6 +9470,20 @@ function planEdFinalTasks() {
   });
 }
 
+// Step 7 re-plan diffing: compare the plan the operator submitted to what the
+// plan checker returned (by index + title) so changed/added/removed task cards
+// are flagged — "don't make the user play spot-the-difference." Returns
+// {added:Set, changed:Set, removed:number}.
+function planEdComputeDiff(before, after) {
+  const norm = s => (s || '').trim().toLowerCase();
+  const added = new Set(), changed = new Set();
+  after.forEach((t, i) => {
+    if (i >= before.length) added.add(i);
+    else if (norm(before[i].title) !== norm(t.title)) changed.add(i);
+  });
+  return { added, changed, removed: Math.max(0, before.length - after.length) };
+}
+
 // Multi-step goal → staged DAG preview (assumptions + auto-repairs shown), full
 // plan editing (R1), create on confirm
 function proposeWorkflowModal(wf, meta) {
@@ -9495,8 +9515,9 @@ function proposeWorkflowModal(wf, meta) {
     ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase — or ✏️ edit the affected task right here.</span></div>` : ''}
     <div id="wfRepairs" style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px"></div>
     <div id="wfStages" style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto"></div>
-    <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
+    <div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <button class="btn-sm" id="wfAddTask">➕ Add a task</button>
+      ${planSessionId ? `<button class="btn-sm" id="wfRerunCritique" title="Re-run the premortem on the current (edited) plan">🔍 Re-run premortem</button>` : ''}
       <span class="form-hint" style="margin:0">✏️ edit any task — the plan checker re-verifies edited plans (quality gates, wiring) before anything is created.</span>
     </div>
     ${isCoding ? `
@@ -9550,6 +9571,9 @@ function proposeWorkflowModal(wf, meta) {
   if (planSessionId && meta && meta.critique_enabled) setTimeout(() => deepPlanRunCritique(), 60);
   const addBtn = $('#wfAddTask');
   if (addBtn) addBtn.onclick = () => planEdAddTask();
+  // Step 7: re-run the premortem after edits (auto-run only fires on first draft).
+  const rerunBtn = $('#wfRerunCritique');
+  if (rerunBtn) rerunBtn.onclick = () => deepPlanRunCritique();
   const b = $('#wfCreateBtn');
   // repo picker options (coding projects only)
   const repoSel = $('#wf-repo');
@@ -9580,6 +9604,7 @@ function proposeWorkflowModal(wf, meta) {
     // anything, show the repaired plan and let the operator confirm again.
     if (planEd.edited) {
       b.disabled = true; b.textContent = 'Checking the edited plan…';
+      const before = finalTasks.map(t => ({ title: t.title }));  // snapshot to diff against the checker's output
       let r;
       try {
         r = await api('POST', '/api/tasks/wizard/revalidate', { name: wf.name, tasks: finalTasks });
@@ -9591,10 +9616,14 @@ function proposeWorkflowModal(wf, meta) {
       planEd.keep = planEd.tasks.map(() => true);
       planEd.edited = false;
       planEd.repairs = r.repairs || [];
+      planEd.diff = planEdComputeDiff(before, planEd.tasks);  // Step 7: flag changed/added/removed cards
+      const d = planEd.diff, changedPlan = d.added.size || d.changed.size || d.removed;
       b.disabled = false;
       planEdRender();
-      if ((r.repairs || []).length) {
-        toast('The plan checker adjusted your edits — review, then press Create again', 'info');
+      // Stop for one more confirm whenever the checker changed the plan (repair
+      // note OR a structural add/change/remove) so the flagged cards are seen.
+      if ((r.repairs || []).length || changedPlan) {
+        toast('The plan checker adjusted your edits — changed/added/removed tasks are flagged; review, then press Create again', 'info');
         return;
       }
       finalTasks = planEdFinalTasks();
