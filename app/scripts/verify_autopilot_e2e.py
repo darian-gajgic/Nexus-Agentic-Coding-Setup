@@ -81,6 +81,38 @@ chk("rule2 Eco + high_stakes STILL auto-judges (risk floor beats speed)",
     c_eco_hs["auto_judge"] is True and c_eco_hs["preference"] == "speed")
 chk("rule1 preference recorded, not independently set", c_smart.get("spend_profile") == "smart")
 
+print("=== rule 8 / P6 — adaptive early-exit (respecified; no dead flag) ===")
+# P4-required gate for rule-8 early-exit. Per the P6 respec, early-exit is NOT a
+# derived preset flag (fan-out is planning-time; the reconciler cannot be skipped
+# at runtime). It is realized by two mechanisms, and derive() emits no field:
+#   P6(a) the SHIP quiet-stop (loop_engine._sweep_super_result), and
+#   P6(b) the reconciler's own agreement-first framing (server._reconciler_gate_task).
+chk("rule8 no dead early_exit flag emitted by derive() (2nd judge pass)",
+    all("early_exit" not in ap.derive("assisted", sp) for sp in ("eco", "optimal", "smart")))
+# P6(a): the SHIP quiet-stop IS the Optimal/Smart SR early-exit — design_loop
+# surfaces it to the operator as the loop's stop condition ("Stops on SHIP").
+c_opt_sr = le.design_loop("task", {"title": "X", "domain": "marketing", "super_result": True,
+                                   "spend_profile": "optimal", "autopilot": "assisted"})
+sr_opt = [t for t in c_opt_sr["triggers"] if t["id"] == "super_result"]
+chk("rule8 P6(a) SHIP quiet-stop is the Optimal SR early-exit (surfaced as 'Stops on SHIP')",
+    bool(sr_opt) and "Stops on SHIP" in (sr_opt[0].get("explain") or ""))
+# P6(b): the reconciler's OWN framing computes agreement first and adversarially
+# re-verifies only the DISAGREEMENTS. Drive the deterministic fan-out repair (the
+# plan editor's revalidate) so the reconciler gate task is really produced.
+try:
+    fo = [{"title": "Lens A", "specialist": None, "domain": "marketing",
+           "tags": ["investigation"], "depends_on_idx": []},
+          {"title": "Lens B", "specialist": None, "domain": "marketing",
+           "tags": ["investigation"], "depends_on_idx": []}]
+    rf = post("/api/tasks/wizard/revalidate", json={"name": "Fanout early-exit", "tasks": fo})
+    rtasks = rf.json().get("tasks", [])
+    rec = next((t for t in rtasks if "reconciler" in (t.get("tags") or [])), None)
+    desc = (rec or {}).get("description", "")
+    chk("rule8 P6(b) reconciler framing = agreement-first, re-verify only DISAGREEMENTS",
+        rec is not None and "AGREEMENT" in desc and "DISAGREEMENTS" in desc and "early-exit" in desc)
+except Exception:
+    chk("rule8 P6(b) reconciler revalidate reachable", False)
+
 print("=== Q4 — decision log harvest + injection ===")
 wid = f"wf-t{int(time.time())}"
 wsdir = hd.WORKSPACES / f"workflow-{wid}"

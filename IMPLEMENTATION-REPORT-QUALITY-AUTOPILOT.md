@@ -107,7 +107,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 | 5 profiles shape pipeline depth | BUILT (judge finding 1 fixed 2026-07-10) | wizard `pipeline_depth` note + `_repair_workflow` Eco collapse. Risk-floor scan now EXCLUDES quality-gate stages (`_GATE_SPECIALISTS`) so the always-high-stakes verifier doesn't defeat the collapse on real plans; review still re-inserted when a genuine WORK stage is high-stakes — rule 2 wins |
 | 6 Smart round cap = 3 | BUILT | `derive` round_cap; `design_loop` clamps every trigger |
 | 7 scheduler/JARVIS passthrough | BUILT | B4 template + JARVIS framing carry both axes |
-| 8 adaptive early-exit (P6) | BUILT | `early_exit` flag + reconciler framing computes agreement first, re-verifies only disagreements |
+| 8 adaptive early-exit (P6) | BUILT (dead flag removed — 2nd judge pass) | NO derived preset flag (the old `early_exit` boolean was consumed nowhere → removed). Realized unconditionally by **P6(a)** the SHIP quiet-stop (`loop_engine._sweep_super_result` ends the SR loop on SHIP, skipping the residual round — surfaced to the operator as "Stops on SHIP" in `design_loop`) + **P6(b)** the reconciler's own agreement-first framing (`_reconciler_gate_task`: compute agreement first, re-verify only DISAGREEMENTS) |
 | 9 router-collapse instrumentation | BUILT | `routing.sweep_stats` WARNs when Balanced saturates to the max-spend path |
 | 10 Eco validated behaviourally | DEFERRED (Phase 8) | documented in the Eco card copy + this report |
 | 11 specialist sweep | BUILT | all 18 defs + frontier-method skill aligned to `[UNSURE]`, live↔vendored synced |
@@ -205,3 +205,26 @@ tag filter is unchanged. Verified:
 $ app/.venv/bin/python scripts/verify_block2_e2e.py      → 48 passed, 0 failed   (stable across repeated runs)
 $ bash app/scripts/verify.sh                             → ALL CHECKS PASSED: 373/373   (pre-commit hook)
 ```
+
+## Second judge review — REVISE #2 → all four blockers addressed (2026-07-10)
+
+A second independent judge pass on Phase 3 returned **REVISE** with four blocking findings.
+Each was re-verified against HEAD (re-located by symbol), fixed (or recorded already-ok with
+evidence), given a regression check, and committed granularly. The tree is fully committed.
+
+1. **`autopilot.py` rule-8 `early_exit` was a dead flag; the P4 early-exit gate was missing.**
+   Confirmed at HEAD: `derive()` emitted `early_exit = sp in ("optimal","smart")` (autopilot.py)
+   but a repo-wide grep found NO consumer — the flag was theatre, and the report's rule-8 row
+   over-claimed it. The two real P6 mechanisms both exist and run **unconditionally** (not gated
+   by any preset flag): P6(a) the SHIP quiet-stop in `loop_engine._sweep_super_result` (SHIP →
+   done, residual round skipped) and P6(b) the reconciler's agreement-first framing in
+   `server._reconciler_gate_task` ("compute AGREEMENT … re-verify only the DISAGREEMENTS … rule 8
+   early-exit"). **Fix:** removed the dead flag from `derive()` and documented the honest reality
+   in the module docstring + inline (P6(a) = SHIP quiet-stop, P6(b) = reconciler framing); no
+   `early_exit` field is emitted. **Regression:** `verify_autopilot_e2e.py` gains a "rule 8 / P6"
+   group — (i) `derive()` emits no `early_exit` field for any profile, (ii) the Optimal SR loop
+   surfaces the SHIP quiet-stop as its stop condition via `design_loop` ("Stops on SHIP"), and
+   (iii) a 2-lens fan-out driven through `/api/tasks/wizard/revalidate` produces a reconciler
+   whose framing is agreement-first / re-verify-only-DISAGREEMENTS. `verify.sh` adds a rule-8
+   static check (no `early_exit` in autopilot.py; "rule 8 early-exit" in server.py; "Stops on
+   SHIP" in loop_engine.py). Rule-8 row above corrected.
