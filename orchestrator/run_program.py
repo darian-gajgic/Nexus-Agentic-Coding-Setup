@@ -303,6 +303,13 @@ def run_claude(state, name, prompt, model, allowed, timeout, cont_prompt=None):
     Returns dict {ok, timed_out, text, log_path}.
     """
     LOGS.mkdir(parents=True, exist_ok=True)
+    # Subscription-only guarantee: strip anything that could reroute billing to a
+    # metered API or a third-party gateway. Children then authenticate solely via
+    # the `claude login` OAuth credentials (the operator's subscription).
+    child_env = {k: v for k, v in os.environ.items()
+                 if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                              "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+                              "CLAUDE_CODE_USE_VERTEX")}
     argv = ["claude", "-p", prompt, "--model", model,
             "--output-format", "json",
             "--permission-mode", "acceptEdits",
@@ -317,7 +324,7 @@ def run_claude(state, name, prompt, model, allowed, timeout, cont_prompt=None):
         timed_out = False
         try:
             p = subprocess.run(argv, cwd=str(REPO), timeout=timeout,
-                               capture_output=True, text=True)
+                               env=child_env, capture_output=True, text=True)
             rc, stdout, stderr = p.returncode, p.stdout or "", p.stderr or ""
         except subprocess.TimeoutExpired as e:
             timed_out = True
