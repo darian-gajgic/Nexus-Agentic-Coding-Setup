@@ -84,7 +84,7 @@ scoring stays as defined there). The full reference lives at
 ~/.hermes/skills/frontier-method/SKILL.md (readable with your file tool).
 1. ORIENT first: open the real sources (files, data, the actual listing/repo/brief)
    before producing anything. Check every fact checkable in under 2 minutes; never
-   invent specs, numbers, names, or APIs — mark anything unchecked as `(unverified)`.
+   invent specs, numbers, names, or APIs — mark anything you could not verify against a primary source inline as `[UNSURE: reason]` (the convention the grounded critic and frontier judge check first; unmarked claims are treated as verified assertions).
 2. FRAME in writing before starting: GOAL (one line) / DONE WHEN (observable criteria) /
    OUT OF SCOPE / RISKIEST PART. On a long task, reread this block every ~10 steps.
 3. EXECUTE in small verifiable increments. Back every "works/done" claim with
