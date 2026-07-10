@@ -1,34 +1,39 @@
-/* JARVIS 3D v6 — sculpted anatomical particle bust.
+/* JARVIS 3D v7 — holographic head (2026-07-10).
 
-   Direction from the operator (2026-07-08): stop chasing scan likeness —
-   model a SOLID, believable 3D human first, and adapt only the shape data
-   we trust from his frames: head aspect 0.82, his hair-silhouette curve,
-   beard region. Everything else is canonical human anatomy, sculpted
-   procedurally: cranium ellipsoid + displacement brushes (brow ridge, eye
-   sockets, cheekbones, muzzle, chin, temples, occiput), a real nose wedge,
-   ears, tapering jaw, neck cylinder and trapezius shoulders.
+   A violet point-lattice hologram in the style of the operator's reference
+   clip: the three.js "facecap" head (model by Face Cap —
+   bannaflak.com/face-cap; texture + baked clips stripped offline by
+   scripts/build_facecap_hologram.py) with all 52 ARKit blendshapes,
+   rendered three ways off ONE shared geometry:
+     occluder  — near-black Mesh (+teeth): hides the far side → reads solid
+     wireframe — faint additive violet lattice (the hologram "grid")
+     points    — morph-aware ShaderMaterial dots: fresnel rim, per-dot
+                 twinkle, scanline shimmer, rare glitch flicker
+   All three share ONE morphTargetInfluences array (r160 texture-based
+   morphs work for Points + ShaderMaterial; the renderer binds the morph
+   texture per object automatically). Eyes are separate meshes under
+   rotatable pivot groups — gaze rotates the pivots, the glints ride along.
+   Post: EffectComposer → UnrealBloomPass (half-res) → OutputPass.
 
-   What makes it read SOLID:
-   - an OPAQUE dark occluder mesh of the same surfaces renders underneath
-     the particles, so the far side of the head is hidden (the see-through
-     scatter was the main "not solid" tell);
-   - particles are dense, small and hug the surface;
-   - per-point lighting (key lambert + fill + rim) is baked from real
-     surface normals; hair/beard/brows darken the right regions.
+   Per-frame animation writes into the shared influences array:
+     blink   — measured human dynamics (Trutoiu et al., ACM TAP 2011)
+     visemes — text-aligned Oculus viseme timeline (vendor/lipsync-en.mjs,
+               MIT) stretched over the REAL per-sentence audio window and
+               gated by the live RMS envelope (speak()/stopSpeech() API)
+     gaze    — saccade/fixation state machine, camera-dominant
+     idle    — breathing + subtle sway; the head always FACES THE USER
+   Fallback: an ellipsoid lattice bust if the GLB can't load.
 
-   Scene layers, front to back (v10): bust (z≈0, anchored at the frame
-   bottom) → the REAL memory galaxy (the memory-tab map at 10× node spacing,
-   slowly spinning, z≈-7800) → the static memory matrix backdrop (z≈-11500).
-   100 links run from the back of the skull to the 100 most-linked memory
-   nodes; electric signals ride them (rapid inter-node traffic while
-   thinking, a flood into the head when the answer starts). toggleGalaxy()
-   flies the camera through the bust into the galaxy for orbit / hover /
-   click-to-edit (onMemorySelect), like the Memory tab's 3D map.
+   Scene layers, front to back: head (z≈0, face at +z) → the REAL memory
+   galaxy (z≈-7800, 50× node spacing) → static matrix backdrop (z≈-11500).
+   100 links run from the back of the skull to the most-linked memory
+   nodes; toggleGalaxy() flies the camera through the head into the galaxy
+   for orbit / hover / click-to-edit (onMemorySelect), like the Memory tab.
 
-   window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations, toggleGalaxy }
-   Lazy CDN three.js import — the string "three" never appears in index.html
-   (verify.sh gate). Lip-sync: mouth-band points (exact by construction)
-   displaced by setLevel; eye-band points blink. */
+   window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations,
+                       toggleGalaxy, speak, stopSpeech }
+   Lazy CDN three.js import — the string "three" never appears in
+   index.html (verify.sh gate). Vendored addons: static/vendor/threejsm/. */
 
 let THREE = null;
 let threePromise = null;
@@ -45,14 +50,13 @@ function loadThree() {
 
 const J = {
   renderer: null, scene: null, camera: null, raf: null, container: null,
-  head: null, headGroup: null, headGeo: null, occluders: [],
-  glints: [], mouthIdx: [], eyeIdx: [], basePos: null,
-  baseB: null, baseW: null, mouthY: [0, 1], level: 0, mode: 'idle', t: 0,
+  head: null, headGroup: null, holo: null, composer: null, bloom: null,
+  glints: [], level: 0, mode: 'idle', t: 0,
   animOn: true, disposed: false, resizeObs: null,
   pointer: { x: 0, y: 0 }, pointerHandler: null,
   // research-grounded animation state (docs/JARVIS-VOICE.md §0)
-  env: 0, levelHF: 0, jit: null, eyesY: [0, 1], mouthXh: 6,
-  blinkAt: 2, blinkT: -1, lidPrev: 0,
+  env: 0, levelHF: 0, blinkAt: 2, blinkT: -1,
+  utterQ: [], utterCtx: null,
   // memory galaxy + static matrix + camera modes
   mem: emptyMem(), matrix: null, galaxyMode: false, fly: null,
   gCam: { theta: Math.PI / 2, phi: 1.35, dist: 700 }, lookCur: null,
@@ -67,11 +71,12 @@ function emptyMem() {
            marker: null, panel: null, hint: null };
 }
 
+// RGB multipliers on the violet hologram base (>1 amplifies into bloom)
 const MODE_TINT = {
-  idle:      [0.30, 0.85, 1.00],
-  listening: [0.37, 0.92, 0.83],
-  thinking:  [0.50, 1.05, 1.15],   // lit-up electric cyan (>1 amplifies)
-  talking:   [0.45, 0.95, 1.00],
+  idle:      [1.00, 0.95, 1.15],
+  listening: [0.75, 1.15, 1.05],   // toward --accent-2 teal
+  thinking:  [1.25, 1.10, 1.45],   // lit-up electric violet
+  talking:   [1.10, 1.00, 1.30],
 };
 
 let _glowTex = null;
@@ -90,312 +95,289 @@ function glowTexture() {
   return _glowTex;
 }
 
-/* ═══════════════ sculpted bust geometry ═══════════════ */
+/* ═══════════ hologram head (facecap GLB, ARKit-52 morphs) ═══════════ */
 
 const D2R = Math.PI / 180;
-const sm = (a, b, x) => {
-  const s = Math.min(1, Math.max(0, (x - a) / (b - a)));
-  return s * s * (3 - 2 * s);
-};
-// operator's measured hair/head silhouette (front view, angle from "up"
-// -90°..+90° in 12° steps, radius / head height) — the one personal shape
-// input we trust; everything else is canonical anatomy.
-const HAIR_RADII = [0.43, 0.406, 0.643, 0.602, 0.559, 0.544, 0.527, 0.523,
-                    0.523, 0.527, 0.54, 0.576, 0.51, 0.452, 0.422, 0.411];
-const HAIR_MIN = 0.406, HAIR_MAX = 0.643;
+const HOLO_WIRE = 0x5b3fd6, HOLO_OCC = 0x05060f, HOLO_EYE = 0x0b0e1f,
+      HOLO_GLINT = 0xb9a5ff, HOLO_BG = 0x05050c;
+// the fit anchors on the EYES (the perceptual center of a face), not the
+// bbox: facecap's cranium is deep and tall, so bbox-anchoring drops the
+// face out of frame. Fitted: crown ≈ +13, mouth ≈ −12, neck cut ≈ −21
+// (the dots fade out above the cut — floating-head hologram, like the
+// reference clip; frame shows y ≈ −33..41 at z=0)
+const HEAD_H = 44;          // world height of the fitted head bbox
+const EYE_Y = 0, EYE_Z = 3;   // world anchor for the eye midpoint
+const FADE_Y = [-23, -14];  // dot brightness fades to 0 toward the neck cut
+const POINT_SUBDIV = true;  // midpoint-subdivide the dot lattice (2.7k → ~10.4k)
 
-// displacement brushes: gaussian bumps in (θ from top, φ azimuth; φ=0 front)
-const BRUSHES = [
-  { t: 52, p: 0,    st: 5,  sp: 26, amp: +0.030 },  // brow ridge
-  { t: 58, p: 13,   st: 6.5, sp: 8, amp: -0.075 },  // eye socket R
-  { t: 58, p: -13,  st: 6.5, sp: 8, amp: -0.075 },  // eye socket L
-  { t: 67, p: 27,   st: 8,  sp: 10, amp: +0.035 },  // cheekbone R
-  { t: 67, p: -27,  st: 8,  sp: 10, amp: +0.035 },  // cheekbone L
-  { t: 76, p: 0,    st: 9,  sp: 15, amp: +0.035 },  // muzzle
-  { t: 88, p: 0,    st: 7,  sp: 9,  amp: +0.050 },  // chin boss
-  { t: 55, p: 180,  st: 25, sp: 40, amp: +0.050 },  // occiput fullness
-  { t: 95, p: 180,  st: 12, sp: 50, amp: -0.100 },  // skull base in
-  { t: 50, p: 68,   st: 12, sp: 14, amp: -0.030 },  // temple R
-  { t: 50, p: -68,  st: 12, sp: 14, amp: -0.030 },  // temple L
-  { t: 62, p: 92,   st: 7,  sp: 5,  amp: +0.060 },  // ear R
-  { t: 62, p: -92,  st: 7,  sp: 5,  amp: +0.060 },  // ear L
-  { t: 36, p: 0,    st: 10, sp: 24, amp: -0.015 },  // forehead plane
-  { t: 95, p: 115,  st: 10, sp: 30, amp: -0.120 },  // under-jaw hollow R
-  { t: 95, p: -115, st: 10, sp: 30, amp: -0.120 },  // under-jaw hollow L
-];
-
-const RX = 12.2, RY = 15.0, RZ = 12.9;   // head half axes (aspect ≈ 0.82)
-const HEAD_CY = 13;                       // head center y (world)
-
-function dphi(a, b) {
-  let d = Math.abs(a - b) % (2 * Math.PI);
-  return d > Math.PI ? 2 * Math.PI - d : d;
-}
-
-function hairAmp(phi) {
-  // map the measured frontal silhouette onto the azimuth; mirror for the back
-  const a = Math.abs(phi) <= Math.PI / 2 ? phi : (Math.PI - Math.abs(phi)) * Math.sign(phi);
-  const idx = ((a / D2R) + 90) / 12;
-  const i0 = Math.max(0, Math.min(HAIR_RADII.length - 1, Math.floor(idx)));
-  const i1 = Math.min(HAIR_RADII.length - 1, i0 + 1);
-  const f = Math.min(1, Math.max(0, idx - i0));
-  const v = HAIR_RADII[i0] * (1 - f) + HAIR_RADII[i1] * f;
-  return (v - HAIR_MIN) / (HAIR_MAX - HAIR_MIN);   // 0..1
-}
-
-function curl(theta, phi) {
-  return Math.sin(phi * 7.3 + 1.7) * Math.sin(theta * 9.1 + 0.6) * 0.5
-       + Math.sin(phi * 12.7) * Math.sin(theta * 5.3 + 2.1) * 0.5;
-}
-
-// head radius along direction (θ,φ) + region info
-function headRadius(theta, phi) {
-  const dx = Math.sin(theta) * Math.sin(phi);
-  const dy = Math.cos(theta);
-  const dz = Math.sin(theta) * Math.cos(phi);
-  let r = 1 / Math.sqrt((dx * dx) / (RX * RX) + (dy * dy) / (RY * RY) + (dz * dz) / (RZ * RZ));
-  let mul = 1;
-  for (const b of BRUSHES) {
-    const dt = (theta - b.t * D2R) / (b.st * D2R);
-    const dp = dphi(phi, b.p * D2R) / (b.sp * D2R);
-    mul += b.amp * Math.exp(-(dt * dt + dp * dp) / 2);
+let addonsPromise = null;
+function loadAddons() {
+  if (!addonsPromise) {
+    addonsPromise = (async () => {
+      const V = '?v=1';
+      const [gl, mo, ec, rp, ub, op, lip] = await Promise.all([
+        import('/static/vendor/threejsm/loaders/GLTFLoader.js' + V),
+        import('/static/vendor/threejsm/libs/meshopt_decoder.module.js' + V),
+        import('/static/vendor/threejsm/postprocessing/EffectComposer.js' + V),
+        import('/static/vendor/threejsm/postprocessing/RenderPass.js' + V),
+        import('/static/vendor/threejsm/postprocessing/UnrealBloomPass.js' + V),
+        import('/static/vendor/threejsm/postprocessing/OutputPass.js' + V),
+        import('/static/vendor/lipsync/lipsync-en.mjs' + V),
+      ]);
+      return {
+        GLTFLoader: gl.GLTFLoader, MeshoptDecoder: mo.MeshoptDecoder,
+        EffectComposer: ec.EffectComposer, RenderPass: rp.RenderPass,
+        UnrealBloomPass: ub.UnrealBloomPass, OutputPass: op.OutputPass,
+        LipsyncEn: lip.LipsyncEn,
+      };
+    })().catch((e) => { addonsPromise = null; throw e; });
   }
-  // jaw taper: the lower face narrows toward the chin, sides pull in
-  const jt = sm(70 * D2R, 110 * D2R, theta) * sm(20 * D2R, 90 * D2R, dphi(phi, 0));
-  mul *= 1 - 0.26 * jt;
-  // hair: above the hairline the operator's silhouette + curls take over
-  const hairline = (34 + 21 * sm(0, Math.PI, dphi(phi, 0))) * D2R;
-  const hf = sm(hairline + 6 * D2R, hairline - 8 * D2R, theta);
-  if (hf > 0) {
-    mul *= 1 + hf * (0.06 + 0.13 * hairAmp(phi) + 0.035 * curl(theta, phi));
-  }
-  return { r: r * mul, hair: hf };
+  return addonsPromise;
 }
 
-function headPoint(theta, phi) {
-  const { r, hair } = headRadius(theta, phi);
-  return {
-    x: r * Math.sin(theta) * Math.sin(phi),
-    y: HEAD_CY + r * Math.cos(theta),
-    z: r * Math.sin(theta) * Math.cos(phi),
-    hair,
-  };
-}
-
-// nose: a wedge grown out of the face (separate surface, s∈[0,1] down the
-// ridge, w∈[-1,1] across); protrudes past the sculpted surface
-function nosePoint(s, w) {
-  const theta = (57 + s * 14) * D2R;
-  const halfw = (0.55 + s * 0.95) * (1 + 0.25 * sm(0.75, 1, s));  // nostril flare
-  const phi = (w * halfw * 2.4) * D2R;
-  const base = headRadius(theta, phi).r;
-  const lift = Math.sin(Math.min(1, s * 1.15) * Math.PI * 0.62) * 1.4 * (1 - Math.abs(w) * 0.72);
-  const r = base + Math.max(0, lift);
-  return {
-    x: r * Math.sin(theta) * Math.sin(phi),
-    y: HEAD_CY + r * Math.cos(theta),
-    z: r * Math.sin(theta) * Math.cos(phi),
-  };
-}
-
-// neck: elliptical cylinder from INSIDE the skull base down into the torso
-function neckPoint(u, v) {          // u∈[0,1] around, v∈[0,1] down
-  const a = u * Math.PI * 2;
-  const y = 8 - v * 15;             // starts inside the skull, ends in the torso
-  const rx = 5.2 + v * 1.8, rz = 5.5 + v * 1.4;
-  return { x: Math.sin(a) * rx, y, z: Math.cos(a) * rz + 0.6 - v * 0.4 };
-}
-
-// shoulders/upper torso: superelliptic slab with a trapezius slope
-function shoulderPoint(u, v) {      // u around [0,1), v down [0,1]
-  const a = u * Math.PI * 2;
-  const y = -6 - v * 21;
-  const slope = sm(0, 0.5, v);
-  const halfw = 7.5 + 16 * slope;   // trapezius widening (~2 head-widths)
-  const depth = 6.5 + 3 * slope;
-  const c = Math.cos(a), s = Math.sin(a);
-  const k = 3;                       // superellipse exponent → soft-rect
-  const denom = Math.pow(Math.pow(Math.abs(s / halfw), k) + Math.pow(Math.abs(c / depth), k), 1 / k);
-  const r = 1 / Math.max(1e-4, denom);
-  return { x: s * r, y, z: c * r * 0.92 };
-}
-
-/* numeric normal of any param surface fn(p1,p2)->{x,y,z} */
-function normalOf(fn, a, b, ea, eb) {
-  const p = fn(a, b), pa = fn(a + ea, b), pb = fn(a, b + eb);
-  const ux = pa.x - p.x, uy = pa.y - p.y, uz = pa.z - p.z;
-  const vx = pb.x - p.x, vy = pb.y - p.y, vz = pb.z - p.z;
-  let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-  const l = Math.hypot(nx, ny, nz) || 1;
-  return [nx / l, ny / l, nz / l];
-}
-
-const KEYL = [-0.45, 0.55, 0.8];
-(function () { const l = Math.hypot(...KEYL); KEYL[0] /= l; KEYL[1] /= l; KEYL[2] /= l; })();
-
-function shade(n, opts = {}) {
-  const lam = Math.max(0, n[0] * KEYL[0] + n[1] * KEYL[1] + n[2] * KEYL[2]);
-  const fill = Math.max(0, n[2]) * 0.10;
-  const rim = Math.pow(1 - Math.abs(n[2]), 2.0) * (opts.rim ?? 0.32);
-  return 0.10 + 0.58 * Math.pow(lam, 1.2) + fill + rim;
-}
-
-/* primary: prebuilt bust from a real male head scan (Lee Perry-Smith /
-   Infinite-Realities, CC-BY 3.0 — built by scripts/build_avatar_from_glb.py
-   into static/avatar/head_points.json, incl. occluder meshes). */
-function buildFromPrebuilt(cloud) {
-  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
-  const P = cloud.pos, B = cloud.bri;
-  const [my0, my1, mxh] = cloud.mouth || [0, 1, 6];
-  const [ey0, ey1, exh] = cloud.eyes || [0, 1, 8];
-  for (let i = 0; i < B.length; i++) {
-    const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
-    const b = B[i];
-    const n = pos.length / 3;
-    pos.push(x + (Math.random() - .5) * .12,
-             y + (Math.random() - .5) * .12,
-             z + (Math.random() - .5) * .12);
-    const w = b > 0.9 ? Math.min(1, (b - 0.9) / 0.25) * 0.4 : 0;
-    bri.push(b); wmi.push(w);
-    col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
-             b * (MODE_TINT.idle[1] * (1 - w) + w),
-             b * (MODE_TINT.idle[2] * (1 - w) + w));
-    if (z > 2 && y > my0 && y < my1 && Math.abs(x) < mxh) mouthIdx.push(n);
-    if (z > 2 && y > ey0 && y < ey1 && Math.abs(x) > exh * 0.22 && Math.abs(x) < exh) eyeIdx.push(n);
-  }
-  return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY: [my0, my1] };
-}
-
-function buildPrebuiltOccluders(cloud) {
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0x060913, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
-  });
-  return (cloud.occ || []).map((o) => {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(o.v), 3));
-    geo.setIndex(o.i);
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.scale.setScalar(0.985);
-    mesh.renderOrder = 0;
-    return mesh;
-  });
-}
-
-function buildSculpt() {
-  const pos = [], col = [], bri = [], wmi = [], mouthIdx = [], eyeIdx = [];
-  const push = (p, n, b) => {
-    const i = pos.length / 3;
-    pos.push(p.x + (Math.random() - .5) * .3,
-             p.y + (Math.random() - .5) * .3,
-             p.z + (Math.random() - .5) * .3);
-    b = Math.min(1.35, Math.max(0.03, b));
-    const w = b > 0.9 ? Math.min(1, (b - 0.9) / 0.25) * 0.4 : 0;
-    bri.push(b); wmi.push(w);
-    col.push(b * (MODE_TINT.idle[0] * (1 - w) + w),
-             b * (MODE_TINT.idle[1] * (1 - w) + w),
-             b * (MODE_TINT.idle[2] * (1 - w) + w));
-    return i;
-  };
-
-  // ── head skin/hair points ──
-  const NH = 52000;
-  for (let k = 0; k < NH; k++) {
-    const theta = Math.acos(1 - 2 * Math.random());
-    if (theta > 118 * D2R) continue;
-    const phi = Math.random() * 2 * Math.PI - Math.PI;
-    const p = headPoint(theta, phi);
-    const n = normalOf((a, b2) => headPoint(a, b2), theta, phi, 0.01, 0.01);
-    let b = shade(n);
-    const td = theta / D2R, pd = dphi(phi, 0) / D2R;
-    if (p.hair > 0) {                       // hair: darker, curly speckle
-      b *= 0.42 + 0.22 * (curl(theta, phi) * 0.5 + 0.5);
-      b *= 1 - 0.25 * p.hair;
-    } else {
-      // brows
-      const browL = Math.exp(-(((td - 50) / 2.6) ** 2 + ((dphi(phi, 13 * D2R) / D2R) / 6.5) ** 2) / 2);
-      const browR = Math.exp(-(((td - 50) / 2.6) ** 2 + ((dphi(phi, -13 * D2R) / D2R) / 6.5) ** 2) / 2);
-      b *= 1 - 0.62 * Math.min(1, browL + browR);
-      // beard: lower face + jaw darken with speckle (his beard)
-      const beard = sm(70, 78, td) * (1 - sm(96, 106, td)) * (1 - sm(46, 60, pd));
-      if (beard > 0) b *= 1 - beard * (0.45 + 0.18 * Math.abs(curl(theta, phi)));
-      // lips: slightly darker band
-      const lips = Math.exp(-(((td - 77) / 2.2) ** 2 + (pd / 9) ** 2) / 2);
-      b *= 1 - 0.30 * lips;
-      // sockets shadow deepen
-      const sock = Math.exp(-(((td - 58) / 5) ** 2 + ((Math.min(dphi(phi, 13 * D2R), dphi(phi, -13 * D2R)) / D2R) / 7) ** 2) / 2);
-      b *= 1 - 0.35 * sock;
+// bake a mesh's world transform (+ the scene fit) into plain Float32
+// geometry: quantized/meshopt attributes → clean floats. Morph POSITION
+// deltas transform by the linear part; morph NORMAL deltas are dropped —
+// halves the morph texture, and dot fresnel doesn't need morphed normals.
+function bakeGeometry(mesh, fit) {
+  const src = mesh.geometry;
+  const M = new THREE.Matrix4().multiplyMatrices(fit, mesh.matrixWorld);
+  const L = new THREE.Matrix3().setFromMatrix4(M);
+  const NM = new THREE.Matrix3().getNormalMatrix(M);
+  const n = src.attributes.position.count;
+  const v = new THREE.Vector3();
+  const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    v.fromBufferAttribute(src.attributes.position, i).applyMatrix4(M);
+    pos[i * 3] = v.x; pos[i * 3 + 1] = v.y; pos[i * 3 + 2] = v.z;
+    if (src.attributes.normal) {
+      v.fromBufferAttribute(src.attributes.normal, i).applyMatrix3(NM).normalize();
+      nor[i * 3] = v.x; nor[i * 3 + 1] = v.y; nor[i * 3 + 2] = v.z;
     }
-    const i = push(p, n, b);
-    if (td > 74 && td < 80 && pd < 9 && p.z > 0) { mouthIdx.push(i); }
-    if (td > 55 && td < 61 && pd > 6 && pd < 20 && p.z > 0) eyeIdx.push(i);
   }
-
-  // ── nose wedge (dim — an over-bright nose reads as a beak) ──
-  for (let k = 0; k < 2400; k++) {
-    const s = Math.random(), w = Math.random() * 2 - 1;
-    const p = nosePoint(s, w);
-    const n = normalOf((a, b2) => nosePoint(a, b2), Math.min(s, 0.98), Math.min(w, 0.98), 0.02, 0.02);
-    push(p, n, shade(n) * 0.5);
-  }
-
-  // ── neck ──
-  for (let k = 0; k < 5200; k++) {
-    const u = Math.random(), v = Math.random();
-    const p = neckPoint(u, v);
-    const n = normalOf(neckPoint, u, v, 0.01, 0.02);
-    push(p, n, shade(n) * 0.92);
-  }
-
-  // ── shoulders ──
-  for (let k = 0; k < 15000; k++) {
-    const u = Math.random(), v = Math.random();
-    const p = shoulderPoint(u, v);
-    const n = normalOf(shoulderPoint, u, v, 0.005, 0.01);
-    // dark shirt with cloth-noise
-    push(p, n, shade(n, { rim: 0.42 }) * (0.42 + 0.1 * Math.abs(curl(v * 6, u * 12))));
-  }
-
-  const ys = mouthIdx.map(i => pos[i * 3 + 1]);
-  const mouthY = ys.length ? [Math.min(...ys), Math.max(...ys)] : [0, 1];
-  return { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY };
-}
-
-/* occluder meshes: same surfaces, slightly inset, opaque near-black — they
-   hide the far side of the bust, which is what makes it read as SOLID */
-function buildOccluders() {
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0x060913, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
-  });
-  const grids = [
-    { fn: (a, b) => headPoint(a * 118 * D2R + 0.001, b * 2 * Math.PI - Math.PI), nu: 72, nv: 96 },
-    { fn: (a, b) => neckPoint(b, a), nu: 12, nv: 28 },
-    { fn: (a, b) => shoulderPoint(b, a), nu: 18, nv: 40 },
-  ];
-  const meshes = [];
-  for (const g of grids) {
-    const positions = [];
-    const indices = [];
-    for (let i = 0; i <= g.nu; i++) {
-      for (let jx = 0; jx <= g.nv; jx++) {
-        const p = g.fn(i / g.nu, jx / g.nv);
-        positions.push(p.x, p.y, p.z);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  if (src.index) geo.setIndex(Array.from(src.index.array));
+  const morphs = src.morphAttributes.position || [];
+  if (morphs.length) {
+    geo.morphAttributes.position = morphs.map((m) => {
+      const d = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) {
+        v.fromBufferAttribute(m, i).applyMatrix3(L);
+        d[i * 3] = v.x; d[i * 3 + 1] = v.y; d[i * 3 + 2] = v.z;
       }
-    }
-    for (let i = 0; i < g.nu; i++) {
-      for (let jx = 0; jx < g.nv; jx++) {
-        const a = i * (g.nv + 1) + jx, b = a + 1, c = a + g.nv + 1, d = c + 1;
-        indices.push(a, b, c, b, d, c);
-      }
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(positions), 3));
-    geo.setIndex(indices);
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.scale.setScalar(0.985);
-    mesh.renderOrder = 0;
-    meshes.push(mesh);
+      return new THREE.BufferAttribute(d, 3);
+    });
+    geo.morphTargetsRelative = true;
   }
-  return meshes;
+  return geo;
+}
+
+// one midpoint subdivision for the dot lattice only: one new vertex per
+// unique edge; morph deltas midpoint-average (exact for linear morphs)
+function subdivideForPoints(geo) {
+  const idx = geo.getIndex().array;
+  const n0 = geo.attributes.position.count;
+  const edges = new Map();
+  for (let i = 0; i < idx.length; i += 3) {
+    const tri = [idx[i], idx[i + 1], idx[i + 2]];
+    for (let e = 0; e < 3; e++) {
+      const a = tri[e], b = tri[(e + 1) % 3];
+      const k = a < b ? a * n0 + b : b * n0 + a;
+      if (!edges.has(k)) edges.set(k, [a, b]);
+    }
+  }
+  const pairs = [...edges.values()];
+  const n = n0 + pairs.length;
+  const avg3 = (src) => {
+    const out = new Float32Array(n * 3);
+    out.set(src.array.subarray(0, n0 * 3));
+    pairs.forEach(([a, b], e) => {
+      const o = (n0 + e) * 3;
+      for (let c = 0; c < 3; c++) {
+        out[o + c] = (src.array[a * 3 + c] + src.array[b * 3 + c]) / 2;
+      }
+    });
+    return out;
+  };
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(avg3(geo.attributes.position), 3));
+  const nn = avg3(geo.attributes.normal);
+  for (let i = 0; i < n; i++) {
+    const o = i * 3, l = Math.hypot(nn[o], nn[o + 1], nn[o + 2]) || 1;
+    nn[o] /= l; nn[o + 1] /= l; nn[o + 2] /= l;
+  }
+  out.setAttribute('normal', new THREE.BufferAttribute(nn, 3));
+  out.morphAttributes.position = (geo.morphAttributes.position || []).map(
+    (m) => new THREE.BufferAttribute(avg3(m), 3));
+  out.morphTargetsRelative = true;
+  return out;
+}
+
+// Points draw per index entry when an index exists (shared verts would
+// stack additively) — share the attributes, drop the index
+function deindexForPoints(geo) {
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', geo.attributes.position);
+  out.setAttribute('normal', geo.attributes.normal);
+  out.morphAttributes.position = geo.morphAttributes.position || [];
+  out.morphTargetsRelative = true;
+  return out;
+}
+
+// front-most vertex of a pivot-local eye = the cornea (face is +z)
+function corneaOf(geo) {
+  const p = geo.attributes.position;
+  let best = 0, bz = -1e9;
+  for (let i = 0; i < p.count; i++) {
+    const z = p.getZ(i);
+    if (z > bz) { bz = z; best = i; }
+  }
+  return new THREE.Vector3(p.getX(best), p.getY(best), p.getZ(best));
+}
+
+function hologramPointsMaterial() {
+  return new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, depthTest: true,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+      uTime: { value: 0 }, uSize: { value: 1.05 }, uScale: { value: 1000 },
+      uOpacity: { value: 0.8 }, uGlitch: { value: 1 },
+      // base hologram violet (#8a6bff); MODE_TINT multiplies on top
+      uBase: { value: new THREE.Vector3(0.54, 0.42, 1.0) },
+      uTint: { value: new THREE.Vector3(...MODE_TINT.idle) },
+      uFade: { value: new THREE.Vector2(FADE_Y[0], FADE_Y[1]) },
+    },
+    vertexShader: `
+      #include <morphtarget_pars_vertex>
+      attribute float aSeed; attribute float aSize; attribute float aB;
+      uniform float uTime, uSize, uScale, uGlitch;
+      uniform vec3 uBase, uTint;
+      uniform vec2 uFade;
+      varying vec3 vColor;
+      void main() {
+        vec3 transformed = vec3(position);
+        #include <morphtarget_vertex>
+        // organic micro-drift: each dot breathes on its own seed
+        vec3 p = transformed + 0.05 * vec3(sin(uTime * 1.1 + aSeed * 17.0),
+                                           sin(uTime * 1.4 + aSeed * 29.0),
+                                           sin(uTime * 0.9 + aSeed * 41.0));
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        vec3 vN = normalize(normalMatrix * normal);
+        float rim = pow(1.0 - abs(dot(vN, normalize(-mv.xyz))), 2.0);
+        float tw = 1.0 + 0.22 * sin(uTime * (3.1 + aSeed * 6.3) + aSeed * 40.0);
+        float scan = 1.0 + 0.12 * sin(p.y * 1.4 - uTime * 2.2);
+        // the head dissolves toward the neck cut — floating hologram
+        float fade = smoothstep(uFade.x, uFade.y, p.y);
+        vColor = aB * (0.28 + 0.62 * rim) * tw * scan * fade * uGlitch * uBase * uTint;
+        gl_PointSize = uSize * aSize * (uScale / -mv.z);   // manual attenuation
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform float uOpacity;
+      varying vec3 vColor;
+      void main() {
+        float r = length(gl_PointCoord - 0.5) * 2.0;
+        if (r > 1.0) discard;
+        float core = smoothstep(0.45, 0.0, r);              // bright node core
+        float halo = pow(max(0.0, 1.0 - r), 2.4) * 0.35;    // soft glow skirt
+        gl_FragColor = vec4(vColor * (core + halo), (core + halo) * uOpacity);
+      }`,
+  });
+}
+
+// the three renderables off one geometry, sharing ONE influences array —
+// a single controller write per frame drives occluder + wireframe + dots
+function assembleHologram(baseGeo, ptsGeo, dict) {
+  const N = ptsGeo.attributes.position.count;
+  const aSeed = new Float32Array(N), aSize = new Float32Array(N), aB = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    aSeed[i] = Math.random();
+    aSize[i] = 0.55 + Math.random() * 0.4;
+    aB[i] = 0.5 + Math.random() * 0.3;
+  }
+  ptsGeo.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 1));
+  ptsGeo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
+  ptsGeo.setAttribute('aB', new THREE.BufferAttribute(aB, 1));
+  const occ = new THREE.Mesh(baseGeo, new THREE.MeshBasicMaterial({
+    color: HOLO_OCC, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
+  }));
+  occ.scale.setScalar(0.985);
+  occ.renderOrder = 0;
+  const wire = new THREE.Mesh(baseGeo, new THREE.MeshBasicMaterial({
+    color: HOLO_WIRE, wireframe: true, transparent: true, opacity: 0.13,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  wire.renderOrder = 1;
+  const pts = new THREE.Points(ptsGeo, hologramPointsMaterial());
+  pts.renderOrder = 2;
+  const influences = new Float32Array((baseGeo.morphAttributes.position || []).length);
+  for (const o of [occ, wire, pts]) o.morphTargetInfluences = influences;
+  return { occ, wire, pts, influences, dict: dict || {} };
+}
+
+async function buildHologramHead(A) {
+  const loader = new A.GLTFLoader();
+  loader.setMeshoptDecoder(A.MeshoptDecoder);
+  const gltf = await loader.loadAsync('/static/avatar/facecap_hologram.glb');
+  const root = gltf.scene;
+  root.updateMatrixWorld(true);
+  // gltfpack layout: named holder nodes wrap unnamed mesh children
+  const meshOf = (name) => {
+    let m = null;
+    root.getObjectByName(name).traverse((o) => { if (o.isMesh && !m) m = o; });
+    return m;
+  };
+  const headMesh = meshOf('head'), teethMesh = meshOf('teeth');
+  const pivots = { L: root.getObjectByName('grp_eyeLeft'),
+                   R: root.getObjectByName('grp_eyeRight') };
+  const dict = { ...(headMesh.morphTargetDictionary || {}) };
+  if (dict.jawOpen === undefined || dict.eyeBlink_L === undefined) {
+    throw new Error('facecap morph target names missing');
+  }
+
+  // fit: uniform scale to HEAD_H, then place the eye midpoint at the world
+  // anchor (EYE_Y/EYE_Z), face toward +z (the camera)
+  headMesh.geometry.computeBoundingBox();
+  const bb = headMesh.geometry.boundingBox.clone().applyMatrix4(headMesh.matrixWorld);
+  const ctr = bb.getCenter(new THREE.Vector3());
+  const eyeMid = new THREE.Vector3().setFromMatrixPosition(pivots.L.matrixWorld)
+    .add(new THREE.Vector3().setFromMatrixPosition(pivots.R.matrixWorld))
+    .multiplyScalar(0.5);
+  const s = HEAD_H / Math.max(1e-6, bb.max.y - bb.min.y);
+  const flip = eyeMid.z < ctr.z;      // the eyes sit at the front of the skull
+  const R = flip ? new THREE.Matrix4().makeRotationY(Math.PI) : new THREE.Matrix4();
+  const em = eyeMid.clone().applyMatrix4(R).multiplyScalar(s);
+  const fit = new THREE.Matrix4()
+    .makeTranslation(-em.x, EYE_Y - em.y, EYE_Z - em.z)
+    .multiply(new THREE.Matrix4().makeScale(s, s, s))
+    .multiply(R);
+
+  const baseGeo = bakeGeometry(headMesh, fit);
+  const teethGeo = bakeGeometry(teethMesh, fit);
+  const eyes = {};
+  for (const k of ['L', 'R']) {
+    const pv = pivots[k];
+    const mesh = meshOf(k === 'L' ? 'eyeLeft' : 'eyeRight');
+    const pvPos = new THREE.Vector3().setFromMatrixPosition(pv.matrixWorld).applyMatrix4(fit);
+    const toLocal = new THREE.Matrix4()
+      .makeTranslation(-pvPos.x, -pvPos.y, -pvPos.z).multiply(fit);
+    eyes[k] = { geo: bakeGeometry(mesh, toLocal), pos: pvPos };
+  }
+  return { baseGeo, teethGeo, eyes, dict };
+}
+
+// degraded-but-visible stand-in if the GLB can't load: ellipsoid lattice
+// (no morphs — the mouth/eye controllers no-op on the empty dict)
+function buildFallbackHead() {
+  const geo = new THREE.SphereGeometry(1, 40, 30);
+  geo.scale(12.5, 16.5, 13.5);
+  geo.translate(0, -12, 0);
+  geo.computeVertexNormals();
+  const h = assembleHologram(geo, deindexForPoints(geo), {});
+  console.warn('Jarvis3D: procedural fallback head active (GLB unavailable)');
+  return h;
 }
 
 /* ═══════ memory galaxy (the memory-tab 3D map, embedded) + matrix ═══════ */
@@ -805,52 +787,72 @@ function tick() {
     }
   }
 
-  if (J.head && J.headGroup) {
-    // the whole bust (points + occluders + eye glints) turns as one
-    J.headGroup.rotation.y = Math.sin(t * 0.16) * 0.17 + (J.mode === 'listening' ? 0.05 : 0);
-    J.headGroup.rotation.x = Math.sin(t * 0.11) * 0.035;
-    J.headGroup.scale.y = 1 + Math.sin(t * 1.1) * 0.005;
+  if (J.headGroup && J.holo) {
+    // ── IdleController: breathing + subtle sway; the head FACES THE USER
+    // (no turntable — operator decision 2026-07-09) ──
+    const listening = J.mode === 'listening';
+    J.headGroup.rotation.y = Math.sin(t * 0.44) * 0.05;
+    J.headGroup.rotation.x = Math.sin(t * 0.28) * 0.02
+      + (J.mode === 'talking' ? Math.sin(t * 3.1) * 0.01 * Math.min(1, J.env) : 0);
+    J.headGroup.rotation.z += ((listening ? 0.05 : 0) - J.headGroup.rotation.z) * 0.04;
+    J.headGroup.scale.y = 1 + Math.sin(t * 1.38) * 0.006;
 
-    // ── ALL head animation is uniforms-only; the shader displaces the dots.
-    // Mouth: fast attack / slow release envelope (never lags the audio,
-    // settles through pauses), sibilance narrows the aperture. Blink:
-    // measured human dynamics (Trutoiu et al., Disney Research / ACM TAP
-    // 2011) — ~80ms accelerating close, brief closure, ~220ms asymptotic
-    // reopen, randomized 2–6s apart with occasional double blinks. ──
-    const u = J.head.material.uniforms;
-    u.uTime.value = t;
+    // every controller writes into the ONE shared influences array
+    const inf = J.holo.influences, dict = J.holo.dict;
+    inf.fill(0);
+    const put = (name, v) => {
+      const ix = dict[name];
+      if (ix !== undefined) inf[ix] = Math.max(inf[ix], Math.min(1, v));
+    };
 
+    // mouth — amplitude envelope on jawOpen (fast attack / slow release,
+    // sibilance narrows); the viseme timeline replaces this in P3
     const target = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12)
       * (1 - 0.35 * J.levelHF);
     J.env += (target - J.env) * (target > J.env ? 0.55 : 0.10);
-    u.uOpen.value = J.env;
+    put('jawOpen', 0.5 * J.env * (1 - 0.5 * J.levelHF));
+    put('mouthStretch_L', 0.2 * J.levelHF * J.env);
+    put('mouthStretch_R', 0.2 * J.levelHF * J.env);
 
+    // blink — measured human dynamics (Trutoiu et al., Disney Research /
+    // ACM TAP 2011): ~80ms accelerating close, brief closure, ~220ms
+    // asymptotic reopen, randomized 2–6s apart, 12% double blinks
     if (J.blinkT < 0 && t >= J.blinkAt) J.blinkT = t;
     let lid = 0;
     if (J.blinkT >= 0) {
       const x = t - J.blinkT;
-      if (x < 0.08) lid = Math.pow(x / 0.08, 1.7);                 // accelerating close
-      else if (x < 0.12) lid = 1;                                  // brief full closure
-      else if (x < 0.34) lid = Math.pow(1 - (x - 0.12) / 0.22, 2.6); // asymptotic reopen
+      if (x < 0.08) lid = Math.pow(x / 0.08, 1.7);
+      else if (x < 0.12) lid = 1;
+      else if (x < 0.34) lid = Math.pow(1 - (x - 0.12) / 0.22, 2.6);
       else {
         J.blinkT = -1;
         J.blinkAt = t + (Math.random() < 0.12 ? 0.25 : 2 + Math.random() * 4);
       }
     }
-    u.uLid.value = lid;
+    put('eyeBlink_L', lid);
+    put('eyeBlink_R', lid);
 
-    // mode tint eases over (thinking = lit-up electric cyan)
+    // mode postures (P4 adds the full saccade/fixation gaze machine)
+    if (J.mode === 'thinking') put('browInnerUp', 0.35);
+    if (listening) { put('eyeWide_L', 0.12); put('eyeWide_R', 0.12); }
+
+    // uniforms: time, glitch flicker, mode tint ease, size pulse
+    const u = J.head.material.uniforms;
+    u.uTime.value = t;
+    const fr = (x => x - Math.floor(x))(Math.sin(Math.floor(t * 3) * 91.7) * 437.585);
+    u.uGlitch.value = fr > 0.992 ? 0.85 : 1;
     const tc = u.uTint.value;
     tc.x += (tint[0] - tc.x) * 0.05;
     tc.y += (tint[1] - tc.y) * 0.05;
     tc.z += (tint[2] - tc.z) * 0.05;
-
     u.uSize.value = 1.05 + Math.min(0.35, J.level * 0.25)
       + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.07 : 0);
+    // the wireframe lattice follows the tint (#5b3fd6 × tint)
+    J.holo.wire.material.color.setRGB(0.357 * tc.x, 0.247 * tc.y, 0.839 * tc.z);
 
     // the glints slip under the closing lid
     const gvis = (1 - lid) * (1 - lid);
-    for (const g of J.glints) g.material.opacity = 0.85 * gvis;
+    for (const g of J.glints) g.material.opacity = 0.45 * gvis;
   }
 
   if (J.matrix) J.matrix.rotation.y = Math.sin(t * 0.02) * 0.03;
@@ -980,7 +982,8 @@ function tick() {
     }
   }
 
-  J.renderer.render(J.scene, J.camera);
+  if (J.composer) J.composer.render();
+  else J.renderer.render(J.scene, J.camera);
 }
 
 /* ═══════════════ public API ═══════════════ */
@@ -998,13 +1001,16 @@ async function mount(container, opts) {
   _tmpV = new THREE.Vector3();
   const w = container.clientWidth || 800, h = container.clientHeight || 600;
   J.scene = new THREE.Scene();
+  // solid background: UnrealBloomPass artifacts over transparent canvases —
+  // and it matches the stage's CSS vignette base tone anyway
+  J.scene.background = new THREE.Color(HOLO_BG);
   // fog light enough that the galaxy (~7800) and matrix (~11500) stay visible
   J.scene.fog = new THREE.FogExp2(0x05050c, 0.00006);
   J.camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 16000);
   J.camera.position.set(0, 4, 88);
   J.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   J.renderer.setSize(w, h);
-  J.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  J.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   J.renderer.domElement.className = 'jarvis3d-canvas';
   container.prepend(J.renderer.domElement);
 
@@ -1062,122 +1068,54 @@ async function mount(container, opts) {
     'memory galaxy · drag orbit · scroll zoom · hover a star · click to edit · 🧠 Memory returns to JARVIS';
   container.appendChild(J.mem.hint);
 
-  // primary: the prebuilt real-scan bust; fallback: the procedural sculpt
-  let prebuilt = null;
-  try {
-    const r = await fetch('/static/avatar/head_points.json');
-    if (r.ok) {
-      const c = await r.json();
-      if (c && c.occ && c.pos && c.pos.length > 9000) prebuilt = c;
+  // ── hologram head: facecap GLB (model: Face Cap, bannaflak.com) — dark
+  // occluder + additive wireframe lattice + morph-aware glowing dots; an
+  // ellipsoid lattice keeps the stage alive if the GLB fails ──
+  let A = null;
+  try { A = await loadAddons(); } catch (e) { console.warn('Jarvis3D: addons unavailable', e); }
+  if (J.disposed) return;
+  if (A) {
+    try {
+      const built = await buildHologramHead(A);
+      if (J.disposed) return;
+      const ptsGeo = POINT_SUBDIV ? subdivideForPoints(built.baseGeo)
+                                  : deindexForPoints(built.baseGeo);
+      const holo = assembleHologram(built.baseGeo, ptsGeo, built.dict);
+      holo.teeth = new THREE.Mesh(built.teethGeo, holo.occ.material);
+      holo.teeth.renderOrder = 0;
+      holo.eyePivots = {};
+      for (const k of ['L', 'R']) {
+        const e = built.eyes[k];
+        const pv = new THREE.Group();
+        pv.position.copy(e.pos);
+        const em = new THREE.Mesh(e.geo, new THREE.MeshBasicMaterial({ color: HOLO_EYE }));
+        em.renderOrder = 0;
+        pv.add(em);
+        // glint at the cornea (front-most vertex, pivot-local) — it rides
+        // the pivot, so the eyes visibly move even as a dot lattice
+        const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: glowTexture(), color: HOLO_GLINT, transparent: true,
+          opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false,
+        }));
+        sp.scale.set(1.0, 1.0, 1);
+        sp.position.copy(corneaOf(e.geo)).multiplyScalar(1.03);
+        sp.renderOrder = 3;
+        pv.add(sp);
+        J.glints.push(sp);
+        holo.eyePivots[k] = pv;
+      }
+      holo.lip = new A.LipsyncEn();
+      J.holo = holo;
+    } catch (e) {
+      console.warn('Jarvis3D: hologram head failed — using fallback lattice', e);
     }
-  } catch { }
-  if (J.disposed) return;
-  const built = prebuilt ? buildFromPrebuilt(prebuilt) : buildSculpt();
-  const { pos, col, bri, wmi, mouthIdx, eyeIdx, mouthY } = built;
-  if (J.disposed) return;
-  J.mouthY = mouthY;
-  J.basePos = Float32Array.from(pos);
-  J.baseB = Float32Array.from(bri);
-  J.baseW = Float32Array.from(wmi);
-  J.mouthIdx = mouthIdx;
-  J.eyeIdx = eyeIdx;
-  J.mouthXh = prebuilt ? prebuilt.mouth[2] : 6;
-  // eye-band vertical extent (drives the geometric lid sweep)
-  let _e0 = 1e9, _e1 = -1e9;
-  for (const n of eyeIdx) {
-    const ny = pos[n * 3 + 1];
-    if (ny < _e0) _e0 = ny;
-    if (ny > _e1) _e1 = ny;
   }
-  J.eyesY = eyeIdx.length ? [_e0, _e1] : [0, 1];
-  // stable per-point mouth jitter seeds — regenerating per frame boils
-  J.jit = Float32Array.from(mouthIdx, () => Math.random() * 2 - 1);
+  if (J.disposed) return;
+  if (!J.holo) J.holo = buildFallbackHead();
   J.env = 0; J.levelHF = 0;
   J.blinkAt = J.t + 1.5 + Math.random() * 3;
-  J.blinkT = -1; J.lidPrev = 0;
-  // ── the bust as DISCRETE memory-node dots, animated ON THE GPU ──
-  // Per-particle data (base position, brightness, mouth/lid displacement
-  // vectors, seeds) is uploaded ONCE as attributes; per frame only uniforms
-  // change (uOpen/uLid/uTint/uTime). Per-frame JS attribute writes — the old
-  // approach — are the documented anti-pattern for particle morph animation.
-  const N = bri.length;
-  const aB = new Float32Array(N), aWm = new Float32Array(N);
-  const aSeed = new Float32Array(N), aSize = new Float32Array(N);
-  const aMouthVec = new Float32Array(N * 3);
-  const aLid = new Float32Array(N), aEye = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    aB[i] = bri[i]; aWm[i] = wmi[i];
-    aSeed[i] = Math.random();
-    aSize[i] = 0.8 + Math.random() * 0.5 + Math.min(0.25, Math.max(0, bri[i] - 0.9));
-  }
-  // bake the research-grounded displacements at open=1 / lid=1: jaw drop
-  // grows toward the chin (corners sealed, upper lip near-static); the lid
-  // sweep pulls upper eye-band dots down over the eye
-  {
-    const mc = (mouthY[0] + mouthY[1]) / 2;
-    const mh = Math.max(0.7, (mouthY[1] - mouthY[0]) / 2);
-    for (const n of mouthIdx) {
-      const bx = pos[n * 3], by = pos[n * 3 + 1];
-      const rel = (by - mc) / mh;
-      const jaw = Math.max(0, Math.min(1.1, 0.55 - 0.55 * rel));
-      const corner = 0.3 + 0.7 * Math.max(0, 1 - Math.abs(bx) / J.mouthXh);
-      aMouthVec[n * 3 + 1] = -(jaw * corner * mh * 1.5) - 0.22 * (Math.random() * 2 - 1);
-      aMouthVec[n * 3 + 2] = corner * Math.max(0, 1 - Math.abs(rel)) * 0.7;
-    }
-    const ey0 = J.eyesY[0], eh = Math.max(0.5, J.eyesY[1] - J.eyesY[0]);
-    for (const n of eyeIdx) {
-      aLid[n] = -(pos[n * 3 + 1] - ey0) * 0.85;
-      aEye[n] = 1;
-    }
-  }
-  J.headGeo = new THREE.BufferGeometry();
-  J.headGeo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
-  J.headGeo.setAttribute('aB', new THREE.BufferAttribute(aB, 1));
-  J.headGeo.setAttribute('aW', new THREE.BufferAttribute(aWm, 1));
-  J.headGeo.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 1));
-  J.headGeo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
-  J.headGeo.setAttribute('aMouthVec', new THREE.BufferAttribute(aMouthVec, 3));
-  J.headGeo.setAttribute('aLid', new THREE.BufferAttribute(aLid, 1));
-  J.headGeo.setAttribute('aEye', new THREE.BufferAttribute(aEye, 1));
-  J.head = new THREE.Points(J.headGeo, new THREE.ShaderMaterial({
-    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-    uniforms: {
-      uTime: { value: 0 }, uOpen: { value: 0 }, uLid: { value: 0 },
-      uSize: { value: 1.05 }, uScale: { value: 1000 }, uOpacity: { value: 0.9 },
-      uTint: { value: new THREE.Vector3(MODE_TINT.idle[0], MODE_TINT.idle[1], MODE_TINT.idle[2]) },
-    },
-    vertexShader: `
-      attribute float aB; attribute float aW; attribute float aSeed;
-      attribute float aSize; attribute vec3 aMouthVec;
-      attribute float aLid; attribute float aEye;
-      uniform float uTime, uOpen, uLid, uSize, uScale;
-      uniform vec3 uTint;
-      varying vec3 vColor;
-      void main() {
-        vec3 p = position + aMouthVec * uOpen;
-        p.y += aLid * uLid;
-        // organic micro-drift: each dot breathes on its own seed
-        p += 0.06 * vec3(sin(uTime * 1.1 + aSeed * 17.0),
-                         sin(uTime * 1.4 + aSeed * 29.0),
-                         sin(uTime * 0.9 + aSeed * 41.0));
-        vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        float shade = 1.0 - 0.45 * uLid * aEye;   // closing lid shadows the eye
-        vColor = aB * shade * mix(uTint, vec3(1.0), aW);
-        gl_PointSize = uSize * aSize * (uScale / -mv.z);   // manual attenuation
-        gl_Position = projectionMatrix * mv;
-      }`,
-    fragmentShader: `
-      uniform float uOpacity;
-      varying vec3 vColor;
-      void main() {
-        float r = length(gl_PointCoord - 0.5) * 2.0;
-        if (r > 1.0) discard;
-        float core = smoothstep(0.45, 0.0, r);              // bright node core
-        float halo = pow(max(0.0, 1.0 - r), 2.4) * 0.5;     // soft glow skirt
-        gl_FragColor = vec4(vColor * (core + halo), (core + halo) * uOpacity);
-      }`,
-  }));
-  J.head.renderOrder = 1;
+  J.blinkT = -1;
+  J.head = J.holo.pts;   // carries the shared uniforms (uTint/uTime/uSize)
   // manual size attenuation (ShaderMaterial loses sizeAttenuation): points
   // are sized in device pixels from the drawing-buffer height and the fov
   J.setPtScale = () => {
@@ -1188,28 +1126,32 @@ async function mount(container, opts) {
   J.setPtScale();
 
   J.headGroup = new THREE.Group();
-  J.headGroup.add(J.head);
-  J.occluders = prebuilt ? buildPrebuiltOccluders(prebuilt) : buildOccluders();
-  for (const m of J.occluders) J.headGroup.add(m);
-
-  // eye glints: two soft sparks ON the eye surface — positions are baked by
-  // the build script from the scan itself (no more floating in front)
-  const eyeY = prebuilt ? (prebuilt.eyes[0] + prebuilt.eyes[1]) / 2 : null;
-  const glintPts = prebuilt
-    ? (prebuilt.glints || [[-5.4, eyeY, 12], [5.4, eyeY, 12]]).map(g => ({ x: g[0], y: g[1], z: g[2] }))
-    : [headPoint(58 * D2R, -13 * D2R), headPoint(58 * D2R, 13 * D2R)];
-  for (const gp of glintPts) {
-    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: glowTexture(), color: 0x9df5ff, transparent: true, opacity: 0.85,
-      blending: THREE.AdditiveBlending, depthWrite: false,
-    }));
-    sp.scale.set(2.2, 2.2, 1);
-    sp.position.set(gp.x, gp.y, gp.z + 0.4);
-    sp.renderOrder = 2;
-    J.headGroup.add(sp);
-    J.glints.push(sp);
-  }
+  J.headGroup.add(J.holo.occ, J.holo.wire, J.holo.pts);
+  if (J.holo.teeth) J.headGroup.add(J.holo.teeth);
+  if (J.holo.eyePivots) J.headGroup.add(J.holo.eyePivots.L, J.holo.eyePivots.R);
   J.scene.add(J.headGroup);
+
+  // post: bloom halo — RenderPass → UnrealBloomPass (half-res) → OutputPass.
+  // MSAA render target: composer passes bypass the canvas antialias flag.
+  if (A) {
+    try {
+      const rt = new THREE.WebGLRenderTarget(w, h, {
+        type: THREE.HalfFloatType, samples: 4,
+      });
+      J.composer = new A.EffectComposer(J.renderer, rt);
+      J.composer.addPass(new A.RenderPass(J.scene, J.camera));
+      // threshold high: the additive dot pile easily sums past 1.0 — bloom
+      // only the hottest cores or the whole head blows out to white
+      J.bloom = new A.UnrealBloomPass(new THREE.Vector2(w / 2, h / 2), 0.45, 0.30, 0.85);
+      J.composer.addPass(J.bloom);
+      J.composer.addPass(new A.OutputPass());
+      J.composer.setPixelRatio(J.renderer.getPixelRatio());
+      J.composer.setSize(w, h);
+    } catch (e) {
+      console.warn('Jarvis3D: composer unavailable — direct render', e);
+      J.composer = null; J.bloom = null;
+    }
+  }
 
   const memData = await buildGalaxyData();
   if (J.disposed) return;
@@ -1223,6 +1165,7 @@ async function mount(container, opts) {
     J.camera.aspect = W / H;
     J.camera.updateProjectionMatrix();
     J.renderer.setSize(W, H);
+    if (J.composer) J.composer.setSize(W, H);
     if (J.setPtScale) J.setPtScale();
   });
   J.resizeObs.observe(container);
@@ -1246,7 +1189,27 @@ function dispose() {
   if (J.renderer) {
     try { J.renderer.dispose(); J.renderer.domElement.remove(); } catch { }
   }
-  if (J.head) { try { J.head.geometry.dispose(); J.head.material.dispose(); } catch { } J.head = null; }
+  if (J.composer) { try { J.composer.dispose(); } catch { } J.composer = null; J.bloom = null; }
+  if (J.holo) {
+    // base geometry dispose also frees the r160 morph texture (WeakMap +
+    // dispose listener); the eye/teeth/point geometries are their own
+    try {
+      const seen = new Set();
+      for (const o of [J.holo.occ, J.holo.wire, J.holo.pts, J.holo.teeth]) {
+        if (!o || seen.has(o.geometry)) continue;
+        seen.add(o.geometry);
+        o.geometry.dispose(); o.material.dispose();
+      }
+      for (const k of ['L', 'R']) {
+        const pv = J.holo.eyePivots && J.holo.eyePivots[k];
+        if (pv) pv.traverse((o) => {
+          try { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); } catch { }
+        });
+      }
+    } catch { }
+    J.holo = null;
+  }
+  J.head = null;
   for (const root of [J.mem.group, J.matrix]) {
     if (!root) continue;
     root.traverse((o) => {
@@ -1262,11 +1225,10 @@ function dispose() {
   J.mem = emptyMem();
   J.matrix = null; J.galaxyMode = false; J.fly = null;
   J.drag = null; J.downAt = null; J.onMemorySelect = null;
-  for (const m of J.occluders) { try { m.geometry.dispose(); } catch { } }
   for (const g of J.glints) { try { g.material.dispose(); } catch { } }
-  J.occluders = []; J.glints = []; J.headGroup = null;
+  J.glints = []; J.headGroup = null;
   J.renderer = null; J.scene = null;
-  J.headGeo = null; J.basePos = null; J.baseB = null; J.baseW = null;
+  J.utterQ = []; J.utterCtx = null;
 }
 
 function setMode(mode) {
