@@ -3328,7 +3328,11 @@ def _decision_card_from_approval(ap: dict) -> dict:
         "cost_hint": payload.get("cost_hint") or fb.get("cost_hint") or "",
         "task_id": payload.get("task_id"),
         "risk_level": ap.get("risk_level") or "medium",
-        "blocking": blocking, "age": time.time() - (ap.get("requested_at") or time.time()),
+        # No computed "age" here: the payload must be byte-stable between polls —
+        # the Decisions view only re-renders when the JSON changes, and a
+        # time.time()-derived field made every 3s tick a full rebuild (flicker).
+        # Age renders client-side from requested_at.
+        "blocking": blocking,
         "requested_at": ap.get("requested_at"),
         "source": "approval",
     }
@@ -3357,7 +3361,7 @@ def _collect_decision_cards(uid: str, admin: bool) -> list[dict]:
             "recommendation": "Review the recovery plan" if drafted else "Draft a recovery plan",
             "reasons": [rp.get("reason") or "a stage failed with no automatic fix left"],
             "cost_hint": "", "workflow_id": w["id"], "risk_level": "high",
-            "blocking": True, "age": time.time() - (rp.get("detected_at") or time.time()),
+            "blocking": True,
             "requested_at": rp.get("detected_at"), "source": "replan"})
     cards.sort(key=lambda c: (0 if c["blocking"] else 1, c.get("requested_at") or 0))
     return cards
