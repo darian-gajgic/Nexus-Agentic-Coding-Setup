@@ -1,3 +1,4 @@
 logs/
 state.json
 ESCALATION.md
+__pycache__/
