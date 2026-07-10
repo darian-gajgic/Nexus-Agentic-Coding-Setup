@@ -1,4 +1,4 @@
-"""NEXUS Agent OS — App Runner (v3.3): test a task's program output live.
+"""NEXUS Agent OS — App Runner (v3.4): test a task's program output live.
 
 A task that produced a program shouldn't end at a file listing — the operator
 presses ▶ Test app and gets the running application in a new browser tab.
@@ -8,6 +8,11 @@ Detection (workspace root, then first subdirectory with markers):
   python  — app.py/main.py + reqs  -> venv + pip install + python entry (PORT env)
   static  — index.html             -> python -m http.server (own port = own origin)
 
+Port truth (v3.4): vite scripts get `-- --port <p> --strictPort --host 127.0.0.1`
+appended (vite ignores the PORT env); any other server that ignores PORT is
+adopted from the URL it prints in its own log (_adopt_logged_port rewrites the
+registry port/url once that port answers).
+
 Every app runs as its own process group on a dedicated 127.0.0.1 port from
 _PORT_RANGE, logs to <workspace>/_preview.log (the _ prefix keeps it out of
 deliverable listings), is auto-stopped after _TTL_S, and the registry persists
@@ -15,6 +20,7 @@ to disk so a Nexus restart reaps orphans instead of leaking them.
 """
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -100,6 +106,9 @@ def detect_app(workspace: str) -> dict | None:
             script = "dev" if "dev" in scripts else ("start" if "start" in scripts else None)
             if script:
                 return {"type": "node", "dir": str(d), "script": script,
+                        # the script runs vite itself → port goes on the CLI
+                        # (vite ignores the PORT env; vitest must not match)
+                        "vite": "vite" in (scripts.get(script) or "").split(),
                         "label": f"Node app ({d.name or 'root'} · npm run {script})",
                         "installed": (d / "node_modules").is_dir()}
     for d in candidates:
@@ -139,6 +148,31 @@ def _listening(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_URL_PORT_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})")
+
+
+def _adopt_logged_port(key: str, a: dict) -> bool:
+    """A dev server that ignored the PORT env announces its real URL in its
+    log (vite: 'Local: http://localhost:3001/' — ANSI codes sit INSIDE the
+    URL, strip first). If that port answers, rewrite the registry entry in
+    place so the UI opens the right place."""
+    ports = _URL_PORT_RE.findall(_ANSI_RE.sub("", log_tail(a.get("workspace") or "", 40)))
+    p = int(ports[-1]) if ports else 0          # last announcement wins
+    if not p or p == a.get("port") or not _listening(p):
+        return False
+    a["port"], a["url"] = p, f"http://127.0.0.1:{p}"
+    with _lock:
+        reg = _load()
+        cur = reg.get(key)
+        if cur and cur.get("pid") == a.get("pid"):   # not replaced meanwhile
+            cur["port"], cur["url"] = p, f"http://127.0.0.1:{p}"
+            _save(reg)
+    db.log_activity("info", "preview",
+                    f"Preview {key} answers on :{p} (found in its log) — URL updated")
+    return True
+
+
 def start_app(task_id: str, workspace: str) -> dict:
     with _lock:
         reg = _load()
@@ -164,9 +198,12 @@ def start_app(task_id: str, workspace: str) -> dict:
                "HOSTNAME": "127.0.0.1", "BROWSER": "none", "CI": "1",
                "NEXUS_PREVIEW": "1"}
         if app["type"] == "node":
+            # vite ignores the PORT env: pin it on the CLI, else a config port
+            # (server.port) auto-increments when busy and strands the preview
+            args = f" -- --port {port} --strictPort --host 127.0.0.1" if app.get("vite") else ""
             # npm install first when needed (logged; the UI polls the log).
             inner = (f"npm install --no-audit --no-fund && " if not app["installed"] else "") \
-                + f"exec npm run {app['script']}"
+                + f"exec npm run {app['script']}{args}"
         elif app["type"] == "python":
             venv = Path(app["dir"]) / ".venv-preview"
             pre = ""
@@ -207,7 +244,7 @@ def instances(prefix: str) -> list[dict]:
     for key, a in _load().items():
         if not key.startswith(prefix) or not _pid_is_ours(a.get("pid", -1)):
             continue
-        ready = _listening(a["port"])
+        ready = _listening(a["port"]) or _adopt_logged_port(key, a)
         out.append({**a, "key": key, "ready": ready,
                     "state": "ready" if ready else
                     ("installing" if a.get("installing") else "starting")})
@@ -219,7 +256,7 @@ def app_status(task_id: str, workspace: str) -> dict:
     cur = reg.get(task_id)
     out = {"detected": detect_app(workspace)}
     if cur and _pid_is_ours(cur.get("pid", -1)):
-        ready = _listening(cur["port"])
+        ready = _listening(cur["port"]) or _adopt_logged_port(task_id, cur)
         out["running"] = {**cur, "ready": ready,
                           "state": "ready" if ready else
                           ("installing" if cur.get("installing") else "starting")}
