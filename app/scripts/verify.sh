@@ -434,6 +434,10 @@ chk "rule11 vendored copies synced"    "for f in ../setup/hermes/agents/*.md; do
 chk "rule12 JARVIS advisor stance"   "grep -q 'PROACTIVE ADVISOR' server.py && grep -q 'INSPECTOR' server.py"
 chk "rule12 JARVIS knows decisions"  "grep -q 'DECISIONS INBOX: GET /api/decisions' server.py"
 chk "rule12 JARVIS knows presets"    "grep -q 'spend_profile.*eco|optimal|smart' server.py"
+# P9 — ops hardening (busy_timeout + critic-sandbox age-out at startup + scheduler)
+chk "P9 busy_timeout set explicitly"  "grep -q 'PRAGMA busy_timeout' database.py"
+chk "P9 critic-sandbox sweep helper"  "grep -q 'def sweep_critic_sandboxes' evals.py"
+chk "P9 sandbox swept at startup+cron" "grep -q 'sweep_critic_sandboxes' server.py && grep -q 'sweep_critic_sandboxes' scheduler.py"
 chk "autopilot e2e gate exists"      "[ -f scripts/verify_autopilot_e2e.py ]"
 chk "autopilot UI gate exists"       "[ -f scripts/verify_autopilot_ui.py ]"
 chk "autopilot module + routing/lessons" "[ -f autopilot.py ] && [ -f routing.py ] && [ -f lessons.py ]"

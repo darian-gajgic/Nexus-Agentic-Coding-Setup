@@ -151,6 +151,7 @@ def _trigger(job: dict):
 
 def scheduler_loop(stop_event: threading.Event):
     """Background thread: fire due jobs every ~15s."""
+    last_sandbox_sweep = 0.0
     while not stop_event.is_set():
         try:
             now = time.time()
@@ -160,6 +161,20 @@ def scheduler_loop(stop_event: threading.Event):
             )
             for job in due:
                 _trigger(job)
+            # P9 (ops hardening): age-out disposable critic sandboxes hourly so
+            # crash leftovers are reclaimed even when no new critic run happens
+            # (previously the age-out fired ONLY on the next build). Throttled —
+            # the sweep itself is a cheap dir scan.
+            if now - last_sandbox_sweep >= 3600:
+                last_sandbox_sweep = now
+                try:
+                    import evals as _ev
+                    n = _ev.sweep_critic_sandboxes()
+                    if n:
+                        db.log_activity("info", "scheduler",
+                                        f"Swept {n} stale critic sandbox(es)")
+                except Exception as e:
+                    print(f"[scheduler] sandbox sweep error: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[scheduler] error: {e}", file=sys.stderr)
         stop_event.wait(15)

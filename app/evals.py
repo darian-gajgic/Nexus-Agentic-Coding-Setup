@@ -469,6 +469,31 @@ def _scrubbed_env() -> dict:
     return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
 
 
+def sweep_critic_sandboxes(max_age_h: float = 24.0) -> int:
+    """P9 (ops hardening): age-out disposable critic sandboxes older than
+    `max_age_h`. Called (a) lazily before each new sandbox build, (b) at server
+    startup, and (c) periodically by the scheduler — so crash leftovers are
+    reclaimed even when no new critic run happens (the old code swept ONLY on the
+    next build, so a machine that stopped running critics leaked forever).
+    Returns the number of sandboxes removed. Never raises."""
+    import shutil
+    removed = 0
+    try:
+        if not CRITIC_SANDBOXES.exists():
+            return 0
+        cutoff = time.time() - max_age_h * 3600
+        for d in CRITIC_SANDBOXES.iterdir():
+            try:
+                if d.is_dir() and d.stat().st_mtime < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
 def build_critic_sandbox(task: dict, round_no: int = 1):
     """Disposable evidence copy → (sandbox_root: Path, deliverable_rel: str).
     Isolation (§4.3a): workspace copytree (heavy build dirs excluded; _history/,
@@ -478,14 +503,9 @@ def build_critic_sandbox(task: dict, round_no: int = 1):
     import shutil
     import subprocess as sp
     CRITIC_SANDBOXES.mkdir(parents=True, exist_ok=True)
-    # backstop (§4.2): sweep crash leftovers older than 24 h
-    cutoff = time.time() - 24 * 3600
-    for d in CRITIC_SANDBOXES.iterdir():
-        try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
-                shutil.rmtree(d, ignore_errors=True)
-        except Exception:
-            pass
+    # backstop (§4.2 / P9): sweep crash leftovers older than 24 h (shared helper,
+    # also run at startup + on the scheduler so it isn't lazy-only).
+    sweep_critic_sandboxes(24.0)
     ws = task.get("workspace_path") or ""
     if not os.path.isdir(ws):
         raise ValueError(f"task {task.get('id')} has no workspace directory to sandbox")

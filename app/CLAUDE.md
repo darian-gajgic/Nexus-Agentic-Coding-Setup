@@ -223,7 +223,7 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   → revalidate reconciler/multi-review repair. ~27 checks, self-cleaning, restores
   super.critic_cmd.
 - **Runtime gate — Quality Autopilot:** `.venv/bin/python scripts/verify_autopilot_e2e.py` —
-  36 checks, mostly deterministic + a stubbed distillation: Q7a preset derivation (rules
+  50 checks, mostly deterministic + a stubbed distillation: Q7a preset derivation (rules
   1/2/4/6, P2 staged), design_loop derivation + the rule-2 risk floor, Q4 decision-log
   harvest/injection, Q5 [UNSURE] framing/tools, Q1 exemplar selection + guards (L3),
   Q2 stubbed distill → admin lesson card → apply (canonical + L2 overlay), L1 outcome
@@ -234,7 +234,7 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   Part-5 UI row: the Decisions inbox renders a seeded card + lights the nav badge, the User
   Manual renders its plain-language sections (autopilot dials + Decisions inbox chapters), and
   the Q7a two-axis preset cards mount in BOTH the project proposal wizard and the task-create
-  wizard. 14 checks, self-cleaning (seeded approval/task removed).
+  wizard. 17 checks, self-cleaning (seeded approval/task removed).
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env

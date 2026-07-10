@@ -417,6 +417,24 @@ try:
 except Exception as _e:
     chk("Q2 reject→accept approval cycle reachable", False)
 
+print("=== P9 — ops hardening (busy_timeout + critic-sandbox age-out) ===")
+import evals as _evals
+chk("P9 PRAGMA busy_timeout is set explicitly (10s)",
+    int(db.get_conn().execute("PRAGMA busy_timeout").fetchone()[0]) == 10000)
+# critic-sandbox age-out is now a shared helper run at startup + on the scheduler,
+# not lazy-only: a stale (>24h) sandbox is reclaimed while a fresh one survives.
+_evals.CRITIC_SANDBOXES.mkdir(parents=True, exist_ok=True)
+_stale = _evals.CRITIC_SANDBOXES / "qa-stale-sbx"
+_fresh = _evals.CRITIC_SANDBOXES / "qa-fresh-sbx"
+_stale.mkdir(exist_ok=True)
+_fresh.mkdir(exist_ok=True)
+_cleanup.append(lambda: shutil.rmtree(_stale, ignore_errors=True))
+_cleanup.append(lambda: shutil.rmtree(_fresh, ignore_errors=True))
+os.utime(_stale, (time.time() - 48 * 3600, time.time() - 48 * 3600))
+_removed = _evals.sweep_critic_sandboxes(24.0)
+chk("P9 sweep reclaims stale (>24h) sandboxes, keeps fresh ones (startup/scheduler-driven)",
+    _removed >= 1 and not _stale.exists() and _fresh.exists())
+
 for fn in _cleanup:
     try:
         fn()
