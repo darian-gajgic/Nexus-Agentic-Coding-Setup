@@ -285,7 +285,7 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
 - **Skill wizard**: `/api/hermes-skills` list/get/save + `/api/hermes-skills/wizard` (AI
   drafts SKILL.md → human reviews → save writes `~/.hermes/skills/<name>/SKILL.md`).
   Specialist wizard: `/api/specialists/wizard` (same pattern; eval gate on save stays).
-- **App preview (v3.3)**: ▶ Test a task's program output live. app_runner.py detects the
+- **App preview (v3.4)**: ▶ Test a task's program output live. app_runner.py detects the
   runnable in the workspace (package.json dev/start → npm install+run; app.py/main.py
   (+requirements→.venv-preview) → python; index.html → python -m http.server), runs it as
   its own process group on a dedicated 127.0.0.1 port (8790-8820, max 3 concurrent, env
@@ -293,8 +293,10 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   30 min (reaper thread also kills restart-orphans; registry workspaces/.preview-apps.json).
   Endpoints: GET/POST /api/tasks/{id}/app(/start|/stop|/log). UI: ▶ Test app in the
   Deliverables rows + task detail → modal with live log → opens the app in a new tab when
-  it answers. Caveat: dev servers that ignore the PORT env (vite without --port) show as
-  'starting' forever — the log tells the truth.
+  it answers. Port truth (v3.4): vite dev scripts get `-- --port <p> --strictPort --host
+  127.0.0.1` appended (vite ignores the PORT env and a busy config port auto-increments);
+  any other server that ignores PORT is adopted from the URL it prints in its log —
+  `_adopt_logged_port` rewrites the registry port/url once that port answers.
 - **Project app preview (v3.6)**: ▶ Test project — run the WHOLE assembled project (every
   stage's changes together, not one task's output), at the current state OR any earlier one,
   side by side on separate ports to compare new vs old / spot regressions. `project_preview.py`
