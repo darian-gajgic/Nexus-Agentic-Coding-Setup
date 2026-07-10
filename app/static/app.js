@@ -2291,7 +2291,7 @@ function settingsRegistryHTML() {
     </div></div>`).join('');
 }
 
-const PURPOSE_ROUTES = { complicated: 'hermes', easy: 'hermes', mechanical: 'hermes', frontier_judge: 'cli' };
+const PURPOSE_ROUTES = { complicated: 'hermes', easy: 'hermes', mechanical: 'hermes', frontier_judge: 'cli', spec_model: 'cli' };
 
 function modelsCardHTML() {
   const effOpts = (cur) => ['', 'minimal', 'low', 'medium', 'high', 'max'].map(v =>

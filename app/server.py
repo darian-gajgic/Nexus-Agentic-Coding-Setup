@@ -6993,9 +6993,9 @@ async def models_assign(body: dict):
             return JSONResponse(status_code=400, content={
                 "error": f"{purpose}: needs a hermes-route model (CLI models can only judge). "
                          "More providers become task-routable when Hermes gains them."})
-        if purpose == "frontier_judge" and m["route"] != "cli":
+        if purpose in sreg.CLI_PURPOSES and m["route"] != "cli":
             return JSONResponse(status_code=400, content={
-                "error": "frontier_judge: needs a cli-route model (runs via judge.cmd)"})
+                "error": f"{purpose}: needs a cli-route model (runs via the headless CLI)"})
     now = time.time()
     for purpose, mid in body.items():
         if mid is None:
