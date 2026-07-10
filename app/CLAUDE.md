@@ -51,12 +51,23 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 
 ## JARVIS v2 (2026-07-08) — particle avatar, WS TTS, vision, files, control
 **Full docs: `docs/JARVIS-VOICE.md` §0 — READ IT before editing JARVIS code.**
-- **Avatar**: Three.js particle head (`static/jarvis3d.js`) sampled from
-  `static/avatar/reference.jpg` (edge-boosted luminance → density), node streams into the
-  real memory galaxy behind; renders BEHIND the chat. States idle/listening/thinking/talking.
-  FX on/off button freezes the RAF loop. Wav2Lip is RETIRED (/talk + /lipsync return
-  410 Gone since 2026-07-09 — they were live and loaded Wav2Lip onto the shared GPU;
-  lipsync.py stays on disk but nothing reaches it).
+- **Avatar (v7 hologram, 2026-07-10)**: violet point-lattice hologram head
+  (`static/jarvis3d.js`): the three.js "facecap" model (52 ARKit blendshapes, credit
+  Face Cap/bannaflak.com; KTX2 texture stripped offline by
+  `scripts/build_facecap_hologram.py` → `static/avatar/facecap_hologram.glb`) rendered
+  as dark occluder + additive wireframe + morph-aware shader dots behind an
+  UnrealBloomPass composer. Lip sync = TEXT-ALIGNED VISEMES: app.js registers a live
+  per-sentence utterance record (`Jarvis3D.speak(rec, ctx)`, cleared via
+  `stopSpeech()`); its Oculus-viseme timeline (vendored MIT
+  `static/vendor/lipsync/lipsync-en.mjs`) is stretched over the sentence's REAL audio
+  window on the AudioContext clock and gated by the live RMS envelope. Eyes =
+  saccade/fixation gaze machine on rotatable eye pivots (camera/pointer tracking) +
+  Trutoiu blink dynamics on eyeBlink morphs. Vendored three.js r160 addons live in
+  `static/vendor/threejsm/` (single shared THREE instance — see
+  `static/vendor/_VENDORING.md`). Memory galaxy renders behind, unchanged. States
+  idle/listening/thinking/talking; FX button freezes the RAF loop. Wav2Lip is RETIRED
+  (/talk + /lipsync return 410 Gone since 2026-07-09; lipsync.py stays on disk but
+  nothing reaches it).
 - **Voice out**: `/ws/jarvis/tts` streams raw PCM per sentence (`voice.synthesize_stream`);
   the browser schedules chunks gaplessly + drives the avatar mouth from an AnalyserNode on
   the same graph (native-timing lip-sync). Sentences are spoken WHILE the reply streams.
