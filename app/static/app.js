@@ -6045,7 +6045,19 @@ function viewAgentic() {
         <h3 style="margin-bottom:14px">Schedule Job</h3>
         <input id="jbName" class="modal-input" placeholder="job name" style="width:100%;margin-bottom:8px">
         <input id="jbCron" class="modal-input" placeholder="cron (min hr dom mon dow), e.g. */5 * * * *" style="width:100%;margin-bottom:8px">
-        <input id="jbAction" class="modal-input" placeholder="action" style="width:100%;margin-bottom:8px">
+        <input id="jbAction" class="modal-input" placeholder="action (the task the job creates each run)" style="width:100%;margin-bottom:8px">
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <select id="jbSpend" class="modal-input" style="flex:1" title="Spending profile for the recurring task (B4)">
+            <option value="">— profile: default —</option>
+            <option value="eco">🌱 Eco</option><option value="optimal">⚖ Balanced</option><option value="smart">🧠 Smart</option>
+          </select>
+          <select id="jbDtype" class="modal-input" style="flex:1" title="Deliverable type">
+            <option value="">— type: auto —</option>
+            <option value="analysis">analysis</option><option value="content">content</option>
+            <option value="research">research</option><option value="code_change">code_change</option>
+          </select>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:10px"><input type="checkbox" id="jbSuper"> ✨ Super Result on each run (recurring high-value job)</label>
         <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn-primary" onclick="createJob()">Create</button></div>
       </div>
     </div>` : ''}
@@ -6139,7 +6151,11 @@ async function runVerify() {
 async function createJob() {
   const name = $('#jbName').value.trim(); const cron = $('#jbCron').value.trim(); const action = $('#jbAction').value.trim();
   if (!name || !cron || !action) return;
-  await api('POST', '/api/scheduler', { name, cron_expr: cron, action });
+  const body = { name, cron_expr: cron, action };  // B4: carry the task template
+  if ($('#jbSuper') && $('#jbSuper').checked) body.super_result = true;
+  if ($('#jbSpend') && $('#jbSpend').value) body.spend_profile = $('#jbSpend').value;
+  if ($('#jbDtype') && $('#jbDtype').value) body.deliverable_type = $('#jbDtype').value;
+  await api('POST', '/api/scheduler', body);
   $('#jobModal').style.display = 'none';
   toast('Job scheduled', 'ok');
   await loadAgenticData();

@@ -417,6 +417,11 @@ chk "L1 outcome capture wired"       "grep -q 'def record_outcome' routing.py &&
 chk "L1 stats job (no LLM)"          "grep -q 'def sweep_stats' routing.py && grep -q '_routing.sweep_stats' loop_engine.py"
 chk "L4 learned_params + fingerprint" "grep -q 'CREATE TABLE IF NOT EXISTS learned_params' database.py && grep -q 'def config_fingerprint' routing.py && grep -q 'def learned_param' routing.py"
 chk "rule9 collapse monitor"         "grep -q 'ROUTER COLLAPSE WARNING' routing.py"
+# B4 — scheduler template passthrough (+ rule 7)
+chk "B4 task_template column"        "grep -q 'ADD COLUMN task_template TEXT' database.py"
+chk "B4 scheduler applies template"  "grep -q 'task_template' scheduler.py && grep -q 'spend_profile' scheduler.py && grep -q '_sync_super_result_loop' scheduler.py"
+chk "B4 endpoint stores template"    "grep -q 'task_template' server.py"
+chk "B4 job UI template fields"      "grep -q 'jbSuper' static/app.js && grep -q 'jbSpend' static/app.js"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"

@@ -3516,10 +3516,26 @@ async def scheduler_create(body: dict):
     jid = f"job-{uuid.uuid4().hex[:10]}"
     nr = _sched_mod.next_run(cron_expr)
     now = time.time()
+    # B4 (+ rule 7): the job may carry a task template so a recurring high-value
+    # job gets Super Result / deliverable type / autopilot preset automatically.
+    tmpl = {}
+    for k in ("super_result", "high_stakes"):
+        if body.get(k):
+            tmpl[k] = True
+    if body.get("deliverable_type") in _DELIVERABLE_TYPES:
+        tmpl["deliverable_type"] = body["deliverable_type"]
+    if body.get("domain"):
+        tmpl["domain"] = str(body["domain"])[:60]
+    import autopilot as _ap
+    if (body.get("autopilot") or "").strip():
+        tmpl["autopilot"] = _ap.norm_involvement(body["autopilot"])
+    if (body.get("spend_profile") or "").strip():
+        tmpl["spend_profile"] = _ap.norm_spend(body["spend_profile"])
     db.execute(
-        "INSERT INTO scheduled_jobs (id, name, cron_expr, agent_id, action, enabled, next_run, created_at) "
-        "VALUES (?,?,?,?,?,1,?,?)",
-        (jid, name, cron_expr, body.get("agent_id"), action, nr, now),
+        "INSERT INTO scheduled_jobs (id, name, cron_expr, agent_id, action, enabled, next_run, created_at, task_template) "
+        "VALUES (?,?,?,?,?,1,?,?,?)",
+        (jid, name, cron_expr, body.get("agent_id"), action, nr, now,
+         json.dumps(tmpl) if tmpl else None),
     )
     job = db.query_one("SELECT * FROM scheduled_jobs WHERE id = ?", (jid,))
     await mgr.broadcast({"type": "job_created", "data": job})

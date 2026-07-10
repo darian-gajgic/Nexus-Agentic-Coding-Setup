@@ -407,6 +407,12 @@ def init_db():
         status TEXT DEFAULT 'new'
     )""")
 
+    # B4: a scheduled job may carry a task TEMPLATE (JSON) so recurring high-value
+    # jobs get Super Result / deliverable type / autopilot preset automatically.
+    _sj_cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduled_jobs)").fetchall()}
+    if "task_template" not in _sj_cols:
+        conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN task_template TEXT")
+
     # Migrate dispatches columns (table shipped in S1 without the executor heartbeat)
     existing_disp_cols = {r[1] for r in conn.execute("PRAGMA table_info(dispatches)").fetchall()}
     if "heartbeat_at" not in existing_disp_cols:
