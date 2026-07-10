@@ -6216,6 +6216,16 @@ def sweep_stale_plan_sessions(max_age_days: float = 7.0):
     return len(stale)
 
 
+@app.post("/api/plan/telemetry")
+async def plan_telemetry(body: dict):
+    """Accept/deny telemetry for the Deep Plan soft gate (router-collapse watch,
+    §2 of the plan). Best-effort activity log — never fails the caller."""
+    ev = str((body or {}).get("event") or "")[:60]
+    if ev:
+        db.log_activity("info", "plan", f"Deep Plan gate: {ev}", user_id=auth.current_user_id())
+    return {"ok": True}
+
+
 @app.get("/api/plan/sessions")
 async def plan_sessions_list():
     uid = auth.current_user_id()

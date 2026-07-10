@@ -4638,6 +4638,7 @@ async function submitSpawn() {
 }
 
 function showTaskModal(status) {
+  __deepPlanTaskSession = null;  // a normal task-create clears any stale Deep Plan stash
   const agentOptions = (state.agents || []).map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
   const progOptions = (state.programs || []).map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
   $('#modalContent').innerHTML = `
@@ -4879,6 +4880,11 @@ async function submitTask() {
   });
   taskCreateContext = null;
   const nAtt = await attachStageUploadAll('tc-attach', 'task', created.id);
+  // Deep Plan (Step 8): a single-task Deep Plan attaches its SPEC to the task.
+  if (__deepPlanTaskSession) {
+    try { await api('POST', `/api/plan/sessions/${__deepPlanTaskSession}/attach`, { kind: 'task', id: created.id }); } catch (e) { }
+    __deepPlanTaskSession = null;
+  }
   wfState.fetched = false;
   state.tasks = await api('GET', '/api/tasks');
   toast(`Task created${nAtt ? ` with ${nAtt} attachment${nAtt > 1 ? 's' : ''}` : ''}`, 'ok');
@@ -9056,8 +9062,17 @@ function describeTaskUI() {
     <div class="form-hint" style="margin-top:6px">💡 This wizard only <strong>plans</strong> — the actual work happens later, inside the task it creates. Describe the goal and desired outcome (e.g. "a summary of what is on a picture"); if the work needs files, 📎 attach them to the created task afterwards.</div>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-ghost" id="twDeep" title="Plan a complex goal conversationally — a short interview builds a spec, then drafts + premortem-checks the plan">✦ Deep Plan</button>
       <button class="btn-primary" id="twGo">✨ Plan it</button>
     </div>`);
+  const twDeep = $('#twDeep');
+  if (twDeep) twDeep.onclick = () => {
+    const instruction = ($('#twAsk') || {}).value || '';
+    if (!instruction.trim()) { toast('Describe the goal first', 'err'); return; }
+    startDeepPlan(instruction.trim(), {
+      super_result: !!($('#twSuper') && $('#twSuper').checked),
+      family: null });
+  };
   const twSel = $('#twRepo');
   if (twSel) {
     api('GET', '/api/projects').then(d => {
@@ -9091,13 +9106,46 @@ function describeTaskUI() {
   };
 }
 
-const wizardCtx = { repo_path: null, super_result: false, fanout: null };
+const wizardCtx = { repo_path: null, super_result: false, fanout: null, spend_profile: null, autopilot: null };
 
 // Route a wizard response: one question round, or straight to the plan preview.
+// Deep Plan soft gate (Step 3): when triage recommends it, offer Deep Plan ONCE
+// above the normal flow — accept or decline in one click; quick path stays default.
+const _deepPlanOffered = new Set();
 function handleWizardPlan(instruction, r) {
-  if (r.type === 'questions') { wizardQuestionsModal(instruction, r); return; }
-  if (r.type === 'workflow') { proposeWorkflowModal(r.workflow, r); }
-  else { closeModal(); applyWizardTask(r.task, r); }
+  const proceed = () => {
+    if (r.type === 'questions') { wizardQuestionsModal(instruction, r); return; }
+    if (r.type === 'workflow') { proposeWorkflowModal(r.workflow, r); }
+    else { closeModal(); applyWizardTask(r.task, r); }
+  };
+  if (r.triage && r.triage.recommend_deep_plan && !_deepPlanOffered.has(instruction)) {
+    _deepPlanOffered.add(instruction);
+    deepPlanRecommendModal(instruction, r, proceed);
+  } else proceed();
+}
+
+function deepPlanRecommendModal(instruction, r, proceed) {
+  const t = r.triage || {};
+  const reasons = (t.reasons || []).slice(0, 5);
+  showModal(`
+    <h2>✦ This looks complex — plan it properly?</h2>
+    <div class="view-intro" style="margin-bottom:8px">A short guided interview builds a structured
+      spec, then drafts and premortem-checks the plan. It steers the whole run with a better
+      contract — worth it for complex or ambiguous goals. Planning tokens are tiny next to the work.</div>
+    ${reasons.length ? `<div class="agentic-row" style="margin-bottom:8px"><strong>Why:</strong><br>${reasons.map(x => '· ' + esc(x)).join('<br>')}</div>` : ''}
+    ${t.recommend_super_result ? `<div class="form-hint" style="margin-bottom:6px">✨ Super Result is also suggested for this goal (independent grounded verification).</div>` : ''}
+    <div class="modal-actions">
+      <button class="btn-ghost" id="dpDeny">Quick plan anyway</button>
+      <button class="btn-primary" id="dpAccept">✦ Start Deep Plan</button>
+    </div>`);
+  const acc = $('#dpAccept');
+  if (acc) acc.onclick = () => startDeepPlan(instruction, {
+    family: t.family || null,
+    super_result: (wizardCtx.super_result || t.recommend_super_result) || false,
+    spend_profile: wizardCtx.spend_profile || null,
+    autopilot: wizardCtx.autopilot || null });
+  const den = $('#dpDeny');
+  if (den) den.onclick = () => { logDecision('deep_plan_deny'); proceed(); };
 }
 
 // One round of clarifying questions — every question skippable with its default.
@@ -9251,6 +9299,7 @@ function planEdRowHTML(t, i) {
       </div>
       ${(t.depends_on_idx || []).length ? `<div style="font-size:11px;color:var(--text-faint)">⛓ waits for: ${t.depends_on_idx.map(x => x + 1).join(', ')}</div>` : ''}
       <div style="font-size:11.5px;color:var(--text-dim);white-space:pre-wrap">${esc((t.description || '').slice(0, 220))}${(t.description || '').length > 220 ? '…' : ''}</div>
+      ${((planEd.annotations || {})[i] || []).map(a => `<div style="font-size:11px;color:var(--warn,#eab308);margin-top:3px">${esc(a)}</div>`).join('')}
     </div>`;
 }
 
@@ -9318,6 +9367,9 @@ function planEdRender() {
   const rb = $('#wfRepairs');
   if (rb) rb.innerHTML = (planEd.repairs || []).length
     ? `🔧 wizard auto-fixed: ${planEd.repairs.map(esc).join(' · ')}` : '';
+  const sw = $('#dpSpecWarnings');
+  if (sw) sw.innerHTML = (planEd.specWarnings || []).length
+    ? (planEd.specWarnings || []).map(w => `<div style="font-size:11px;color:var(--warn,#eab308)">${esc(w)}</div>`).join('') : '';
 }
 
 function planEdBindStages() {
@@ -9417,6 +9469,13 @@ function planEdFinalTasks() {
 function proposeWorkflowModal(wf, meta) {
   const tasks = wf.tasks || [];
   const isCoding = tasks.some(t => t.specialist === 'code-implementer');
+  const planSessionId = (meta && meta.plan_session_id) || null;
+  // Deep Plan premortem warnings (Step 7) seed the per-task annotations.
+  const annotations = {}; const specWarnings = [];
+  ((meta && meta.warnings) || []).forEach(w => {
+    if (w.scope === 'task' && w.task_idx != null) (annotations[w.task_idx] = annotations[w.task_idx] || []).push('⚠ ' + w.message);
+    else specWarnings.push('⚠ ' + w.message);
+  });
   planEd = {
     mode: 'wizard', domain: wf.domain || 'general', name: wf.name,
     tasks: JSON.parse(JSON.stringify(tasks)),
@@ -9424,12 +9483,15 @@ function proposeWorkflowModal(wf, meta) {
     editing: null, edited: false,
     repairs: (meta && meta.repairs) || [],
     roster: specialistNamesCache || [],
+    planSessionId, annotations, specWarnings,
   };
   planEdLoadRoster().then(() => planEdRender());
   const assumptions = (meta && meta.assumptions) || [];
   showModal(`
-    <h2>✨ Proposed project: ${esc(wf.name)}</h2>
+    <h2>${planSessionId ? '✦ Deep Plan' : '✨'} — proposed project: ${esc(wf.name)}</h2>
     <div class="view-intro" style="margin-bottom:8px">${esc(wf.goal || '')}</div>
+    ${planSessionId ? `<div class="agentic-row" style="margin-bottom:6px;background:rgba(94,234,212,.06)">📋 Built from your Deep Plan spec — it will travel with the project (every task, the critic, the judge). <span id="dpCritiqueStatus" style="color:var(--text-faint)"></span></div>
+    <div id="dpSpecWarnings" style="margin-bottom:6px"></div>` : ''}
     ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase — or ✏️ edit the affected task right here.</span></div>` : ''}
     <div id="wfRepairs" style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px"></div>
     <div id="wfStages" style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto"></div>
@@ -9484,6 +9546,8 @@ function proposeWorkflowModal(wf, meta) {
     </div>`);
   planEdRender();
   attachStageWire('wz-attach');
+  // Deep Plan: auto-run the premortem critique on first draft (advisory).
+  if (planSessionId && meta && meta.critique_enabled) setTimeout(() => deepPlanRunCritique(), 60);
   const addBtn = $('#wfAddTask');
   if (addBtn) addBtn.onclick = () => planEdAddTask();
   const b = $('#wfCreateBtn');
@@ -9593,6 +9657,11 @@ function proposeWorkflowModal(wf, meta) {
         ids.push(created.id);
       }
       const nAtt = await attachStageUploadAll('wz-attach', 'workflow', w.id);
+      // Deep Plan (Step 8): the SPEC travels — write it into the project and
+      // close the planning session.
+      if (planEd.planSessionId) {
+        try { await api('POST', `/api/plan/sessions/${planEd.planSessionId}/attach`, { kind: 'workflow', id: w.id }); } catch (e) { }
+      }
       wfState.fetched = false;
       state.tasks = await api('GET', '/api/tasks');
       planEd = null;
@@ -9604,6 +9673,231 @@ function proposeWorkflowModal(wf, meta) {
       b.disabled = false; b.textContent = 'Create project';
     }
   };
+}
+
+// ═══════════════════ DEEP PLAN (conversational planning phase — Phase 5) ═══════════════════
+// A short scaffolded interview builds a per-family SPEC (left = conversation,
+// right = the live editable spec), then Draft → the SAME proposal modal + plan
+// editor render the DAG with premortem annotations. The spec then travels
+// downstream on create. Extends the wizard, never replaces the quick path.
+let deepPlan = null;  // { session, super_result, spend_profile, autopilot, sending }
+
+async function startDeepPlan(goal, opts) {
+  opts = opts || {};
+  if (!goal || !goal.trim()) { toast('Describe the goal first', 'err'); return; }
+  try {
+    logDecision('deep_plan_accept');
+    const s = await api('POST', '/api/plan/sessions', {
+      goal: goal.trim(), family: opts.family || null,
+      super_result: !!opts.super_result, spend_profile: opts.spend_profile || null,
+      autopilot: opts.autopilot || null });
+    deepPlan = { session: s, super_result: !!opts.super_result,
+      spend_profile: opts.spend_profile || null, autopilot: opts.autopilot || null,
+      sending: false };
+    deepPlanModal();
+  } catch (e) { toast('Could not start Deep Plan: ' + e.message, 'err'); }
+}
+
+function logDecision(kind) {
+  // fire-and-forget accept/deny telemetry (router-collapse watch)
+  api('POST', '/api/plan/telemetry', { event: kind }).catch(() => { });
+}
+
+function deepPlanModal() {
+  showModal(`
+    <h2>✦ Deep Plan <span class="chip c-cyan" id="dpFamilyChip"></span></h2>
+    <div class="view-intro" style="margin-bottom:8px">A few targeted questions build a structured
+      spec, then it drafts and premortem-checks the plan. You can edit any slot directly, type
+      freely, switch the plan type, or <strong>Draft plan</strong> at any time.</div>
+    <div id="dpGrid" style="display:grid;grid-template-columns:1.1fr .9fr;gap:14px;align-items:start">
+      <div id="dpConvo" style="min-height:220px;max-height:460px;overflow-y:auto"></div>
+      <div id="dpSpec" style="min-height:220px;max-height:460px;overflow-y:auto;border-left:1px solid var(--border,rgba(255,255,255,.08));padding-left:12px"></div>
+    </div>
+    <div class="modal-actions" style="justify-content:space-between">
+      <button class="btn-ghost" id="dpAbandon" title="Discard this planning session">Abandon</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn-ghost" id="dpDraft" title="Draft the plan now from the current spec">Draft plan →</button>
+      </div>
+    </div>`);
+  const ab = $('#dpAbandon'); if (ab) ab.onclick = deepPlanAbandon;
+  const dr = $('#dpDraft'); if (dr) dr.onclick = deepPlanDraft;
+  deepPlanRender();
+}
+
+function deepPlanRender() {
+  if (!deepPlan || !deepPlan.session) return;
+  const s = deepPlan.session;
+  const chip = $('#dpFamilyChip'); if (chip) chip.textContent = s.family_label || s.family || '';
+  const convo = $('#dpConvo'), spec = $('#dpSpec');
+  if (convo) convo.innerHTML = deepPlanConvoHTML(s);
+  if (spec) spec.innerHTML = deepPlanSpecHTML(s);
+  // wire the send button + option quick-fills
+  const send = $('#dpSend');
+  if (send) send.onclick = () => {
+    const inp = $('#dpInput'); const v = inp ? inp.value.trim() : '';
+    if (!v) { toast('Type an answer, or press Draft plan', 'info'); return; }
+    deepPlanSend(v);
+  };
+  const inp = $('#dpInput');
+  if (inp) inp.onkeydown = (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); const b = $('#dpSend'); if (b) b.click(); } };
+}
+
+function deepPlanConvoHTML(s) {
+  const ready = s.ready || s.required_filled;
+  let h = '';
+  if (s.message) h += `<div class="agentic-row" style="background:rgba(94,234,212,.06)"><strong>Planner:</strong> ${esc(s.message)}</div>`;
+  (s.questions || []).forEach((q, i) => {
+    const opts = (q.options || []).map(o =>
+      `<button class="btn-sm dp-opt" data-label="${esc(o.label)}" style="margin:3px 4px 0 0;${o.recommended ? 'border-color:var(--accent)' : ''}">${o.recommended ? '★ ' : ''}${esc(o.label)}</button>`).join('');
+    h += `<div class="agentic-row"><div><strong>${esc(q.question)}</strong>${q.slot ? ` <span class="task-tag">${esc(q.slot)}</span>` : ''}</div>
+      ${q.why ? `<div style="font-size:11px;color:var(--text-faint)">${esc(q.why)}</div>` : ''}
+      <div style="margin-top:4px">${opts}</div></div>`;
+  });
+  if (ready && !(s.questions || []).length) {
+    h += `<div class="agentic-row" style="color:var(--ok,#4ade80)">✓ Required slots filled — ready to draft.</div>`;
+  }
+  h += `<div style="margin-top:8px">
+      <textarea class="form-textarea" id="dpInput" style="height:64px" placeholder="Answer here (click an option to fill it in), or just describe more…"></textarea>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
+        <span class="form-hint" style="margin:0">Turn ${s.turns || 0}. Ctrl+Enter to send.</span>
+        <button class="btn-primary btn-sm" id="dpSend">Send</button>
+      </div></div>`;
+  return h;
+}
+
+function deepPlanSpecHTML(s) {
+  const fam = (s.families || []).map(f =>
+    `<option value="${esc(f.key)}" ${f.key === s.family ? 'selected' : ''}>${esc(f.label)}</option>`).join('');
+  let h = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+      <span class="form-label" style="margin:0">SPEC</span>
+      <select class="form-select" id="dpFamily" style="max-width:180px" onchange="deepPlanSwitchFamily(this.value)">${fam}</select>
+    </div>`;
+  (s.spec || []).forEach(slot => {
+    const req = slot.required;
+    const need = req && !slot.filled;
+    const badge = slot.filled ? '<span style="color:var(--ok,#4ade80)">✓</span>'
+      : (req ? '<span style="color:var(--warn,#eab308)">● required</span>' : '<span class="muted">optional</span>');
+    const val = slot.kind === 'list' ? (slot.value || []).join('\n') : (slot.value || '');
+    const field = slot.kind === 'list'
+      ? `<textarea class="form-textarea dp-slot" data-slot="${esc(slot.key)}" data-kind="list" style="height:56px;${need ? 'border-color:var(--warn,#eab308)' : ''}" placeholder="${esc(slot.hint || '')} (one per line)">${esc(val)}</textarea>`
+      : `<input class="form-input dp-slot" data-slot="${esc(slot.key)}" data-kind="text" style="${need ? 'border-color:var(--warn,#eab308)' : ''}" placeholder="${esc(slot.hint || '')}" value="${esc(val)}">`;
+    h += `<div class="form-group" style="margin-bottom:8px">
+        <label class="form-label" style="display:flex;justify-content:space-between">${esc(slot.label)} ${badge}</label>
+        ${field}</div>`;
+  });
+  return h;
+}
+
+async function deepPlanSend(message) {
+  if (!deepPlan || deepPlan.sending) return;
+  deepPlan.sending = true;
+  const btn = $('#dpSend'); if (btn) { btn.disabled = true; btn.textContent = 'Thinking…'; }
+  try {
+    deepPlan.session = await api('POST', `/api/plan/sessions/${deepPlan.session.id}/turn`, { message });
+    deepPlanRender();
+  } catch (e) {
+    toast('Planner turn failed: ' + e.message, 'err');
+    if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
+  } finally { deepPlan.sending = false; }
+}
+
+// debounced direct slot edit → PATCH /spec (delegated from the modal)
+let _dpSlotTimer = null;
+document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (!el || !el.classList || !el.classList.contains('dp-slot') || !deepPlan) return;
+  clearTimeout(_dpSlotTimer);
+  const slot = el.dataset.slot, value = el.value;
+  _dpSlotTimer = setTimeout(async () => {
+    try {
+      deepPlan.session = await api('PATCH', `/api/plan/sessions/${deepPlan.session.id}/spec`,
+        { updates: { [slot]: value } });
+      // refresh ONLY the badges/family chip, not the fields (would eat the cursor)
+      const chip = $('#dpFamilyChip'); if (chip) chip.textContent = deepPlan.session.family_label || '';
+    } catch (err) { /* transient — next edit retries */ }
+  }, 700);
+});
+
+// quick-fill: clicking an option appends its label to the input
+document.addEventListener('click', (e) => {
+  const b = e.target && e.target.closest ? e.target.closest('.dp-opt') : null;
+  if (!b || !deepPlan) return;
+  const inp = $('#dpInput'); if (!inp) return;
+  const label = b.dataset.label || '';
+  inp.value = (inp.value.trim() ? inp.value.trim() + '; ' : '') + label;
+  inp.focus();
+});
+
+async function deepPlanSwitchFamily(family) {
+  if (!deepPlan) return;
+  try {
+    deepPlan.session = await api('PATCH', `/api/plan/sessions/${deepPlan.session.id}/spec`, { family });
+    deepPlanRender();
+  } catch (e) { toast('Could not switch plan type: ' + e.message, 'err'); }
+}
+
+async function deepPlanAbandon() {
+  if (!deepPlan) { closeModal(); return; }
+  const id = deepPlan.session.id;
+  deepPlan = null; closeModal();
+  try { await api('DELETE', `/api/plan/sessions/${id}`); } catch (e) { }
+}
+
+async function deepPlanDraft() {
+  if (!deepPlan) return;
+  const btn = $('#dpDraft');
+  if (btn) { btn.disabled = true; btn.textContent = 'Drafting…'; }
+  const sess = deepPlan.session;
+  try {
+    const r = await api('POST', `/api/plan/sessions/${sess.id}/draft`, {
+      super_result: deepPlan.super_result, spend_profile: deepPlan.spend_profile,
+      autopilot: deepPlan.autopilot });
+    // meta carries the plan_session_id (→ spec attach on create) + premortem info
+    const meta = { ...r, plan_session_id: sess.id };
+    deepPlan = null;
+    if (r.type === 'workflow') { proposeWorkflowModal(r.workflow, meta); }
+    // applyWizardTask → showTaskModal clears the stash, so set it AFTER.
+    else { closeModal(); applyWizardTask(r.task, meta); __deepPlanTaskSession = sess.id; }
+  } catch (e) {
+    toast('Draft failed: ' + e.message, 'err');
+    if (btn) { btn.disabled = false; btn.textContent = 'Draft plan →'; }
+  }
+}
+
+// pending single-task Deep Plan session id → spec attach fires on task create
+let __deepPlanTaskSession = null;
+
+// Premortem critique: called after a Deep-Plan draft renders the plan editor.
+// Findings render as ⚠ annotations on the matching task cards / spec slots.
+async function deepPlanRunCritique() {
+  if (!planEd || !planEd.planSessionId) return;
+  const banner = $('#dpCritiqueStatus');
+  if (banner) banner.textContent = '⏳ Premortem critique running…';
+  try {
+    const finalTasks = planEd.tasks.map((t, i) => ({ ...t, _idx: i }));
+    const r = await api('POST', `/api/plan/sessions/${planEd.planSessionId}/critique`,
+      { tasks: planEd.tasks });
+    planEd.annotations = {};   // rebuilt from the authoritative critique response
+    planEd.specWarnings = [];
+    (r.warnings || []).forEach(w => {
+      if (w.scope === 'task' && w.task_idx != null) {
+        (planEd.annotations[w.task_idx] = planEd.annotations[w.task_idx] || []).push('⚠ ' + w.message);
+      } else { planEd.specWarnings.push('⚠ ' + w.message); }
+    });
+    (r.findings || []).forEach(f => {
+      const msg = `⚠ ${f.problem}${f.fix ? ' → ' + f.fix : ''}`;
+      if (f.task_idx != null && f.task_idx < planEd.tasks.length) {
+        (planEd.annotations[f.task_idx] = planEd.annotations[f.task_idx] || []).push(msg);
+      } else { planEd.specWarnings.push(msg + (f.slot ? ` (spec: ${f.slot})` : '')); }
+    });
+    planEdRender();
+    const nb = $('#dpCritiqueStatus');
+    if (nb) nb.textContent = r.critique_enabled
+      ? `✓ Premortem done — ${(r.findings || []).length} finding(s), ${(r.warnings || []).length} structural note(s). Advisory only.`
+      : `Structural checks: ${(r.warnings || []).length} note(s).`;
+  } catch (e) {
+    const nb = $('#dpCritiqueStatus'); if (nb) nb.textContent = 'Premortem unavailable (advisory only).';
+  }
 }
 
 // ═══════════════════ HERMES SKILL WIZARD ═══════════════════
