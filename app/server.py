@@ -1551,13 +1551,27 @@ def get_memory():
                 out["vector_distance"] = vp.get("distance")
         except Exception:
             pass
-        req = urllib.request.Request(
-            f"{base}/collections/{coll}/points/scroll",
-            data=json.dumps({"limit": 500, "with_payload": True, "with_vector": False}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            pts = (json.loads(r.read()).get("result") or {}).get("points", [])
+        # Paginate the scroll — a single fixed-size page silently hides
+        # memories once the collection grows past it (a point whose id lands
+        # in the untouched tail vanishes from the list). Follow
+        # next_page_offset to the end. Hard stop bounds a runaway cursor.
+        pts = []
+        offset = None
+        for _ in range(200):  # 200 * 500 = 100k points, far above real size
+            page = {"limit": 500, "with_payload": True, "with_vector": False}
+            if offset is not None:
+                page["offset"] = offset
+            req = urllib.request.Request(
+                f"{base}/collections/{coll}/points/scroll",
+                data=json.dumps(page).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                res = (json.loads(r.read()).get("result") or {})
+            pts.extend(res.get("points", []))
+            offset = res.get("next_page_offset")
+            if offset is None:
+                break
         mems = []
         me = auth.current_user_id()
         for p in pts:
