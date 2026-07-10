@@ -222,6 +222,14 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   escalations → SHIP quiet-stop → open-mode checkpoint + approve/reject → workflow cascade
   → revalidate reconciler/multi-review repair. ~27 checks, self-cleaning, restores
   super.critic_cmd.
+- **Runtime gate — Quality Autopilot:** `.venv/bin/python scripts/verify_autopilot_e2e.py` —
+  36 checks, mostly deterministic + a stubbed distillation: Q7a preset derivation (rules
+  1/2/4/6, P2 staged), design_loop derivation + the rule-2 risk floor, Q4 decision-log
+  harvest/injection, Q5 [UNSURE] framing/tools, Q1 exemplar selection + guards (L3),
+  Q2 stubbed distill → admin lesson card → apply (canonical + L2 overlay), L1 outcome
+  capture + L4 fingerprint invalidation + rule-9 collapse monitor, Q7b auto-approve-ship
+  guard + /api/decisions, rule-5 Eco collapse + high-stakes re-insertion, rule-7 scheduler
+  template. Self-cleaning; restores settings.
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
@@ -450,6 +458,36 @@ The Agents fleet is now the REAL execution layer of Hermes — the v1 simulation
   max_findings, fanout_*, keep_sandbox). Critic runs bill the Claude CLI subscription, NOT
   the GLM budget counters (B7 note) — Usage under-reports SR cost by design.
 - **Cost**: ~5–10× a single pass. Default OFF; per-task/workflow opt-in.
+
+### Quality Autopilot (2026-07-10, QUALITY-AUTOPILOT-PLAN-2026-07-10.md is source of truth)
+Phase 3 of the quality program — compounding quality levers + full automation.
+- **Q1 golden exemplars** (`hermes_dispatch.golden_exemplars`): the operator's own SHIP'd,
+  high-scoring past deliverables injected as MUST-READ few-shot paths (content/research/
+  analysis only; never code; L3 age-out). **Q4 decision log**: workflow members read a
+  running `workspaces/workflow-<id>/DECISIONS.md` and end with a `## Decisions` section that
+  `_finalize_result` harvests (deterministic). **Q5 uncertainty tagging**: executors mark
+  unverified claims `[UNSURE: reason]`; the critic/judge check those first (unmarked-false =
+  critical). **Q3 acceptance-tests-first**: the spec stage owns an executable `acceptance/`
+  suite + hashes; `_repair_workflow._apply_tests_first` binds it (`pipeline.tests_first`).
+- **Q2 edit distillation / N8** (`lessons.py` + vendored `cdistill`): `edit_evidence` table
+  captures rejections + user comments + rejected→accepted diffs; a cron/manual judgment-tier
+  call proposes ≤5 PLAYBOOK/RUBRIC/STYLE-VOICE deltas → ONE admin-scoped `lesson_deltas`
+  approval → apply writes `~/knowledge` + git-commits (autonomy ceiling). L2 routes
+  canonical vs user_overlay.
+- **Q7a autopilot** (`autopilot.py::derive`): two axes — `autopilot` (full_auto/assisted/
+  manual) × `spend_profile` (eco/optimal/smart) — columns on tasks+workflows, set every
+  downstream knob (preference, mode, SR, fan-out, round caps, judge scope, budget ×0.5/1/2,
+  pipeline depth). Guardrail rules 1–10 enforced (risk is an independent hard floor; forward
+  deps P2-staged). **Q7b Decision Inbox**: `GET /api/decisions` — one card list (headline/
+  recommendation/reasons/cost), unified `decBadge`, `autopilot.auto_approve_ship_hours` (Full
+  Auto SHIP only, never high-stakes/SR). **Q7c**: house metaphor (worker/inspector/foreman/
+  planner/you=client) + `?` explainers + manual sections.
+- **Learning loop**: L1 `routing_outcomes` + `routing.sweep_stats` (no-LLM threshold proposals
+  + rule-9 collapse monitor); L4 `learned_params` fingerprint-invalidated on tier rotation.
+- **N5** `judge.auto_scope=all_quality`, **N6** `replan.auto_draft`, **N7** `judge.on_blind_reject`,
+  **B4** `scheduled_jobs.task_template` (SR/type/preset passthrough).
+- Settings section `quality` + `judge.auto_scope`/`on_blind_reject`. Gate:
+  `scripts/verify_autopilot_e2e.py`. Deep Plan + Appendix C + Phase-8 benchmarks are LATER phases.
 
 ### Block 3 (2026-07-08, docs/SPEC-BLOCK3.md is source of truth)
 - **Plan editor in the proposal modal (R1)**: every wizard-proposed task is editable in place
