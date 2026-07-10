@@ -463,7 +463,7 @@ chk "spec templates + stub"          "grep -q 'SPEC_TEMPLATES' plan_engine.py &&
 chk "plan session endpoints"         "grep -q '/api/plan/sessions' server.py && grep -q '/api/plan/sessions/{sid}/turn' server.py && grep -q '/api/plan/sessions/{sid}/draft' server.py && grep -q '/api/plan/sessions/{sid}/critique' server.py && grep -q '/api/plan/sessions/{sid}/attach' server.py"
 chk "B7 no-block: model work off-loop" "grep -q 'run_in_threadpool(_plan_run_turn' server.py && grep -q 'run_in_threadpool(_plan_draft_raw' server.py && grep -q 'run_in_threadpool(_ev.run_plan_critique' server.py"
 chk "plan.stub short-circuits turns" "grep -q \"plan.stub\" server.py && grep -q 'def stub_plan' plan_engine.py"
-chk "session hygiene sweep"          "grep -q 'def sweep_stale_plan_sessions' server.py && grep -q 'sweep_stale_plan_sessions' scheduler.py"
+chk "session hygiene sweep (+drafted)" "grep -q 'def sweep_stale_plan_sessions' server.py && grep -q 'sweep_stale_plan_sessions' scheduler.py && grep -q \"status IN ('active','drafted')\" server.py"
 # Step 6 — draft
 chk "draft seeds spec block"         "grep -q 'spec_block: str' server.py && grep -q 'SPEC CONTRACT' server.py && grep -q 'def _plan_draft_raw' server.py"
 # Step 7 — validators + premortem (external model, frontier gate)
@@ -479,7 +479,7 @@ chk "replan seeds original spec"     "grep -q 'def _workflow_spec_md' server.py 
 chk "deep plan UI"                   "grep -q 'function startDeepPlan' static/app.js && grep -q 'function deepPlanModal' static/app.js && grep -q 'function deepPlanRunCritique' static/app.js && grep -q 'function deepPlanRecommendModal' static/app.js"
 chk "premortem annotations in editor" "grep -q 'planEd.annotations' static/app.js && grep -q 'planEd.planSessionId' static/app.js"
 # Step 9 — JARVIS framing (rule 12)
-chk "JARVIS knows Deep Plan"         "grep -q 'DEEP PLAN:' server.py && grep -q '/api/plan/sessions' server.py"
+chk "JARVIS knows Deep Plan (+attach)" "grep -q 'DEEP PLAN:' server.py && grep -q '/api/plan/sessions' server.py && grep -q 'sessions/ID/attach' server.py"
 # Step 10 — gates
 chk "deep plan e2e gate exists"      "[ -f scripts/verify_deep_plan_e2e.py ]"
 chk "deep plan UI gate exists"       "[ -f scripts/verify_deep_plan_ui.py ]"
