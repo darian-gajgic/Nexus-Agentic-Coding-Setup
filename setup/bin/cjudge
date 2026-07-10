@@ -28,7 +28,7 @@ fi
 
 PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC. $TYPE_RUBRIC_BLOCK
 
-Stance: REFUTE BY DEFAULT. The deliverable's own assertions and self-scores are never evidence. You cannot run its commands, so judge the EVIDENCE ON THE PAGE: a load-bearing conclusion must rest on cited primary evidence (exact file:line, command + quoted output, source + date). A conclusion resting on a proxy inference ('tests pass' therefore 'code healthy') or on unlocated hand-waving FAILS the gate that covers it, no matter how plausible it reads.
+Stance: REFUTE BY DEFAULT. The deliverable's own assertions and self-scores are never evidence. You cannot run its commands, so judge the EVIDENCE ON THE PAGE: a load-bearing conclusion must rest on cited primary evidence (exact file:line, command + quoted output, source + date). A conclusion resting on a proxy inference ('tests pass' therefore 'code healthy') or on unlocated hand-waving FAILS the gate that covers it, no matter how plausible it reads. Check claims tagged '[UNSURE: reason]' FIRST — the author flagged them as unconfirmed; a marked claim that proves false is a medium finding, an UNMARKED claim that proves false is critical (it was presented as verified).
 
 Steps:
 1. Read $FILE, $RUBRIC, $KNOW/BUSINESS-CONTEXT.md, and $KNOW/STYLE-VOICE.md (plus the type rubric if named above).

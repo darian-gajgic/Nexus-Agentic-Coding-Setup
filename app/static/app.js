@@ -8620,13 +8620,21 @@ function bindDeliverables() {
   if (s) s.oninput = e => { delState.q = e.target.value; render(); setTimeout(() => { const x = $('#delSearch'); if (x) { x.focus(); x.setSelectionRange(x.value.length, x.value.length); } }, 0); };
 }
 
+// Q5 (uncertainty tagging): wrap [UNSURE: reason] spans — post-escape, so the
+// input is already safe HTML — in an amber marker so the operator sees every
+// claim the system flagged as unverified at a glance.
+function highlightUnsure(escaped) {
+  return (escaped || '').replace(/\[UNSURE:[^\]]*\]/g,
+    '<span class="unsure-tag" title="The system flagged this claim as unverified against a primary source">$&</span>');
+}
+
 async function previewDeliverable(taskId, name) {
   try {
     const r = await fetch(`/api/tasks/${taskId}/files/${encPath(name)}`);
     const text = await r.text();
     showModal(`
       <h2>📄 ${esc(name)}</h2>
-      <pre style="max-height:60vh;overflow-y:auto;white-space:pre-wrap;font-size:12.5px;font-family:var(--font-ui);line-height:1.55">${esc(text)}</pre>
+      <pre style="max-height:60vh;overflow-y:auto;white-space:pre-wrap;font-size:12.5px;font-family:var(--font-ui);line-height:1.55">${highlightUnsure(esc(text))}</pre>
       <div class="modal-actions">
         <a class="btn-ghost" href="/api/tasks/${esc(taskId)}/files/${encPath(name)}" download style="text-decoration:none">⬇ Download</a>
         <button class="btn-primary" onclick="closeModal()">Close</button>

@@ -51,7 +51,7 @@ The deliverable under critique is: $FILE
 
 METHOD, in this order:
 (a) CLAIM LEDGER — extract every load-bearing claim in the deliverable: facts, numbers, file:line references, 'tests pass' statements, causal conclusions.
-(b) VERIFY, refute-by-default — a claim stays UNVERIFIED until confirmed against primary evidence: read the actual files, re-run the exact commands whose output the deliverable quotes, re-derive numbers yourself. The deliverable's own assertions and self-scores are never evidence. A proxy inference ('tests pass' therefore 'code correct') is NOT verification.
+(b) VERIFY, refute-by-default — a claim stays UNVERIFIED until confirmed against primary evidence: read the actual files, re-run the exact commands whose output the deliverable quotes, re-derive numbers yourself. The deliverable's own assertions and self-scores are never evidence. A proxy inference ('tests pass' therefore 'code correct') is NOT verification. VERIFY CLAIMS TAGGED '[UNSURE: reason]' FIRST — the author flagged these as unconfirmed; every UNMARKED claim is presented as a verified assertion and is held to that standard.
 (c) CONTRADICTIONS — diff the deliverable against the previous version (path in context.json), against each sibling report (_critic_context/siblings/), and against itself. Every contradiction is a finding or an entry in 'contradictions'.
 (d) COMPLETENESS — what is missing versus the brief and versus every rubric dimension.
 (e) Score the must-pass gates of BOTH rubrics (domain + type, whichever exist in _critic_context/) briefly.
@@ -87,6 +87,7 @@ RULES:
 - At most $MAXF findings, most severe first.
 - Every finding must cite verifiable evidence (a file:line you read, a command you ran with its real output). No evidence, no finding.
 - line_no/line_text must reference a real existing line of file_path, or be null.
+- UNCERTAINTY SEVERITY: an UNMARKED claim that proves false is a 'critical' finding (it was presented as verified); a claim the author explicitly marked '[UNSURE: …]' that proves false is at most 'medium' (they flagged the risk) — but a marked claim that is load-bearing and wrong still blocks SHIP.
 - SHIP only when there are zero critical/high findings AND all rubric must-pass gates pass.
 - revision_brief must be actionable on its own: what to fix, in what order, with the evidence locations."
 
