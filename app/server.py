@@ -4992,6 +4992,13 @@ def _specialist_roster() -> str:
 
 _DEV_SPECIALISTS = {"tech-lead-orchestrator", "code-implementer", "code-reviewer",
                     "debugger", "acceptance-verifier"}
+# The quality-gate stages carry a MANDATORY high_stakes flag independent of the
+# work's real risk (the acceptance-verifier is ALWAYS high-stakes — see
+# _verify_gate_task / the wizard prompt "high_stakes TRUE always"). They must be
+# EXCLUDED from the rule-2 risk-floor scan, or rule 5's Eco collapse could never
+# fire on a real coding plan (which always ships a verifier). Only a genuine
+# work stage (spec/impl) being high-stakes re-inserts the review/fix gates.
+_GATE_SPECIALISTS = {"code-reviewer", "acceptance-verifier"}
 _FALLBACK_SPECIALISTS = _DEV_SPECIALISTS | {
     "web-researcher", "market-researcher", "strategy-consultant", "brand-strategist",
     "content-strategist", "copywriter-specialist", "long-form-writer", "seo-strategist",
@@ -5445,7 +5452,12 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
     # Q7a rule 5: Eco collapses the coding template to implement→verify — skip the
     # AUTO-inserted review + fix gates, UNLESS a stage is high-stakes (rule 2, the
     # risk floor, re-inserts them). Smart/Optimal keep the full gates.
-    eco_collapse = (spend_profile == "eco") and not any(t.get("high_stakes") for t in tasks)
+    # Scan ONLY genuine work stages for the risk floor — the always-high-stakes
+    # verifier (and any high-stakes reviewer) is a gate, not a risk signal, so it
+    # must not defeat the Eco collapse on real coding plans.
+    eco_collapse = (spend_profile == "eco") and not any(
+        t.get("high_stakes") for t in tasks
+        if t.get("specialist") not in _GATE_SPECIALISTS)
     try:
         impl = [i for i, t in enumerate(tasks) if t["specialist"] == "code-implementer"]
         if impl:
