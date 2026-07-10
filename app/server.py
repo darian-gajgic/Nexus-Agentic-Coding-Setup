@@ -640,6 +640,10 @@ async def create_task(body: TaskCreate):
     if body.super_result:
         _sync_super_result_loop("task", task)
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
+    else:
+        # No explicit flag → inherit the project's Super Result contract when
+        # this task is created directly into a super_result workflow.
+        task = _inherit_super_result(task)
     await mgr.broadcast({"type": "task_created", "data": task}, user_id=uid)
     return task
 
@@ -716,6 +720,10 @@ async def update_task(task_id: str, body: TaskUpdate):
     if super_flipped:
         _sync_super_result_loop("task", task)
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    elif body.workflow_id is not None:
+        # (Re)attached to a workflow without an explicit flag → inherit its SR
+        # contract (clearing the workflow_id is a no-op inside the helper).
+        task = _inherit_super_result(task)
     await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return task
 
@@ -4179,6 +4187,34 @@ def _sync_super_result_loop(kind: str, row: dict):
                         "Super Result trigger removed from "
                         f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
                         user_id=row.get("user_id"))
+
+
+def _inherit_super_result(task: dict) -> dict:
+    """A task attached to a super_result WORKFLOW inherits the flag so it loops
+    with its siblings. The inherited-loop sweep (_sweep_super_result) requires
+    tasks.super_result=1, and the workflow-PATCH→members cascade only fires on a
+    LATER workflow PATCH — creating a member, or re-parenting a task, had no
+    inheritance, so such a member never looped. (There is NO high_stakes analog
+    to mirror: high_stakes has the SAME create/attach gap — recorded as a
+    follow-up, not changed in this batch.) The loop trigger lives on the
+    workflow's own loop_config (members sweep via the inherited-cfg rules); a
+    task carrying its OWN loop_config gets the trigger synced onto it too.
+    Returns the (re-read) task row."""
+    wf_id = task.get("workflow_id")
+    if not wf_id or task.get("super_result"):
+        return task
+    wf = db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,))
+    if not wf or not wf.get("super_result"):
+        return task
+    db.execute("UPDATE tasks SET super_result=1 WHERE id=?", (task["id"],))
+    _sync_super_result_loop("workflow", wf)  # ensure the project loop has the trigger
+    if task.get("loop_config"):
+        _sync_super_result_loop(
+            "task", db.query_one("SELECT * FROM tasks WHERE id=?", (task["id"],)))
+    db.log_activity("info", "loop",
+                    f"Task {task['id']} inherited Super Result from workflow {wf_id}",
+                    user_id=task.get("user_id"))
+    return db.query_one("SELECT * FROM tasks WHERE id=?", (task["id"],))
 
 
 @app.post("/api/tasks/{task_id}/feedback")
