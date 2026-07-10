@@ -429,6 +429,10 @@ chk "Q7c manual autopilot section"   "grep -q 'Autopilot — two simple dials' s
 # Rule 11 — specialist sweep (18 defs aligned to the [UNSURE] contract, in sync)
 chk "rule11 specialists use [UNSURE]"  "[ \$(grep -rl '\[UNSURE: reason\]' \$HOME/.hermes/agents/*.md | wc -l) -eq 18 ] && [ \$(grep -rl 'mark anything unchecked as' \$HOME/.hermes/agents/*.md | wc -l) -eq 0 ]"
 chk "rule11 vendored copies synced"    "for f in ../setup/hermes/agents/*.md; do cmp -s \"\$f\" \"\$HOME/.hermes/agents/\$(basename \$f)\" || exit 1; done"
+# Rule 12 — JARVIS stays current (advisor stance + new endpoints/fields in framing)
+chk "rule12 JARVIS advisor stance"   "grep -q 'PROACTIVE ADVISOR' server.py && grep -q 'INSPECTOR' server.py"
+chk "rule12 JARVIS knows decisions"  "grep -q 'DECISIONS INBOX: GET /api/decisions' server.py"
+chk "rule12 JARVIS knows presets"    "grep -q 'spend_profile.*eco|optimal|smart' server.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
