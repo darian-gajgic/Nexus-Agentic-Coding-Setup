@@ -50,7 +50,26 @@ def delete(p, **k): return requests.delete(BASE + p, cookies=CK, verify=False, t
 
 
 # ── clean slate + stub the planning model ──
-db.execute("DELETE FROM plan_sessions")
+# Fable-5 checker finding N1: NEVER wipe the whole table — that destroys the
+# operator's real planning history and orphans live Hermes sessions. Scope every
+# delete to THIS gate's known goals, and free a linked Hermes session first.
+GATE_GOALS = ("Build a login API", "another goal", "drafted goal")
+
+
+def _wipe_gate_sessions():
+    ph = ",".join("?" * len(GATE_GOALS))
+    for r in db.query_all(f"SELECT id, hermes_session_id FROM plan_sessions WHERE goal IN ({ph})",
+                          GATE_GOALS):
+        if r.get("hermes_session_id"):
+            try:
+                import hermes_dispatch as hd
+                hd.delete_session(r["hermes_session_id"])
+            except Exception:
+                pass
+    db.execute(f"DELETE FROM plan_sessions WHERE goal IN ({ph})", GATE_GOALS)
+
+
+_wipe_gate_sessions()
 _stub0 = db.get_setting("plan.stub", "0")
 db.set_setting("plan.stub", "1")
 
@@ -172,7 +191,7 @@ chk("stale drafted session swept → abandoned",
 for wid in _created_wf:
     delete(f"/api/workflows/{wid}")
     shutil.rmtree(f"workspaces/workflow-{wid}", ignore_errors=True)
-db.execute("DELETE FROM plan_sessions")
+_wipe_gate_sessions()
 db.set_setting("plan.stub", _stub0)
 
 print(f"\n{'='*44}")

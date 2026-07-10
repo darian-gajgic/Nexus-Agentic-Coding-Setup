@@ -9907,7 +9907,12 @@ async function deepPlanAbandon() {
   if (!deepPlan) { closeModal(); return; }
   const id = deepPlan.session.id;
   deepPlan = null; closeModal();
-  try { await api('DELETE', `/api/plan/sessions/${id}`); } catch (e) { }
+  try { await api('DELETE', `/api/plan/sessions/${id}`); }
+  catch (e) {
+    // a failed abandon leaves the session active (resumable for the same goal;
+    // the 7-day sweep is the backstop) — tell the operator instead of hiding it
+    toast('Could not abandon the planning session — it stays resumable: ' + e.message, 'err');
+  }
 }
 
 async function deepPlanDraft() {
