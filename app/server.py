@@ -4099,11 +4099,16 @@ async def run_critic(task_id: str):
     deliv = os.path.join(task.get("workspace_path") or "", "deliverable.md")
     if not task.get("workspace_path") or not os.path.isfile(deliv):
         return JSONResponse(status_code=400, content={"error": "no deliverable.md to critique yet"})
-    if task.get("critic_verdict") == "running":
-        return JSONResponse(status_code=409, content={"error": "critic already running"})
     round_no = int(task.get("critic_round") or 0) + 1
-    db.execute("UPDATE tasks SET critic_verdict='running', critic_output=NULL, critic_ts=? "
-               "WHERE id=?", (time.time(), task_id))
+    # CAS so two concurrent POSTs can't both spawn a critic thread (check-then-
+    # act let both through). Only the row that actually flips to 'running' wins;
+    # a lost race is a 409, mirroring claim_task / db.claim_task_cas.
+    cur = db.execute(
+        "UPDATE tasks SET critic_verdict='running', critic_output=NULL, critic_ts=? "
+        "WHERE id=? AND (critic_verdict IS NULL OR critic_verdict!='running')",
+        (time.time(), task_id))
+    if cur.rowcount == 0:
+        return JSONResponse(status_code=409, content={"error": "critic already running"})
     threading.Thread(target=_critic_thread, args=(task_id,), daemon=True).start()
     db.log_activity("info", "critic", f"Super Result critic started on {task_id} "
                     f"(round {round_no})", user_id=task.get("user_id"))
