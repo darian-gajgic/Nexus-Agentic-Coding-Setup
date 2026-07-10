@@ -49,6 +49,7 @@ def chk(name, cond):
 
 def get(p, **k): return requests.get(BASE + p, cookies=CK, verify=False, timeout=15, **k)
 def post(p, **k): return requests.post(BASE + p, cookies=CK, verify=False, timeout=20, **k)
+def patch(p, **k): return requests.patch(BASE + p, cookies=CK, verify=False, timeout=25, **k)
 
 
 print("=== Q7a — preset derivation (rules 1/2/4/6) ===")
@@ -341,6 +342,80 @@ try:
         _cleanup.append(lambda: db.execute("DELETE FROM scheduled_jobs WHERE id=?", (jid,)))
 except Exception:
     chk("rule7 scheduler create reachable", False)
+
+print("=== Q7a — workflow PATCH cascade of BOTH preset axes → member tasks (HTTP) ===")
+# Part-5 gate: "workflow cascade of both fields". PATCH a workflow's two axes and
+# assert every member task inherits BOTH autopilot AND spend_profile (mirrors the
+# high_stakes cascade). Runs against the live server so the real cascade fires.
+try:
+    wc = post("/api/workflows", json={"name": "QA cascade proj"})
+    wcid = wc.json().get("id")
+    if wcid:
+        _cleanup.append(lambda: db.execute("DELETE FROM workflows WHERE id=?", (wcid,)))
+        for i in range(2):
+            db.execute("INSERT OR REPLACE INTO tasks (id, title, status, user_id, workflow_id, "
+                       "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                       (f"wc-m{i}", f"Member {i}", "backlog", uid, wcid, time.time(), time.time()))
+        _cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE workflow_id=?", (wcid,)))
+        pr = patch(f"/api/workflows/{wcid}", json={"autopilot": "full_auto", "spend_profile": "smart"})
+        mem = db.query_all("SELECT autopilot, spend_profile FROM tasks WHERE workflow_id=?", (wcid,))
+        chk("Q7a workflow PATCH cascades BOTH axes to every member task",
+            pr.status_code == 200 and len(mem) == 2
+            and all(m["autopilot"] == "full_auto" and m["spend_profile"] == "smart" for m in mem))
+        wrow = db.query_one("SELECT autopilot, spend_profile FROM workflows WHERE id=?", (wcid,))
+        chk("Q7a workflow row itself carries both axes after PATCH",
+            wrow and wrow["autopilot"] == "full_auto" and wrow["spend_profile"] == "smart")
+    else:
+        chk("Q7a workflow create for cascade reachable", False)
+except Exception:
+    chk("Q7a workflow cascade reachable", False)
+
+print("=== Q2 — edit-evidence capture through a REAL reject→accept cycle (_capture_accept_diff) ===")
+# Part-5 gate: "edit-evidence capture on reject→accept cycle". Exercise the ACTUAL
+# approval endpoint (not record_evidence directly): a rejection versions the
+# deliverable + captures feedback, then an accept of the reworked version drives
+# server._capture_accept_diff → an 'accept_diff' evidence row. A dangling dependency
+# parks the task so no live worker ever claims/dispatches it (deps_satisfied is
+# fail-closed), keeping the cycle deterministic and LLM-free.
+ev_ws = hd.WORKSPACES / f"qa-edit-{int(time.time())}"
+ev_ws.mkdir(parents=True, exist_ok=True)
+_cleanup.append(lambda: shutil.rmtree(ev_ws, ignore_errors=True))
+(ev_ws / "deliverable.md").write_text("Draft one.\nNo call to action.\nHedged, unsure phrasing.\n")
+etid = f"qa-edit-{int(time.time())}"
+db.execute("INSERT OR REPLACE INTO tasks (id, title, status, user_id, domain, workspace_path, "
+           "dispatch_state, depends_on, created_at, updated_at) "
+           "VALUES (?,?,?,?,?,?,?,?,?,?)",
+           (etid, "Edit-evidence task", "review", uid, "ecommerce", str(ev_ws),
+            "completed", json.dumps(["qa-missing-blocker"]), time.time(), time.time()))
+_cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE id=?", (etid,)))
+_cleanup.append(lambda: db.execute("DELETE FROM edit_evidence WHERE domain='ecommerce' AND task_id=?", (etid,)))
+_cleanup.append(lambda: db.execute("DELETE FROM routing_outcomes WHERE task_id=?", (etid,)))
+_cleanup.append(lambda: db.execute("DELETE FROM approvals WHERE id IN ('qa-appr-rej','qa-appr-acc')"))
+db.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
+           "risk_level, requested_at, user_id) VALUES ('qa-appr-rej','a','deliverable','d',?,'pending','low',?,?)",
+           (json.dumps({"task_id": etid}), time.time(), uid))
+try:
+    rj = patch("/api/approvals/qa-appr-rej",
+               json={"status": "rejected", "feedback": "Add a strong CTA; cut the hedging."})
+    v1 = ev_ws / "deliverable.v1.md"
+    chk("Q2 reject versioned the rejected deliverable (deliverable.v1.md)",
+        rj.status_code == 200 and v1.is_file())
+    fb_ev = db.query_one("SELECT * FROM edit_evidence WHERE task_id=? AND kind='feedback'", (etid,))
+    chk("Q2 reject captured the operator feedback as evidence",
+        bool(fb_ev) and "CTA" in (fb_ev["content"] or ""))
+    # simulate the rework: a new accepted deliverable, task back in review for sign-off
+    (ev_ws / "deliverable.md").write_text("Final draft.\nStrong call to action: Buy now.\nConfident, verified claims.\n")
+    db.execute("UPDATE tasks SET status='review', dispatch_state='completed', claimed_by=NULL WHERE id=?", (etid,))
+    db.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
+               "risk_level, requested_at, user_id) VALUES ('qa-appr-acc','a','deliverable','d',?,'pending','low',?,?)",
+               (json.dumps({"task_id": etid}), time.time(), uid))
+    ac = patch("/api/approvals/qa-appr-acc", json={"status": "approved"})
+    diff_ev = db.query_one("SELECT * FROM edit_evidence WHERE task_id=? AND kind='accept_diff'", (etid,))
+    chk("Q2 accept drove _capture_accept_diff → an accept_diff evidence row",
+        ac.status_code == 200 and bool(diff_ev)
+        and "Buy now" in (diff_ev["content"] or "") and "call to action" in (diff_ev["content"] or ""))
+except Exception as _e:
+    chk("Q2 reject→accept approval cycle reachable", False)
 
 for fn in _cleanup:
     try:

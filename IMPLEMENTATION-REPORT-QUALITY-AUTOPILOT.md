@@ -247,3 +247,17 @@ evidence), given a regression check, and committed granularly. The tree is fully
    preference from `derivedPref(spend_profile)`. `app.js?v=81`. **Regression:** `verify_autopilot_ui.py`
    asserts zero `m-task-loop-pref` radios, a present `#m-task-pref-derived` chip, and that the chip
    reacts to the Eco spend selection (Eco → Speed). Rule-1 row above corrected.
+
+3. **`verify_autopilot_e2e.py` missing two Part-5-enumerated behavioral checks.** Part 5 lists a
+   "workflow cascade of both fields" and "edit-evidence capture on reject→accept cycle"; the gate had
+   neither — the Q7a group never PATCHed a workflow, and the Q2 group seeded `edit_evidence` directly
+   via `record_evidence`, so `server._capture_accept_diff` (the strongest correction signal) was never
+   exercised. **Fix — two new behavioral groups (deterministic, no LLM):** (a) *workflow cascade* —
+   `POST /api/workflows`, seed 2 members, `PATCH` both preset axes, assert every member inherits BOTH
+   `autopilot` and `spend_profile` (and the workflow row too); (b) *real reject→accept cycle* — seed a
+   review-stage task with a live workspace and a **dangling dependency** (so `deps_satisfied`, which is
+   fail-closed, parks it and no worker ever claims/dispatches it — deterministic), then `PATCH` its
+   deliverable approval **rejected** (asserting the deliverable is versioned to `deliverable.v1.md` and
+   the feedback is captured as evidence), stage the reworked deliverable, and `PATCH` a fresh approval
+   **approved** — asserting `_capture_accept_diff` fired and wrote an `accept_diff` evidence row carrying
+   the actual added→removed text. Self-cleaning (verified: no leftover tasks/approvals/evidence/workspaces).
