@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Runtime gate — Deep Plan mode (DEEP-PLAN-MODE-PLAN-2026-07-10).
+
+Drives the conversational planning phase end to end against the LIVE server with
+the PLANNING model stubbed via `plan.stub` (C-5: mirrors evals.stub — the
+judge/critic command stubs do NOT reach session turns, so this flips plan.stub
+instead). Deterministic parts (triage heuristics, structural validators,
+family→deliverable_type, sweep) are exercised directly.
+
+Run from app/:  .venv/bin/python scripts/verify_deep_plan_e2e.py
+"""
+import os
+import sys
+import time
+import json
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import database as db
+import plan_engine as pe
+import evals as ev
+import server as srv
+
+import requests
+import urllib3
+urllib3.disable_warnings()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gate_auth import owner_cookie
+
+CK = owner_cookie()
+BASE = "https://127.0.0.1:8777"
+PASS = 0
+FAIL = 0
+_created_wf = []
+
+
+def chk(name, cond):
+    global PASS, FAIL
+    if cond:
+        print(f"  PASS  {name}"); PASS += 1
+    else:
+        print(f"  FAIL  {name}"); FAIL += 1
+
+
+def post(p, **k): return requests.post(BASE + p, cookies=CK, verify=False, timeout=40, **k)
+def get(p, **k): return requests.get(BASE + p, cookies=CK, verify=False, timeout=15, **k)
+def patch(p, **k): return requests.patch(BASE + p, cookies=CK, verify=False, timeout=15, **k)
+def delete(p, **k): return requests.delete(BASE + p, cookies=CK, verify=False, timeout=15, **k)
+
+
+# ── clean slate + stub the planning model ──
+db.execute("DELETE FROM plan_sessions")
+_stub0 = db.get_setting("plan.stub", "0")
+db.set_setting("plan.stub", "1")
+
+print("=== Step 2 — triage heuristics (deterministic, no model) ===")
+simple = pe.triage_heuristics("Fix the typo in the footer link")
+complex_ = pe.triage_heuristics(
+    "Audit the whole system, then build a marketing site and an email campaign "
+    "based on the findings and deploy it to production")
+chk("simple goal → low complexity, no recommend",
+    simple["complexity"] < 3 and pe.recommend(simple)["recommend_deep_plan"] is False)
+chk("complex goal → high complexity + recommend + blast radius",
+    complex_["complexity"] >= 5 and pe.recommend(complex_)["recommend_deep_plan"] is True
+    and complex_["blast_radius"] is True)
+chk("recommendation payload shape",
+    set(pe.recommend(complex_)) >= {"complexity", "ambiguity", "recommend_deep_plan",
+                                    "recommend_super_result", "reasons", "family"})
+chk("spend profile overrides setting (eco→never, smart→always)",
+    pe.recommend(complex_, spend_profile="eco")["recommend_deep_plan"] is False
+    and pe.recommend(simple, spend_profile="smart")["recommend_deep_plan"] is True)
+chk("divergence math flags disagreement",
+    pe.divergence([{"task_count": 1, "tokens": {"login"}, "shape": "single"},
+                   {"task_count": 4, "tokens": {"db", "email"}, "shape": "dag"}])["score"] > 0.5)
+
+print("=== Step 4 — session CRUD + resume + slot-fill READY stop rule ===")
+r = post("/api/plan/sessions", json={"goal": "Build a login API", "family": "software"})
+chk("start session (200)", r.status_code == 200)
+s = r.json(); sid = s["id"]
+chk("family + first questions + spec slots",
+    s["family"] == "software" and len(s["spec"]) >= 3 and s["turns"] == 1)
+chk("resume: GET one + list", get(f"/api/plan/sessions/{sid}").status_code == 200
+    and any(x["id"] == sid for x in get("/api/plan/sessions").json()["sessions"]))
+# fill required slots turn by turn until READY
+for msg in ("FastAPI + SQLite", "returns 401 on expired token", "logs each failed login"):
+    if s.get("ready"):
+        break
+    s = post(f"/api/plan/sessions/{sid}/turn", json={"message": msg}).json()
+chk("required slots fill → READY stop rule", s["required_filled"] and s["ready"])
+chk("direct slot edit (PATCH spec)",
+    [x for x in patch(f"/api/plan/sessions/{sid}/spec",
+                      json={"updates": {"out_of_scope": "no OAuth"}}).json()["spec"]
+     if x["key"] == "out_of_scope"][0]["filled"])
+
+print("=== Step 6 — draft seeds phase-2 + criteria distribution + family type ===")
+# add a 2nd acceptance criterion so distribution is observable
+patch(f"/api/plan/sessions/{sid}/spec",
+      json={"updates": {"acceptance_criteria": ["returns 401 on expired token",
+                                                "returns 200 on valid login"]}})
+d = post(f"/api/plan/sessions/{sid}/draft", json={"super_result": False}).json()
+chk("draft returns a workflow proposal + session id",
+    d["type"] == "workflow" and d.get("plan_session_id") == sid)
+tks = d["workflow"]["tasks"]
+chk("family→deliverable_type on every task (software→code_change)",
+    all(t.get("deliverable_type") == "code_change" for t in tks))
+chk("acceptance criteria distributed as 'Done when:' lines",
+    sum(ln.startswith("Done when:") for t in tks for ln in t["description"].splitlines()) >= 2)
+chk("draft flips session status to drafted",
+    get(f"/api/plan/sessions/{sid}").json()["status"] == "drafted")
+
+print("=== Step 7 — structural validators + premortem stub → annotations ===")
+orphan_spec = {"acceptance_criteria": ["returns 401 on expired token",
+                                       "an orphan criterion covered nowhere zzz"],
+               "stack_platform": "FastAPI"}
+orphan_plan = [{"title": "Implement login", "depends_on_idx": [],
+                "description": "implement. Done when: returns 401 on expired token"}]
+w = srv._validate_plan(orphan_plan, "software", orphan_spec)
+chk("orphan-criterion validator fires",
+    any("not covered by any task" in x["message"] for x in w))
+c = post(f"/api/plan/sessions/{sid}/critique", json={"tasks": tks}).json()
+chk("premortem stub → findings annotations payload",
+    isinstance(c.get("findings"), list) and len(c["findings"]) >= 1
+    and c["findings"][0].get("task_idx") is not None)
+chk("critique returns structural warnings + advisory flag",
+    isinstance(c.get("warnings"), list) and c.get("critique_enabled") is True)
+
+print("=== Step 8 — spec travels: attachment + critic context ===")
+wf = post("/api/workflows", json={"name": "Login API DP", "goal": "Build a login API"}).json()
+_created_wf.append(wf["id"])
+a = post(f"/api/plan/sessions/{sid}/attach", json={"kind": "workflow", "id": wf["id"]})
+adir = f"workspaces/workflow-{wf['id']}/attachments"
+chk("attach writes SPEC.md + spec.json + status=created",
+    a.status_code == 200 and os.path.isfile(f"{adir}/SPEC.md")
+    and os.path.isfile(f"{adir}/spec.json")
+    and get(f"/api/plan/sessions/{sid}").json()["status"] == "created")
+# build_critic_sandbox copies spec.json into the critic context
+tw = f"workspaces/dp-critic-{wf['id']}"
+os.makedirs(tw, exist_ok=True)
+open(f"{tw}/deliverable.md", "w").write("# d")
+sb, _rel = ev.build_critic_sandbox(
+    {"id": f"dt-{wf['id']}", "title": "t", "workspace_path": os.path.abspath(tw),
+     "workflow_id": wf["id"], "description": "x"})
+ctx = json.load(open(sb / "_critic_context" / "context.json"))
+chk("spec.json reaches the critic context",
+    ctx.get("spec") == "_critic_context/spec.json"
+    and (sb / "_critic_context" / "spec.json").is_file())
+import shutil
+shutil.rmtree(sb, ignore_errors=True)
+shutil.rmtree(tw, ignore_errors=True)
+
+print("=== Step 4 — session hygiene sweep (abandon stale actives) ===")
+r2 = post("/api/plan/sessions", json={"goal": "another goal", "family": "content"}).json()
+db.execute("UPDATE plan_sessions SET updated_at=? WHERE id=?",
+           (time.time() - 8 * 86400, r2["id"]))
+srv.sweep_stale_plan_sessions()
+chk("stale active session swept → abandoned",
+    (db.query_one("SELECT status FROM plan_sessions WHERE id=?", (r2["id"],)) or {})
+    .get("status") == "abandoned")
+
+# ── cleanup ──
+for wid in _created_wf:
+    delete(f"/api/workflows/{wid}")
+    shutil.rmtree(f"workspaces/workflow-{wid}", ignore_errors=True)
+db.execute("DELETE FROM plan_sessions")
+db.set_setting("plan.stub", _stub0)
+
+print(f"\n{'='*44}")
+if FAIL == 0:
+    print(f"  ALL DEEP PLAN CHECKS PASSED: {PASS}/{PASS}")
+    sys.exit(0)
+print(f"  {FAIL} FAILED, {PASS} passed")
+sys.exit(1)

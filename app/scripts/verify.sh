@@ -447,6 +447,43 @@ chk "autopilot UI gate exists"       "[ -f scripts/verify_autopilot_ui.py ]"
 chk "autopilot module + routing/lessons" "[ -f autopilot.py ] && [ -f routing.py ] && [ -f lessons.py ]"
 
 echo ""
+echo -e "${YELLOW}═══ 20. DEEP PLAN (conversational planning — DEEP-PLAN-MODE-PLAN-2026-07-10) ═══${NC}"
+# Step 1 — DB / settings / purpose seed
+chk "plan_sessions table"            "grep -q 'CREATE TABLE IF NOT EXISTS plan_sessions' database.py"
+chk "spec_model purpose seeded+whitelisted" "grep -q '\"spec_model\"' database.py && grep -q 'migrated.spec_model' database.py && grep -q 'spec_model' settings_registry.py && grep -q 'MODEL_PURPOSES = ' database.py"
+chk "CLI_PURPOSES gate (judge+spec)" "grep -q 'CLI_PURPOSES' settings_registry.py && grep -q 'sreg.CLI_PURPOSES' server.py"
+chk "plan.* settings section"        "grep -q 'plan.deep_enabled' settings_registry.py && grep -q 'plan.recommend' settings_registry.py && grep -q 'plan.triage_samples' settings_registry.py && grep -q 'plan.critique_enabled' settings_registry.py && grep -q 'plan.stub' settings_registry.py"
+# Step 2 — triage
+chk "plan_engine module + triage"    "[ -f plan_engine.py ] && grep -q 'def triage_heuristics' plan_engine.py && grep -q 'def divergence' plan_engine.py && grep -q 'def recommend' plan_engine.py"
+chk "family→deliverable_type map"    "grep -q 'FAMILY_DELIVERABLE_TYPE' plan_engine.py && grep -q '\"code_change\"' plan_engine.py"
+chk "triage wired into wizard"       "grep -q 'def _wizard_triage' server.py && grep -q '_wizard_triage(instruction' server.py && grep -q 'out\[.triage.\] = triage' server.py"
+chk "triage sampling non-blocking"   "grep -q 'def _triage_sample' server.py && grep -q 'threading.Thread(target=_triage_sample' server.py"
+# Step 4 — session backend + templates + hygiene
+chk "spec templates + stub"          "grep -q 'SPEC_TEMPLATES' plan_engine.py && grep -q 'def stub_turn' plan_engine.py && grep -q 'def render_spec_md' plan_engine.py"
+chk "plan session endpoints"         "grep -q '/api/plan/sessions' server.py && grep -q '/api/plan/sessions/{sid}/turn' server.py && grep -q '/api/plan/sessions/{sid}/draft' server.py && grep -q '/api/plan/sessions/{sid}/critique' server.py && grep -q '/api/plan/sessions/{sid}/attach' server.py"
+chk "B7 no-block: model work off-loop" "grep -q 'run_in_threadpool(_plan_run_turn' server.py && grep -q 'run_in_threadpool(_plan_draft_raw' server.py && grep -q 'run_in_threadpool(_ev.run_plan_critique' server.py"
+chk "plan.stub short-circuits turns" "grep -q \"plan.stub\" server.py && grep -q 'def stub_plan' plan_engine.py"
+chk "session hygiene sweep"          "grep -q 'def sweep_stale_plan_sessions' server.py && grep -q 'sweep_stale_plan_sessions' scheduler.py"
+# Step 6 — draft
+chk "draft seeds spec block"         "grep -q 'spec_block: str' server.py && grep -q 'SPEC CONTRACT' server.py && grep -q 'def _plan_draft_raw' server.py"
+# Step 7 — validators + premortem (external model, frontier gate)
+chk "structural validators"          "grep -q 'def _validate_plan' server.py && grep -q 'not covered by any task' server.py"
+chk "premortem external + frontier gate" "grep -q 'def run_plan_critique' evals.py && grep -q 'def spec_model_for' evals.py && grep -q 'with _FRONTIER_GATE' evals.py"
+chk "premortem parse + advisory"     "grep -q 'def parse_plan_critique' evals.py && grep -q 'PLAN_JSON_BEGIN' evals.py"
+# Step 8 — spec travels downstream
+chk "spec attach (SPEC.md+spec.json)" "grep -q 'def _write_session_spec' server.py && grep -q 'SPEC.md' server.py && grep -q \"status='created'\" server.py"
+chk "spec → critic context"          "grep -q 'spec_ctx' evals.py && grep -q '\"spec\": spec_ctx' evals.py"
+chk "spec → judge (JUDGE_SPEC)"       "grep -q 'JUDGE_SPEC' evals.py && grep -q 'JUDGE_SPEC' ../setup/bin/cjudge && grep -q 'JUDGE_SPEC' \$HOME/.local/bin/cjudge"
+chk "replan seeds original spec"     "grep -q 'def _workflow_spec_md' server.py && grep -q 'ORIGINAL SPEC' server.py"
+# Step 3/5 — UI
+chk "deep plan UI"                   "grep -q 'function startDeepPlan' static/app.js && grep -q 'function deepPlanModal' static/app.js && grep -q 'function deepPlanRunCritique' static/app.js && grep -q 'function deepPlanRecommendModal' static/app.js"
+chk "premortem annotations in editor" "grep -q 'planEd.annotations' static/app.js && grep -q 'planEd.planSessionId' static/app.js"
+# Step 9 — JARVIS framing (rule 12)
+chk "JARVIS knows Deep Plan"         "grep -q 'DEEP PLAN:' server.py && grep -q '/api/plan/sessions' server.py"
+# Step 10 — e2e gate
+chk "deep plan e2e gate exists"      "[ -f scripts/verify_deep_plan_e2e.py ]"
+
+echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then
   echo -e "  ${GREEN}ALL CHECKS PASSED: $PASS/$PASS${NC}"
