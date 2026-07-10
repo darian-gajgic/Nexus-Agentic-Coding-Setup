@@ -3089,17 +3089,18 @@ function appPreviewModal(taskId, title, info) {
       if (logEl) { logEl.textContent = lg.log || '…'; logEl.scrollTop = logEl.scrollHeight; }
       const run = st.running;
       const stEl = $('#ap-state');
+      const beTxt = r => r.backend_port ? (' · API backend :' + r.backend_port + (r.backend_ready ? ' ✅' : ' ⏳')) : '';
       if (run && run.ready) {
         stEl.className = 'chip c-green';
-        stEl.textContent = '✅ running — ' + run.url;
+        stEl.textContent = '✅ running — ' + run.url + beTxt(run);
         const a = $('#ap-open');
         if (a) { a.style.display = 'inline-block'; a.href = run.url; }
         if (!opened) { opened = true; window.open(run.url, '_blank'); }
       } else if (run) {
         stEl.className = 'chip c-orange';
-        stEl.textContent = run.state === 'installing'
+        stEl.textContent = (run.state === 'installing'
           ? '📦 installing dependencies… (first run can take minutes)'
-          : '⏳ starting — waiting for the app to answer on ' + run.url;
+          : '⏳ starting — waiting for the app to answer on ' + run.url) + beTxt(run);
       } else if (st.exited) {
         stEl.className = 'chip c-red';
         stEl.textContent = '✕ the app exited before becoming ready — see the log above';
@@ -3179,6 +3180,7 @@ function projectAppModal(wfId, name, info) {
         <div class="agentic-row slim" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <span style="font-family:var(--font-mono);font-size:11px">${esc(a.version)}</span>
           <span class="chip ${a.ready ? 'c-green' : 'c-orange'}">${a.ready ? '✅ running' : (a.state === 'installing' ? '📦 installing…' : '⏳ starting…')}</span>
+          ${a.backend_port ? `<span class="chip ${a.backend_ready ? 'c-green' : 'c-orange'}" title="API backend on 127.0.0.1:${a.backend_port}">${a.backend_ready ? '⚙ api ✅' : '⚙ api ⏳'}</span>` : ''}
           <span style="flex:1;font-size:11px;color:var(--text-faint)">${esc(a.label || '')}</span>
           ${a.ready ? `<a class="btn-sm" href="${esc(a.url)}" target="_blank" style="text-decoration:none;border-color:var(--accent-2)">↗ Open</a>` : ''}
           <button class="btn-sm" onclick="projAppFocus='${esc(a.version)}'">📜 Log</button>
