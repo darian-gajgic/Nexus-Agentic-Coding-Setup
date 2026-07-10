@@ -97,6 +97,13 @@ app.add_middleware(AuthMiddleware)
 @app.on_event("startup")
 def startup():
     db.init_db()
+    # Capture the running loop so synchronous background threads can broadcast
+    # WS events (sync startup handlers run ON the loop thread, so this resolves).
+    global _EVENT_LOOP
+    try:
+        _EVENT_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        _EVENT_LOOP = None
     # Judge runs in a daemon thread — a server restart mid-judge would leave
     # judge_verdict='running' locked in the DB forever (every later judge call
     # 409s). Any 'running' at boot is by definition a dead judge: clear it.
@@ -246,6 +253,38 @@ class ConnectionManager:
 
 
 mgr = ConnectionManager()
+
+
+# The server's event loop, captured at startup so SYNCHRONOUS threads (loop
+# engine, judge/critic threads) can push WS events. Without this, verdict
+# transitions that happen off the request path fired no task_updated — the UI
+# toast was dead on SHIP / escalation / stored-critic-verdict.
+_EVENT_LOOP: "asyncio.AbstractEventLoop | None" = None
+
+
+def broadcast_threadsafe(data: dict, user_id: str | None = None):
+    """Schedule a ConnectionManager broadcast from a non-async thread. No-op
+    until startup captures the loop; never raises into the caller."""
+    loop = _EVENT_LOOP
+    if loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(mgr.broadcast(data, user_id), loop)
+    except Exception:
+        pass
+
+
+def _broadcast_task_row(task_id: str, user_id: str | None = None):
+    """Fetch a task row and broadcast task_updated from a synchronous thread
+    (critic/judge threads, loop engine). Best-effort — never raises."""
+    try:
+        row = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if row:
+            broadcast_threadsafe({"type": "task_updated", "data": row},
+                                 user_id=user_id if user_id is not None
+                                 else row.get("user_id"))
+    except Exception:
+        pass
 
 
 # --- Models ---
@@ -3801,6 +3840,21 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey,
                             type_rubric=trubric)
     verdict, learning = _parse_judge_output(out)
+    # Frontier quota/rate-limit is transient, not a scoring failure (premortem
+    # P1): back off and leave the row re-judgeable ('interrupted', no judge_ts
+    # so auto-judge re-runs after the window) instead of storing 'error'. Only
+    # when NO verdict parsed, so a rubric that mentions rate limits is safe.
+    if verdict is None and _ev.is_frontier_quota_error(out):
+        wait = _ev.note_frontier_quota_hit()
+        db.execute("UPDATE tasks SET judge_verdict='interrupted', judge_output=? WHERE id=?",
+                   (out[-30000:], task_id))
+        db.log_activity("warn", "judge",
+                        f"Frontier judge on {task_id} deferred — quota/rate-limit, "
+                        f"backing off {wait}s (run it again after)", user_id=owner)
+        _broadcast_task_row(task_id, owner)
+        return
+    if verdict:
+        _ev.note_frontier_quota_ok()  # a clean run resets the escalation counter
     db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=? WHERE id=?",
                (verdict or "error", out[-30000:], time.time(), task_id))
     # N3: when the (upgraded) judge emitted structured findings, auto-fill the
@@ -3932,53 +3986,99 @@ def _critic_thread(task_id: str):
     run) and persist verdict/findings/auto-comments. Blocking work stays in
     this thread (B7's no-block-in-async rule)."""
     import evals as _ev
-    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
-    if not task:
-        return
-    round_no = int(task.get("critic_round") or 0) + 1
-    owner = task.get("user_id")
-    jmodel, jkey = _ev.judge_model_for(owner)
-    domain = (task.get("domain") or "").strip() or None
+    round_no = 1
+    owner = None
     try:
-        out = _ev.run_critic_cmd(task, domain, model=jmodel, api_key=jkey,
-                                 round_no=round_no)
+        task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if not task:
+            return
+        round_no = int(task.get("critic_round") or 0) + 1
+        owner = task.get("user_id")
+        jmodel, jkey = _ev.judge_model_for(owner)
+        domain = (task.get("domain") or "").strip() or None
+        try:
+            out = _ev.run_critic_cmd(task, domain, model=jmodel, api_key=jkey,
+                                     round_no=round_no)
+        except Exception as e:
+            out = f"[critic failed to run: {e}]"
+        try:
+            parsed = _ev.parse_critic_json(out, repo_task=bool(task.get("repo_path")))
+        except ValueError as e:
+            # No usable output. Classify the frontier subscription's quota/
+            # rate-limit ceiling APART from a genuine content error (premortem
+            # P1): a quota hit is transient — back off, clear the verdict so the
+            # sweep re-critiques after the window, and NEVER store 'error' /
+            # escalate to the human. Only consulted here, where there is no
+            # valid critique, so a critique that discusses rate limits is safe.
+            if _ev.is_frontier_quota_error(out):
+                wait = _ev.note_frontier_quota_hit()
+                db.execute(
+                    "UPDATE tasks SET critic_verdict=NULL, critic_ts=NULL, "
+                    "critic_output=? WHERE id=?", ((out or "")[-30000:], task_id))
+                db.log_activity("warn", "critic",
+                                f"Super Result critic on {task_id} deferred — frontier "
+                                f"quota/rate-limit, backing off {wait}s (will retry)",
+                                user_id=owner)
+                _broadcast_task_row(task_id, owner)
+                return
+            # genuine unusable output → 'error' verdict; the sweep escalates on it
+            db.execute("UPDATE tasks SET critic_verdict='error', critic_output=?, "
+                       "critic_ts=?, critic_round=? WHERE id=?",
+                       ((out or "")[-30000:], time.time(), round_no, task_id))
+            db.log_activity("error", "critic",
+                            f"Super Result critic on {task_id}: unusable output "
+                            f"({str(e)[:120]})", user_id=owner)
+            _broadcast_task_row(task_id, owner)
+            return
+        _ev.note_frontier_quota_ok()  # a clean run resets the escalation counter
+        # Convergence bookkeeping: this round's finding keys + last round's, so
+        # the sweep can detect "no NEW findings" (keys ⊆ prev) without re-parsing.
+        try:
+            old = json.loads(task.get("critic_keys") or "null") or {}
+        except Exception:
+            old = {}
+        critic_keys = json.dumps({"round": round_no, "keys": parsed["_keys"],
+                                  "prev": old.get("keys") or []})
+        # Persist the verdict BEFORE the comment insert: if _insert_critic_comments
+        # raises, the row must not stay stuck at 'running' (B1 boot-reset only
+        # heals AT restart). The comment insert + notify run after — a failure
+        # there keeps the real verdict (see the catch-all's WHERE guard).
+        db.execute(
+            "UPDATE tasks SET critic_verdict=?, critic_output=?, critic_json=?, "
+            "critic_ts=?, critic_round=?, critic_keys=? WHERE id=?",
+            (parsed["verdict"], (out or "")[-30000:], json.dumps(parsed)[:60000],
+             time.time(), round_no, critic_keys, task_id))
+        _broadcast_task_row(task_id, owner)  # stored-verdict transition → UI toast
+        n = _insert_critic_comments(task, parsed, source="critic")
+        db.log_activity("info", "critic",
+                        f"Super Result round {round_no} on {task_id}: {parsed['verdict']} — "
+                        f"{len(parsed['findings'])} finding(s), {n} comment(s) posted",
+                        user_id=owner)
+        try:
+            hd.notify_desktop("Nexus: Super Result",
+                              f"{parsed['verdict']} — {len(parsed['findings'])} finding(s) "
+                              f"on '{(task.get('title') or '')[:60]}'")
+        except Exception:
+            pass
     except Exception as e:
-        out = f"[critic failed to run: {e}]"
-    try:
-        parsed = _ev.parse_critic_json(out, repo_task=bool(task.get("repo_path")))
-    except ValueError as e:
-        # unusable output → 'error' verdict; the loop sweep escalates on it
-        db.execute("UPDATE tasks SET critic_verdict='error', critic_output=?, "
-                   "critic_ts=?, critic_round=? WHERE id=?",
-                   ((out or "")[-30000:], time.time(), round_no, task_id))
+        # Catch-all so the thread NEVER strands the row at 'running'. If a real
+        # verdict was already persisted, the failure was in the post-store
+        # comment insert / notify — keep the verdict (WHERE critic_verdict IS
+        # NULL OR ='running'); only heal a row we left mid-flight.
+        try:
+            db.execute(
+                "UPDATE tasks SET critic_verdict='error', "
+                "critic_output=COALESCE(critic_output,'')||?, critic_ts=?, "
+                "critic_round=? WHERE id=? AND "
+                "(critic_verdict IS NULL OR critic_verdict='running')",
+                (f"\n[critic thread crashed: {str(e)[:300]}]", time.time(),
+                 round_no, task_id))
+        except Exception:
+            pass
         db.log_activity("error", "critic",
-                        f"Super Result critic on {task_id}: unusable output "
-                        f"({str(e)[:120]})", user_id=owner)
-        return
-    # Convergence bookkeeping: this round's finding keys + last round's, so
-    # the sweep can detect "no NEW findings" (keys ⊆ prev) without re-parsing.
-    try:
-        old = json.loads(task.get("critic_keys") or "null") or {}
-    except Exception:
-        old = {}
-    critic_keys = json.dumps({"round": round_no, "keys": parsed["_keys"],
-                              "prev": old.get("keys") or []})
-    n = _insert_critic_comments(task, parsed, source="critic")
-    db.execute(
-        "UPDATE tasks SET critic_verdict=?, critic_output=?, critic_json=?, "
-        "critic_ts=?, critic_round=?, critic_keys=? WHERE id=?",
-        (parsed["verdict"], (out or "")[-30000:], json.dumps(parsed)[:60000],
-         time.time(), round_no, critic_keys, task_id))
-    db.log_activity("info", "critic",
-                    f"Super Result round {round_no} on {task_id}: {parsed['verdict']} — "
-                    f"{len(parsed['findings'])} finding(s), {n} comment(s) posted",
-                    user_id=owner)
-    try:
-        hd.notify_desktop("Nexus: Super Result",
-                          f"{parsed['verdict']} — {len(parsed['findings'])} finding(s) "
-                          f"on '{(task.get('title') or '')[:60]}'")
-    except Exception:
-        pass
+                        f"Super Result critic thread on {task_id} crashed: {str(e)[:160]}",
+                        user_id=owner)
+        _broadcast_task_row(task_id, owner)
 
 
 @app.post("/api/tasks/{task_id}/critic")

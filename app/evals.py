@@ -48,6 +48,97 @@ JUDGE_JSON_END = "NEXUS_JUDGE_JSON_END"
 DELIVERABLE_TYPES = ("analysis", "code_change", "content", "research")
 
 
+# ─────────────────────────── Frontier backpressure (premortem P1) ───────────────────────────
+# Every judge/critic run spawns the Claude CLI against ONE subscription with hard
+# usage ceilings. A GLOBAL gate caps concurrent frontier subprocesses (setting
+# frontier.max_concurrent, default 2 — mirrors hermes_dispatch's per-model GLM
+# slot gate), and CLI rate-limit/quota failures are classified APART from content
+# failures so the caller backs off + requeues instead of storing verdict='error'
+# and escalating a transient ceiling to the human.
+
+FRONTIER_QUOTA_SIGNATURES = (
+    "rate limit", "rate_limit", "429", "quota", "usage limit", "usage_limit",
+    "overloaded", "too many requests", "resource_exhausted",
+    "credit balance", "insufficient_quota",
+)
+
+
+def is_frontier_quota_error(text: str) -> bool:
+    """A Claude-CLI failure caused by the subscription's rate/usage ceiling
+    (transient) rather than bad content. Consulted ONLY when a run produced no
+    usable output, so a critique that merely discusses rate-limiting code can't
+    false-positive into a quota deferral."""
+    t = (text or "").lower()
+    return any(sig in t for sig in FRONTIER_QUOTA_SIGNATURES)
+
+
+def frontier_backoff_active() -> bool:
+    try:
+        return float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time()
+    except Exception:
+        return False
+
+
+def note_frontier_quota_hit() -> int:
+    """Exponential global backoff (60s doubling, cap 30 min), acknowledged once
+    per window — mirrors hermes_dispatch.note_quota_hit for the frontier side."""
+    now = time.time()
+    until = float(db.get_setting("frontier.quota_backoff_until", "0") or 0)
+    if until > now:
+        return int(until - now)  # storm already acknowledged by another run
+    n = int(db.get_setting("frontier.quota_consecutive", "0") or 0) + 1
+    backoff = min(60 * (2 ** (n - 1)), 1800)
+    db.set_setting("frontier.quota_consecutive", n)
+    db.set_setting("frontier.quota_backoff_until", now + backoff)
+    db.log_activity("warn", "frontier",
+                    f"Frontier (Claude CLI) quota/rate-limit hit #{n} — backing off {backoff}s")
+    return backoff
+
+
+def note_frontier_quota_ok():
+    """A clean frontier run resets the escalation counter; the active window is
+    left to expire on its own (the GLM-side semantics)."""
+    try:
+        if int(db.get_setting("frontier.quota_consecutive", "0") or 0):
+            db.set_setting("frontier.quota_consecutive", "0")
+    except Exception:
+        pass
+
+
+class _FrontierGate:
+    """Bounds concurrent frontier subprocesses. Re-reads the limit on each
+    acquisition (and each 1s wake) so a settings change applies without a
+    restart — the gate object is never rebuilt (rebuilding would leak the
+    in-flight count)."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._active = 0
+
+    def _limit(self) -> int:
+        import settings_registry as sreg
+        try:
+            return max(1, int(sreg.conf("frontier.max_concurrent", "2") or 2))
+        except Exception:
+            return 2
+
+    def __enter__(self):
+        with self._cond:
+            while self._active >= self._limit():
+                self._cond.wait(timeout=1.0)
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify()
+        return False
+
+
+_FRONTIER_GATE = _FrontierGate()
+
+
 def knowledge_root() -> str:
     return os.path.expanduser(db.get_setting("onboarding.root", "") or KNOWLEDGE_DIR)
 
@@ -227,8 +318,9 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         # passes it only when the case opts in via frontmatter).
         env["JUDGE_TYPE_RUBRIC"] = type_rubric
     try:
-        r = sp.run(tokens, capture_output=True, text=True, timeout=900,
-                   cwd=KNOWLEDGE_DIR, env=env)
+        with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
+            r = sp.run(tokens, capture_output=True, text=True, timeout=900,
+                       cwd=KNOWLEDGE_DIR, env=env)
         out = (r.stdout or "")
         if r.returncode != 0:
             out += f"\n[judge exited {r.returncode}] {(r.stderr or '')[-1000:]}"
@@ -551,8 +643,9 @@ def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
         env["SUPER_MAX_FINDINGS"] = sreg.conf("super.max_findings", "25")
         timeout_s = int(sreg.conf("super.timeout_s", "1500") or 1500)
         try:
-            r = sp.run(tokens, capture_output=True, text=True, timeout=timeout_s,
-                       cwd=str(sandbox), env=env)
+            with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
+                r = sp.run(tokens, capture_output=True, text=True, timeout=timeout_s,
+                           cwd=str(sandbox), env=env)
             out = (r.stdout or "")
             if r.returncode != 0:
                 out += f"\n[critic exited {r.returncode}] {(r.stderr or '')[-1000:]}"
