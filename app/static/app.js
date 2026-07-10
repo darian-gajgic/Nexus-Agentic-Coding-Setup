@@ -1868,6 +1868,23 @@ function viewManual() {
     <p>High-stakes deliverables can be graded by a stronger AI (Claude) against your own quality rubric — verdict, findings, and a score. On quality-mode loops this happens automatically.</p>
     <h4>Rejection with feedback</h4>
     <p>Your "Reject" + one sentence is the strongest quality tool: the agent gets your words verbatim and must address them. Specialists also <b>learn</b> from this — feedback becomes lessons they apply to future work.</p>
+
+    <h4>Who's who (the house metaphor)</h4>
+    <p>Everything uses the same plain words: the <b>worker</b> builds the deliverable; the <b>inspector</b> (Super Result critic) independently re-checks it against the real files and commands — not just re-reading, actually verifying; the <b>foreman</b> (the loop) sends work back until it passes; the <b>planner</b> shapes the job into steps; and <b>you are the client</b> who signs off. The 📄 preview highlights any claim the worker flagged as unverified in <span style="background:rgba(251,191,36,.18);color:#fbbf24;padding:0 3px;border-radius:3px">amber</span>.</p>
+
+    <h4>Autopilot — two simple dials</h4>
+    <p>Instead of a dozen knobs, two plain-language choices set everything. <b>How much should I ask you?</b> — 🚀 Full Auto (I only stop at the big moments), 🤝 Assisted (I pause at the inspector), 🎛 Manual (you drive every step). <b>How much should this cost?</b> — 🌱 Eco (cheapest that works), ⚖ Balanced (checking scaled to the stakes — the default), 🧠 Smart (spare no fuel, ~2×). Every "?" chip next to these opens a one-screen explainer. Professionals can still open <b>Advanced</b> to touch the raw knobs.</p>
+    <div class="m-tip">💡 <b>tokens ≈ the system's fuel</b> — more checking rounds and cross-checks burn more fuel. "Balanced" aims for the best result per unit of fuel; a Smart audit "uses roughly 5–10× more fuel — worth it for work you'd pay a specialist to double-check."</div>
+
+    <h4>Your Decisions inbox</h4>
+    <p>The <b>Decisions</b> tab is the single surface for everything that needs you: deliverables to approve, inspector checkpoints, stalled projects, and lessons distilled from your past corrections. Each card is answerable in seconds — a plain headline, a ★ recommended button, the evidence, and (where relevant) what another round would cost. Work top-down; the blocking cards come first.</p>
+
+    <h4>When to use what</h4>
+    <div class="m-steps">
+      <div class="m-step"><div><b>Super Result / the inspector</b> — for audits, high-stakes content, anything where being wrong is expensive.</div></div>
+      <div class="m-step"><div><b>Full Auto</b> — for a batch of routine work you want to walk away from; it still stops for high-stakes approvals and anything irreversible.</div></div>
+      <div class="m-step"><div><b>Smart profile</b> — when quality matters more than cost. <b>Eco</b> — for quick, low-stakes drafts.</div></div>
+    </div>
   </div>
 
   <div class="manual-sec" id="m-coding">
@@ -3333,6 +3350,47 @@ function selectedAutopilot(prefix) {
   return { autopilot: inv ? inv.value : AUTOPILOT_DEFAULTS.involvement,
            spend_profile: sp ? sp.value : AUTOPILOT_DEFAULTS.spend };
 }
+
+// Q7c — plain-language layer. The house metaphor, used everywhere: the WORKER
+// builds, the INSPECTOR (critic) independently re-checks against the real files,
+// the FOREMAN (loop engine) sends work back until it passes, the PLANNER shapes
+// the job, and YOU are the CLIENT who signs off. Every "?" chip opens a 2-3
+// sentence explainer that ends with "what should I do?" guidance — no jargon.
+const EXPLAINERS = {
+  'autopilot-involvement': ['How much should I ask you?',
+    'This sets how hands-on you are. <b>🚀 Full Auto</b>: I run the fix-loops and only stop for the big moments (plan, final result, anything risky). <b>🤝 Assisted</b>: I fix things automatically but pause at the inspector so you can look before each re-run. <b>🎛 Manual</b>: I only flag problems — you press the button on every step.',
+    'Leave it on Assisted unless you want to watch every step (Manual) or walk away (Full Auto).'],
+  'autopilot-spend': ['How much should this cost?',
+    'This sets how much "fuel" (tokens ≈ the system\'s fuel; more checking = more fuel) a job may burn. <b>🌱 Eco</b>: cheapest that still works. <b>⚖ Balanced</b>: checking scaled to the stakes — the sensible default. <b>🧠 Smart</b>: spare no fuel — maximum checking and cross-checking (~2×).',
+    'Balanced is right for almost everything. Use Smart for work you\'d pay a specialist to double-check; Eco for quick, low-stakes drafts.'],
+  'decisions-inbox': ['Your Decisions inbox',
+    'One place for everything that needs a human call — deliverables to approve, inspector checkpoints, distilled lessons, stalled projects. Each card has a plain headline, a ★ recommended action, and the "why". You are the client; the workers and inspector have already done their part.',
+    'Work top-down: the blocking ones are first. When unsure, the ★ button is the system\'s recommendation.'],
+  'inspector': ['The inspector (Super Result critic)',
+    'A second, stronger AI that independently re-checks the work against the REAL files and commands — not just re-reading it, actually verifying the claims. It files line comments and sends work back until it holds up.',
+    'Turn it on (✨ Super Result) for work that has to be right; it costs ~5–10× the fuel.'],
+  'foreman': ['The foreman (the loop)',
+    'The foreman sends work back to be fixed and re-checked automatically, a bounded number of rounds, then escalates to you. It\'s how a good team works: build → check → fix → re-check.',
+    'Leave looping on for important work; it stops itself at the round cap and never overspends your budget.'],
+  'super-result': ['Super Result',
+    'The full quality machinery: the inspector re-verifies every version and the foreman loops the fixes. Best for audits, high-stakes content, and anything you\'d want a second pair of eyes on.',
+    'Worth it when being wrong is expensive. Skip it for throwaway drafts.'],
+};
+
+function showExplainer(key) {
+  const e = EXPLAINERS[key];
+  if (!e) return;
+  showModal(`<h2>${esc(e[0])}</h2>
+    <p style="font-size:13px;line-height:1.6">${e[1]}</p>
+    <p style="font-size:12.5px;color:var(--accent-2,#5eead4);margin-top:8px"><b>What should I do?</b> ${e[2]}</p>
+    <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Got it</button></div>`);
+}
+
+// one delegated listener for every "?" chip, present now or rendered later
+document.addEventListener('click', (ev) => {
+  const q = ev.target.closest && ev.target.closest('.qmark[data-help]');
+  if (q) { ev.preventDefault(); ev.stopPropagation(); showExplainer(q.getAttribute('data-help')); }
+});
 
 async function designLoop(kind, opts) {
   const r = await api('POST', '/api/loop/design', Object.assign({ kind }, opts));

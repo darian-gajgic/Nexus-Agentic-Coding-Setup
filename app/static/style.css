@@ -1701,3 +1701,9 @@ code, pre, .mono { font-family: var(--font-mono); }
 /* Q5 (uncertainty tagging): amber marker for [UNSURE: …] spans in deliverable previews */
 .unsure-tag { background:rgba(251,191,36,.18); color:#fbbf24; border-bottom:1px dotted #fbbf24;
   border-radius:3px; padding:0 2px; font-weight:600; cursor:help; }
+
+/* Q7c — plain-language "?" explainer chips */
+.qmark { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+  border-radius:50%; border:1px solid var(--accent); color:var(--accent); font-size:10px;
+  font-weight:700; cursor:help; line-height:1; vertical-align:middle; user-select:none; }
+.qmark:hover { background:var(--accent); color:#fff; }
