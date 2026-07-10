@@ -9071,7 +9071,7 @@ function describeTaskUI() {
     if (!instruction.trim()) { toast('Describe the goal first', 'err'); return; }
     startDeepPlan(instruction.trim(), {
       super_result: !!($('#twSuper') && $('#twSuper').checked),
-      family: null });
+      family: null }, twDeep);
   };
   const twSel = $('#twRepo');
   if (twSel) {
@@ -9143,7 +9143,7 @@ function deepPlanRecommendModal(instruction, r, proceed) {
     family: t.family || null,
     super_result: (wizardCtx.super_result || t.recommend_super_result) || false,
     spend_profile: wizardCtx.spend_profile || null,
-    autopilot: wizardCtx.autopilot || null });
+    autopilot: wizardCtx.autopilot || null }, acc);
   const den = $('#dpDeny');
   if (den) den.onclick = () => { logDecision('deep_plan_deny'); proceed(); };
 }
@@ -9711,9 +9711,14 @@ function proposeWorkflowModal(wf, meta) {
 // downstream on create. Extends the wizard, never replaces the quick path.
 let deepPlan = null;  // { session, super_result, spend_profile, autopilot, sending }
 
-async function startDeepPlan(goal, opts) {
+let _dpStarting = false; // re-entry guard: starting a session runs a real model turn (~10-30s)
+async function startDeepPlan(goal, opts, btn) {
   opts = opts || {};
   if (!goal || !goal.trim()) { toast('Describe the goal first', 'err'); return; }
+  if (_dpStarting) { toast('Deep Plan session is already starting — one moment…', 'info'); return; }
+  _dpStarting = true;
+  const btnText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '✦ Starting the interview… (~20 s)'; }
   try {
     logDecision('deep_plan_accept');
     const s = await api('POST', '/api/plan/sessions', {
@@ -9724,7 +9729,10 @@ async function startDeepPlan(goal, opts) {
       spend_profile: opts.spend_profile || null, autopilot: opts.autopilot || null,
       sending: false };
     deepPlanModal();
-  } catch (e) { toast('Could not start Deep Plan: ' + e.message, 'err'); }
+  } catch (e) {
+    toast('Could not start Deep Plan: ' + e.message, 'err');
+    if (btn) { btn.disabled = false; btn.textContent = btnText; }
+  } finally { _dpStarting = false; }
 }
 
 function logDecision(kind) {

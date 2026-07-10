@@ -6171,7 +6171,19 @@ def _plan_run_turn(uid: str | None, hermes_sid: str | None, family: str,
     if db.get_setting("plan.stub", "0") == "1":
         return _pe.stub_turn(spec, family, user_message, turns, max_turns)
     msg = _plan_turn_message(spec, family, user_message)
-    res = hd.stream_turn(hermes_sid, msg, max_seconds=180)
+    # The interview framing MUST ride every turn as the ephemeral system_message:
+    # upstream api_server stores the session-level system_prompt but never injects
+    # it into chat turns (same flaw class as the session-model core-mod #6), so a
+    # session_prompt-only role lock silently never reaches the model — which then
+    # treats "OPERATOR: audit the system" as an order and starts tool-executing
+    # the audit inside the PLANNING session (observed live 2026-07-10).
+    try:
+        max_q = int(sreg.conf("plan.max_questions_per_turn", "3") or 3)
+    except Exception:
+        max_q = 3
+    goal = str((spec or {}).get("goal") or user_message or "")
+    framing = _pe.interview_framing(family, max_q, max_turns, goal)
+    res = hd.stream_turn(hermes_sid, msg, system_message=framing, max_seconds=180)
     if res.get("error"):
         raise RuntimeError(str(res["error"])[:200])
     return _pe.parse_turn(res.get("content") or "")
