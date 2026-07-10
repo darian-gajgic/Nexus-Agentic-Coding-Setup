@@ -3336,7 +3336,7 @@ function autopilotCardsHTML(prefix, inv, spend) {
     <div class="ap-axis" data-help="autopilot-spend" style="margin-top:8px" onchange="updateDerivedPref('${prefix}')">
       <div style="font-size:11.5px;font-weight:600;margin-bottom:4px">How much should this cost? <span class="qmark" data-help="autopilot-spend" title="Click for a plain-language explainer">?</span></div>
       <div style="display:flex;gap:7px">
-        ${card('spend', 'eco', '🌱', 'Eco', 'Cheapest that still works — fewest rounds, no fan-out, lean pipeline. ~½ the fuel.', spend === 'eco')}
+        ${card('spend', 'eco', '🌱', 'Eco', 'Cheapest that still works — fewest rounds, no fan-out, lean pipeline. ~½ the fuel. (Heuristic — not yet benchmark-validated.)', spend === 'eco')}
         ${card('spend', 'optimal', '⚖', 'Balanced', 'Best result per fuel — checking scaled to the stakes. The sensible default.', spend === 'optimal')}
         ${card('spend', 'smart', '🧠', 'Smart', 'Spare no fuel — maximum checking, fan-out, the works. ~2× the fuel.', spend === 'smart')}
       </div>
@@ -3371,7 +3371,7 @@ const EXPLAINERS = {
     'Leave it on Assisted unless you want to watch every step (Manual) or walk away (Full Auto).'],
   'autopilot-spend': ['How much should this cost?',
     'This sets how much "fuel" (tokens ≈ the system\'s fuel; more checking = more fuel) a job may burn. <b>🌱 Eco</b>: cheapest that still works. <b>⚖ Balanced</b>: checking scaled to the stakes — the sensible default. <b>🧠 Smart</b>: spare no fuel — maximum checking and cross-checking (~2×).',
-    'Balanced is right for almost everything. Use Smart for work you\'d pay a specialist to double-check; Eco for quick, low-stakes drafts.'],
+    'Balanced is right for almost everything. Use Smart for work you\'d pay a specialist to double-check; Eco for quick, low-stakes drafts. Note: Eco\'s "same answer for less" is a sensible default but NOT yet benchmark-validated — the deferred measurement campaign confirms it or raises Eco\'s floor.'],
   'decisions-inbox': ['Your Decisions inbox',
     'One place for everything that needs a human call — deliverables to approve, inspector checkpoints, distilled lessons, stalled projects. Each card has a plain headline, a ★ recommended action, and the "why". You are the client; the workers and inspector have already done their part.',
     'Work top-down: the blocking ones are first. When unsure, the ★ button is the system\'s recommendation.'],

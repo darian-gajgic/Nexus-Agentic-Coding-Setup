@@ -109,7 +109,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 | 7 scheduler/JARVIS passthrough | BUILT | B4 template + JARVIS framing carry both axes |
 | 8 adaptive early-exit (P6) | BUILT (dead flag removed — 2nd judge pass) | NO derived preset flag (the old `early_exit` boolean was consumed nowhere → removed). Realized unconditionally by **P6(a)** the SHIP quiet-stop (`loop_engine._sweep_super_result` ends the SR loop on SHIP, skipping the residual round — surfaced to the operator as "Stops on SHIP" in `design_loop`) + **P6(b)** the reconciler's own agreement-first framing (`_reconciler_gate_task`: compute agreement first, re-verify only DISAGREEMENTS) |
 | 9 router-collapse instrumentation | BUILT | `routing.sweep_stats` WARNs when Balanced saturates to the max-spend path |
-| 10 Eco validated behaviourally | DEFERRED (Phase 8) | documented in the Eco card copy + this report |
+| 10 Eco validated behaviourally | DEFERRED (Phase 8) | the Eco preset card + spend explainer now carry a "Heuristic — not yet benchmark-validated" caveat (added in the 3rd judge pass, finding 4) + this report; the final campaign validates or raises the floor |
 | 11 specialist sweep | BUILT | all 18 defs + frontier-method skill aligned to `[UNSURE]`, live↔vendored synced |
 | 12 JARVIS stays current | BUILT | advisor stance + `/api/decisions` + preset fields in the framing; boots clean (live smoke) |
 
@@ -123,7 +123,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 
 - **Q4 `framing.brief_mode`:** `task_dependencies` already resolves only DIRECT predecessors, so brief mode does not further trim the reading list — it makes deep members lean on the DECISION LOG. Setting wired + documented; behaviour is correct, the token saving is the log substituting for reading history.
 - **L2 for PLAYBOOK/RUBRIC:** the read-path overlay (`_knowledge_paths`) covers BUSINESS-CONTEXT + STYLE-VOICE only, so a user_overlay classification meaningfully routes STYLE-VOICE to the member overlay; PLAYBOOK/RUBRIC user_overlay deltas fall back to canonical (there is no executor read-path for a per-user PLAYBOOK). Recorded, not hidden.
-- **Rule 10 / Phase-8 measurement:** Eco's "same answer, cheaper" and Optimal's thresholds ship HEURISTIC and unmeasured, per the operator's deferral — the Eco card copy says so and the final campaign validates or raises the floor.
+- **Rule 10 / Phase-8 measurement:** Eco's "same answer, cheaper" and Optimal's thresholds ship HEURISTIC and unmeasured, per the operator's deferral. The Eco preset card body ("Heuristic — not yet benchmark-validated") and the spend `?` explainer ("Eco's 'same answer for less' … NOT yet benchmark-validated — the deferred measurement campaign confirms it or raises Eco's floor") now say so out loud (added in the 3rd judge pass — the earlier report claim that this was "documented in the Eco card copy" was false until then, finding 4); the final campaign validates or raises the floor.
 - **Q7a plan-time derivation in the wizard entry flow:** the profile fully governs at CREATE time (loop knobs, budget, cascade, judge scope, round caps) and at revalidate (Eco collapse); a fresh wizard *plan* is produced before the proposal-modal profile pick, so plan-time SR/fan-out/depth from the profile apply on the direct create + revalidate paths, not the very first wizard draft. Noted.
 
 ## Judge review — REVISE → all three blockers addressed (2026-07-10)
@@ -340,3 +340,15 @@ granularly. The tree is fully committed.
    three sections and asserts `DECISIONS < attachments < retry`; `verify.sh` adds a static awk
    ordering check (`_attachment_lines` line > `task_dependencies` line, and the retry line >
    the attachments line). P10a premortem row above corrected to name attachments explicitly.
+
+4. **Report claimed Eco's unvalidated behaviour was "documented in the Eco card copy" — it
+   wasn't.** Confirmed at HEAD: the rule-10 row and the Deviations note both asserted the Eco
+   card copy carried the caveat, but the Eco preset card body, the spend `?` explainer, and the
+   Advanced view had NO "heuristic / unvalidated / not-yet-measured" language anywhere — a false
+   documentation claim. **Fix (added the copy so the claim is true):** the Eco preset card body
+   now reads "… ~½ the fuel. (Heuristic — not yet benchmark-validated.)" and the spend explainer
+   guidance gains "Eco's 'same answer for less' is a sensible default but NOT yet
+   benchmark-validated — the deferred measurement campaign confirms it or raises Eco's floor."
+   The rule-10 row and Deviations note above are corrected to point at the real copy. `app.js?v=84`.
+   **Regression:** `verify.sh` "rule3/10 Eco unvalidated caveat" asserts both marker phrases are
+   present in `app.js`.
