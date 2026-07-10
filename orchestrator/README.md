@@ -109,6 +109,14 @@ claude -p "ok"        # 5-second sanity check that headless auth works
 
 - Models: `QP_IMPL_MODEL` (default `claude-opus-4-8`), `QP_JUDGE_MODEL` (default
   `claude-fable-5`). A preflight pings both once before anything runs.
+- **Subscription-only billing:** children run on the `claude login` OAuth
+  credentials; the runner strips `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
+  `ANTHROPIC_BASE_URL` / Bedrock/Vertex flags from the child env, so a stray API key
+  in the shell can never silently meter the run. The `total_cost_usd` figures in
+  logs/`--status` are **API-equivalent accounting, not charges** — marginal Claude
+  cost on a subscription is $0. The only metered spend is GLM (Z.ai) executor tokens:
+  small smoke-test amounts in Phases 1–7, real spend only in Phase 8 (which always
+  stops at a checkpoint first).
 - Children run with `--permission-mode acceptEdits` + broad `--allowedTools` and a
   deny-list (`git push`, `gh`, `sudo`) — the same vetted pattern as `cverify`. That
   IS a full-autonomy grant to the child sessions; that's the deal you're making.
