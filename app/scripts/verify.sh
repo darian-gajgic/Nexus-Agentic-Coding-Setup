@@ -422,6 +422,10 @@ chk "B4 task_template column"        "grep -q 'ADD COLUMN task_template TEXT' da
 chk "B4 scheduler applies template"  "grep -q 'task_template' scheduler.py && grep -q 'spend_profile' scheduler.py && grep -q '_sync_super_result_loop' scheduler.py"
 chk "B4 endpoint stores template"    "grep -q 'task_template' server.py"
 chk "B4 job UI template fields"      "grep -q 'jbSuper' static/app.js && grep -q 'jbSpend' static/app.js"
+# Q7c — plain-language layer
+chk "Q7c explainers + handler"       "grep -q 'const EXPLAINERS' static/app.js && grep -q 'function showExplainer' static/app.js && grep -q 'qmark' static/style.css"
+chk "Q7c house metaphor"             "grep -q 'the house metaphor' static/app.js && grep -q 'you are the client' static/app.js"
+chk "Q7c manual autopilot section"   "grep -q 'Autopilot — two simple dials' static/app.js && grep -q 'Your Decisions inbox' static/app.js"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
