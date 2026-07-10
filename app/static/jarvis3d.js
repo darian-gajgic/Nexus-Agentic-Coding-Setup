@@ -328,7 +328,8 @@ function assembleHologram(baseGeo, ptsGeo, dict) {
   dressPoints(ptsGeo, 1);
   const occ = new THREE.Mesh(baseGeo, new THREE.MeshBasicMaterial({
     color: HOLO_OCC, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
-  }));
+    side: THREE.DoubleSide,   // the torso neck tube is open at the top —
+  }));                        // its inner wall must occlude, not see-through
   occ.scale.setScalar(0.985);
   occ.renderOrder = 0;
   const wire = new THREE.Mesh(baseGeo, new THREE.MeshBasicMaterial({
@@ -550,68 +551,35 @@ function updateGaze(t, put) {
   else { put('eyeLookOut_L', 0.6 * Math.min(1, -h)); put('eyeLookIn_R', 0.6 * Math.min(1, -h)); }
 }
 
-/* ── procedural torso: neck + shoulders under the head (hologram bust) ──
-   Parametric grids in the old sculpt's proportions, sized off the fitted
-   head half-width; each surface renders as occluder + wireframe lattice +
-   dots like the head (static — no morphs). The dots share the head's fade
-   so the bust dissolves at the frame bottom. */
-function torsoSurfaceGeo(fn, nu, nv) {
-  const pos = [];
-  for (let i = 0; i <= nu; i++) {
-    for (let j = 0; j <= nv; j++) pos.push(...fn(i / nu, j / nv));
-  }
-  const idx = [];
-  for (let i = 0; i < nu; i++) {
-    for (let j = 0; j < nv; j++) {
-      const a = i * (nv + 1) + j, b = a + 1, c = a + nv + 1, d = c + 1;
-      idx.push(a, b, c, b, d, c);
-    }
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
-  geo.setIndex(idx);
-  geo.computeVertexNormals();
-  return geo;
-}
-
-function buildTorso(halfW, occMat, wireMat) {
-  const zc = -0.15 * halfW;           // torso axis sits behind the face
-  const neck = (u, v) => {            // top rim tucks INSIDE the jaw
-    const a = u * 2 * Math.PI;        // silhouette, widening downward
-    const rx = (0.33 + 0.23 * v) * halfW, rz = (0.32 + 0.19 * v) * halfW;
-    return [Math.sin(a) * rx, EYE_Y - 9 - v * 17, Math.cos(a) * rz + zc];
-  };
-  const shoulder = (u, v) => {        // superellipse slab, trapezius slope
-    const a = u * 2 * Math.PI;
-    const sl = ss01(v * 2);
-    const hw = (0.62 + 1.13 * sl) * halfW;
-    const dp = (0.50 + 0.22 * sl) * halfW;
-    const sA = Math.sin(a), cA = Math.cos(a);
-    const r = 1 / Math.max(1e-4,
-      Math.pow(Math.pow(Math.abs(sA / hw), 3) + Math.pow(Math.abs(cA / dp), 3), 1 / 3));
-    return [sA * r, EYE_Y - 22 - v * 19, cA * r * 0.92 + zc];
-  };
-  const parts = [], ptsMat = hologramPointsMaterial();
-  for (const { fn, nu, nv, wnu, wnv } of [
-    { fn: neck, nu: 30, nv: 20, wnu: 22, wnv: 12 },
-    { fn: shoulder, nu: 72, nv: 30, wnu: 48, wnv: 16 },
-  ]) {
-    // dots on a DENSE grid (the sparse torso read as a hole next to the
-    // 10k-dot head); the wireframe lattice stays coarser for the grid look
-    const dotGeo = torsoSurfaceGeo(fn, nu, nv);
-    const wireGeo = torsoSurfaceGeo(fn, wnu, wnv);
-    const occ = new THREE.Mesh(wireGeo, occMat);
-    occ.renderOrder = 0;
-    const wire = new THREE.Mesh(wireGeo, wireMat);
-    wire.renderOrder = 1;
-    const pg = deindexForPoints(dotGeo);
-    dressPoints(pg, 1.15);
-    const pts = new THREE.Points(pg, ptsMat);
-    pts.renderOrder = 2;
-    pts.userData.dotGeo = dotGeo;   // disposed with the part
-    parts.push(occ, wire, pts);
-  }
-  return { parts, ptsMat };
+/* ── torso: the Lee Perry-Smith scan bust (neck + shoulders) ──
+   The pre-v7 avatar's REAL anatomy (photogrammetry scan by Lee
+   Perry-Smith / Infinite-Realities, CC-BY 3.0 — via the three.js
+   examples). scripts/build_torso_from_scan.py slices the scan below
+   mid-neck and normalizes it: neck ring at the origin, ONE UNIT = the
+   scan head's half-width. Scaled at runtime by the hologram head's world
+   half-width, the body is proportioned exactly as if its original head
+   were this head. The facecap neck stub tucks INSIDE the scan's wider
+   neck ring — the seam-hiding overlap used in game-avatar pipelines
+   (align the neck cross-sections, overlap, let occlusion eat the joint). */
+async function loadScanTorso(A, halfW, anchor, occMat, wireMat) {
+  const gltf = await new A.GLTFLoader().loadAsync('/static/avatar/torso_scan.glb');
+  gltf.scene.updateMatrixWorld(true);
+  let mesh = null;
+  gltf.scene.traverse((o) => { if (o.isMesh && !mesh) mesh = o; });
+  const fit = new THREE.Matrix4()
+    .makeTranslation(anchor.x, anchor.y, anchor.z)
+    .multiply(new THREE.Matrix4().makeScale(halfW, halfW, halfW));
+  const geo = bakeGeometry(mesh, fit);
+  const occ = new THREE.Mesh(geo, occMat);
+  occ.renderOrder = 0;
+  const wire = new THREE.Mesh(geo, wireMat);
+  wire.renderOrder = 1;
+  const pg = subdivideForPoints(geo);   // same density treatment as the head
+  dressPoints(pg, 0.9);
+  const ptsMat = hologramPointsMaterial();
+  const pts = new THREE.Points(pg, ptsMat);
+  pts.renderOrder = 2;
+  return { parts: [occ, wire, pts], ptsMat };
 }
 
 // degraded-but-visible stand-in if the GLB can't load: ellipsoid lattice
@@ -622,7 +590,6 @@ function buildFallbackHead() {
   geo.translate(0, -12, 0);
   geo.computeVertexNormals();
   const h = assembleHologram(geo, deindexForPoints(geo), {});
-  h.torso = buildTorso(12.5, h.occ.material, h.wire.material);
   console.warn('Jarvis3D: procedural fallback head active (GLB unavailable)');
   return h;
 }
@@ -1371,9 +1338,40 @@ async function mount(container, opts) {
         holo.eyePivots[k] = pv;
       }
       holo.lip = new A.LipsyncEn();
-      // the head sits ON a torso rising from the frame bottom (like the
-      // pre-v7 bust); occluder + wireframe share the head materials
-      holo.torso = buildTorso(built.halfW, holo.occ.material, holo.wire.material);
+      // seat the head on the scan-bust torso: the anchor is the head's
+      // neck-stub ring (centroid of its lowest vertices); the torso's
+      // neck ring goes a few units UP inside the stub so the meshes
+      // overlap and the occluders swallow the seam
+      try {
+        // measure the head's neck-stub ring (raw position min — r160's
+        // computeBoundingBox would expand by morph deltas and put the
+        // ring window below every real vertex)
+        const hp = built.baseGeo.attributes.position;
+        let hMinY = 1e9;
+        for (let i = 0; i < hp.count; i++) hMinY = Math.min(hMinY, hp.getY(i));
+        let sx = 0, sz = 0, sn = 0;
+        for (let i = 0; i < hp.count; i++) {
+          if (hp.getY(i) < hMinY + 2.5) { sx += hp.getX(i); sz += hp.getZ(i); sn++; }
+        }
+        if (!sn) throw new Error('no neck-stub ring vertices');
+        const cx = sx / sn, cz = sz / sn;
+        // scale: 0.75× the head half-width puts the scan's shoulders at
+        // ~75% of the frame (the pre-v7 composition: neck + trapezius
+        // visible, shoulders exiting at the bottom corners) while its
+        // neck ring (0.665 units) stays comfortably wider than the stub —
+        // the seam-hiding overlap. z −5: the scan bust leans forward;
+        // retreat it so the chest sits at the nose plane, not past it.
+        const tScale = built.halfW * 0.75;
+        const anchor = { x: cx, y: hMinY + 7, z: cz - 3.5 };
+        holo.torso = await loadScanTorso(A, tScale, anchor,
+                                         holo.occ.material, holo.wire.material);
+        // seam blend: with the torso in place the HEAD's dots dissolve just
+        // below the chin (the scan neck takes over underneath) — the ragged
+        // stub cut never shows. The torso keeps the frame-bottom fade.
+        holo.pts.material.uniforms.uFade.value.set(hMinY + 1, hMinY + 7);
+      } catch (e) {
+        console.warn('Jarvis3D: scan torso unavailable — head only', e);
+      }
       J.holo = holo;
     } catch (e) {
       console.warn('Jarvis3D: hologram head failed — using fallback lattice', e);
