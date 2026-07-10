@@ -107,7 +107,11 @@ const HOLO_WIRE = 0x1595b0, HOLO_OCC = 0x05060f, HOLO_EYE = 0x0b0e1f,
 // (frame shows y ≈ −33..41 at z=0)
 const HEAD_H = 53;          // world height of the fitted head bbox
 const EYE_Y = -2, EYE_Z = 3;  // world anchor for the eye midpoint
-const FADE_Y = [-40, -33];  // the bust dissolves at the frame bottom edge
+const FADE_Y = [-27, -21];  // the head dissolves just under the chin
+// torso PARKED (operator, 2026-07-10): the scan-bust attempt didn't look
+// good enough — revisit in a dedicated session. Flip to re-enable; the
+// loader + torso_scan.glb + build_torso_from_scan.py stay in place.
+const SHOW_TORSO = false;
 const POINT_SUBDIV = true;  // midpoint-subdivide the dot lattice (2.7k → ~10.4k)
 
 let addonsPromise = null;
@@ -577,7 +581,8 @@ async function loadScanTorso(A, halfW, anchor, occMat, wireMat) {
   const pg = subdivideForPoints(geo);   // same density treatment as the head
   dressPoints(pg, 0.9);
   const ptsMat = hologramPointsMaterial();
-  const pts = new THREE.Points(pg, ptsMat);
+  ptsMat.uniforms.uFade.value.set(-40, -33);   // torso fades at the frame
+  const pts = new THREE.Points(pg, ptsMat);    // bottom, not under the chin
   pts.renderOrder = 2;
   return { parts: [occ, wire, pts], ptsMat };
 }
@@ -1342,7 +1347,7 @@ async function mount(container, opts) {
       // neck-stub ring (centroid of its lowest vertices); the torso's
       // neck ring goes a few units UP inside the stub so the meshes
       // overlap and the occluders swallow the seam
-      try {
+      if (SHOW_TORSO) try {
         // measure the head's neck-stub ring (raw position min — r160's
         // computeBoundingBox would expand by morph deltas and put the
         // ring window below every real vertex)

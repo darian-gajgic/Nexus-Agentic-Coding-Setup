@@ -77,7 +77,7 @@ but nothing reaches it). The v2 stack:
   Fit anchors on the EYE PIVOTS (grp_eyeLeft/Right), NOT the bbox — the
   cranium is deep/tall and bbox-anchoring drops the face out of frame
   (HEAD_H 53, eye mid → (0, −2, +3), face +z, auto-flip if authored -z).
-  The head sits ON the Lee Perry-Smith SCAN BUST torso (the pre-v7
+  TORSO IS PARKED (SHOW_TORSO=false — operator call 2026-07-10: not good enough yet; revisit in a dedicated session). The parked path: Lee Perry-Smith SCAN BUST (pre-v7
   anatomy, CC-BY 3.0): scripts/build_torso_from_scan.py slices the scan
   below mid-neck, normalized to head-width units → torso_scan.glb; runtime
   scales it 0.75× the head half-width, anchors it at the neck-stub ring and
