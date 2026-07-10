@@ -456,11 +456,14 @@ function updateQuotaBanner() {
 }
 
 function updateApprovalBadge() {
-  const n = (state.approvals || []).length;
+  // Q7b: the Decisions badge (#decBadge) is the SINGLE human-attention number —
+  // it aggregates every pending approval (all kinds) + replan checkpoints. The
+  // legacy per-Agentic approvals badge is ABSORBED into it (3rd judge finding 2):
+  // the element stays for backward-compat but is never lit as a second number, and
+  // any approval change refreshes the one Decisions badge instead.
   const b = $('#apprBadge');
-  if (!b) return;
-  if (n > 0) { b.textContent = n; b.style.display = 'inline-block'; }
-  else { b.style.display = 'none'; }
+  if (b) b.style.display = 'none';
+  loadDecisions(currentView === 'decisions');
 }
 
 // Q7b: the Decisions badge shows the BLOCKING count (falls back to total) —
@@ -6942,7 +6945,7 @@ function jarvisSetDomain(domain, label) {
   }
 }
 
-// ── command deck: board · deliverables (▶ Test app) · approvals, without
+// ── command deck: board · deliverables (▶ Test app) · Decisions inbox, without
 //    leaving the conversation. Data mirrors the dedicated tabs; actions reuse
 //    their handlers (testAppUI, decideApproval, describeTaskUI). ──
 function jarvisToggleDeck() {
@@ -6957,16 +6960,17 @@ function jarvisToggleDeck() {
 async function jarvisLoadDeck() {
   const body = $('#jDeckBody');
   if (!body) return;
-  let tasks = [], delivs = [], approvals = [];
+  let tasks = [], delivs = [], decisions = [], decBlocking = 0;
   try {
     const [tr, dr, ar] = await Promise.all([
       api('GET', '/api/tasks').catch(() => ({ tasks: [] })),
       api('GET', '/api/deliverables?limit=8').catch(() => ({ deliverables: [] })),
-      api('GET', '/api/approvals?status=pending').catch(() => ({ approvals: [] })),
+      api('GET', '/api/decisions').catch(() => ({ decisions: [], blocking: 0 })),
     ]);
     tasks = tr.tasks || [];
     delivs = dr.deliverables || [];
-    approvals = ar.approvals || ar.pending || [];
+    decisions = ar.decisions || [];
+    decBlocking = ar.blocking || 0;
   } catch { /* deck is best-effort */ }
   if ($('#jDeckBody') !== body) return;  // view changed mid-fetch
 
@@ -7002,22 +7006,27 @@ async function jarvisLoadDeck() {
       ${delRows}
     </div>`;
 
-  // pending approvals
-  const apRows = approvals.length ? approvals.slice(0, 6).map(a => `
-    <div class="jv2-deck-row">
-      <div class="jv2-deck-row-t" title="${esc(a.description || a.reason || a.action || '')}">${a.action_type === 'super_result' ? '✨ ' : ''}${esc(a.description || a.action || a.reason || a.action_type || 'request')}</div>
-      <div class="jv2-deck-row-a">
-        <button class="jv2-mini-btn ok" title="approve" onclick="decideApproval('${esc(a.id)}','approved').then(jarvisLoadDeck)">✓</button>
-        <button class="jv2-mini-btn warn" title="reject" onclick="decideApproval('${esc(a.id)}','rejected').then(jarvisLoadDeck)">✕</button>
-      </div>
-    </div>`).join('') : '';
-  const approvalsSec = approvals.length ? `
+  // Q7b: reuse the Decisions cards (headline + ★recommendation) instead of raw
+  // approvals, so JARVIS's deck speaks the SAME single human-attention surface
+  // (3rd judge finding 2). Approval-kind cards keep inline approve/reject; other
+  // kinds (e.g. a stalled-project replan) link into the Decisions inbox.
+  const decRows = decisions.length ? decisions.slice(0, 6).map(c => {
+    const act = c.source === 'approval'
+      ? `<button class="jv2-mini-btn ok" title="${esc(c.recommendation || 'approve')}" onclick="decideApproval('${esc(c.id)}','approved').then(jarvisLoadDeck)">✓</button>
+         <button class="jv2-mini-btn warn" title="reject" onclick="decideApproval('${esc(c.id)}','rejected').then(jarvisLoadDeck)">✕</button>`
+      : `<button class="jv2-mini-btn" title="open the Decisions inbox" onclick="switchView('decisions')">Review →</button>`;
+    return `<div class="jv2-deck-row">
+      <div class="jv2-deck-row-t" title="${esc(c.headline || '')}">${c.blocking ? '🔴 ' : ''}${esc(c.headline || c.recommendation || 'Decision')}</div>
+      <div class="jv2-deck-row-a">${act}</div>
+    </div>`;
+  }).join('') : '';
+  const decisionsSec = decisions.length ? `
     <div class="jv2-deck-sec">
-      <div class="jv2-deck-h">Approvals · ${approvals.length}</div>
-      ${apRows}
+      <div class="jv2-deck-h">Decisions · ${decBlocking || decisions.length} <button class="jv2-mini-btn" onclick="switchView('decisions')" title="open the Decisions inbox">all</button></div>
+      ${decRows}
     </div>` : '';
 
-  body.innerHTML = board + deliverables + approvalsSec + `
+  body.innerHTML = board + deliverables + decisionsSec + `
     <button class="btn-ghost" style="width:100%;margin-top:4px" onclick="describeTaskUI()"
       title="Describe a goal in plain words — the fleet plans and builds it">✨ Hand a task to the fleet</button>`;
 }

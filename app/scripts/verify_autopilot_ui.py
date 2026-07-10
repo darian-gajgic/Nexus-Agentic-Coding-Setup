@@ -100,6 +100,13 @@ async def main():
         badge_vis = await badge.is_visible() if await badge.count() else False
         ok("nav Decisions badge shows the blocking count", badge_vis and badge_txt.isdigit()
            and int(badge_txt) >= 1, f"vis={badge_vis} txt={badge_txt!r}")
+        # Q7b: the legacy Agentic approvals badge is ABSORBED into the single
+        # Decisions badge — with a pending approval seeded it must NOT light as a
+        # second number (3rd judge finding 2).
+        appr = page.locator("#apprBadge")
+        appr_vis = await appr.is_visible() if await appr.count() else False
+        ok("legacy approvals badge absorbed into Decisions (never lit)", not appr_vis,
+           f"apprBadge visible={appr_vis}")
 
         # ── User Manual: plain-language sections ──
         await page.evaluate("() => switchView('manual')")
