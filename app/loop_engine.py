@@ -510,6 +510,15 @@ def _escalate_super(t: dict, trig: dict, per_task: str | None,
                "verdict": t.get("critic_verdict")}
     if reason:
         payload["reason"] = reason
+    # Q7b decision-card fields (the inbox renders these; falls back if absent).
+    payload["headline"] = (
+        f"The inspector on “{(t.get('title') or '')[:50]}” "
+        + (f"needs your call: {reason}" if reason
+           else f"posted {k} finding(s) at round {rnd} — review before the next re-run."))
+    payload["recommendation"] = ("Open the review" if reason else "Review the auto-comments")
+    payload["reasons"] = [f"critic verdict {t.get('critic_verdict')} at round {rnd}",
+                          f"{k} finding(s) filed as line comments"]
+    payload["cost_hint"] = "another rework round runs the grounded critic again"
     db.execute(
         "INSERT INTO approvals (id, agent_id, action_type, description, payload, "
         "status, risk_level, requested_at, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -781,9 +790,49 @@ def _sweep_replan_detection():
             pass
 
 
+def _sweep_auto_approve_ship():
+    """Q7b + rule 2: in FULL AUTO only, a SHIP-verdict final deliverable approval
+    may auto-approve after autopilot.auto_approve_ship_hours (0 = never). NEVER
+    for high-stakes tasks, Super Result / escalation approvals, or anything
+    irreversible — those always wait for the human (the risk hard floor)."""
+    try:
+        hours = int(db.get_setting("autopilot.auto_approve_ship_hours", "0") or 0)
+    except Exception:
+        hours = 0
+    if hours <= 0:
+        return
+    cutoff = time.time() - hours * 3600
+    rows = db.query_all(
+        "SELECT a.*, t.autopilot AS t_ap, t.high_stakes AS t_hs, t.judge_verdict AS t_jv, "
+        "t.id AS t_id FROM approvals a "
+        "JOIN tasks t ON t.id = json_extract(a.payload, '$.task_id') "
+        "WHERE a.status='pending' AND a.action_type='deliverable' AND a.requested_at <= ?",
+        (cutoff,))
+    for a in rows:
+        if a.get("t_hs"):            # rule 2: high-stakes never auto-approves
+            continue
+        if a.get("t_ap") != "full_auto":   # Full Auto involvement only
+            continue
+        if a.get("t_jv") != "SHIP":        # only a SHIP verdict auto-ships
+            continue
+        cur = db.execute(
+            "UPDATE approvals SET status='approved', decided_at=?, decided_by=? "
+            "WHERE id=? AND status='pending'", (time.time(), "autopilot", a["id"]))
+        if cur.rowcount:
+            tid = a["t_id"]
+            db.execute("UPDATE tasks SET status='done', completed_at=?, updated_at=? WHERE id=?",
+                       (time.time(), time.time(), tid))
+            db.log_activity("info", "loop",
+                            f"Full Auto: auto-approved a SHIP deliverable after {hours}h "
+                            f"(task {tid}) — high-stakes/SR/escalations never auto-approve",
+                            user_id=a.get("user_id"))
+            _broadcast_task(tid, a.get("user_id"))
+
+
 def loop_sweep():
     if db.get_setting("dispatch.enabled", "0") != "1":
         return
+    _sweep_auto_approve_ship()
     _sweep_replan_detection()
     left = _sweep_super_result(MAX_ACTIONS_PER_SWEEP)
     left = _sweep_workflow_loops(left)

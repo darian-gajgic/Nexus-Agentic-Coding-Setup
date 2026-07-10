@@ -404,6 +404,13 @@ chk "P2 staged forward-deps"         "grep -q 'def _feature_present' autopilot.p
 chk "Q7a create/patch plumbing"      "grep -q 'ap_inv, ap_spend' server.py && grep -q '_regen_loop_for_profile' server.py"
 chk "Q7a workflow cascade"           "grep -q 'UPDATE tasks SET autopilot=? WHERE workflow_id=?' server.py && grep -q 'UPDATE tasks SET spend_profile=? WHERE workflow_id=?' server.py"
 chk "Q7a UI card rows + expander"    "grep -q 'function autopilotCardsHTML' static/app.js && grep -q 'function selectedAutopilot' static/app.js"
+# Q7b — Decision Inbox
+chk "Q7b decisions endpoint"         "grep -q '/api/decisions' server.py && grep -q 'def _decision_card_from_approval' server.py"
+chk "Q7b producers attach fields"    "grep -q '\"recommendation\":' hermes_dispatch.py && grep -q 'payload\[.recommendation.\]' loop_engine.py"
+chk "Q7b decisions view + badge"     "grep -q 'function viewDecisions' static/app.js && grep -q 'function updateDecisionBadge' static/app.js && grep -q 'decBadge' static/index.html"
+chk "Q7b decisions nav item"         "grep -q 'data-view=\"decisions\"' static/index.html"
+chk "Q7b auto-approve-ship guard"    "grep -q 'def _sweep_auto_approve_ship' loop_engine.py && grep -q 'auto_approve_ship_hours' loop_engine.py"
+chk "Q7b P7 admin scope in decisions" "grep -q \"scope='admin'\" server.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
