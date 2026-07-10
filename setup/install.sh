@@ -67,10 +67,10 @@ done
 # without these on PATH, judging fails with command-not-found on a fresh box.
 # They additionally need the `claude` CLI installed and logged in.
 if [ -d "$REPO/bin" ]; then
-  say "Installing frontier bridge scripts (cspec/creview/cjudge/cverify) into ~/.local/bin"
+  say "Installing frontier bridge scripts (cspec/creview/cjudge/cverify/cdistill) into ~/.local/bin"
   mkdir -p "$HOME/.local/bin"
   cp -a "$REPO"/bin/. "$HOME/.local/bin/"
-  chmod +x "$HOME/.local/bin/cspec" "$HOME/.local/bin/creview" "$HOME/.local/bin/cjudge" "$HOME/.local/bin/cverify" 2>/dev/null || true
+  chmod +x "$HOME/.local/bin/cspec" "$HOME/.local/bin/creview" "$HOME/.local/bin/cjudge" "$HOME/.local/bin/cverify" "$HOME/.local/bin/cdistill" 2>/dev/null || true
   command -v claude >/dev/null 2>&1 || warn "the 'claude' CLI is not installed — cjudge/cspec/creview need it (npm i -g @anthropic-ai/claude-code, then 'claude' to log in)"
 fi
 

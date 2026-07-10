@@ -3060,6 +3060,52 @@ async def create_approval(body: ApprovalCreate):
     return ap
 
 
+# ── Q2 (operator-edit distillation) glue: evidence capture + apply, all
+#    best-effort so a distillation hiccup never blocks an approval decision. ──
+def _lessons_safe(fn: str, *args):
+    try:
+        import lessons as _lsn
+        return getattr(_lsn, fn)(*args)
+    except Exception as e:
+        db.log_activity("warn", "lessons", f"{fn} failed: {str(e)[:80]}")
+        return None
+
+
+def _lessons_apply(domain: str, deltas: list, user_id, username: str):
+    return _lessons_safe("apply_deltas", domain, deltas, user_id, username)
+
+
+def _capture_accept_diff(task: dict):
+    """Q2: when a deliverable is finally accepted after ≥1 rejection, the diff
+    between the last rejected version (deliverable.vN.md, highest N) and the
+    accepted deliverable.md is the strongest correction signal — capture it."""
+    ws = task.get("workspace_path")
+    if not ws or not os.path.isdir(ws):
+        return
+    accepted_p = os.path.join(ws, "deliverable.md")
+    if not os.path.isfile(accepted_p):
+        return
+    vers = []
+    try:
+        for f in os.listdir(ws):
+            m = _re.match(r"deliverable\.v(\d+)\.md$", f)
+            if m:
+                vers.append((int(m.group(1)), f))
+    except Exception:
+        return
+    if not vers:
+        return  # accepted first try — no correction to learn from
+    _, latest = max(vers, key=lambda x: x[0])
+    try:
+        rejected = open(os.path.join(ws, latest), encoding="utf-8").read()
+        accepted = open(accepted_p, encoding="utf-8").read()
+    except Exception:
+        return
+    diff = _lessons_safe("compact_diff", rejected, accepted, task.get("id") or "")
+    if diff:
+        _lessons_safe("record_evidence", task, "accept_diff", diff)
+
+
 @app.patch("/api/approvals/{approval_id}")
 async def decide_approval(approval_id: str, body: dict):
     decision = body.get("status")  # 'approved' or 'rejected'
@@ -3097,10 +3143,13 @@ async def decide_approval(approval_id: str, body: dict):
                 db.execute("UPDATE tasks SET status='done', completed_at=?, updated_at=? WHERE id=?",
                            (time.time(), time.time(), task_id))
                 db.log_activity("info", "system", f"Deliverable approved — task {task_id} shipped")
+                _capture_accept_diff(task)  # Q2: rejected→accepted diff is the strongest lesson signal
             else:
                 # N7: a blind reject (no feedback) on an unjudged version gate-runs
                 # the judge first so the retry carries real findings (setting-gated).
                 fb = (body.get("feedback") or "").strip() or None
+                if fb:  # Q2: rejection feedback becomes distillation evidence
+                    _lessons_safe("record_evidence", task, "feedback", fb)
                 await run_in_threadpool(_blind_reject_judge_if_wanted, task_id, fb)
                 # _retry_task falls back to the judge's findings automatically
                 # (snapshots the workspace — copytree — so off the loop)
@@ -3122,14 +3171,72 @@ async def decide_approval(approval_id: str, body: dict):
                 _loop.mark_super_done(task_id)
                 db.log_activity("info", "system",
                                 f"Super Result checkpoint approved — task {task_id} accepted")
+                _capture_accept_diff(task)  # Q2
             else:
-                await run_in_threadpool(
-                    _retry_task, task_id, (body.get("feedback") or "").strip() or None)
+                fb = (body.get("feedback") or "").strip() or None
+                if fb:
+                    _lessons_safe("record_evidence", task, "feedback", fb)
+                await run_in_threadpool(_retry_task, task_id, fb)
                 _loop.bump_super_round(task_id)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
+    # Q2/L2: an admin-scoped lesson_deltas card — approve applies the (possibly
+    # edited) deltas to the knowledge base + git-commits; reject with feedback
+    # feeds that feedback back as evidence for the next distillation.
+    elif ap.get("action_type") == "lesson_deltas":
+        try:
+            payload = json.loads(ap.get("payload") or "{}") or {}
+        except Exception:
+            payload = {}
+        domain = payload.get("domain") or ""
+        if decision == "approved":
+            # the UI may pass edited deltas (e.g. target flipped canonical↔overlay
+            # — that IS the L2 "share with all users?" decision); else apply as filed
+            deltas = body.get("deltas") if isinstance(body.get("deltas"), list) else payload.get("deltas")
+            res = await run_in_threadpool(
+                _lessons_apply, domain, deltas or [], ap.get("user_id"),
+                (decided_by or "operator"))
+            db.log_activity("info", "lessons",
+                            f"Lesson deltas approved for '{domain}': "
+                            f"{len((res or {}).get('applied') or [])} applied")
+        else:
+            fb = (body.get("feedback") or "").strip()
+            if fb and domain:
+                _lessons_safe("_record_domain_feedback", domain, ap.get("user_id"), fb)
     await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
     return ap
+
+
+# ── Q2: operator-edit distillation (manual trigger + evidence view) ──
+
+@app.post("/api/lessons/distill")
+async def lessons_distill(body: dict):
+    """Manually run the lessons distillation for a domain (admin — it edits the
+    shared knowledge base on approval). Ignores the min-evidence gate so the
+    operator can force a run; still files the deltas as an approval, never
+    applies directly."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    domain = (body.get("domain") or "").strip()
+    if not _re.match(r"^[a-z0-9-]+$", domain):
+        return JSONResponse(status_code=400, content={"error": "valid domain required"})
+    import lessons as _lsn
+    res = await run_in_threadpool(_lsn.run_distillation, domain, auth.current_user_id(), 1)
+    if not res.get("ok"):
+        return JSONResponse(status_code=400, content={"error": res.get("reason") or "distillation failed"})
+    return res
+
+
+@app.get("/api/lessons/evidence")
+async def lessons_evidence():
+    """Admin view: how much undistilled correction evidence has accrued per domain."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    rows = db.query_all(
+        "SELECT domain, COUNT(*) AS new_items FROM edit_evidence WHERE distilled=0 "
+        "GROUP BY domain ORDER BY new_items DESC")
+    return {"domains": rows,
+            "min_evidence": int(db.get_setting("lessons.min_evidence", "5") or 5)}
 
 
 # ── 4. Self-healing watchdog status (Resilience) ──

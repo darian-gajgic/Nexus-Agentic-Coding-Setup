@@ -736,6 +736,13 @@ def loop_sweep():
     left = _sweep_super_result(MAX_ACTIONS_PER_SWEEP)
     left = _sweep_workflow_loops(left)
     _sweep_task_loops(left)
+    # Q2/N8: cron-gated operator-edit distillation (self-guards on lessons.cron +
+    # a last-run marker, so this frequent sweep only fires it once per window).
+    try:
+        import lessons as _lsn
+        _lsn.sweep_distillation()
+    except Exception as e:
+        db.log_activity("warn", "lessons", f"distillation sweep error: {str(e)[:80]}")
 
 
 def loop_engine_thread(stop_event: threading.Event):

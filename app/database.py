@@ -315,6 +315,29 @@ def init_db():
     if "source" not in rc_cols:
         conn.execute("ALTER TABLE review_comments ADD COLUMN source TEXT NOT NULL DEFAULT 'user'")
 
+    # Q2 (operator-edit distillation): per-domain evidence that feeds the lessons
+    # distillation job — rejection feedback, user review comments, and the diff
+    # between a human-rejected version and the accepted one (the strongest signal).
+    # kind: 'feedback' | 'comment' | 'accept_diff'. content capped at 8000 chars.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS edit_evidence (
+        id TEXT PRIMARY KEY,
+        task_id TEXT,
+        domain TEXT,
+        user_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'feedback',
+        content TEXT DEFAULT '',
+        distilled INTEGER DEFAULT 0,
+        created_at REAL
+    )""")
+
+    # P7: approvals gain a scope. 'user' (default, historical) rows belong to one
+    # user and fail-closed to them; 'admin' rows (lesson deltas, cross-user share
+    # cards) have no task and are visible to every admin in the Decisions inbox.
+    _appr_cols0 = {r[1] for r in conn.execute("PRAGMA table_info(approvals)").fetchall()}
+    if "scope" not in _appr_cols0:
+        conn.execute("ALTER TABLE approvals ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'")
+
     # Migrate workflows columns (looping v3.2)
     existing_wf_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)").fetchall()}
     if "loop_config" not in existing_wf_cols:

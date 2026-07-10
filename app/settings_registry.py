@@ -159,6 +159,24 @@ SECTIONS = [
              "help": "L3 lifecycle: past-work exemplars older than this age out (unless "
                      "re-confirmed by a newer SHIP); the candidate pool is capped at "
                      "exemplars.max×3 so stale 'excellence' can't anchor new work."},
+            {"key": "lessons.auto_distill", "label": "Auto-distill operator corrections", "type": "bool",
+             "default": "1",
+             "help": "Q2/N8: on a schedule, turn the operator's corrections (rejections, "
+                     "review comments, rejected→accepted diffs, learning notes) into durable "
+                     "PLAYBOOK/RUBRIC/STYLE-VOICE deltas — filed as ONE approval per domain. "
+                     "The WRITE to the knowledge base always waits for your one-click approval."},
+            {"key": "lessons.min_evidence", "label": "Min new evidence to distill", "type": "int",
+             "default": "5", "min": 1, "max": 50,
+             "help": "Q2: a domain needs at least this many NEW correction items before a "
+                     "distillation call runs (one frontier call per domain)."},
+            {"key": "lessons.cron", "label": "Distillation schedule (cron)", "type": "str",
+             "default": "0 4 * * 1",
+             "help": "Q2: when the autonomous distillation sweep fires (default weekly, "
+                     "Monday 04:00). Manual 'Distill lessons' runs any time regardless."},
+            {"key": "lessons.cmd", "label": "Distillation command template", "type": "command",
+             "default": "cdistill {domain} {evidence}",
+             "help": "Tokens: {domain} {evidence} and optional {model}. The resolved frontier "
+                     "model is exported as JUDGE_MODEL. Gates stub this — restore after testing."},
         ],
     },
     {
