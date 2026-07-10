@@ -267,6 +267,10 @@ def init_db():
         ("critic_ts", "REAL"),
         ("critic_round", "INTEGER DEFAULT 0"),
         ("critic_keys", "TEXT"),                 # {"round":N,"keys":[...],"prev":[...]} convergence state
+        # Quality Autopilot Q7a: two orthogonal preset axes. NULL = legacy (P10b:
+        # no derivation, existing explicit preference honored as-is).
+        ("autopilot", "TEXT"),                   # full_auto|assisted|manual|NULL
+        ("spend_profile", "TEXT"),               # eco|optimal|smart|NULL
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -356,6 +360,11 @@ def init_db():
     # Super Result: project-level flag cascades to member tasks (like high_stakes)
     if "super_result" not in existing_wf_cols:
         conn.execute("ALTER TABLE workflows ADD COLUMN super_result INTEGER DEFAULT 0")
+    # Quality Autopilot Q7a: preset axes cascade to member tasks (like high_stakes)
+    if "autopilot" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN autopilot TEXT")
+    if "spend_profile" not in existing_wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN spend_profile TEXT")
 
     # Known issues: operator feedback with interaction context (v3.4)
     conn.execute("""CREATE TABLE IF NOT EXISTS known_issues (

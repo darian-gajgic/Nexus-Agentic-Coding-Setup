@@ -317,6 +317,9 @@ class TaskCreate(BaseModel):
     # Super Result (SUPER-RESULT-PLAN-2026-07-09.md)
     super_result: bool = False
     deliverable_type: Optional[str] = None
+    # Quality Autopilot Q7a (two preset axes)
+    autopilot: Optional[str] = None
+    spend_profile: Optional[str] = None
 
 
 _DELIVERABLE_TYPES = ("analysis", "code_change", "content", "research")
@@ -338,6 +341,26 @@ def _derive_client(client, repo_path):
     return None
 
 
+def _autopilot_fields(autopilot, spend_profile, high_stakes: bool,
+                      explicit_budget: Optional[int]):
+    """Q7a: normalise the two preset axes and apply the budget multiplier (rule 4).
+    Returns (autopilot|None, spend_profile|None, effective_budget). NULL axes =
+    legacy behaviour (P10b): no derivation, explicit budget untouched."""
+    import autopilot as _ap
+    inv = _ap.norm_involvement(autopilot) if (autopilot or "").strip() else None
+    sp = _ap.norm_spend(spend_profile) if (spend_profile or "").strip() else None
+    budget = explicit_budget
+    if sp and explicit_budget is None:
+        # rule 4: scale the per-task DEFAULT budget with the profile (the hard
+        # cost backstop must move with the spend axis).
+        try:
+            base = int(db.get_setting("dispatch.default_task_budget", "5000000") or 5000000)
+            budget = _ap.derive(inv, sp, high_stakes=bool(high_stakes), base_budget=base)["budget"]
+        except Exception:
+            budget = explicit_budget
+    return inv, sp, budget
+
+
 class TaskUpdate(BaseModel):
     status: Optional[str] = None
     priority: Optional[int] = None
@@ -356,6 +379,8 @@ class TaskUpdate(BaseModel):
     client: Optional[str] = None
     super_result: Optional[bool] = None
     deliverable_type: Optional[str] = None
+    autopilot: Optional[str] = None
+    spend_profile: Optional[str] = None
 
 
 class ProgramCreate(BaseModel):
@@ -621,20 +646,22 @@ async def create_task(body: TaskCreate):
     if body.deliverable_type and body.deliverable_type not in _DELIVERABLE_TYPES:
         return JSONResponse(status_code=400, content={
             "error": f"deliverable_type must be one of {list(_DELIVERABLE_TYPES)}"})
+    ap_inv, ap_spend, budget = _autopilot_fields(body.autopilot, body.spend_profile,
+                                                 body.high_stakes, body.budget_tokens)
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
          domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id,
-         super_result, deliverable_type)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         super_result, deliverable_type, autopilot, spend_profile)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tid, body.title, body.description, body.status, body.priority,
          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
-         body.domain, body.specialist, 1 if body.high_stakes else 0, body.budget_tokens, body.model,
+         body.domain, body.specialist, 1 if body.high_stakes else 0, budget, body.model,
          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
          json.dumps(body.loop_config) if body.loop_config else None,
          (body.repo_path or None), (_derive_client(body.client, body.repo_path)), uid,
-         1 if body.super_result else 0, body.deliverable_type or None))
+         1 if body.super_result else 0, body.deliverable_type or None, ap_inv, ap_spend))
     db.log_activity("info", "system", f"Task created: '{body.title}'", user_id=uid)
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     if body.super_result:
@@ -710,6 +737,14 @@ async def update_task(task_id: str, body: TaskUpdate):
     if body.super_result is not None:
         updates["super_result"] = 1 if body.super_result else 0
         super_flipped = True
+    profile_changed = False
+    if body.autopilot is not None or body.spend_profile is not None:
+        import autopilot as _ap
+        if body.autopilot is not None:
+            updates["autopilot"] = _ap.norm_involvement(body.autopilot) if body.autopilot.strip() else None
+        if body.spend_profile is not None:
+            updates["spend_profile"] = _ap.norm_spend(body.spend_profile) if body.spend_profile.strip() else None
+        profile_changed = True
     updates["updated_at"] = time.time()
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -717,6 +752,12 @@ async def update_task(task_id: str, body: TaskUpdate):
     db.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
 
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if profile_changed and task.get("loop_config"):
+        # Q7a: the operator set/changed a preset → regenerate the loop so its
+        # derived knobs (preference, mode, round caps) follow (P10b: only ever on
+        # an explicit profile set, never a silent flip of a legacy item).
+        _regen_loop_for_profile("task", task)
+        task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if super_flipped:
         _sync_super_result_loop("task", task)
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -4298,7 +4339,8 @@ def _sync_super_result_loop(kind: str, row: dict):
         if kind == "task":
             meta = {"title": row.get("title"), "domain": row.get("domain"),
                     "high_stakes": bool(row.get("high_stakes")),
-                    "specialist": row.get("specialist"), "super_result": True}
+                    "specialist": row.get("specialist"), "super_result": True,
+                    "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
         else:
             specs = [r["specialist"] for r in db.query_all(
                 "SELECT specialist FROM tasks WHERE workflow_id=?", (row["id"],))
@@ -4308,7 +4350,8 @@ def _sync_super_result_loop(kind: str, row: dict):
                 (row["id"],))
             meta = {"title": row.get("name"), "domain": row.get("domain"),
                     "specialists": specs, "super_result": True,
-                    "high_stakes": bool(row.get("high_stakes") or (hs or {}).get("c"))}
+                    "high_stakes": bool(row.get("high_stakes") or (hs or {}).get("c")),
+                    "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
         newcfg = _loop.design_loop(kind, meta,
                                    preference=(cfg or {}).get("preference", "quality"),
                                    mode=(cfg or {}).get("mode", "closed"))
@@ -4336,6 +4379,47 @@ def _sync_super_result_loop(kind: str, row: dict):
                         "Super Result trigger removed from "
                         f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
                         user_id=row.get("user_id"))
+
+
+def _regen_loop_for_profile(kind: str, row: dict):
+    """Q7a: regenerate an existing loop_config so its knobs re-derive from the
+    (changed) preset axes — preserving round accounting of surviving triggers."""
+    import loop_engine as _loop
+    try:
+        cfg = json.loads(row.get("loop_config") or "null")
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return
+    table = "tasks" if kind == "task" else "workflows"
+    has_sr = any((t.get("id") == "super_result") for t in cfg.get("triggers") or [])
+    if kind == "task":
+        meta = {"title": row.get("title"), "domain": row.get("domain"),
+                "high_stakes": bool(row.get("high_stakes")), "specialist": row.get("specialist"),
+                "super_result": has_sr, "autopilot": row.get("autopilot"),
+                "spend_profile": row.get("spend_profile")}
+    else:
+        specs = [r["specialist"] for r in db.query_all(
+            "SELECT specialist FROM tasks WHERE workflow_id=?", (row["id"],)) if r.get("specialist")]
+        meta = {"name": row.get("name"), "domain": row.get("domain"), "specialists": specs,
+                "super_result": has_sr, "high_stakes": bool(row.get("high_stakes")),
+                "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
+    newcfg = _loop.design_loop(kind, meta,
+                               preference=cfg.get("preference", "quality"),
+                               mode=cfg.get("mode", "closed"))
+    old = {t.get("id"): t for t in cfg.get("triggers") or []}
+    for t in newcfg.get("triggers") or []:
+        o = old.get(t.get("id"))
+        if o:
+            t["used"] = int(o.get("used") or 0)
+            for k in ("used_tasks", "state_tasks"):
+                if o.get(k):
+                    t[k] = o[k]
+    db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?", (json.dumps(newcfg), row["id"]))
+    db.log_activity("info", "loop",
+                    f"Loop re-derived from the autopilot preset on {kind} "
+                    f"'{(row.get('title') or row.get('name') or '')[:50]}'",
+                    user_id=row.get("user_id"))
 
 
 def _inherit_super_result(task: dict) -> dict:
@@ -4836,7 +4920,7 @@ _WIZARD_ROLE_LOCK = (
 
 def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
                          super_result: bool = False, fanout: bool = False,
-                         fanout_n: int = 3) -> str:
+                         fanout_n: int = 3, pipeline_depth: str = "standard") -> str:
     # Q3 (acceptance-tests-first): when the setting is on, the spec stage owns an
     # executable acceptance/ suite + RUN.md — the deterministic contract the
     # implementer makes pass and the verifier re-runs. _repair_workflow appends
@@ -4854,6 +4938,20 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
     tf_ver = (" FIRST re-verify the SHA-256 of every acceptance/ file against the SPEC's "
               "recorded hashes (tampering = automatic FAIL), THEN run acceptance/RUN.md "
               "exactly as written." if tests_first else "")
+    # Q7a rule 5: the spend profile shapes pipeline DEPTH. Eco collapses the
+    # coding template to spec→implement→verify (the review + separate fix stage
+    # are re-inserted deterministically only when a stage is high-stakes — the
+    # risk floor wins); Smart keeps the full pipeline (+ fan-out where allowed).
+    depth_block = ""
+    if pipeline_depth == "collapsed":
+        depth_block = ("SPENDING PROFILE = ECO (cheapest that works): COLLAPSE the coding "
+                       "pipeline to spec→implement→verify — omit the separate code-review and "
+                       "fix stages UNLESS a stage is high-stakes. Prefer a single task for "
+                       "non-coding goals. Keep it lean.\n\n")
+    elif pipeline_depth == "full":
+        depth_block = ("SPENDING PROFILE = SMART (spare no fuel): use the FULL pipeline and "
+                       "fan-out where the goal allows — independent perspectives + a "
+                       "reconciler; do not economise on quality gates.\n\n")
     # Super Result fan-out (SUPER-RESULT-PLAN §6 Step 7b): planning-time shape,
     # per goal family — independent perspectives cross-check, then reconcile.
     sr_block = ""
@@ -4979,7 +5077,7 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
         "MUSIC-DJ: single task (dj-set-curator or music-producer).\n"
         "EVERYTHING ELSE: single task is the default. Propose a workflow only when steps "
         "truly feed each other's outputs.\n\n"
-        + sr_block +
+        + depth_block + sr_block +
         "NEVER:\n"
         "- invent specialist names, domains or models\n"
         "- emit 'documentation', 'ship', 'commit' or 'deploy' tasks (shipping is the human's gate)\n"
@@ -5039,6 +5137,11 @@ def _clamp_wizard_task(t: dict, repairs: list | None = None,
         "super_result": bool(t.get("super_result")),
         "deliverable_type": (t.get("deliverable_type")
                              if t.get("deliverable_type") in _DELIVERABLE_TYPES else None),
+        # Q7a preset axes passthrough — survive the edit → revalidate loop too
+        "autopilot": (t.get("autopilot") if t.get("autopilot") in
+                      ("full_auto", "assisted", "manual") else None),
+        "spend_profile": (t.get("spend_profile") if t.get("spend_profile") in
+                          ("eco", "optimal", "smart") else None),
     }
     if out["model"] == default_model:
         out["model"] = None  # default — keep the column clean (resolved at dispatch)
@@ -5085,12 +5188,16 @@ def _reconciler_gate_task(goal: str) -> dict:
         "description": (
             "Reconciliation gate for the parallel investigation. Take EVERY sibling "
             "report from the INPUT deliverables and produce the final report: "
-            "(1) UNION of findings — nothing silently dropped; (2) adversarially "
-            "VERIFY every claim you keep against primary evidence (read the actual "
-            "files, re-run the quoted commands — a sibling's assertion is never "
-            "evidence); (3) resolve every contradiction explicitly, naming which "
-            "investigator was wrong and why; (4) an honest 'What was NOT checked' "
-            "section. The final report must stand alone."),
+            "(1) UNION of findings — nothing silently dropped; (2) FIRST compute "
+            "AGREEMENT across the investigator reports — strongly-agreed claims need "
+            "only a spot-check, and you spend your adversarial verification budget on "
+            "the DISAGREEMENTS (rule 8 early-exit: don't re-verify what all lenses "
+            "already confirm); (3) adversarially VERIFY every disputed or load-bearing "
+            "claim you keep against primary evidence (read the actual files, re-run the "
+            "quoted commands — a sibling's assertion is never evidence); (4) resolve "
+            "every contradiction explicitly, naming which investigator was wrong and "
+            "why; (5) an honest 'What was NOT checked' section. The final report must "
+            "stand alone."),
         "domain": "general", "specialist": None,
         "high_stakes": False, "model": None, "priority": 2,
         "budget_tokens": 3000000, "tags": ["reconciler", "quality-gate"],
@@ -5199,7 +5306,7 @@ def _clamp_wizard_questions(data: dict) -> list:
 
 
 def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
-                     uid: str | None = None) -> tuple[list, list]:
+                     uid: str | None = None, spend_profile: str | None = None) -> tuple[list, list]:
     """Deterministic post-LLM validation + auto-repair of a proposed project DAG.
     Never trusts the model's wiring: enforces the earlier-index invariant (acyclic
     by construction), inserts the mandatory quality gates for coding projects
@@ -5230,6 +5337,10 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
         if note:
             repairs.append(note)
 
+    # Q7a rule 5: Eco collapses the coding template to implement→verify — skip the
+    # AUTO-inserted review + fix gates, UNLESS a stage is high-stakes (rule 2, the
+    # risk floor, re-inserts them). Smart/Optimal keep the full gates.
+    eco_collapse = (spend_profile == "eco") and not any(t.get("high_stakes") for t in tasks)
     try:
         impl = [i for i, t in enumerate(tasks) if t["specialist"] == "code-implementer"]
         if impl:
@@ -5260,7 +5371,11 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
             rev_is = [i for i, t in enumerate(tasks)
                       if t["specialist"] == "code-reviewer"]
             rev_i = rev_is[0] if rev_is else None
-            if rev_i is None:
+            if rev_i is None and eco_collapse:
+                # Eco: no review/fix gate — the pipeline is spec→implement→verify.
+                repairs.append("Eco profile: collapsed to implement→verify "
+                               "(review/fix gate skipped; re-added only when high-stakes)")
+            elif rev_i is None:
                 gate = _review_gate_task(wf_name)
                 gate["depends_on_idx"] = sorted(set(impl)
                                                 | ({spec_i} if spec_i is not None else set()))
@@ -5391,6 +5506,7 @@ async def loop_design(body: dict):
             meta = {"title": t.get("title"), "domain": t.get("domain"),
                     "high_stakes": bool(t.get("high_stakes")),
                     "super_result": bool(t.get("super_result")),
+                    "autopilot": t.get("autopilot"), "spend_profile": t.get("spend_profile"),
                     "specialist": t.get("specialist"), **meta}
     elif oid and kind == "workflow":
         w = _owned_workflow(oid)
@@ -5401,7 +5517,8 @@ async def loop_design(body: dict):
                 "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND high_stakes=1", (oid,))
             meta = {"title": w.get("name"), "domain": w.get("domain"),
                     "specialists": specs, "high_stakes": bool((hs or {}).get("c")),
-                    "super_result": bool(w.get("super_result")), **meta}
+                    "super_result": bool(w.get("super_result")),
+                    "autopilot": w.get("autopilot"), "spend_profile": w.get("spend_profile"), **meta}
     cfg = _loop.design_loop(kind, meta,
                             preference=body.get("preference") or "quality",
                             mode=body.get("mode") or "closed")
@@ -5462,6 +5579,25 @@ async def task_wizard(body: dict):
     fanout = body.get("fanout")
     if fanout is None:
         fanout = sreg.conf("super.fanout_default", "1") == "1"
+    # Q7a: the spend profile derives Super Result + fan-out width + pipeline depth
+    # (rule 5). Smart → SR on + max fan-out; Eco → SR off + no fan-out + collapsed
+    # coding pipeline; Optimal → leave the explicit/triage choice. Involvement is
+    # carried onto the plan for the loop to consume at create time.
+    import autopilot as _ap
+    involvement = _ap.norm_involvement(body.get("autopilot")) if (body.get("autopilot") or "").strip() else None
+    spend = _ap.norm_spend(body.get("spend_profile")) if (body.get("spend_profile") or "").strip() else None
+    pipeline_depth = "standard"
+    if spend:
+        deriv = _ap.derive(involvement, spend, high_stakes=bool(body.get("high_stakes")))
+        pipeline_depth = deriv["pipeline_depth"]
+        if deriv["super_result"] is True:
+            super_result = True
+        elif deriv["super_result"] is False:
+            super_result = False
+        if deriv["fanout"] == "max":
+            fanout = True
+        elif deriv["fanout"] == 0:
+            fanout = False
     fanout = bool(fanout) and super_result
     fanout_n = int(sreg.conf("super.fanout_n", "3") or 3)
 
@@ -5518,7 +5654,7 @@ async def task_wizard(body: dict):
     async def _call(allow_questions: bool) -> dict:
         framing = _task_wizard_framing(allow_questions, uid=wizard_uid,
                                        super_result=super_result, fanout=fanout,
-                                       fanout_n=fanout_n)
+                                       fanout_n=fanout_n, pipeline_depth=pipeline_depth)
 
         def _run():
             # Session-level system prompt = persistent role lock (stronger
@@ -5605,7 +5741,8 @@ async def task_wizard(body: dict):
         wf = data["workflow"]
         name = str(wf.get("name") or "").strip()[:120] or "New project"
         tasks, repairs = _repair_workflow(wf.get("tasks") or [], name,
-                                          max_raw=(7 if fanout else 5), uid=wizard_uid)
+                                          max_raw=(7 if fanout else 5), uid=wizard_uid,
+                                          spend_profile=spend)
         if tasks and assumptions:
             tasks[0]["description"] = _with_assumptions(tasks[0]["description"])
         # Deterministic post-step (§7a — not the LLM's job): the project and
@@ -5615,11 +5752,19 @@ async def task_wizard(body: dict):
             for i, t in enumerate(tasks):
                 if i not in incoming:
                     t["super_result"] = True
+        # Q7a: the preset axes ride the proposal onto the project + every task.
+        if spend or involvement:
+            for t in tasks:
+                if involvement:
+                    t["autopilot"] = involvement
+                if spend:
+                    t["spend_profile"] = spend
         out = {"type": "workflow", "workflow": {
             "name": name,
             "goal": str(wf.get("goal") or "").strip()[:500],
             "domain": wf.get("domain") if wf.get("domain") in _TASK_DOMAINS else None,
             "super_result": super_result,
+            "autopilot": involvement, "spend_profile": spend,
             "tasks": tasks},
             "assumptions": assumptions, "repairs": repairs}
         for r in repairs:
@@ -5631,6 +5776,10 @@ async def task_wizard(body: dict):
         t["description"] = _with_assumptions(t["description"])
         if super_result:
             t["super_result"] = True
+        if involvement:
+            t["autopilot"] = involvement
+        if spend:
+            t["spend_profile"] = spend
         out = {"type": "task", "task": t, "assumptions": assumptions, "repairs": repairs}
     if valid_repo:
         out["repo_path"] = valid_repo  # proposal modal preselects it
@@ -5655,7 +5804,11 @@ async def task_wizard_revalidate(body: dict):
         # _repair_workflow reads depends_on. Accept both.
         if isinstance(rt, dict) and "depends_on" not in rt:
             rt["depends_on"] = rt.get("depends_on_idx") or []
-    tasks, repairs = _repair_workflow(raw, name, max_raw=7, uid=auth.current_user_id())
+    # Q7a: honour the plan's spend profile on the edit round-trip (Eco collapse).
+    spend = body.get("spend_profile") or next(
+        (rt.get("spend_profile") for rt in raw if isinstance(rt, dict) and rt.get("spend_profile")), None)
+    tasks, repairs = _repair_workflow(raw, name, max_raw=7, uid=auth.current_user_id(),
+                                      spend_profile=spend)
     if repairs:
         db.log_activity("info", "system",
                         f"Plan editor auto-repair on '{name[:40]}': " + " · ".join(repairs)[:300])
@@ -5703,14 +5856,17 @@ async def create_workflow(body: dict):
     now = time.time()
     uid = auth.current_user_id()
     lc = body.get("loop_config")
-    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path, user_id, super_result) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    import autopilot as _ap
+    ap_inv = _ap.norm_involvement(body.get("autopilot")) if (body.get("autopilot") or "").strip() else None
+    ap_spend = _ap.norm_spend(body.get("spend_profile")) if (body.get("spend_profile") or "").strip() else None
+    db.execute("INSERT INTO workflows (id, name, goal, domain, status, created_at, updated_at, loop_config, high_stakes, client, project_path, user_id, super_result, autopilot, spend_profile) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (wid, name, body.get("goal") or "", body.get("domain"), "active", now, now,
                 json.dumps(lc) if isinstance(lc, dict) else None,
                 1 if body.get("high_stakes") else 0,
                 _derive_client(body.get("client"), body.get("project_path")),
                 ((body.get("project_path") or "").strip() or None), uid,
-                1 if body.get("super_result") else 0))
+                1 if body.get("super_result") else 0, ap_inv, ap_spend))
     db.log_activity("info", "system", f"Workflow created: '{name}'", user_id=uid)
     if body.get("super_result"):
         _sync_super_result_loop("workflow",
@@ -5796,6 +5952,20 @@ async def update_workflow(wf_id: str, body: dict):
                         f"Workflow {wf_id}: super_result={'on' if sr else 'off'} applied to all member tasks")
         _sync_super_result_loop("workflow",
                                 db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+    # Q7a: the preset axes cascade to member tasks exactly like high_stakes.
+    if "autopilot" in body or "spend_profile" in body:
+        import autopilot as _ap
+        if "autopilot" in body:
+            inv = _ap.norm_involvement(body["autopilot"]) if (body.get("autopilot") or "").strip() else None
+            db.execute("UPDATE workflows SET autopilot=?, updated_at=? WHERE id=?", (inv, time.time(), wf_id))
+            db.execute("UPDATE tasks SET autopilot=? WHERE workflow_id=?", (inv, wf_id))
+        if "spend_profile" in body:
+            sp = _ap.norm_spend(body["spend_profile"]) if (body.get("spend_profile") or "").strip() else None
+            db.execute("UPDATE workflows SET spend_profile=?, updated_at=? WHERE id=?", (sp, time.time(), wf_id))
+            db.execute("UPDATE tasks SET spend_profile=? WHERE workflow_id=?", (sp, wf_id))
+        db.log_activity("info", "system",
+                        f"Workflow {wf_id}: autopilot preset applied to all member tasks")
+        _regen_loop_for_profile("workflow", db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
 
 

@@ -56,10 +56,24 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
     loop_config dict incl. plain-language reasoning."""
     preference = preference if preference in ("quality", "speed") else "quality"
     mode = mode if mode in ("closed", "open") else "closed"
+    high_stakes = bool(meta.get("high_stakes"))
+    # Q7a: when the item carries autopilot preset axes, they DERIVE the loop knobs
+    # (rule 1: spend absorbs the quality/speed preference; involvement sets the
+    # mode). Legacy items (no profile) keep the explicit preference/mode passed in
+    # (P10b). Risk stays an independent hard floor (rule 2), applied below.
+    ap = None
+    round_cap = None
+    if meta.get("spend_profile") or meta.get("autopilot"):
+        import autopilot as _ap
+        ap = _ap.derive(meta.get("autopilot"), meta.get("spend_profile"),
+                        high_stakes=high_stakes)
+        preference = ap["preference"]
+        # Assisted keeps fix-rounds closed but Super Result checkpoints open.
+        mode = ap["sr_mode"] if meta.get("super_result") else ap["mode"]
+        round_cap = ap["round_cap"]
     q = preference == "quality"
     title = (meta.get("title") or meta.get("name") or "").strip()
     domain = (meta.get("domain") or "").strip() or None
-    high_stakes = bool(meta.get("high_stakes"))
     specialists = meta.get("specialists") or ([meta.get("specialist")] if meta.get("specialist") else [])
     specialists = [s for s in specialists if s]
     has_verifier = "acceptance-verifier" in specialists
@@ -77,6 +91,8 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
 
     if meta.get("super_result"):
         rounds = int(db.get_setting("super.max_rounds", "3") or 3)
+        if round_cap is not None:
+            rounds = min(rounds, round_cap)  # Q7a: spend profile caps rework rounds (rule 6)
         triggers.append({
             "id": "super_result", "enabled": True,
             "label": "Super Result — grounded critic → auto-comments → rework",
@@ -98,6 +114,8 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
 
     if kind == "workflow" and has_verifier:
         rounds = 2 if q else 1
+        if round_cap is not None:
+            rounds = min(rounds, round_cap)
         triggers.append({
             "id": "verify_fail", "enabled": True,
             "label": "Failed inspection → automatic fix round",
@@ -127,8 +145,13 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
                 "Note: no dedicated fix task exists, so the findings go back "
                 "to the task that produced the result.")
 
+    # Q7a: when a profile is present, its judge scope governs; else the setting.
+    if ap is not None:
+        all_quality = ap["judge_scope"] == "all_quality"
     if judge_ok and (high_stakes or kind == "task" or all_quality) and not meta.get("super_result"):
         rounds = 2 if q else 1
+        if round_cap is not None:
+            rounds = min(rounds, round_cap)
         triggers.append({
             "id": "judge_revise", "enabled": True,
             "label": "Judge says REVISE → automatic rework",
@@ -148,8 +171,11 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
             "a second model family catches blind spots the working model "
             "cannot see about itself.")
 
-    auto_judge = bool(q and judge_ok and (high_stakes or all_quality) and mode == "closed"
-                      and not meta.get("super_result"))
+    # rule 2 (risk hard floor): a high-stakes deliverable is auto-judged + gated in
+    # closed mode regardless of the spend profile — even Eco (speed) cannot skip
+    # it. Non-high-stakes auto-judge follows the quality + scope decision.
+    auto_judge = bool(judge_ok and mode == "closed" and not meta.get("super_result")
+                      and (high_stakes or (q and all_quality)))
     if auto_judge:
         reasoning.append(
             "Because you chose quality"
@@ -196,6 +222,17 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
             "task's token budget and the daily cap, so a runaway loop is "
             "structurally impossible.")
 
+    if ap is not None:
+        reasoning.append(
+            f"Autopilot preset: {_ap_label(ap['involvement'])} + {_ap_label(ap['spend_profile'])}. "
+            f"It set the quality/speed preference to ‘{preference}’, the loop to "
+            f"{mode.upper()}, and the rework cap to {round_cap} round(s)"
+            + (" — high-stakes still forces the judge + your approval (a hard safety "
+               "floor no cost setting can switch off)." if high_stakes else "."))
+        if ap.get("staged"):
+            reasoning.append(
+                "Some preset effects are STAGED until later phases land: "
+                + "; ".join(ap["staged"].values()) + ".")
     return {
         "enabled": True,
         "mode": mode,
@@ -205,7 +242,18 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
         "reasoning": reasoning,
         "designed_for": title[:120],
         "designed_at": time.time(),
+        # Q7a: record the preset axes so the runtime sweep + UI can read them.
+        "autopilot": meta.get("autopilot"),
+        "spend_profile": meta.get("spend_profile"),
     }
+
+
+def _ap_label(v: str) -> str:
+    try:
+        import autopilot as _ap
+        return _ap.INVOLVEMENT_LABELS.get(v) or _ap.SPEND_LABELS.get(v) or v
+    except Exception:
+        return v
 
 
 # ─────────────────────────── RUNTIME ENGINE ───────────────────────────
@@ -375,9 +423,13 @@ def _sweep_task_loops(actions_left: int) -> int:
         # 1) auto-judge a fresh deliverable (quality mode, rubric; high-stakes, or
         # every quality deliverable when judge.auto_scope=all_quality — N5). The
         # cfg.auto_judge flag already encodes the scope decision from design_loop.
+        # Q7a: a task under the optimal/smart spend profile carries all_quality
+        # scope of its own, independent of the global setting.
         all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
+        prof = (t.get("spend_profile") or "").strip()
+        scope_ok = bool(t.get("high_stakes")) or all_quality or prof in ("optimal", "smart")
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \
-                and (bool(t.get("high_stakes")) or all_quality) and _judgeable(t.get("domain")):
+                and scope_ok and _judgeable(t.get("domain")):
             # frontier quota/rate-limit backoff (premortem P1): don't auto-judge
             # straight into a quota wall — retry a later sweep.
             if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
