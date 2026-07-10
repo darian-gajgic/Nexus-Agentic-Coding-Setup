@@ -213,8 +213,17 @@ JUDGE'S BLOCKING LIST:
 """
 
 QUOTA_RE = re.compile(
-    r"(usage limit|rate.?limit|quota|overloaded|too many requests|limit reached|"
-    r"out of extra usage|resets at)", re.I)
+    r"(usage limit|session limit|rate.?limit|quota|overloaded|too many requests|"
+    r"limit reached|out of extra usage|hit your .{0,20}limit|resets \d|resets at)", re.I)
+
+
+def is_quota_error(envelope, blob):
+    """The CLI envelope is authoritative: 429 = quota/rate-limit. Phrasing regex
+    is the fallback for non-JSON output (verified 2026-07-10: a session-limit hit
+    returns api_error_status=429 with text 'You've hit your session limit')."""
+    if envelope.get("api_error_status") == 429:
+        return True
+    return bool(QUOTA_RE.search(blob))
 
 # ---------------------------------------------------------------- small helpers
 
@@ -357,7 +366,7 @@ def run_claude(state, name, prompt, model, allowed, timeout, cont_prompt=None):
             return {"ok": True, "timed_out": False, "text": text, "log_path": log_path}
 
         blob = (stdout + "\n" + stderr)
-        if QUOTA_RE.search(blob):
+        if is_quota_error(envelope, blob):
             if quota_waited >= MAX_QUOTA_WAIT_S:
                 escalate(state, name, "quota wait budget exhausted",
                          f"Waited {quota_waited // 60} min total. Last output tail:\n"
@@ -449,8 +458,11 @@ def read_prompt(fname):
 
 def db_backup(tag):
     src = REPO / "app/nexus.db"
+    dst = REPO / f"app/nexus.db.bak-{tag}"
+    if dst.exists():
+        log(f"db backup {dst.name} already exists (resume) — keeping the original")
+        return
     if src.exists():
-        dst = REPO / f"app/nexus.db.bak-{tag}"
         shutil.copy2(src, dst)
         log(f"db backup → {dst.name}")
     else:
@@ -466,17 +478,23 @@ def run_impl_phase(state, phase):
 
     cont = CONTINUATION_PROMPT.format(phase=phase, report=report or "the phase report",
                                       prompt=read_prompt(prompt_file)) + IMPL_SUFFIX
-    res = run_claude(state, f"{phase}-impl", prompt, IMPL_MODEL,
-                     IMPL_ALLOWED, IMPL_TIMEOUT_S, cont_prompt=cont)
-    conts = 0
-    while (res["timed_out"] or "PHASE PARTIAL" in res["text"]) and conts < MAX_CONTINUATIONS:
-        conts += 1
-        log(f"{phase}: interrupted/partial — continuation {conts}/{MAX_CONTINUATIONS}")
-        res = run_claude(state, f"{phase}-impl-cont{conts}", cont, IMPL_MODEL,
+    if phase in state.setdefault("impl_done", []):
+        log(f"{phase}: implementation child already completed on a previous run — "
+            f"skipping straight to completion checks")
+    else:
+        res = run_claude(state, f"{phase}-impl", prompt, IMPL_MODEL,
                          IMPL_ALLOWED, IMPL_TIMEOUT_S, cont_prompt=cont)
-    if res["timed_out"] or "PHASE PARTIAL" in res["text"]:
-        escalate(state, phase, "phase still incomplete after continuation budget",
-                 f"See {res['log_path']} and any HANDOFF-*.md at the repo root.")
+        conts = 0
+        while (res["timed_out"] or "PHASE PARTIAL" in res["text"]) and conts < MAX_CONTINUATIONS:
+            conts += 1
+            log(f"{phase}: interrupted/partial — continuation {conts}/{MAX_CONTINUATIONS}")
+            res = run_claude(state, f"{phase}-impl-cont{conts}", cont, IMPL_MODEL,
+                             IMPL_ALLOWED, IMPL_TIMEOUT_S, cont_prompt=cont)
+        if res["timed_out"] or "PHASE PARTIAL" in res["text"]:
+            escalate(state, phase, "phase still incomplete after continuation budget",
+                     f"See {res['log_path']} and any HANDOFF-*.md at the repo root.")
+        state["impl_done"].append(phase)
+        save_state(state)
 
     failures = collect_failures(phase)
     if failures:
