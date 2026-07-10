@@ -282,7 +282,8 @@ def spec_model_for(user_id: str | None) -> tuple[str | None, str | None]:
 
 
 def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
-                  api_key: str | None = None, type_rubric: str | None = None) -> str:
+                  api_key: str | None = None, type_rubric: str | None = None,
+                  spec_path: str | None = None) -> str:
     """Run the frontier judge command on a file (shared with the task judge).
     Template lives in settings judge.cmd so gates can stub it (R4.3).
 
@@ -301,6 +302,7 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
     import subprocess as sp
     tmpdir = Path(KNOWLEDGE_DIR) / ".nexus-judge-tmp"
     judged_path = file_path
+    spec_tmp = None
     try:
         tmpdir.mkdir(exist_ok=True)
         tmp_file = tmpdir / f"judge-{uuid.uuid4().hex[:8]}.md"
@@ -331,6 +333,15 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         # Optional parameter: absent = exactly today's behavior (eval runner
         # passes it only when the case opts in via frontmatter).
         env["JUDGE_TYPE_RUBRIC"] = type_rubric
+    if spec_path and os.path.isfile(spec_path):
+        # Deep Plan (Step 8): the ORIGINAL SPEC contract — cjudge also checks the
+        # deliverable against it when set (optional token; absent = today's behavior).
+        try:
+            spec_tmp = tmpdir / f"SPEC-{uuid.uuid4().hex[:8]}.md"
+            shutil.copy2(spec_path, spec_tmp)
+            env["JUDGE_SPEC"] = str(spec_tmp)
+        except Exception:
+            pass
     try:
         with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
             r = sp.run(tokens, capture_output=True, text=True, timeout=900,
@@ -346,6 +357,11 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         try:
             if judged_path != file_path:
                 os.unlink(judged_path)
+        except Exception:
+            pass
+        try:
+            if spec_tmp:
+                os.unlink(spec_tmp)
         except Exception:
             pass
     return out
@@ -592,6 +608,18 @@ def build_critic_sandbox(task: dict, round_no: int = 1):
         shutil.copy2(bc, ctx_dir / "BUSINESS-CONTEXT.md")
         business = "_critic_context/BUSINESS-CONTEXT.md"
 
+    # Deep Plan (Step 8): the ORIGINAL contract travels to the critic — a task in
+    # a Deep-Plan project gets its workflow's spec.json copied in so the critic
+    # verifies against the spec, not just the task brief.
+    spec_ctx = None
+    wfid = task.get("workflow_id")
+    if wfid:
+        sp_json = (Path(__file__).parent / "workspaces" / f"workflow-{wfid}"
+                   / "attachments" / "spec.json")
+        if sp_json.is_file():
+            shutil.copy2(sp_json, ctx_dir / "spec.json")
+            spec_ctx = "_critic_context/spec.json"
+
     # Sibling reports: each DONE predecessor's deliverable — this is how the
     # N investigator reports reach the reconciler's critic for cross-checking.
     siblings = []
@@ -637,6 +665,7 @@ def build_critic_sandbox(task: dict, round_no: int = 1):
         "sibling_reports": siblings,
         "rubrics": rubrics,
         "business_context": business,
+        "spec": spec_ctx,  # Deep Plan: the original SPEC contract (Step 8)
         "max_findings": int(sreg.conf("super.max_findings", "25") or 25),
         "open_comments": open_comments,
     }
