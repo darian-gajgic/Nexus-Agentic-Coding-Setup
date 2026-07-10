@@ -156,14 +156,29 @@ SECTIONS = [
              "help": "Playback pace multiplier — 1.0 is the voice's native speed, 1.25 is 25% "
                      "faster, 0.9 slower. Applies to the next spoken sentence (no restart)."},
             {"key": "voice.stt_model", "label": "STT model (faster-whisper)", "type": "str",
-             "default": "medium.en",
-             "help": "Any faster-whisper checkpoint, e.g. medium.en or large-v3-turbo "
-                     "(multilingual, better accuracy, similar VRAM). Downloads on first use."},
+             "default": "large-v3",
+             "help": "The machine's ONE shared STT model (JARVIS voice-in + dictation + "
+                     "meetings). large-v3 = most accurate, weights already cached; "
+                     "large-v3-turbo = faster alternative (downloads on first use). "
+                     "Applies at the next worker spawn."},
             {"key": "voice.stt_device", "label": "STT device", "type": "str", "default": "auto",
-             "help": "auto = CUDA with automatic CPU fallback on GPU errors; or force cuda / cpu."},
+             "help": "auto = CUDA with automatic CPU fallback on GPU errors; or force cuda / cpu. "
+                     "Applies at the next worker spawn."},
+            {"key": "voice.stt_compute", "label": "STT compute type (CUDA)", "type": "str",
+             "default": "int8_float16",
+             "help": "CUDA precision: int8_float16 ≈ 2GB VRAM for large-v3 (recommended on the "
+                     "shared 12GB card — what the old dictation tool ran), float16 ≈ 3.3GB for a "
+                     "marginal accuracy gain. CPU always uses int8."},
+            {"key": "voice.stt_idle_timeout", "label": "STT idle unload (s)", "type": "int",
+             "default": "300", "min": 60, "max": 3600,
+             "help": "Seconds of STT inactivity before the worker process is killed, freeing "
+                     "100% of its VRAM (weights + CUDA context). Dictation and meetings reset "
+                     "the timer on every segment; the next use pays a ~4-8s warm-up (hidden by "
+                     "warm-on-mic-press / warm-on-hotkey)."},
             {"key": "voice.stt_language", "label": "STT language", "type": "str", "default": "en",
              "help": "ISO code spoken to JARVIS (en, de, …). Empty = autodetect per utterance. "
-                     "Ignored by english-only (*.en) checkpoints."},
+                     "Ignored by english-only (*.en) checkpoints. Dictation manages its own "
+                     "language (dictation.language + live cycling)."},
         ],
     },
     {
@@ -178,6 +193,127 @@ SECTIONS = [
                      "this long after the LAST look. 60s keeps an active webcam Q&A responsive "
                      "while still freeing VRAM once you're done; 0 unloads immediately (cold "
                      "reload on every look); 5m holds it longer for heavy vision sessions."},
+            {"key": "vision.idle_timeout", "label": "Vision worker idle kill (s)", "type": "int",
+             "default": "600", "min": 60, "max": 3600,
+             "help": "Seconds of vision inactivity before the SigLIP/SDXL worker process is "
+                     "killed (full VRAM reclaim). Lower to 300 for a uniform ≤5-min unload "
+                     "policy; the next frame pays a worker respawn + model reload."},
+        ],
+    },
+    {
+        "id": "dictation", "title": "Dictation",
+        "desc": "System-wide dictation (absorbed from WisprFlow 2026-07-10): hotkey → record → "
+                "shared STT → LLM cleanup → type into the focused window. Non-restart keys "
+                "apply at the next dictation session.",
+        "items": [
+            {"key": "dictation.enabled", "label": "Dictation enabled", "type": "bool",
+             "default": "1", "restart": True,
+             "help": "Master switch for the dictation subsystem (hotkey listener, control "
+                     "socket, overlay). Off = JARVIS voice-in still works; only system-wide "
+                     "dictation stops."},
+            {"key": "dictation.hotkey_keycode", "label": "Hotkey (evdev keycode)", "type": "int",
+             "default": "425", "min": 1, "max": 767, "restart": True,
+             "help": "evdev keycode that toggles recording. 425 = KEY_PRESENTATION (the "
+                     "dedicated mic key on this Acer). Find codes with evtest."},
+            {"key": "dictation.hotkey_debounce_ms", "label": "Hotkey debounce (ms)", "type": "int",
+             "default": "250", "min": 0, "max": 2000, "restart": True,
+             "help": "Duplicate-press suppression window — this laptop reports the hotkey from "
+                     "TWO input devices per press; the debounce collapses them."},
+            {"key": "dictation.language", "label": "Dictation language", "type": "str",
+             "default": "en",
+             "help": "Default session language (en/de/ro). The overlay's language button (or "
+                     "the `lang` socket command) cycles per-session without changing this."},
+            {"key": "dictation.beam_size", "label": "STT beam size", "type": "int",
+             "default": "5", "min": 1, "max": 10,
+             "help": "Decode beam for dictation (5 = WisprFlow's accuracy-leaning setting; "
+                     "JARVIS voice-in uses 3 for latency)."},
+            {"key": "dictation.auto_stop", "label": "Auto-stop on silence", "type": "bool",
+             "default": "0",
+             "help": "Stop recording automatically after the silence window instead of waiting "
+                     "for the second hotkey press."},
+            {"key": "dictation.vad_rms_threshold", "label": "VAD RMS threshold", "type": "float",
+             "default": "0.010", "min": 0.001, "max": 0.2,
+             "help": "Energy level counted as speech. Raise if background noise keeps "
+                     "auto-stop from firing."},
+            {"key": "dictation.silence_ms", "label": "Auto-stop silence (ms)", "type": "int",
+             "default": "900", "min": 200, "max": 5000,
+             "help": "Silence duration that ends the recording when auto-stop is on."},
+            {"key": "dictation.max_seconds", "label": "Segment length cap (s)", "type": "int",
+             "default": "300", "min": 30, "max": 1800,
+             "help": "Per-SEGMENT boundary, not a stop: reaching it cuts at the next pause and "
+                     "keeps recording while the finished segment is transcribed and typed. "
+                     "(WisprFlow silently DISCARDED everything past its 120s cap — fixed here.)"},
+            {"key": "dictation.input_device", "label": "Input device", "type": "str",
+             "default": "",
+             "help": "sounddevice input name/index; empty = system default mic."},
+            {"key": "dictation.llm_enable", "label": "LLM cleanup", "type": "bool",
+             "default": "1",
+             "help": "Polish the raw transcript (punctuation, fillers) with a small local LLM "
+                     "before typing. Any failure falls back to the raw transcript."},
+            {"key": "dictation.llm_url", "label": "Cleanup ollama URL", "type": "str",
+             "default": "http://localhost:11435",
+             "help": "The ISOLATED cleanup ollama (f16 KV cache — the system ollama's q4_0 KV "
+                     "garbles small models). Unit: nexus-cleanup-llm.service."},
+            {"key": "dictation.llm_model", "label": "Cleanup model", "type": "str",
+             "default": "gemma3:4b",
+             "help": "Model on the cleanup ollama used for the transcript polish."},
+            {"key": "dictation.llm_keep_alive", "label": "Cleanup keep-alive", "type": "str",
+             "default": "2m",
+             "help": "How long ollama keeps the cleanup model in VRAM after a dictation "
+                     "(~2.9GB). Sent per-request; short = frees the shared card sooner."},
+            {"key": "dictation.llm_timeout", "label": "Cleanup timeout (s)", "type": "int",
+             "default": "60", "min": 5, "max": 300,
+             "help": "Cleanup call budget; on timeout the raw transcript is typed instead."},
+            {"key": "dictation.llm_max_words", "label": "Cleanup max words", "type": "int",
+             "default": "1800", "min": 100, "max": 10000,
+             "help": "Transcripts longer than this skip the LLM entirely (gemma3's 4096-token "
+                     "context would silently drop the BEGINNING of longer inputs)."},
+            {"key": "dictation.inject_method", "label": "Injection method", "type": "str",
+             "default": "type",
+             "help": "type = layout-aware ydotool keystrokes (works in terminals AND GUIs, any "
+                     "layout); paste = wl-copy + paste chord; clipboard = copy only. Degrades "
+                     "to clipboard automatically when ydotoold is unavailable."},
+            {"key": "dictation.paste_chord", "label": "Paste chord", "type": "str",
+             "default": "ctrl+v",
+             "help": "Chord for inject_method=paste: ctrl+v, ctrl+shift+v (terminals) or "
+                     "shift+insert."},
+            {"key": "dictation.key_delay_ms", "label": "Typing key delay (ms)", "type": "int",
+             "default": "4", "min": 0, "max": 100,
+             "help": "Delay between injected key events; raise if apps drop characters."},
+            {"key": "dictation.trailing_space", "label": "Trailing space", "type": "bool",
+             "default": "1",
+             "help": "Append a space after each dictation (newline in note mode) so "
+                     "consecutive dictations don't run together."},
+            {"key": "dictation.note_mode", "label": "Note mode at boot", "type": "bool",
+             "default": "0", "restart": True,
+             "help": "Start with one-sentence-per-line formatting on. The overlay's Note "
+                     "button toggles it live per-session."},
+            {"key": "dictation.overlay", "label": "On-screen overlay", "type": "bool",
+             "default": "1",
+             "help": "The status pill (listening/processing/meeting) with Meeting/Note/"
+                     "Language buttons. Needs tkinter (apt python3-tk)."},
+            {"key": "dictation.overlay_python", "label": "Overlay interpreter", "type": "str",
+             "default": "",
+             "help": "Python with tkinter for the overlay subprocess; empty = auto-detect."},
+            {"key": "dictation.meeting_dir", "label": "Meeting transcripts dir", "type": "str",
+             "default": "~/wf-meetings",
+             "help": "Where meeting-*.md transcripts land (kept at the WisprFlow path so old "
+                     "transcripts stay in one place). The Meetings tab reads this."},
+            {"key": "dictation.meeting_vad_floor", "label": "Meeting VAD floor", "type": "float",
+             "default": "0.02", "min": 0.001, "max": 0.5,
+             "help": "Per-channel speech energy floor for meeting segmentation."},
+            {"key": "dictation.meeting_silence_ms", "label": "Meeting silence (ms)", "type": "int",
+             "default": "700", "min": 200, "max": 5000,
+             "help": "Silence that closes a meeting speech segment."},
+            {"key": "dictation.meeting_min_speech_ms", "label": "Meeting min speech (ms)",
+             "type": "int", "default": "300", "min": 100, "max": 5000,
+             "help": "Segments shorter than this are discarded as noise."},
+            {"key": "dictation.meeting_max_seg_s", "label": "Meeting max segment (s)", "type": "int",
+             "default": "24", "min": 5, "max": 120,
+             "help": "Hard per-segment cap so a monologue still transcribes incrementally."},
+            {"key": "dictation.meeting_beam_size", "label": "Meeting beam size", "type": "int",
+             "default": "3", "min": 1, "max": 10,
+             "help": "Decode beam for meeting segments (3 = throughput-leaning)."},
         ],
     },
     {

@@ -43,7 +43,7 @@ DIM = 1152
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 VLM_MODEL = os.environ.get("JARVIS_VLM_MODEL", "qwen3-vl:8b")
 
-VISION_IDLE_TIMEOUT = 600.0     # kill the worker after 10 min without use
+VISION_IDLE_TIMEOUT = 600.0     # default worker idle-kill; setting vision.idle_timeout overrides
 DUP_COSINE = 0.985              # frames this similar to the previous one are skipped
 FRAME_KEEP = 4000               # per-user cap; oldest frames beyond it are pruned
 
@@ -132,10 +132,17 @@ async def _ask_worker(req: dict, timeout: float = 180.0) -> dict:
             raise
 
 
+def _idle_timeout() -> float:
+    try:
+        return float(_conf("vision.idle_timeout", str(VISION_IDLE_TIMEOUT)))
+    except (TypeError, ValueError):
+        return VISION_IDLE_TIMEOUT
+
+
 def check_and_unload_idle():
     """Called from the server's periodic unloader (same cadence as voice)."""
     global _worker
-    if _worker_alive() and _last_use and (time.time() - _last_use) > VISION_IDLE_TIMEOUT:
+    if _worker_alive() and _last_use and (time.time() - _last_use) > _idle_timeout():
         try:
             _worker.kill()
         except Exception:

@@ -1,50 +1,56 @@
 """NEXUS Agent OS — JARVIS Voice Pipeline.
 
-GPU-accelerated STT (faster-whisper) and TTS (Piper) running locally.
+TTS: Piper (onnx, CPU, zero VRAM) — loaded in-process, streaming synthesis.
+STT: faster-whisper large-v3 — the ONE speech-to-text model for the whole
+machine (JARVIS mic, dictation, meeting mode), hosted in a killable
+subprocess (stt_worker.py). This module is the worker CLIENT: it spawns the
+worker on demand, serializes every caller onto its JSON-lines pipe, and kills
+it after `voice.stt_idle_timeout` seconds of STT inactivity — process death
+reclaims 100% of the VRAM including the CUDA context ctranslate2 pins
+(in-process unloading never freed those ~158MiB).
+
 No cloud calls, no API keys, zero cost.
 """
 import gc
 import io
 import os
+import json
 import wave
 import time
 import asyncio
 import tempfile
-import traceback
+import threading
+import subprocess
 import numpy as np
 from pathlib import Path
 from typing import Optional
 
-import gpu_lock
-
-# ── CUDA preload (must happen before ctranslate2 import) ──
-import ctypes, glob
-for _pattern in [
-    "/usr/local/lib/ollama/cuda_v12/libcublas.so.12",
-    "/usr/local/lib/ollama/cuda_v12/libcublasLt.so.12",
-    "/usr/local/lib/ollama/cuda_v12/libcudart.so.12",
-]:
-    try:
-        ctypes.CDLL(_pattern, mode=ctypes.RTLD_GLOBAL)
-    except OSError:
-        pass
-
-from faster_whisper import WhisperModel
 from piper.voice import PiperVoice
 from piper.config import SynthesisConfig
 
 PROJECT = Path(__file__).parent
 PIPER_MODEL = PROJECT / "models" / "piper_voice.onnx"
 PIPER_CONFIG = PROJECT / "models" / "piper_voice.onnx.json"
+STT_WORKER = PROJECT / "stt_worker.py"
+STT_LOG = PROJECT / "logs" / "stt_worker.log"
+(PROJECT / "logs").mkdir(exist_ok=True)
 
-# ── Lazy singletons (loaded once, reused across requests) ──
-_stt_model: Optional[WhisperModel] = None
-_stt_loaded_key: Optional[tuple] = None  # (model_name, device) actually loaded
-_stt_gpu_block_until = 0.0  # after a CUDA failure, skip the GPU until this time
+# ── STT worker client state ──
+_stt_proc: Optional[subprocess.Popen] = None
+_stt_proc_key: Optional[tuple] = None  # (model, device, compute) of the live worker
+_stt_loaded = False                    # last reported model-in-memory state
+_stt_gpu_block_until = 0.0  # after a CUDA failure, spawn on CPU until this time
 GPU_RETRY_COOLDOWN = 600.0  # seconds on CPU before giving CUDA another chance
+# Serializes ALL pipe access: the async JARVIS path (via asyncio.to_thread),
+# the dictation session thread and the meeting worker thread. Must be a
+# threading.Lock, not asyncio — two of the three callers are plain threads.
+_stt_io_lock = threading.Lock()
+_warm_guard = threading.Lock()
+_warm_thread: Optional[threading.Thread] = None
+
+# ── TTS state ──
 _tts_voice: Optional[PiperVoice] = None
 _tts_loaded_path: Optional[str] = None  # which .onnx is currently loaded
-_stt_lock = asyncio.Lock()
 _tts_lock = asyncio.Lock()
 
 
@@ -59,48 +65,32 @@ def _conf(key: str, default: str) -> str:
         return default
 
 # ── Idle model unloading ──
-# Track when each model was last used. After IDLE_TIMEOUT seconds of inactivity,
-# the model is unloaded from GPU memory to free VRAM for other models.
+# STT and TTS idle timers are SEPARATE (memory-audit finding #10: frequent
+# CPU-TTS completions used to keep the GPU whisper resident past its window).
 import time as _time
-IDLE_TIMEOUT = 300.0  # seconds of inactivity before unloading — MUST exceed
-# the 240s chat/stream ceiling, or models unload mid-'thinking' and the
-# first reply sentence pays a cold reload right when the user is waiting
-_last_voice_use = 0.0  # shared: TTS + STT both count as "voice" use
+IDLE_TIMEOUT = 300.0  # TTS idle unload — MUST exceed the 240s chat/stream
+# ceiling, or Piper unloads mid-'thinking' and the first reply sentence pays
+# a cold reload right when the user is waiting
+_last_stt_use = 0.0
+_last_tts_use = 0.0
 
 
-def _touch_voice():
-    """Record that a voice model was just used (resets the idle timer)."""
-    global _last_voice_use
-    _last_voice_use = _time.time()
+def _touch_stt():
+    global _last_stt_use
+    _last_stt_use = _time.time()
 
 
-def _drop_stt():
-    global _stt_model, _stt_loaded_key
-    dropped = _stt_model is not None
-    _stt_model = None
-    _stt_loaded_key = None
-    if dropped:
-        gc.collect()  # break any lingering cycles so VRAM is returned promptly
+def _touch_tts():
+    global _last_tts_use
+    _last_tts_use = _time.time()
 
 
-def unload_voice_models():
-    """Unload TTS + STT models from GPU memory. Called after idle timeout."""
-    global _tts_voice, _tts_loaded_path
-    _drop_stt()
-    if _tts_voice is not None:
-        try:
-            del _tts_voice
-        except Exception:
-            pass
-        _tts_voice = None
-        _tts_loaded_path = None
-        gc.collect()
+# ── STT worker lifecycle ────────────────────────────────────────────────────
 
-
-def _stt_target() -> tuple:
-    """(model_name, device) the next load should use, honoring settings and
-    the post-CUDA-failure cooldown."""
-    model_name = _conf("voice.stt_model", "medium.en")
+def _stt_spawn_key() -> tuple:
+    """(model, device, compute) the next worker spawn should use, honoring
+    settings and the post-CUDA-failure cooldown."""
+    model = _conf("voice.stt_model", "large-v3")
     pref = _conf("voice.stt_device", "auto")
     if pref == "cpu":
         device = "cpu"
@@ -108,22 +98,211 @@ def _stt_target() -> tuple:
         device = "cuda"
     else:  # auto
         device = "cpu" if _time.time() < _stt_gpu_block_until else "cuda"
-    return model_name, device
+    compute = _conf("voice.stt_compute", "int8_float16")
+    return model, device, compute
 
 
-def _get_stt() -> WhisperModel:
-    global _stt_model, _stt_loaded_key
-    key = _stt_target()
-    if _stt_model is None or _stt_loaded_key != key:
-        _drop_stt()
-        model_name, device = key
-        compute = "float16" if device == "cuda" else "int8"
-        print(f"[voice] loading STT {model_name} on {device} ({compute})", flush=True)
-        _stt_model = WhisperModel(model_name, device=device, compute_type=compute)
-        _stt_loaded_key = key
-    _touch_voice()
-    return _stt_model
+def _worker_env() -> dict:
+    """start.sh sets LD_LIBRARY_PATH for cuDNN/cuBLAS; re-derive it here as
+    belt-and-braces so the worker gets CUDA libs even when the parent wasn't
+    launched through start.sh (manual runs, tests)."""
+    env = dict(os.environ)
+    dirs = [
+        os.path.expanduser("~/ml-env/lib/python3.14/site-packages/nvidia/cu13/lib"),
+        os.path.expanduser("~/ml-env/lib/python3.14/site-packages/nvidia/cudnn/lib"),
+    ]
+    current = env.get("LD_LIBRARY_PATH", "")
+    missing = [d for d in dirs if d not in current]
+    if missing:
+        env["LD_LIBRARY_PATH"] = ":".join(missing + ([current] if current else []))
+    return env
 
+
+def _spawn_stt_worker(key: tuple) -> subprocess.Popen:
+    model, device, compute = key
+    print(f"[voice] spawning stt worker: {model} on {device} ({compute})", flush=True)
+    logf = open(STT_LOG, "ab")  # worker stderr — NEVER devnull (respawn loops
+    try:                        # must be diagnosable; audit lesson)
+        return subprocess.Popen(
+            [str(PROJECT / ".venv" / "bin" / "python"), str(STT_WORKER),
+             "--model", model, "--device", device, "--compute", compute],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=logf,
+            cwd=str(PROJECT), text=True, bufsize=1, env=_worker_env())
+    finally:
+        logf.close()  # child holds its own dup of the fd
+
+
+def _stt_worker_alive() -> bool:
+    return _stt_proc is not None and _stt_proc.poll() is None
+
+
+def _kill_stt_worker(reason: str = ""):
+    global _stt_proc, _stt_proc_key, _stt_loaded
+    p, _stt_proc = _stt_proc, None
+    _stt_proc_key = None
+    _stt_loaded = False
+    if p is not None:
+        try:
+            p.kill()
+            p.wait(timeout=5)
+        except Exception:
+            pass
+        if reason:
+            print(f"[voice] stt worker killed: {reason}", flush=True)
+
+
+def _ask_stt_sync(req: dict, timeout: float = 90.0) -> dict:
+    """One request/response on the worker pipe, serialized by _stt_io_lock.
+
+    Timeout discipline: a timer kills the worker if the response doesn't land
+    in time — pipe EOF then unblocks readline, so neither sync (dictation/
+    meeting) nor async (JARVIS) callers can hang forever, and the desynced
+    pipe is never reused (same rationale as the vision worker's
+    kill-and-respawn: a late reply would answer the NEXT request)."""
+    global _stt_proc, _stt_proc_key, _stt_gpu_block_until, _stt_loaded
+    with _stt_io_lock:
+        key = _stt_spawn_key()
+        if not _stt_worker_alive() or _stt_proc_key != key:
+            if _stt_proc_key not in (None, key):
+                _kill_stt_worker(f"config change {_stt_proc_key} -> {key}")
+            else:
+                _kill_stt_worker()
+            _stt_proc = _spawn_stt_worker(key)
+            _stt_proc_key = key
+        _touch_stt()
+        op = req.get("op", "?")
+        timer = threading.Timer(
+            timeout, _kill_stt_worker, [f"{op} timed out after {timeout:.0f}s"])
+        timer.daemon = True
+        timer.start()
+        try:
+            _stt_proc.stdin.write(json.dumps(req) + "\n")
+            _stt_proc.stdin.flush()
+            line = _stt_proc.stdout.readline()
+        except Exception as e:
+            _kill_stt_worker(f"pipe error on {op}: {e!r}")
+            raise RuntimeError(f"stt worker pipe error: {e}") from e
+        finally:
+            timer.cancel()
+        _touch_stt()
+        if not line:
+            _kill_stt_worker(f"died mid-{op}")
+            raise RuntimeError(f"stt worker died mid-request ({op})")
+        resp = json.loads(line)
+        if resp.get("fallback"):
+            # The worker had to drop to CPU (OOM after lock-wait + eviction).
+            # Block CUDA at the next spawn too, so an idle-kill + respawn
+            # during sustained contention doesn't pay a doomed CUDA load.
+            _stt_gpu_block_until = _time.time() + GPU_RETRY_COOLDOWN
+        if "loaded" in resp:
+            _stt_loaded = bool(resp["loaded"])
+        elif "text" in resp:
+            _stt_loaded = True
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        return resp
+
+
+def _transcribe_path(path: str, language: Optional[str] = None,
+                     beam_size: int = 3, vad_filter: bool = True,
+                     initial_prompt: Optional[str] = None) -> str:
+    resp = _ask_stt_sync({
+        "op": "transcribe", "path": path, "language": language,
+        "beam_size": beam_size, "vad_filter": vad_filter,
+        "initial_prompt": initial_prompt,
+        "condition_on_previous_text": False,
+    })
+    return resp.get("text", "")
+
+
+# ── STT: audio bytes → text ──
+# The browser sends webm/opus (compressed container). faster-whisper can
+# decode any ffmpeg-supported format when given a file path, so we save
+# to a temp file and hand the worker the path. Never np.frombuffer() a
+# compressed container.
+
+def _detect_format(audio_bytes: bytes) -> str:
+    """Detect audio format from magic bytes."""
+    if audio_bytes[:4] == b'RIFF':
+        return '.wav'
+    if audio_bytes[:4] == b'OggS' or audio_bytes[:4] == b'\x1a\x45\xdf\xa3':
+        return '.webm'
+    if audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+        return '.mp3'
+    return '.webm'  # default assumption for MediaRecorder output
+
+
+def _transcribe_bytes_sync(audio_bytes: bytes) -> str:
+    ext = _detect_format(audio_bytes)
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+    try:
+        lang = _conf("voice.stt_language", "en") or None  # empty = autodetect
+        return _transcribe_path(tmp_path, language=lang, beam_size=3)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+async def transcribe(audio_bytes: bytes) -> str:
+    """Async wrapper — the pipe call runs in a thread pool (it blocks on the
+    io-lock + worker response; self-times-out via _ask_stt_sync's timer)."""
+    return await asyncio.to_thread(_transcribe_bytes_sync, audio_bytes)
+
+
+def transcribe_pcm(pcm, sample_rate: int = 16000,
+                   language: Optional[str] = None, beam_size: int = 5,
+                   vad_filter: bool = True,
+                   initial_prompt: Optional[str] = None) -> str:
+    """SYNC entry for the dictation and meeting threads: float32 mono PCM →
+    text via the shared worker (writes a temp WAV, same one-path protocol)."""
+    pcm = np.clip(np.asarray(pcm, dtype=np.float32), -1.0, 1.0)
+    if pcm.size == 0:
+        return ""
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(tmp_path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes((pcm * 32767.0).astype("<i2").tobytes())
+        return _transcribe_path(tmp_path, language=language,
+                                beam_size=beam_size, vad_filter=vad_filter,
+                                initial_prompt=initial_prompt)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def warm_stt() -> dict:
+    """Non-blocking: start loading the STT model in the background. Called on
+    JARVIS mic-press and on the dictation hotkey-down so large-v3 loads WHILE
+    the user is still speaking. Safe from any thread; dedup-guarded."""
+    global _warm_thread
+    with _warm_guard:
+        if _stt_loaded and _stt_worker_alive() and _stt_proc_key == _stt_spawn_key():
+            return {"warming": False, "loaded": True}
+        if _warm_thread is not None and _warm_thread.is_alive():
+            return {"warming": True, "loaded": False}
+
+        def _warm():
+            try:
+                _ask_stt_sync({"op": "warm"}, timeout=120.0)
+            except Exception as e:
+                print(f"[voice] stt warm failed: {e!r}", flush=True)
+
+        _warm_thread = threading.Thread(target=_warm, daemon=True, name="stt-warm")
+        _warm_thread.start()
+        return {"warming": True, "loaded": False}
+
+
+# ── TTS ─────────────────────────────────────────────────────────────────────
 
 def _tts_target() -> str:
     """Absolute path of the .onnx voice to use. Setting `voice.tts_voice` (abs or
@@ -174,107 +353,26 @@ def _get_tts() -> PiperVoice:
                 _tts_loaded_path = str(PIPER_MODEL)
             else:
                 raise
-    _touch_voice()
+    _touch_tts()
     return _tts_voice
 
 
-# ── STT: audio bytes → text ──
-# The browser sends webm/opus (compressed container). faster-whisper can
-# decode any ffmpeg-supported format when given a file path, so we save
-# to a temp file and let it handle decoding. This is the correct approach
-# — never try to np.frombuffer() a compressed container.
-
-def _detect_format(audio_bytes: bytes) -> str:
-    """Detect audio format from magic bytes."""
-    if audio_bytes[:4] == b'RIFF':
-        return '.wav'
-    if audio_bytes[:4] == b'OggS' or audio_bytes[:4] == b'\x1a\x45\xdf\xa3':
-        return '.webm'
-    if audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
-        return '.mp3'
-    return '.webm'  # default assumption for MediaRecorder output
-
-
-def _is_gpu_failure(e: Exception) -> bool:
-    """CUDA-side failure (OOM / cudaErrorInvalidDevice / cuBLAS / cuDNN /
-    alloc) — the class of errors where retrying CUDA under VRAM contention
-    just fails again, so the right move is straight to CPU."""
-    s = str(e).lower()
-    return any(sig in s for sig in (
-        "out of memory", "cuda", "cublas", "cudnn", "failed to allocate"))
-
-
-def _run_transcribe(tmp_path: str) -> str:
-    # Heavy GPU section (model load + decode) — serialize with SigLIP/SDXL/VLM
-    # on the shared 12GB card so concurrent bursts stop OOMing each other.
-    # CPU loads skip the lock entirely (a fallback must not queue behind GPU work).
-    with gpu_lock.gpu_section("stt", timeout=20.0,
-                              enabled=_stt_target()[1] == "cuda"):
-        model = _get_stt()
-        lang = _conf("voice.stt_language", "en") or None  # empty = autodetect
-        if lang and _stt_loaded_key and _stt_loaded_key[0].endswith(".en"):
-            lang = "en"  # english-only checkpoints reject other language hints
-        segments, _info = model.transcribe(tmp_path, language=lang, beam_size=3, vad_filter=True)
-        text = " ".join(s.text.strip() for s in segments).strip()
-    _touch_voice()  # completion counts as use — long turns aged out mid-flight
-    return text
-
-
-def _transcribe_sync(audio_bytes: bytes) -> str:
-    """Transcribe audio bytes (webm, wav, mp3 — any ffmpeg-supported format).
-
-    Self-healing: a CUDA failure (OOM / cudaErrorInvalidDevice / cuBLAS under
-    VRAM contention with the vision worker or ollama) goes STRAIGHT to the CPU
-    int8 model — the GPU block is set on the FIRST failure, because retrying
-    CUDA under contention just OOMs a second time (audit §3.6). Non-GPU
-    hiccups keep the drop-model-and-retry-once path.
-    """
-    ext = _detect_format(audio_bytes)
-
-    # Save to temp file — faster-whisper uses ffmpeg to decode any format
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-
-    global _stt_gpu_block_until
-    try:
+def _drop_tts():
+    global _tts_voice, _tts_loaded_path
+    if _tts_voice is not None:
         try:
-            return _run_transcribe(tmp_path)
-        except Exception as e:
-            # loaded_key is None when the LOAD itself failed — judge by target
-            was_cuda = (_stt_loaded_key or _stt_target())[1] == "cuda"
-            if was_cuda and _is_gpu_failure(e):
-                print(f"[voice] STT CUDA failure ({e!r}) — CPU fallback for "
-                      f"{GPU_RETRY_COOLDOWN:.0f}s", flush=True)
-                traceback.print_exc()
-                _stt_gpu_block_until = _time.time() + GPU_RETRY_COOLDOWN
-                _drop_stt()
-                return _run_transcribe(tmp_path)  # target is now CPU
-            print(f"[voice] STT failed ({e!r}) — dropping model and retrying", flush=True)
-            traceback.print_exc()
-            _drop_stt()
-            try:
-                return _run_transcribe(tmp_path)
-            except Exception as e2:
-                if not was_cuda:
-                    raise  # already on CPU — a third identical attempt won't help
-                print(f"[voice] STT retry failed ({e2!r}) — CPU fallback for "
-                      f"{GPU_RETRY_COOLDOWN:.0f}s", flush=True)
-                traceback.print_exc()
-                _stt_gpu_block_until = _time.time() + GPU_RETRY_COOLDOWN
-                _drop_stt()
-                return _run_transcribe(tmp_path)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
+            del _tts_voice
+        except Exception:
             pass
+        _tts_voice = None
+        _tts_loaded_path = None
+        gc.collect()
 
 
-async def transcribe(audio_bytes: bytes) -> str:
-    """Async wrapper — runs STT in a thread pool."""
-    async with _stt_lock:
-        return await asyncio.to_thread(_transcribe_sync, audio_bytes)
+def unload_voice_models():
+    """Kill the STT worker + drop Piper. Called on idle timeout / teardown."""
+    _kill_stt_worker("unload requested")
+    _drop_tts()
 
 
 # ── TTS: text → WAV bytes ──
@@ -318,7 +416,7 @@ async def synthesize_stream(text: str):
         except Exception as e:
             loop.call_soon_threadsafe(q.put_nowait, e)
         finally:
-            _touch_voice()
+            _touch_tts()
             loop.call_soon_threadsafe(q.put_nowait, DONE)
 
     async with _tts_lock:
@@ -336,26 +434,49 @@ async def synthesize_stream(text: str):
 # ── Health check ──
 
 def voice_status() -> dict:
-    model_name, device = _stt_loaded_key or _stt_target()
+    model, device, compute = _stt_proc_key or _stt_spawn_key()
+    try:
+        stt_idle = float(_conf("voice.stt_idle_timeout", "300"))
+    except (TypeError, ValueError):
+        stt_idle = 300.0
     return {
         "tts_loaded": _tts_voice is not None,
-        "stt_loaded": _stt_model is not None,
+        "stt_loaded": _stt_loaded and _stt_worker_alive(),
+        "stt_worker_alive": _stt_worker_alive(),
         "tts_engine": "piper (onnx CPU)",
         "tts_voice": os.path.basename(_tts_loaded_path or _tts_target()).replace(".onnx", ""),
-        "stt_engine": f"faster-whisper {model_name} ({device})",
+        "stt_engine": f"faster-whisper {model} ({device}, {compute}) [worker]",
         "stt_gpu_cooldown_s": max(0, int(_stt_gpu_block_until - _time.time())),
         "cost": "$0.00 — fully local",
-        "last_voice_use": int(_last_voice_use),
+        "last_stt_use": int(_last_stt_use),
+        "last_tts_use": int(_last_tts_use),
+        "stt_idle_timeout": stt_idle,
         "idle_timeout": IDLE_TIMEOUT,
     }
 
 
 def check_and_unload_idle():
-    """Called periodically by the server. Unloads models idle > IDLE_TIMEOUT."""
-    if _last_voice_use == 0:
-        return False  # never used
-    if (_time.time() - _last_voice_use) > IDLE_TIMEOUT:
-        if _stt_model is not None or _tts_voice is not None:
-            unload_voice_models()
-            return True
-    return False
+    """Called periodically by the server (15s loop). STT: kill the worker
+    after `voice.stt_idle_timeout` s of STT inactivity (process death = full
+    VRAM reclaim). TTS: drop Piper after IDLE_TIMEOUT s of TTS inactivity.
+    The timers are independent — see the memory-audit note above."""
+    did = False
+    try:
+        stt_idle = float(_conf("voice.stt_idle_timeout", "300"))
+    except (TypeError, ValueError):
+        stt_idle = 300.0
+    if (_stt_worker_alive() and _last_stt_use
+            and (_time.time() - _last_stt_use) > stt_idle):
+        # never kill mid-request: the io-lock is held while a request is in
+        # flight — try-acquire and skip this tick if the worker is busy
+        if _stt_io_lock.acquire(blocking=False):
+            try:
+                _kill_stt_worker(f"idle > {stt_idle:.0f}s — VRAM freed")
+            finally:
+                _stt_io_lock.release()
+            did = True
+    if (_tts_voice is not None and _last_tts_use
+            and (_time.time() - _last_tts_use) > IDLE_TIMEOUT):
+        _drop_tts()
+        did = True
+    return did

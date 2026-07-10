@@ -1,6 +1,17 @@
 # One STT Model for the Whole Machine — Design & Brainstorm Doc
 
-**Status:** PARKED for a dedicated session. NOT implemented. This is the "Batch 10" feature from the stability work (`FIX-RUNBOOK-2026-07-08.md` §10) — split out here so it can be designed properly on its own. **The stability bugfix work (Batches 1-9) is DONE, verified, and pushed; this doc is the only remaining thread and it is a FEATURE, not a fix.**
+> **⛔ SUPERSEDED — IMPLEMENTED 2026-07-10, with a DIFFERENT topology than this doc
+> recommends.** The operator overrode the B1 recommendation: Nexus owns EVERYTHING —
+> the one whisper (large-v3 in the killable `app/stt_worker.py` subprocess) AND the
+> full dictation UX (hotkey/cleanup/typing/overlay/meetings, ported into
+> `app/dictation*.py` with the 2026-07-10 bug-audit fixes: the silent 120s cap and the
+> adaptive-GPU-monitor OOM-kill loop are gone). All three wf-* services are disabled;
+> `wf-cleanup-llm` renamed → `nexus-cleanup-llm.service` (same ~/.ollama-wf models).
+> `~/local-wisprflow/` stays on disk untouched as the rollback. Current truth lives in
+> `app/CLAUDE.md` ("STT consolidation") + `app/docs/JARVIS-VOICE.md` §0.-1; the
+> implementation plan was `~/.claude/plans/quiet-conjuring-anchor.md`.
+
+**Status:** ~~PARKED for a dedicated session. NOT implemented.~~ This is the "Batch 10" feature from the stability work (`FIX-RUNBOOK-2026-07-08.md` §10) — split out here so it can be designed properly on its own. **The stability bugfix work (Batches 1-9) is DONE, verified, and pushed; this doc is the only remaining thread and it is a FEATURE, not a fix.**
 **Date:** 2026-07-09
 **Read alongside:** `FIX-RUNBOOK-2026-07-08.md` §10, memory `[[nexus-stability-audit-2026-07-08]]`.
 

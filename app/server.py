@@ -194,7 +194,26 @@ def startup():
                 pass
     ilt = threading.Thread(target=_idle_unloader_loop, daemon=True)
     ilt.start()
+    # Start dictation (system-wide voice typing — hotkey listener + control
+    # socket + overlay; absorbed from WisprFlow). Fail-soft: a missing dep
+    # disables dictation, never the server.
+    if _dictation is not None:
+        try:
+            _dictation.manager.start()
+        except Exception as _de:
+            print(f"[dictation] start failed: {_de}", flush=True)
     db.log_activity("info", "system", "NEXUS Agent OS started")
+
+
+@app.on_event("shutdown")
+def _shutdown_hooks():
+    # Bounded (≤4s) dictation teardown — stops recording, kills the overlay,
+    # unlinks the control socket. Fits inside uvicorn's 8s graceful window.
+    if _dictation is not None:
+        try:
+            _dictation.manager.shutdown()
+        except Exception:
+            pass
 
 
 # --- WebSocket for real-time updates ---
@@ -1652,6 +1671,13 @@ except Exception as _e:
     _voice_err = traceback.format_exc()
     print(f"[voice] WARNING: voice pipeline not available: {_e}", flush=True)
 
+# ── Dictation (system-wide voice typing, absorbed from WisprFlow) ──
+_dictation = None
+try:
+    import dictation as _dictation
+except Exception as _e:
+    print(f"[dictation] WARNING: dictation unavailable: {_e}", flush=True)
+
 HERMES_API_BASE = sreg.conf("hermes.api_base")  # setting → env → default; restart applies
 HERMES_API_KEY = os.environ.get("API_SERVER_KEY", "")
 JARVIS_SESSION_FILE = Path(__file__).parent / "jarvis_session.json"
@@ -2314,6 +2340,113 @@ async def jarvis_stt(file: UploadFile = File(...)):
         db.log_activity("error", "jarvis", f"STT failed after fallback: {str(e)[:300]}")
         return JSONResponse(status_code=500, content={"error": f"transcription failed: {str(e)[:200]}"})
     return {"text": text}
+
+
+@app.post("/api/jarvis/stt/warm")
+async def jarvis_stt_warm():
+    """Kick a background load of the STT model (worker spawn + large-v3 into
+    VRAM, ~4-8s) so it's warm by the time the utterance ends. The browser
+    fires this on mic-press; the dictation hotkey does the same in-process.
+    Non-blocking: warm_stt() only spawns a daemon thread."""
+    if not _voice_ready:
+        return JSONResponse(status_code=503, content={"error": "voice pipeline not available"})
+    return _voice.warm_stt()
+
+
+# ===== Dictation + Meetings (system-wide voice typing; Meetings tab) =====
+
+def _meeting_dir() -> Path:
+    d = sreg.conf("dictation.meeting_dir") or "~/wf-meetings"
+    return Path(os.path.expanduser(d))
+
+
+def _valid_meeting_name(name: str) -> bool:
+    import re as _mre
+    return (name == os.path.basename(name)
+            and bool(_mre.fullmatch(r"meeting-[\w.-]+\.md", name)))
+
+
+def _live_meeting_name() -> str | None:
+    if _dictation is not None and _dictation.manager._meeting is not None:
+        p = _dictation.manager._meeting.path
+        if p:
+            return os.path.basename(p)
+    return None
+
+
+@app.get("/api/dictation/status")
+async def dictation_status():
+    if _dictation is None:
+        return {"available": False}
+    return {"available": True, **_dictation.manager.status_dict()}
+
+
+@app.post("/api/dictation/meeting")
+async def dictation_meeting_toggle():
+    """Start a meeting when idle; stop it when one is running (the same
+    semantics as the overlay button + hotkey-during-meeting)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if _dictation is None:
+        return JSONResponse(status_code=503, content={"error": "dictation unavailable"})
+    m = _dictation.manager
+    reply = m.handle("toggle") if m.state == _dictation.MEETING else m.handle("meeting")
+    return {"reply": reply, "state": m.state, "live": _live_meeting_name()}
+
+
+@app.get("/api/meetings")
+async def meetings_list():
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    d = _meeting_dir()
+
+    def _scan():
+        items = []
+        if d.is_dir():
+            for p in sorted(d.glob("meeting-*.md"),
+                            key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    st = p.stat()
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        title = f.readline().strip().lstrip("# ").strip()
+                    items.append({"name": p.name, "mtime": int(st.st_mtime),
+                                  "size": st.st_size, "title": title})
+                except OSError:
+                    continue
+        return items
+
+    items = await asyncio.to_thread(_scan)
+    return {"meetings": items, "live": _live_meeting_name(), "dir": str(d)}
+
+
+@app.get("/api/meetings/{name}")
+async def meeting_get(name: str):
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name):
+        return JSONResponse(status_code=400, content={"error": "bad name"})
+    path = _meeting_dir() / name
+    if not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    content = await asyncio.to_thread(
+        lambda: path.read_text(encoding="utf-8", errors="replace"))
+    return {"name": name, "content": content, "live": _live_meeting_name() == name}
+
+
+@app.delete("/api/meetings/{name}")
+async def meeting_delete(name: str):
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name):
+        return JSONResponse(status_code=400, content={"error": "bad name"})
+    if _live_meeting_name() == name:
+        return JSONResponse(status_code=409,
+                            content={"error": "meeting is live — stop it first"})
+    path = _meeting_dir() / name
+    if not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    await asyncio.to_thread(path.unlink)
+    return {"ok": True}
 
 
 @app.post("/api/jarvis/tts")

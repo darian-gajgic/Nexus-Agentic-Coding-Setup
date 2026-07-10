@@ -62,11 +62,15 @@ else
   echo "      Install Hermes first, then: cp files/hermes-agents/*.md ~/.hermes/agents/"
 fi
 
-# ── systemd user unit ──
-echo "-- Installing systemd user unit"
+# ── systemd user units ──
+echo "-- Installing systemd user units"
 mkdir -p "$HOME/.config/systemd/user"
 sed "s|/home/sinep/nexus-agent-os|$TARGET|g" "$HERE/system/nexus.service" \
   > "$HOME/.config/systemd/user/nexus.service"
+# Isolated cleanup ollama for dictation transcript polish (f16 KV cache; the
+# system ollama's q4_0 KV garbles small models). Fail-soft: without it,
+# dictation types the raw transcript.
+cp "$HERE/system/nexus-cleanup-llm.service" "$HOME/.config/systemd/user/" 2>/dev/null || true
 systemctl --user daemon-reload
 systemctl --user enable nexus >/dev/null 2>&1 || true
 
@@ -75,9 +79,18 @@ echo "== Done. Start with:  systemctl --user start nexus"
 echo "   Dashboard:         https://127.0.0.1:8777  (accept the self-signed cert)"
 echo "   First run creates nexus.db and seeds default settings automatically."
 echo
+echo "Dictation (system-wide voice typing, optional — degrades gracefully):"
+echo "  - system pkgs:  sudo apt install python3-tk python3-dev libportaudio2 \\"
+echo "                       ydotool wl-clipboard ffmpeg pipewire-utils"
+echo "  - hotkey needs the user in the 'input' group:  sudo usermod -aG input \$USER"
+echo "  - typing needs ydotoold:  systemctl --user enable --now ydotool"
+echo "  - transcript cleanup LLM: systemctl --user enable --now nexus-cleanup-llm"
+echo "        then: OLLAMA_HOST=127.0.0.1:11435 ollama pull gemma3:4b"
+echo "  - STT model (large-v3, ~2.9GB) downloads on first use"
+echo
 echo "NOT included (by design):"
 echo "  - JARVIS voice models (optional; see app/requirements-voice.txt +"
-echo "    docs/JARVIS-VOICE.md — needs a GPU + Piper/whisper/Wav2Lip assets)"
+echo "    docs/JARVIS-VOICE.md — needs a GPU + Piper/whisper assets)"
 echo "  - Your task history/workspaces (runtime data stays on each machine)"
 echo
 echo "Sanity check:  cd $TARGET && bash scripts/verify.sh"
