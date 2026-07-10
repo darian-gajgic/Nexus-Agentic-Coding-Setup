@@ -114,6 +114,24 @@ try:
 except Exception:
     chk("rule8 P6(b) reconciler revalidate reachable", False)
 
+print("=== Q7a — default preset is a LIVE control (3rd judge finding 1) ===")
+_ap_inv0 = db.get_setting("autopilot.default_involvement", "assisted")
+_ap_sp0 = db.get_setting("autopilot.default_spend", "optimal")
+_cleanup.append(lambda: (db.set_setting("autopilot.default_involvement", _ap_inv0 or "assisted"),
+                         db.set_setting("autopilot.default_spend", _ap_sp0 or "optimal")))
+db.set_setting("autopilot.default_involvement", "full_auto")
+db.set_setting("autopilot.default_spend", "eco")
+try:
+    apd = get("/api/autopilot/defaults").json()
+    chk("Q7a /api/autopilot/defaults reflects the configured setting (not a dead control)",
+        apd.get("involvement") == "full_auto" and apd.get("spend") == "eco")
+    db.set_setting("autopilot.default_involvement", "bogus-value")
+    apd2 = get("/api/autopilot/defaults").json()
+    chk("Q7a defaults normalize an invalid value to the built-in default",
+        apd2.get("involvement") == "assisted")
+except Exception:
+    chk("Q7a /api/autopilot/defaults reachable", False)
+
 print("=== Q4 — decision log harvest + injection ===")
 wid = f"wf-t{int(time.time())}"
 wsdir = hd.WORKSPACES / f"workflow-{wid}"

@@ -3361,6 +3361,23 @@ async def list_decisions():
             "total": len(cards)}
 
 
+@app.get("/api/autopilot/defaults")
+async def autopilot_defaults():
+    """Q7a: the operator-configured default preset a NEW task/project starts with
+    (settings autopilot.default_involvement / default_spend). The task-create and
+    wizard preset cards preselect these so the setting is a LIVE control, not a
+    decorative one — before this reader the UI hardcoded assisted/optimal and the
+    seeded settings were consumed nowhere (3rd judge finding 1). Normalized against
+    the valid axes; an unknown/blank value falls back to the built-in default."""
+    import autopilot as _ap
+    return {
+        "involvement": _ap.norm_involvement(
+            db.get_setting("autopilot.default_involvement", _ap.INVOLVEMENT_DEFAULT)),
+        "spend": _ap.norm_spend(
+            db.get_setting("autopilot.default_spend", _ap.SPEND_DEFAULT)),
+    }
+
+
 # ── Q2: operator-edit distillation (manual trigger + evidence view) ──
 
 @app.post("/api/lessons/distill")

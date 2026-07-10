@@ -292,6 +292,20 @@ Each was re-verified against HEAD (re-located by symbol; all five reproduced), f
 recorded as an explicit deviation with evidence), given a regression check, and committed
 granularly. The tree is fully committed.
 
+1. **`autopilot.default_involvement`/`default_spend` were a dead operator-facing control.**
+   Confirmed at HEAD: both settings are seeded (`settings_registry.py`) and editable, but a
+   repo-wide grep found NO consumer — no server reader and no UI reader. The task-create and
+   wizard preset cards hardcoded `AUTOPILOT_DEFAULTS = { involvement: 'assisted', spend:
+   'optimal' }` (`static/app.js`) and `selectedAutopilot`/`autopilotCardsHTML` fell back to that
+   constant, so changing the setting did nothing — a live-looking control that wasn't.
+   **Fix:** new `GET /api/autopilot/defaults` reads + normalizes the two settings
+   (`_ap.norm_involvement`/`norm_spend`, invalid → built-in default); `init()` fetches it once
+   and mutates the shared `AUTOPILOT_DEFAULTS` object so every preset card preselects the
+   operator's configured default (`app.js?v=82`). **Regression:** `verify_autopilot_e2e.py`
+   "Q7a default preset is a LIVE control" group PATCHes the settings and asserts the endpoint
+   reflects them (full_auto/eco) and normalizes a bogus value; `verify.sh` "Q7a defaults wired
+   (not dead)" asserts the endpoint + the app.js reader/mutation both exist.
+
 3. **P10(a) binding framing order violated — operator attachments injected before
    DECISIONS/exemplars/predecessors.** Confirmed at HEAD: in `hermes_dispatch.build_framing`
    the `_attachment_lines` block sat right after the STRUCTURED-FACT paragraph (~line 906) —
