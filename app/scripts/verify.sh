@@ -374,6 +374,11 @@ chk "Q3 verifier hash-check"         "grep -q 'sha256sum -c acceptance' server.p
 chk "N5 auto_scope setting+engine"   "grep -q 'judge.auto_scope' settings_registry.py && grep -q 'all_quality' loop_engine.py"
 chk "N6 auto_draft setting+sweep"    "grep -q 'replan.auto_draft' settings_registry.py && grep -q 'replan/draft' loop_engine.py"
 chk "N7 blind-reject judge gate"     "grep -q 'judge.on_blind_reject' settings_registry.py && grep -q 'def _blind_reject_judge_if_wanted' server.py"
+# Q1 — golden-exemplar retrieval (+ L3 lifecycle)
+chk "Q1 exemplar selection"          "grep -q 'def golden_exemplars' hermes_dispatch.py && grep -q \"judge_verdict='SHIP'\" hermes_dispatch.py"
+chk "Q1 exemplar injection"          "grep -q 'QUALITY BAR' hermes_dispatch.py && grep -q 'golden_exemplars(task)' hermes_dispatch.py"
+chk "Q1 exemplar settings"           "grep -q 'exemplars.enabled' settings_registry.py && grep -q 'exemplars.min_score' settings_registry.py && grep -q 'exemplars.max' settings_registry.py"
+chk "L3 exemplar age-out"            "grep -q 'exemplars.max_age_months' settings_registry.py && grep -q 'max_age_days' hermes_dispatch.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
