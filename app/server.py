@@ -3068,9 +3068,10 @@ class ApprovalCreate(BaseModel):
 @app.get("/api/approvals")
 async def list_approvals(status: Optional[str] = None, limit: int = 50):
     # Per-user, fail-closed (gap fix): approvals carry the owner's work
-    # (deliverable reviews) — they exist on the owner's board only.
-    q = "SELECT * FROM approvals WHERE user_id = ?"
-    params = [auth.current_user_id()]
+    # (deliverable reviews) — they exist on the owner's board only. P7: admins
+    # additionally see admin-scoped rows (lesson deltas / cross-user shares).
+    q = "SELECT * FROM approvals WHERE (user_id = ? OR (scope='admin' AND ?))"
+    params = [auth.current_user_id(), 1 if auth.is_admin() else 0]
     if status:
         q += " AND status = ?"; params.append(status)
     q += " ORDER BY requested_at DESC LIMIT ?"
@@ -3246,6 +3247,76 @@ async def decide_approval(approval_id: str, body: dict):
                 _lessons_safe("_record_domain_feedback", domain, ap.get("user_id"), fb)
     await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
     return ap
+
+
+# ── Q7b: the Decision Inbox — ONE surface aggregating every pending human
+#    action (approvals of all kinds + replan checkpoints), each a decision card
+#    with headline / recommendation / reasons / options / cost. Producers attach
+#    recommendation+reasons[]+cost_hint into the approval payload at insert time;
+#    the card falls back gracefully for legacy rows without them. ──
+
+_DECISION_FALLBACKS = {
+    "deliverable": {"headline": "A deliverable is ready for your review.",
+                    "recommendation": "Approve & ship", "cost_hint": ""},
+    "super_result": {"headline": "Super Result reached a checkpoint.",
+                     "recommendation": "Review the inspector's findings", "cost_hint": ""},
+    "lesson_deltas": {"headline": "New lessons distilled from your corrections.",
+                      "recommendation": "Review & apply", "cost_hint": ""},
+}
+
+
+def _decision_card_from_approval(ap: dict) -> dict:
+    try:
+        payload = json.loads(ap.get("payload") or "{}") or {}
+    except Exception:
+        payload = {}
+    at = ap.get("action_type") or "approval"
+    fb = _DECISION_FALLBACKS.get(at, {"headline": ap.get("description") or "Action needed.",
+                                      "recommendation": "Approve", "cost_hint": ""})
+    reason = payload.get("reason")  # SR escalation reason → blocking
+    blocking = bool(reason) or (ap.get("risk_level") == "high") or at in ("super_result",)
+    return {
+        "id": ap["id"], "kind": at, "scope": ap.get("scope") or "user",
+        "headline": payload.get("headline") or ap.get("description") or fb["headline"],
+        "recommendation": payload.get("recommendation") or fb["recommendation"],
+        "reasons": payload.get("reasons") or ([reason] if reason else []),
+        "cost_hint": payload.get("cost_hint") or fb.get("cost_hint") or "",
+        "task_id": payload.get("task_id"),
+        "risk_level": ap.get("risk_level") or "medium",
+        "blocking": blocking, "age": time.time() - (ap.get("requested_at") or time.time()),
+        "requested_at": ap.get("requested_at"),
+        "source": "approval",
+    }
+
+
+@app.get("/api/decisions")
+async def list_decisions():
+    """Every pending human action for this user (P7: admins also see admin-scoped
+    cards like lesson deltas), sorted blocking-first then oldest-first."""
+    uid = auth.current_user_id()
+    admin = auth.is_admin()
+    rows = db.query_all(
+        "SELECT * FROM approvals WHERE status='pending' AND "
+        "(user_id=? OR (scope='admin' AND ?)) ORDER BY requested_at",
+        (uid, 1 if admin else 0))
+    cards = [_decision_card_from_approval(a) for a in rows]
+    # Replan checkpoints (a stalled project needs a recovery-plan decision).
+    for w in db.query_all("SELECT * FROM workflows WHERE user_id=? AND status='active'", (uid,)):
+        rp = _parse_replan(w)
+        if not rp or rp.get("status") not in ("needed", "proposed"):
+            continue
+        drafted = rp.get("status") == "proposed"
+        cards.append({
+            "id": f"replan-{w['id']}", "kind": "replan", "scope": "user",
+            "headline": f"Project “{w.get('name')}” stalled — {(rp.get('reason') or '')[:160]}",
+            "recommendation": "Review the recovery plan" if drafted else "Draft a recovery plan",
+            "reasons": [rp.get("reason") or "a stage failed with no automatic fix left"],
+            "cost_hint": "", "workflow_id": w["id"], "risk_level": "high",
+            "blocking": True, "age": time.time() - (rp.get("detected_at") or time.time()),
+            "requested_at": rp.get("detected_at"), "source": "replan"})
+    cards.sort(key=lambda c: (0 if c["blocking"] else 1, c.get("requested_at") or 0))
+    return {"decisions": cards, "blocking": sum(1 for c in cards if c["blocking"]),
+            "total": len(cards)}
 
 
 # ── Q2: operator-edit distillation (manual trigger + evidence view) ──

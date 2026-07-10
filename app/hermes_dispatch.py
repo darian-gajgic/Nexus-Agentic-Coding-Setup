@@ -1174,7 +1174,14 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
             "status, risk_level, requested_at, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
             (f"appr-{uuid.uuid4().hex[:10]}", agent_id, "deliverable",
              f"High-stakes deliverable ready for review: '{task['title']}'",
-             json.dumps({"task_id": task_id}), "pending", "high", time.time(),
+             # Q7b: decision-card fields so the inbox renders headline/why/cost.
+             json.dumps({"task_id": task_id,
+                         "headline": f"“{task['title']}” is ready for your review.",
+                         "recommendation": "Approve & ship",
+                         "reasons": ["high-stakes deliverable — nothing ships unjudged",
+                                     "review the work, or send it back with changes"],
+                         "cost_hint": ""}),
+             "pending", "high", time.time(),
              task.get("user_id")))  # the approval belongs to the task's owner
         db.log_activity("warn", agent_id,
                         f"Task {task_id} awaits approval (high-stakes) — nothing ships unjudged",

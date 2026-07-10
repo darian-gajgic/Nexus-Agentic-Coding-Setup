@@ -453,6 +453,24 @@ function updateApprovalBadge() {
   else { b.style.display = 'none'; }
 }
 
+// Q7b: the Decisions badge shows the BLOCKING count (falls back to total) —
+// the single human-attention number, aggregating every pending decision.
+function updateDecisionBadge() {
+  const d = state.decisions || {};
+  const n = d.blocking || d.total || 0;
+  const b = $('#decBadge');
+  if (!b) return;
+  if (n > 0) { b.textContent = n; b.style.display = 'inline-block'; }
+  else { b.style.display = 'none'; }
+}
+
+async function loadDecisions(forRender) {
+  try { state.decisions = await api('GET', '/api/decisions'); }
+  catch { state.decisions = { decisions: [], blocking: 0, total: 0 }; }
+  updateDecisionBadge();
+  if (forRender && currentView === 'decisions' && !uiLocked()) render();
+}
+
 async function tick() {
   if (currentView === 'jarvis') return; // JARVIS manages its own updates
   try {
@@ -491,6 +509,10 @@ async function tick() {
         wfState.fetched = true;
         if (!uiLocked()) render();
       }
+    } else if (currentView === 'decisions') {
+      const before = JSON.stringify(state.decisions || {});
+      await loadDecisions(false);
+      if (JSON.stringify(state.decisions || {}) !== before && !uiLocked()) render();
     }
     // monitor updates itself via its own interval; static views don't tick
     updateSidebarMini();
@@ -500,6 +522,7 @@ async function tick() {
       state.quota = await api('GET', '/api/quota');
       updateQuotaBanner();
       updateModelStrip();
+      loadDecisions(false);  // Q7b: keep the Decisions badge fresh everywhere
     }
   } catch (e) { /* ignore transient */ }
 }
@@ -511,6 +534,7 @@ const VIEW_META = {
   kanban: ['Tasks', 'The task board: plan, assign and track every unit of work'],
   workflows: ['Workflows', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
   deliverables: ['Deliverables', 'Every agent output in one place — read, download, chain'],
+  decisions: ['Decisions', 'Your inbox of decisions — every pending human call, one place, answerable in seconds'],
   meetings: ['Meetings', 'Dictation MeetingMode transcripts — watch them live, read, manage'],
   agents: ['Agent Fleet', 'Click any agent for memory, messages & cost'],
   agentic: ['Agentic Capabilities', 'Approvals · verification · scheduling · self-healing · cost control'],
@@ -580,6 +604,7 @@ function render() {
   else if (currentView === 'workflows') { c.innerHTML = wrapView(viewWorkflows()); bindWorkflows(); }
   else if (currentView === 'deliverables') { c.innerHTML = wrapView(viewDeliverables()); bindDeliverables(); }
   else if (currentView === 'meetings') { c.innerHTML = wrapView(viewMeetings()); bindMeetings(); }
+  else if (currentView === 'decisions') { c.innerHTML = wrapView(viewDecisions()); bindDecisions(); }
   else if (currentView === 'jarvis') { renderJarvisView(); }
   updateSidebarMini();
 }
@@ -8714,6 +8739,110 @@ async function loadMeetings(renderIfChanged = false) {
 }
 
 const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+
+// ═══════════════════ DECISIONS INBOX (Q7b) ═══════════════════
+// The ONE human surface: every pending decision as a plain-language card with a
+// headline, a ★ recommendation, the evidence, option buttons, and a cost line.
+// You are the CLIENT; the inspector/foreman/planner do the work (Q7c metaphor).
+function decisionCardHTML(c) {
+  const reasons = (c.reasons || []).filter(Boolean).slice(0, 3)
+    .map(r => `<li>${esc(String(r))}</li>`).join('');
+  let actions = '';
+  if (c.source === 'replan') {
+    actions = `<button class="btn-primary" onclick="openWorkflowDetail('${esc(c.workflow_id)}')">★ ${esc(c.recommendation)}</button>
+      <button class="btn-ghost" onclick="openWorkflowDetail('${esc(c.workflow_id)}')">Open project</button>`;
+  } else {
+    const details = c.kind === 'lesson_deltas'
+      ? `<button class="btn-ghost" onclick="openLessonCard('${esc(c.id)}')">Open details</button>`
+      : (c.task_id ? `<button class="btn-ghost" onclick="reviewTaskUI('${esc(c.task_id)}')">Open details</button>` : '');
+    actions = `<button class="btn-primary" onclick="decideDecision('${esc(c.id)}','approved')">★ ${esc(c.recommendation)}</button>
+      <button class="btn-ghost" onclick="decideDecision('${esc(c.id)}','rejected')">Request changes</button>
+      ${details}`;
+  }
+  const kindChip = { deliverable: '📄 deliverable', super_result: '🔎 inspector', lesson_deltas: '📚 lessons', replan: '🧭 replan' }[c.kind] || c.kind;
+  return `<div class="agentic-row" style="flex-direction:column;align-items:stretch;gap:6px;border-left:3px solid ${c.blocking ? 'var(--warn,#eab308)' : 'var(--accent)'}">
+    <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+      <strong style="font-size:13px">${esc(c.headline)}</strong>
+      <span class="chip">${kindChip}${c.scope === 'admin' ? ' · admin' : ''}</span>
+    </div>
+    ${reasons ? `<ul style="margin:0;padding-left:18px;font-size:11.5px;color:var(--text-dim)">${reasons}</ul>` : ''}
+    ${c.cost_hint ? `<div style="font-size:11px;color:var(--text-faint)">💡 ${esc(c.cost_hint)}</div>` : ''}
+    <div class="row-actions" style="gap:8px">${actions}</div>
+  </div>`;
+}
+
+function viewDecisions() {
+  if (!state.decisions) { loadDecisions(true); return skeletonView(); }
+  const cards = state.decisions.decisions || [];
+  const blocking = state.decisions.blocking || 0;
+  return `
+    <div class="view-intro" style="margin-bottom:12px">Your inbox of decisions — everything the system needs a human call on, in one place, newest-blocking first. You are the <strong>client</strong>: the worker builds, the <strong>inspector</strong> re-checks, the <strong>foreman</strong> sends work back until it passes; each card below is a choice only you can make. <span class="qmark" data-help="decisions-inbox" title="What is this?">?</span></div>
+    ${blocking ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:8px">${blocking} decision${blocking > 1 ? 's' : ''} waiting on you.</div>` : ''}
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${cards.length ? cards.map(decisionCardHTML).join('')
+        : '<div class="empty"><span class="e-ico">✅</span>Nothing needs you right now — the loops are running.</div>'}
+    </div>`;
+}
+
+function bindDecisions() { /* cards are self-contained; tick() keeps them fresh */ }
+
+async function decideDecision(id, decision) {
+  const body = { status: decision, decided_by: 'operator' };
+  if (decision === 'rejected') {
+    const fb = prompt('Request changes — what should change? (optional: leave EMPTY to attach the inspector/judge findings automatically)');
+    if (fb === null) return;
+    if (fb.trim()) body.feedback = fb.trim();
+  }
+  try {
+    await api('PATCH', `/api/approvals/${id}`, body);
+    toast(decision === 'approved' ? 'Approved' : 'Sent back with your notes', 'ok');
+  } catch (e) { toast('Decision failed: ' + e.message, 'err'); }
+  await loadDecisions(true);
+  try { state.tasks = await api('GET', '/api/tasks'); } catch { }
+}
+
+async function openLessonCard(id) {
+  const c = (state.decisions.decisions || []).find(x => x.id === id);
+  if (!c) return;
+  // the card carries no payload — fetch the before/after deltas from the approval
+  let deltas = [];
+  try {
+    const aps = await api('GET', '/api/approvals');
+    const ap = (aps.approvals || aps || []).find(a => a.id === id);
+    if (ap) { const p = typeof ap.payload === 'string' ? JSON.parse(ap.payload) : ap.payload; deltas = (p && p.deltas) || []; }
+  } catch { }
+  const rows = deltas.map((d, i) => `
+    <div style="border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px;margin-bottom:6px">
+      <div style="font-size:11px;color:var(--text-dim)">${esc(d.file)} · <select id="ld-tgt-${i}"><option value="canonical" ${d.target !== 'user_overlay' ? 'selected' : ''}>everyone (canonical)</option><option value="user_overlay" ${d.target === 'user_overlay' ? 'selected' : ''}>just me (overlay)</option></select></div>
+      ${d.before ? `<div style="font-size:11.5px;color:#f87171;white-space:pre-wrap">− ${esc(d.before)}</div>` : ''}
+      <div style="font-size:11.5px;color:#4ade80;white-space:pre-wrap">+ ${esc(d.after)}</div>
+      <div style="font-size:11px;color:var(--text-faint);margin-top:3px">${esc(d.rationale || '')}</div>
+    </div>`).join('');
+  showModal(`<h2>📚 Distilled lessons</h2>
+    <div class="view-intro" style="margin-bottom:8px">Approve to fold these into your knowledge base (git-committed). Flip a target to "just me" to keep a lesson personal, or "everyone" to share it across users.</div>
+    ${rows || '<div class="empty">No deltas.</div>'}
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="decideDecision('${esc(id)}','rejected');closeModal()">Reject</button>
+      <button class="btn-primary" onclick="applyLessonDeltas('${esc(id)}',${deltas.length})">★ Approve & apply</button>
+    </div>`);
+}
+
+async function applyLessonDeltas(id, n) {
+  const c = (state.decisions.decisions || []).find(x => x.id === id);
+  let deltas = [];
+  try {
+    const aps = await api('GET', '/api/approvals');
+    const ap = (aps.approvals || aps || []).find(a => a.id === id);
+    if (ap) { const p = typeof ap.payload === 'string' ? JSON.parse(ap.payload) : ap.payload; deltas = (p && p.deltas) || []; }
+  } catch { }
+  deltas.forEach((d, i) => { const s = $(`#ld-tgt-${i}`); if (s) d.target = s.value; });
+  try {
+    await api('PATCH', `/api/approvals/${id}`, { status: 'approved', decided_by: 'operator', deltas });
+    toast('Lessons applied to the knowledge base', 'ok');
+  } catch (e) { toast('Apply failed: ' + e.message, 'err'); }
+  closeModal();
+  await loadDecisions(true);
+}
 
 function viewMeetings() {
   if (!meetState.fetched) { loadMeetings(); return skeletonView(); }
