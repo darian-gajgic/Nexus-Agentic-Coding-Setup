@@ -17,6 +17,11 @@ def get_conn() -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # P9 (ops hardening): set the busy timeout EXPLICITLY as a PRAGMA (10s) so a
+        # writer waits out a concurrent lock instead of raising "database is locked"
+        # immediately — the periodic sweeps (critic-sandbox age-out, scheduler,
+        # loop engine) all write on their own threads.
+        conn.execute("PRAGMA busy_timeout=10000")
         _local.conn = conn
     return _local.conn
 

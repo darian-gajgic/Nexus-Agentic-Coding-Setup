@@ -117,6 +117,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 
 - **P1** frontier backpressure — pre-existing from Phase 1; every new frontier call (`lessons.run_distillation`) goes through `evals._FRONTIER_GATE` + quota classification. **P2** forward-deps staged behind `_feature_present`. **P4** L1 `routing_outcomes` schema + the new gates. **P7** `approvals.scope` + admin-visible decisions, task-less rows never claimed for the owner. **P10a** framing order honoured (DECISIONS → exemplars → predecessors → retry-last). **P10b** NULL profile = legacy, no silent flip until the operator sets a profile.
 - **P5** (purpose whitelist) is a Deep-Plan / Appendix-C concern (spec_model/escalation_model) — out of Phase-3 scope; noted for Phase 7.
+- **P9** (ops hardening; the two in-Phase-3 items are BUILT — added in the 2nd judge pass): SQLite now sets `PRAGMA busy_timeout=10000` explicitly in `database.get_conn` (a writer waits out a concurrent lock instead of erroring), and the disposable critic-sandbox age-out is a shared `evals.sweep_critic_sandboxes()` run at **server startup** + **hourly on the scheduler** (not lazy-only on the next critic build). The other P9 items are out of Phase-3 scope by contract: the GLM-slot WAIT-under-load is documented existing behavior (auto-reducing fan-out is post-C4), and plan-session `delete_session` hygiene belongs to Deep Plan (Phase 5, no plan sessions exist yet).
 
 ## Deviations & honest notes
 
@@ -261,3 +262,25 @@ evidence), given a regression check, and committed granularly. The tree is fully
    the feedback is captured as evidence), stage the reworked deliverable, and `PATCH` a fresh approval
    **approved** — asserting `_capture_accept_diff` fired and wrote an `accept_diff` evidence row carrying
    the actual added→removed text. Self-cleaning (verified: no leftover tasks/approvals/evidence/workspaces).
+
+4. **P9 (ops hardening) neither implemented nor recorded as deferred.** Confirmed at HEAD: no
+   `PRAGMA busy_timeout` anywhere in `database.py`, and the critic-sandbox age-out lived inline in
+   `evals.build_critic_sandbox` (~lines 480–486) — lazy-only, so a machine that stopped running critics
+   leaked stale sandboxes forever; nothing swept at startup or on a scheduler. **Fix (the two in-scope
+   items):** (a) `database.get_conn` now sets `PRAGMA busy_timeout=10000` explicitly; (b) the age-out is
+   extracted to `evals.sweep_critic_sandboxes(max_age_h=24)` and invoked from three places — lazily before
+   each build (as before), once at **server startup**, and **hourly on the scheduler thread** (throttled).
+   The remaining P9 items are recorded as deferred with rationale (GLM-slot WAIT is documented existing
+   behavior; plan-session `delete_session` is a Phase-5 Deep-Plan concern — see the P9 note above).
+   **Regression:** `verify_autopilot_e2e.py` P9 group asserts the connection's `busy_timeout` is 10000 and
+   that the sweep reclaims a stale (>24h) sandbox while keeping a fresh one; `verify.sh` adds three P9
+   static checks (busy_timeout PRAGMA; the sweep helper; the sweep wired into both server.py + scheduler.py).
+
+**Gates re-run after the four fixes** (real, against the live service after `systemctl --user restart nexus`
+— it booted clean, swept sandboxes at boot, and answered the APIs):
+
+```
+$ bash app/scripts/verify.sh                              → ALL CHECKS PASSED: 377/377   (+ rule-8, +3 P9 checks)
+$ app/.venv/bin/python scripts/verify_autopilot_e2e.py    → 50 passed, 0 failed   (40 base + 10 across the four fixes)
+$ app/.venv/bin/python scripts/verify_autopilot_ui.py     → 17 passed, 0 failed   (14 + 3 finding-2 checks)
+```

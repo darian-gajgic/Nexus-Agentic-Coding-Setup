@@ -154,6 +154,16 @@ def startup():
                             f"Reconciled {len(recl)} orphaned dispatch(es) at boot")
     except Exception as _e:
         print(f"[startup] orphan-dispatch reconcile failed: {_e}", flush=True)
+    # P9 (ops hardening): reclaim disposable critic sandboxes left by a crash/kill
+    # at boot (the age-out was lazy-only before — a box that stopped running critics
+    # leaked them forever). The scheduler repeats this periodically.
+    try:
+        import evals as _ev
+        n = _ev.sweep_critic_sandboxes()
+        if n:
+            db.log_activity("info", "system", f"Swept {n} stale critic sandbox(es) at boot")
+    except Exception as _e:
+        print(f"[startup] critic-sandbox sweep failed: {_e}", flush=True)
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
