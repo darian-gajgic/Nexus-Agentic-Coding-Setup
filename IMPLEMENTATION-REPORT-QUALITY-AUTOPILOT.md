@@ -115,7 +115,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 
 ## Premortem P1–P10 (binding)
 
-- **P1** frontier backpressure — pre-existing from Phase 1; every new frontier call (`lessons.run_distillation`) goes through `evals._FRONTIER_GATE` + quota classification. **P2** forward-deps staged behind `_feature_present`. **P4** L1 `routing_outcomes` schema + the new gates. **P7** `approvals.scope` + admin-visible decisions, task-less rows never claimed for the owner. **P10a** framing order honoured (DECISIONS → exemplars → predecessors → retry-last). **P10b** NULL profile = legacy, no silent flip until the operator sets a profile.
+- **P1** frontier backpressure — pre-existing from Phase 1; every new frontier call (`lessons.run_distillation`) goes through `evals._FRONTIER_GATE` + quota classification. **P2** forward-deps staged behind `_feature_present`. **P4** L1 `routing_outcomes` schema + the new gates. **P7** `approvals.scope` + admin-visible decisions, task-less rows never claimed for the owner. **P10a** framing order honoured (DECISIONS → exemplars → predecessors → attachments → retry-last — attachment position corrected in the 3rd judge pass, see below). **P10b** NULL profile = legacy, no silent flip until the operator sets a profile.
 - **P5** (purpose whitelist) is a Deep-Plan / Appendix-C concern (spec_model/escalation_model) — out of Phase-3 scope; noted for Phase 7.
 - **P9** (ops hardening; the two in-Phase-3 items are BUILT — added in the 2nd judge pass): SQLite now sets `PRAGMA busy_timeout=10000` explicitly in `database.get_conn` (a writer waits out a concurrent lock instead of erroring), and the disposable critic-sandbox age-out is a shared `evals.sweep_critic_sandboxes()` run at **server startup** + **hourly on the scheduler** (not lazy-only on the next critic build). The other P9 items are out of Phase-3 scope by contract: the GLM-slot WAIT-under-load is documented existing behavior (auto-reducing fan-out is post-C4), and plan-session `delete_session` hygiene belongs to Deep Plan (Phase 5, no plan sessions exist yet).
 
@@ -284,3 +284,26 @@ $ bash app/scripts/verify.sh                              → ALL CHECKS PASSED:
 $ app/.venv/bin/python scripts/verify_autopilot_e2e.py    → 50 passed, 0 failed   (40 base + 10 across the four fixes)
 $ app/.venv/bin/python scripts/verify_autopilot_ui.py     → 17 passed, 0 failed   (14 + 3 finding-2 checks)
 ```
+
+## Third judge review — REVISE #3 → all five blockers addressed (2026-07-10)
+
+A third independent judge pass on Phase 3 returned **REVISE** with five blocking findings.
+Each was re-verified against HEAD (re-located by symbol; all five reproduced), fixed (or
+recorded as an explicit deviation with evidence), given a regression check, and committed
+granularly. The tree is fully committed.
+
+3. **P10(a) binding framing order violated — operator attachments injected before
+   DECISIONS/exemplars/predecessors.** Confirmed at HEAD: in `hermes_dispatch.build_framing`
+   the `_attachment_lines` block sat right after the STRUCTURED-FACT paragraph (~line 906) —
+   *before* the Q4 DECISION LOG, the Q1 exemplars, and the predecessor-deliverables blocks.
+   P10(a) (QUALITY-PROGRAM-MASTER-PLAN §5) mandates, later-wins on conflict:
+   `task brief → spec → DECISIONS.md → exemplars → predecessor deliverables → attachments →
+   retry feedback last`. With attachments early, the operator's own attached brief was
+   *overridden* by the project context that came after it — the exact inversion the rule
+   forbids. **Fix:** moved the attachments block to sit AFTER the predecessor-deliverables
+   block and immediately BEFORE the retry-feedback block (now the final word), and sharpened
+   the copy to say the attachments "take precedence over the project context above."
+   **Regression:** `verify_autopilot_e2e.py` new "P10(a)" group builds a framing carrying all
+   three sections and asserts `DECISIONS < attachments < retry`; `verify.sh` adds a static awk
+   ordering check (`_attachment_lines` line > `task_dependencies` line, and the retry line >
+   the attachments line). P10a premortem row above corrected to name attachments explicitly.

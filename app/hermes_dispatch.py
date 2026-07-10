@@ -903,13 +903,6 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
         "APIs with exact commands (verified working). More precise than web search for "
         "these; for everything else use web search as usual."
     )
-    atts = _attachment_lines(task, workspace)
-    if atts:
-        parts.append(
-            "The operator ATTACHED input files for this work — read them FIRST, they are "
-            "part of the brief:\n" + "\n".join(f"- {a}" for a in atts)
-            + f"\nExtract pdf/docx/xlsx/pptx content with {DOC_TOOLS_PY} "
-              "(pypdf, python-docx, openpyxl, python-pptx).")
     domain = (task.get("domain") or "").strip()
     if domain and domain != "general":
         kp = _knowledge_paths(task)
@@ -978,6 +971,18 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             + lines
             + ("\n(Cross-stage decisions live in the project DECISION LOG above — you "
                "need only these direct inputs plus that log.)" if brief_mode else ""))
+    # Operator attachments — P10(a) framing order: injected AFTER predecessor
+    # deliverables (and DECISIONS/exemplars) so, on later-wins precedence, the
+    # operator's own attached brief overrides earlier project context; only the
+    # retry feedback comes later (the final word).
+    atts = _attachment_lines(task, workspace)
+    if atts:
+        parts.append(
+            "The operator ATTACHED input files for this work — read them FIRST, they are "
+            "part of the brief and take precedence over the project context above:\n"
+            + "\n".join(f"- {a}" for a in atts)
+            + f"\nExtract pdf/docx/xlsx/pptx content with {DOC_TOOLS_PY} "
+              "(pypdf, python-docx, openpyxl, python-pptx).")
     if task.get("retry_feedback"):
         parts.append(
             "This is a RETRY: a previous attempt was rejected. Address every point of this "
