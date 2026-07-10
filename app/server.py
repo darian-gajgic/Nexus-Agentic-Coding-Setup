@@ -3098,10 +3098,13 @@ async def decide_approval(approval_id: str, body: dict):
                            (time.time(), time.time(), task_id))
                 db.log_activity("info", "system", f"Deliverable approved — task {task_id} shipped")
             else:
+                # N7: a blind reject (no feedback) on an unjudged version gate-runs
+                # the judge first so the retry carries real findings (setting-gated).
+                fb = (body.get("feedback") or "").strip() or None
+                await run_in_threadpool(_blind_reject_judge_if_wanted, task_id, fb)
                 # _retry_task falls back to the judge's findings automatically
                 # (snapshots the workspace — copytree — so off the loop)
-                await run_in_threadpool(
-                    _retry_task, task_id, (body.get("feedback") or "").strip() or None)
+                await run_in_threadpool(_retry_task, task_id, fb)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
     # Super Result checkpoint (open mode / escalation): approve = accept the
@@ -3881,6 +3884,40 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     db.log_activity("info" if verdict else "error", "judge",
                     f"Frontier judge on {task_id}: {verdict or 'no verdict parsed'}"
                     + (f" — {learning}" if learning else ""))
+
+
+def _blind_reject_judge_if_wanted(task_id: str, feedback: str | None) -> bool:
+    """N7 (judge.on_blind_reject): a deliverable rejected with NO feedback whose
+    current version was never judged would re-run on nothing. When the setting is
+    on, gate-run the frontier judge SYNCHRONOUSLY first (its findings then ride
+    the retry via _retry_task's comment drain). Returns True when it judged.
+    Runs in a threadpool caller — blocking is fine (an explicit human click), and
+    the run passes through the frontier concurrency semaphore."""
+    if db.get_setting("judge.on_blind_reject", "0") != "1":
+        return False
+    if (feedback or "").strip():
+        return False  # substantive feedback already carries the gradient
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        return False
+    fresh = bool(task.get("judge_ts")) and \
+        (task.get("judge_ts") or 0) >= (task.get("completed_at") or task.get("updated_at") or 0)
+    if fresh or task.get("judge_verdict") == "running":
+        return False
+    domain = (task.get("domain") or "").strip()
+    if not _re.match(r"^[a-z0-9-]+$", domain or ""):
+        return False
+    deliv = os.path.join(task.get("workspace_path") or "", "deliverable.md")
+    if not os.path.isfile(os.path.join(KNOWLEDGE_DIR, "domains", domain, "RUBRIC.md")) \
+            or not os.path.isfile(deliv):
+        return False
+    db.execute("UPDATE tasks SET judge_verdict='running', judge_output=NULL, judge_ts=? WHERE id=?",
+               (time.time(), task_id))
+    db.log_activity("info", "judge",
+                    f"Blind reject on {task_id} — gate-running the judge before retry (N7)",
+                    user_id=task.get("user_id"))
+    _judge_thread(task_id, deliv, domain)  # synchronous: findings land before the retry drains them
+    return True
 
 
 @app.post("/api/tasks/{task_id}/judge")

@@ -65,6 +65,9 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
     has_verifier = "acceptance-verifier" in specialists
     has_fixer = "code-implementer" in specialists
     judge_ok = _judgeable(domain)
+    # N5: widen auto-judge from high-stakes-only to every quality-mode deliverable
+    # with a rubric, when the operator opts in (judge.auto_scope=all_quality).
+    all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
 
     triggers, reasoning = [], []
     reasoning.append(
@@ -124,7 +127,7 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
                 "Note: no dedicated fix task exists, so the findings go back "
                 "to the task that produced the result.")
 
-    if judge_ok and (high_stakes or kind == "task") and not meta.get("super_result"):
+    if judge_ok and (high_stakes or kind == "task" or all_quality) and not meta.get("super_result"):
         rounds = 2 if q else 1
         triggers.append({
             "id": "judge_revise", "enabled": True,
@@ -145,14 +148,16 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
             "a second model family catches blind spots the working model "
             "cannot see about itself.")
 
-    auto_judge = bool(q and judge_ok and high_stakes and mode == "closed"
+    auto_judge = bool(q and judge_ok and (high_stakes or all_quality) and mode == "closed"
                       and not meta.get("super_result"))
     if auto_judge:
         reasoning.append(
-            "Because you chose quality and this is high-stakes, the judge is "
-            "run AUTOMATICALLY when a deliverable is ready — you review work "
-            "that already survived the judge, instead of judging it yourself "
-            "first.")
+            "Because you chose quality"
+            + (" and this is high-stakes" if high_stakes else
+               " (auto-judge scope = every quality deliverable)")
+            + ", the judge is run AUTOMATICALLY when a deliverable is ready — you "
+            "review work that already survived the judge, instead of judging it "
+            "yourself first.")
     elif meta.get("super_result") and judge_ok and high_stakes:
         # Super Result suppressed auto-judge — NOT a speed trade-off. The
         # grounded critic replaces the document-only judge (see the Super Result
@@ -367,9 +372,12 @@ def _sweep_task_loops(actions_left: int) -> int:
         verdict = t.get("judge_verdict")
         judged_this_version = bool(t.get("judge_ts")) and \
             (t.get("judge_ts") or 0) >= (t.get("completed_at") or t.get("updated_at") or 0)
-        # 1) auto-judge a fresh deliverable (quality mode, high-stakes, rubric)
+        # 1) auto-judge a fresh deliverable (quality mode, rubric; high-stakes, or
+        # every quality deliverable when judge.auto_scope=all_quality — N5). The
+        # cfg.auto_judge flag already encodes the scope decision from design_loop.
+        all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \
-                and bool(t.get("high_stakes")) and _judgeable(t.get("domain")):
+                and (bool(t.get("high_stakes")) or all_quality) and _judgeable(t.get("domain")):
             # frontier quota/rate-limit backoff (premortem P1): don't auto-judge
             # straight into a quota wall — retry a later sweep.
             if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
@@ -702,9 +710,17 @@ def _sweep_replan_detection():
                    "failed_task_title": (ftitle or "")[:200], "detected_at": time.time()}
         db.execute("UPDATE workflows SET replan=? WHERE id=?",
                    (json.dumps(payload), wf["id"]))
+        # N6: auto-draft the recovery plan so the proposal is already waiting when
+        # the operator opens the project. APPLY stays operator-approved — the engine
+        # still NEVER rewrites the pipeline itself, it only fills the drafting wait.
+        auto_drafted = False
+        if db.get_setting("replan.auto_draft", "0") == "1":
+            auto_drafted = _api("POST", f"/api/workflows/{wf['id']}/replan/draft", {},
+                                user_id=wf.get("user_id"))
         db.log_activity("warn", "loop",
                         f"REPLAN checkpoint on '{wf['name']}': {reason[:150]} "
-                        "(open the project to draft a recovery plan)",
+                        + ("(recovery plan auto-drafted — open the project to review)"
+                           if auto_drafted else "(open the project to draft a recovery plan)"),
                         user_id=wf.get("user_id"))
         try:
             import hermes_dispatch as _hd

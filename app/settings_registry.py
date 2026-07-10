@@ -68,6 +68,17 @@ SECTIONS = [
              "default": "cjudge {file} {domain}",
              "help": "Tokens: {file} {domain} and optional {model}. The resolved judge model is also exported "
                      "as JUDGE_MODEL to the subprocess. Gates stub this — restore after testing."},
+            {"key": "judge.auto_scope", "label": "Auto-judge scope", "type": "str",
+             "default": "high_stakes",
+             "help": "N5: which quality-mode deliverables the closed loop judges automatically. "
+                     "'high_stakes' (default = today's behavior) judges only high-stakes work; "
+                     "'all_quality' judges EVERY quality-mode deliverable with a domain rubric "
+                     "(+1 judge call each) so the loop auto-retries non-high-stakes work too."},
+            {"key": "judge.on_blind_reject", "label": "Judge before a blind retry", "type": "bool",
+             "default": "0",
+             "help": "N7: when an approval is rejected with NO feedback and the current version "
+                     "was never judged, run the frontier judge first so the retry carries real "
+                     "findings instead of re-running on nothing."},
         ],
     },
     {
@@ -125,6 +136,12 @@ SECTIONS = [
                      "implementer must make them pass without editing acceptance/, and the "
                      "verifier checks the acceptance-file hashes before running them. Buys the "
                      "oracle once — the tests, not prose, are the contract."},
+            {"key": "replan.auto_draft", "label": "Auto-draft replan proposals", "type": "bool",
+             "default": "0",
+             "help": "N6: when a project stalls (a stage fails terminally, or the final "
+                     "inspection fails with no automatic fix round left), draft the recovery "
+                     "plan automatically so it is already waiting when you open the project. "
+                     "APPLY still needs your approval — only the wait in the middle disappears."},
         ],
     },
     {
