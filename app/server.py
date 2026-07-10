@@ -4163,8 +4163,14 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     # N1: type-aware judging — the deliverable also faces its TYPE rubric
     # (e.g. INVESTIGATION.md's verified-not-inferred gate for analysis work).
     trubric = _ev.type_rubric_path(_ev.detect_deliverable_type(task)) if task else None
+    # Deep Plan (Step 8): a task in a Deep-Plan project also faces its ORIGINAL
+    # SPEC contract (optional token; absent when the project wasn't deep-planned).
+    spec_path = None
+    if task and task.get("workflow_id"):
+        sp = Path(__file__).parent / "workspaces" / f"workflow-{task['workflow_id']}" / "attachments" / "SPEC.md"
+        spec_path = str(sp) if sp.is_file() else None
     out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey,
-                            type_rubric=trubric)
+                            type_rubric=trubric, spec_path=spec_path)
     verdict, learning = _parse_judge_output(out)
     # Frontier quota/rate-limit is transient, not a scoring failure (premortem
     # P1): back off and leave the row re-judgeable ('interrupted', no judge_ts
@@ -6570,6 +6576,58 @@ async def plan_session_draft(sid: str, body: dict):
     return out
 
 
+def _write_session_spec(kind: str, oid: str, row: dict) -> bool:
+    """Write SPEC.md + spec.json into the object's attachments/ (Step 8). Uses
+    the existing attachment mechanism (ownership-checked inside _attachments_dir);
+    the dispatch framing already marks attachments MUST-READ, so the spec reaches
+    every downstream task. Returns False if the object isn't the caller's."""
+    import plan_engine as _pe
+    d = _attachments_dir(kind, oid, create=True)
+    if d is None:
+        return False
+    family = row.get("family") or "content"
+    spec = json.loads(row.get("spec_json") or "{}")
+    goal = row.get("goal") or ""
+    (d / "SPEC.md").write_text(_pe.render_spec_md(spec, family, goal))
+    (d / "spec.json").write_text(json.dumps(
+        {"family": family, "goal": goal, "spec": spec,
+         "acceptance_criteria": _pe.list_criteria(spec, family),
+         "plan_session_id": row["id"]}, indent=2))
+    return True
+
+
+def _workflow_spec_md(wf_id: str) -> str | None:
+    """The Deep Plan SPEC.md attached to a workflow, if any (for replan seeding)."""
+    fp = Path(__file__).parent / "workspaces" / f"workflow-{wf_id}" / "attachments" / "SPEC.md"
+    try:
+        return fp.read_text() if fp.is_file() else None
+    except Exception:
+        return None
+
+
+@app.post("/api/plan/sessions/{sid}/attach")
+async def plan_session_attach(sid: str, body: dict):
+    """On create: write the SPEC into the created workflow/task and close the
+    session (Step 8 + hygiene). The UI calls this right after creating the
+    Deep-Plan project/task from the proposal."""
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    kind = body.get("kind")
+    oid = body.get("id")
+    if kind not in ("task", "workflow") or not oid:
+        return JSONResponse(status_code=400, content={"error": "kind ('task'|'workflow') + id required"})
+    if not _write_session_spec(kind, oid, row):
+        return JSONResponse(status_code=404, content={"error": f"{kind} not found"})
+    if row.get("hermes_session_id"):
+        await run_in_threadpool(_plan_delete_hermes, row["hermes_session_id"])  # hygiene: created → delete
+    db.execute("UPDATE plan_sessions SET status='created', updated_at=? WHERE id=?",
+               (time.time(), sid))
+    db.log_activity("info", "plan", f"Deep Plan SPEC attached to {kind} {oid}",
+                    user_id=row.get("user_id"))
+    return {"ok": True}
+
+
 @app.delete("/api/plan/sessions/{sid}")
 async def plan_session_abandon(sid: str):
     """Abandon a session (session hygiene: delete the Hermes session too)."""
@@ -6856,6 +6914,12 @@ def _replan_draft_thread(wf_id: str, uid: str | None):
                          "ORDER BY created_at", (wf_id,))
     try:
         user_msg = _replan_context(w, tasks, rp.get("reason") or "operator requested a replan")
+        # Deep Plan (Step 8): re-plan drafting seeds from the ORIGINAL SPEC so the
+        # recovery plan still satisfies the same contract.
+        _spec_md = _workflow_spec_md(wf_id)
+        if _spec_md:
+            user_msg += ("\n\nORIGINAL SPEC (the recovery plan MUST still satisfy every "
+                         "acceptance criterion below):\n<<<SPEC\n" + _spec_md[:4000] + "\nSPEC>>>")
         data = _wizard_plan_sync(f"nexus:replan-{wf_id}", user_msg, uid)
         wf = data.get("workflow") if data.get("type") == "workflow" else None
         raw_tasks = (wf or {}).get("tasks") or ([data.get("task")] if data.get("task") else [])
