@@ -153,6 +153,15 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
             "run AUTOMATICALLY when a deliverable is ready — you review work "
             "that already survived the judge, instead of judging it yourself "
             "first.")
+    elif meta.get("super_result") and judge_ok and high_stakes:
+        # Super Result suppressed auto-judge — NOT a speed trade-off. The
+        # grounded critic replaces the document-only judge (see the Super Result
+        # note above); claiming "speed mode" here when the user chose quality
+        # was simply wrong.
+        reasoning.append(
+            "The document-only judge is NOT auto-run here: Super Result's "
+            "grounded critic replaces it (it re-verifies evidence rather than "
+            "scoring plausibility) and drives the rework rounds automatically.")
     elif judge_ok and high_stakes:
         reasoning.append(
             "Speed mode: the judge is NOT run automatically (it costs time "
