@@ -99,6 +99,11 @@ SECTIONS = [
             {"key": "super.keep_sandbox", "label": "Keep critic sandboxes (debug)", "type": "bool",
              "default": "0",
              "help": "Leave app/workspaces/_critic/<id> in place after a run — debugging only."},
+            {"key": "frontier.max_concurrent", "label": "Max concurrent frontier calls", "type": "int",
+             "default": "2", "min": 1, "max": 8,
+             "help": "Global cap on simultaneous Claude-CLI runs (grounded critic + frontier "
+                     "judge) — one subscription with hard usage ceilings. Excess calls wait; "
+                     "rate-limit/quota failures back off and requeue instead of escalating."},
         ],
     },
     {

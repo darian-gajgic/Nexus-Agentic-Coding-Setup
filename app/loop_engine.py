@@ -252,6 +252,21 @@ def _api(method: str, path: str, body: dict | None = None,
         return False
 
 
+def _broadcast_task(task_id: str, user_id: str | None):
+    """Push a task_updated WS event from the engine thread so the UI toast fires
+    on SHIP / escalation / verdict transitions (the engine has no request to
+    ride, so nothing broadcast before). Best-effort — the broadcast hops onto
+    the server's event loop via broadcast_threadsafe."""
+    try:
+        import server
+        row = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if row:
+            server.broadcast_threadsafe({"type": "task_updated", "data": row},
+                                        user_id=user_id)
+    except Exception:
+        pass
+
+
 def _sweep_workflow_loops(actions_left: int) -> int:
     """verify_fail: verifier finished FAIL → retry fix with findings, re-verify."""
     rows = db.query_all(
@@ -346,6 +361,10 @@ def _sweep_task_loops(actions_left: int) -> int:
         # 1) auto-judge a fresh deliverable (quality mode, high-stakes, rubric)
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \
                 and bool(t.get("high_stakes")) and _judgeable(t.get("domain")):
+            # frontier quota/rate-limit backoff (premortem P1): don't auto-judge
+            # straight into a quota wall — retry a later sweep.
+            if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+                continue
             if _api("POST", f"/api/tasks/{t['id']}/judge", {}, user_id=t.get("user_id")):
                 db.log_activity("info", "loop",
                                 f"Loop auto-ran the frontier judge on '{t['title'][:50]}'"
@@ -438,6 +457,7 @@ def _escalate_super(t: dict, trig: dict, per_task: str | None,
                            f"{reason or f'round {rnd} awaits review'}")
     except Exception:
         pass
+    _broadcast_task(tid, t.get("user_id"))  # escalation transition → UI toast
     return True
 
 
@@ -481,6 +501,10 @@ def _sweep_super_result(actions_left: int) -> int:
             ws = t.get("workspace_path") or ""
             if not ws or not os.path.isfile(os.path.join(ws, "deliverable.md")):
                 continue  # nothing to critique yet
+            # Frontier quota/rate-limit backoff (premortem P1): don't hammer the
+            # one Claude subscription — retry a later sweep once the window ends.
+            if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+                continue
             if _api("POST", f"/api/tasks/{tid}/critic", {}, user_id=t.get("user_id")):
                 db.log_activity("info", "loop",
                                 "Super Result: critic dispatched on "
@@ -501,6 +525,7 @@ def _sweep_super_result(actions_left: int) -> int:
                             "Super Result converged: SHIP after round "
                             f"{int(t.get('critic_round') or 0)} on "
                             f"'{(t.get('title') or '')[:50]}'")
+            _broadcast_task(tid, t.get("user_id"))  # SHIP transition → UI toast
             continue
         if verdict == "error":
             if _escalate_super(t, trig, per_task,
