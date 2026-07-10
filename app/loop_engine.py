@@ -844,6 +844,13 @@ def loop_sweep():
         _lsn.sweep_distillation()
     except Exception as e:
         db.log_activity("warn", "lessons", f"distillation sweep error: {str(e)[:80]}")
+    # L1 + rule 9: deterministic routing statistics (self-guards on a per-N-tasks
+    # counter) — proposes threshold tweaks + runs the router-collapse monitor.
+    try:
+        import routing as _routing
+        _routing.sweep_stats()
+    except Exception as e:
+        db.log_activity("warn", "routing", f"routing stats sweep error: {str(e)[:80]}")
 
 
 def loop_engine_thread(stop_event: threading.Event):

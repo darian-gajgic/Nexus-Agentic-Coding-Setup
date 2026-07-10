@@ -411,6 +411,12 @@ chk "Q7b decisions view + badge"     "grep -q 'function viewDecisions' static/ap
 chk "Q7b decisions nav item"         "grep -q 'data-view=\"decisions\"' static/index.html"
 chk "Q7b auto-approve-ship guard"    "grep -q 'def _sweep_auto_approve_ship' loop_engine.py && grep -q 'auto_approve_ship_hours' loop_engine.py"
 chk "Q7b P7 admin scope in decisions" "grep -q \"scope='admin'\" server.py"
+# L1/L4 — routing telemetry + fingerprint-tagged params + rule 9 collapse monitor
+chk "L1 routing_outcomes table"      "grep -q 'CREATE TABLE IF NOT EXISTS routing_outcomes' database.py"
+chk "L1 outcome capture wired"       "grep -q 'def record_outcome' routing.py && grep -q '_routing.record_outcome' hermes_dispatch.py && grep -q '_record_routing_outcome' server.py"
+chk "L1 stats job (no LLM)"          "grep -q 'def sweep_stats' routing.py && grep -q '_routing.sweep_stats' loop_engine.py"
+chk "L4 learned_params + fingerprint" "grep -q 'CREATE TABLE IF NOT EXISTS learned_params' database.py && grep -q 'def config_fingerprint' routing.py && grep -q 'def learned_param' routing.py"
+chk "rule9 collapse monitor"         "grep -q 'ROUTER COLLAPSE WARNING' routing.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"

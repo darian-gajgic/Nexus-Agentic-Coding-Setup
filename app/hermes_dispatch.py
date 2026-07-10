@@ -1193,6 +1193,11 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     _set_dispatch(dispatch_id, state="completed", ended_at=time.time(),
                   tokens_in=tin, tokens_out=tout)
     db.execute("UPDATE agents SET tasks_completed=tasks_completed+1 WHERE id=?", (agent_id,))
+    try:  # L1: capture the routing outcome at this terminal task state
+        import routing as _routing
+        _routing.record_outcome(task_id)
+    except Exception:
+        pass
     db.log_activity("info", agent_id,
                     f"Task {task_id} {'harvested' if harvested else 'completed'} "
                     f"({total} tokens) → {new_status}", user_id=task.get("user_id"))
