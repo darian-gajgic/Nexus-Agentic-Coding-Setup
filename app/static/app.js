@@ -6302,6 +6302,7 @@ function jarvisTTSMaybeFinish() {
   const ctx = jarvisState.audioContext;
   if (jTTS.pending === 0 && jTTS.sources.length === 0 &&
       (!ctx || ctx.currentTime >= jTTS.nextTime - 0.05)) {
+    jTTS.uq = [];   // all sentences spoken — drop the utterance records
     jarvisState.ttsAnimating = false;
     jarvisBargeMonitorStop();
     if (jarvisState.mode === 'talking') jarvisSetMode('idle');
