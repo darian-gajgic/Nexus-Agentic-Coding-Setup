@@ -9720,6 +9720,21 @@ async function startDeepPlan(goal, opts, btn) {
   const btnText = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = '✦ Starting the interview… (~20 s)'; }
   try {
+    // Resume an existing ACTIVE session for the SAME goal instead of creating a
+    // duplicate (operator finding: a crash/re-click mid-start leaked live sessions).
+    try {
+      const list = (await api('GET', '/api/plan/sessions')).sessions || [];
+      const prev = list.find(p => p.status === 'active' && (p.goal || '').trim() === goal.trim());
+      if (prev) {
+        const full = await api('GET', `/api/plan/sessions/${prev.id}`);
+        deepPlan = { session: full.session || full, super_result: !!opts.super_result,
+          spend_profile: opts.spend_profile || null, autopilot: opts.autopilot || null,
+          sending: false };
+        toast('Resumed your existing planning session for this goal', 'info');
+        deepPlanModal();
+        return;
+      }
+    } catch (e) { /* list/resume is best-effort — fall through to a fresh session */ }
     logDecision('deep_plan_accept');
     const s = await api('POST', '/api/plan/sessions', {
       goal: goal.trim(), family: opts.family || null,
@@ -9746,9 +9761,9 @@ function deepPlanModal() {
     <div class="view-intro" style="margin-bottom:8px">A few targeted questions build a structured
       spec, then it drafts and premortem-checks the plan. You can edit any slot directly, type
       freely, switch the plan type, or <strong>Draft plan</strong> at any time.</div>
-    <div id="dpGrid" style="display:grid;grid-template-columns:1.1fr .9fr;gap:14px;align-items:start">
-      <div id="dpConvo" style="min-height:220px;max-height:460px;overflow-y:auto"></div>
-      <div id="dpSpec" style="min-height:220px;max-height:460px;overflow-y:auto;border-left:1px solid var(--border,rgba(255,255,255,.08));padding-left:12px"></div>
+    <div id="dpGrid" style="display:grid;grid-template-columns:1.1fr .9fr;gap:14px;align-items:stretch">
+      <div id="dpConvo" style="height:clamp(240px,56vh,860px);overflow-y:auto"></div>
+      <div id="dpSpec" style="height:clamp(240px,56vh,860px);overflow-y:auto;border-left:1px solid var(--border,rgba(255,255,255,.08));padding-left:12px"></div>
     </div>
     <div class="modal-actions" style="justify-content:space-between">
       <button class="btn-ghost" id="dpAbandon" title="Discard this planning session">Abandon</button>
@@ -9786,7 +9801,9 @@ function deepPlanConvoHTML(s) {
   (s.questions || []).forEach((q, i) => {
     const opts = (q.options || []).map(o =>
       `<button class="btn-sm dp-opt" data-label="${esc(o.label)}" style="margin:3px 4px 0 0;${o.recommended ? 'border-color:var(--accent)' : ''}">${o.recommended ? '★ ' : ''}${esc(o.label)}</button>`).join('');
-    h += `<div class="agentic-row"><div><strong>${esc(q.question)}</strong>${q.slot ? ` <span class="task-tag">${esc(q.slot)}</span>` : ''}</div>
+    h += `<div class="agentic-row dp-question" data-qi="${i}"><div><strong>${esc(q.question)}</strong>
+      <span class="dp-q-check" style="display:none;color:var(--ok,#4ade80)"> ✓ answered</span>
+      ${q.slot ? ` <span class="task-tag">${esc(q.slot)}</span>` : ''}</div>
       ${q.why ? `<div style="font-size:11px;color:var(--text-faint)">${esc(q.why)}</div>` : ''}
       <div style="margin-top:4px">${opts}</div></div>`;
   });
@@ -9815,9 +9832,13 @@ function deepPlanSpecHTML(s) {
     const badge = slot.filled ? '<span style="color:var(--ok,#4ade80)">✓</span>'
       : (req ? '<span style="color:var(--warn,#eab308)">● required</span>' : '<span class="muted">optional</span>');
     const val = slot.kind === 'list' ? (slot.value || []).join('\n') : (slot.value || '');
+    // Both kinds render as RESIZABLE textareas sized to their content — the planner
+    // auto-fills long values and a one-line <input> hid them (operator finding).
+    const rows = Math.min(10, Math.max(slot.kind === 'list' ? 3 : 2, String(val).split('\n').length,
+                                       Math.ceil(String(val).length / 60)));
     const field = slot.kind === 'list'
-      ? `<textarea class="form-textarea dp-slot" data-slot="${esc(slot.key)}" data-kind="list" style="height:56px;${need ? 'border-color:var(--warn,#eab308)' : ''}" placeholder="${esc(slot.hint || '')} (one per line)">${esc(val)}</textarea>`
-      : `<input class="form-input dp-slot" data-slot="${esc(slot.key)}" data-kind="text" style="${need ? 'border-color:var(--warn,#eab308)' : ''}" placeholder="${esc(slot.hint || '')}" value="${esc(val)}">`;
+      ? `<textarea class="form-textarea dp-slot" data-slot="${esc(slot.key)}" data-kind="list" rows="${rows}" style="resize:vertical;min-height:56px;${need ? 'border-color:var(--warn,#eab308)' : ''}" placeholder="${esc(slot.hint || '')} (one per line)">${esc(val)}</textarea>`
+      : `<textarea class="form-textarea dp-slot" data-slot="${esc(slot.key)}" data-kind="text" rows="${rows}" style="resize:vertical;min-height:40px;${need ? 'border-color:var(--warn,#eab308)' : ''}" placeholder="${esc(slot.hint || '')}">${esc(val)}</textarea>`;
     h += `<div class="form-group" style="margin-bottom:8px">
         <label class="form-label" style="display:flex;justify-content:space-between">${esc(slot.label)} ${badge}</label>
         ${field}</div>`;
@@ -9855,13 +9876,22 @@ document.addEventListener('input', (e) => {
   }, 700);
 });
 
-// quick-fill: clicking an option appends its label to the input
+// quick-fill: clicking an option appends its label to the input, marks the
+// question card ✓ answered and highlights the picked option (operator finding:
+// with several questions per turn you couldn't see which were already covered)
 document.addEventListener('click', (e) => {
   const b = e.target && e.target.closest ? e.target.closest('.dp-opt') : null;
   if (!b || !deepPlan) return;
   const inp = $('#dpInput'); if (!inp) return;
   const label = b.dataset.label || '';
   inp.value = (inp.value.trim() ? inp.value.trim() + '; ' : '') + label;
+  const card = b.closest('.dp-question');
+  if (card) {
+    card.querySelectorAll('.dp-opt').forEach(o => { o.style.background = ''; o.style.opacity = '.75'; });
+    b.style.background = 'rgba(124,92,255,.25)'; b.style.opacity = '1';
+    card.style.opacity = '.65';
+    const chk = card.querySelector('.dp-q-check'); if (chk) chk.style.display = 'inline';
+  }
   inp.focus();
 });
 
