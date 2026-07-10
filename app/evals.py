@@ -418,12 +418,26 @@ def build_critic_sandbox(task: dict, round_no: int = 1):
             repo_base = (b.stdout or "").strip() or None
             import hermes_dispatch as _hd  # lazy: avoid import cycle at module load
             branch = f"nexus/{_hd._repo_slug(task)}"
-            chk = sp.run(["git", "-C", rr, "rev-parse", "--verify", branch],
+            # `git clone --local` brings the task branch in ONLY as a
+            # remote-tracking ref (refs/remotes/origin/<branch>): the branch is
+            # born in a LINKED WORKTREE (worktree.ensure_task_worktree), so the
+            # source repo's HEAD — hence the clone's checkout — stays on the base
+            # branch. Materialize a LOCAL branch from origin/<branch> and check
+            # it out BEFORE removing the remote (which drops the only refs to
+            # that work), or the critic silently reviews the BASE branch. A plain
+            # `rev-parse --verify nexus/<slug>` misses it (it never consults
+            # refs/remotes/origin/*), so verify the remote-tracking ref instead.
+            chk = sp.run(["git", "-C", rr, "rev-parse", "--verify", "--quiet",
+                          f"refs/remotes/origin/{branch}"],
                          capture_output=True, text=True)
             if chk.returncode == 0:
-                sp.run(["git", "-C", rr, "checkout", branch],
-                       capture_output=True, text=True)
-                repo_branch = branch
+                co = sp.run(["git", "-C", rr, "checkout", "-B", branch,
+                             f"origin/{branch}"], capture_output=True, text=True)
+                if co.returncode == 0:
+                    repo_branch = branch
+                else:
+                    repo_note = (co.stderr or co.stdout
+                                 or "task-branch checkout failed")[-300:]
             # push has nowhere to go now (belt: cverify also denies git push)
             sp.run(["git", "-C", rr, "remote", "remove", "origin"],
                    capture_output=True, text=True)
