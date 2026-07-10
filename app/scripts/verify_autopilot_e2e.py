@@ -130,6 +130,23 @@ fr = hd.build_framing({"id": "t2", "title": "Stage Two", "workflow_id": wid,
 chk("Q4 DECISIONS.md injected into a member's framing", str(dpath) in fr)
 chk("Q4 ## Decisions contract present in framing", "## Decisions" in fr and "END your deliverable" in fr)
 
+print("=== P10(a) — attachments AFTER DECISIONS/predecessors, BEFORE retry (framing order) ===")
+# Judge finding 3: operator attachments were injected before DECISIONS/exemplars/
+# predecessors, inverting the later-wins precedence P10(a) mandates. Build a framing
+# that carries all three sections and assert the order DECISIONS < attachments < retry.
+p10ws = hd.WORKSPACES / "p10-ws"; (p10ws / "attachments").mkdir(parents=True, exist_ok=True)
+(p10ws / "attachments" / "brief.txt").write_text("operator brief")
+_cleanup.append(lambda: shutil.rmtree(p10ws, ignore_errors=True))
+p10fr = hd.build_framing({"id": "p10", "title": "Ordered stage", "workflow_id": wid,
+                          "deliverable_type": "content",
+                          "retry_feedback": "address the prior gap"}, p10ws)
+i_dec, i_att, i_ret = (p10fr.find("PROJECT DECISION LOG"),
+                       p10fr.find("ATTACHED input files"),
+                       p10fr.find("This is a RETRY"))
+chk("P10a all three framing sections present", i_dec >= 0 and i_att >= 0 and i_ret >= 0)
+chk("P10a attachments come AFTER the DECISIONS log", i_dec >= 0 and i_att > i_dec)
+chk("P10a retry feedback is the FINAL word (after attachments)", i_att >= 0 and i_ret > i_att)
+
 print("=== Q5 — uncertainty tagging in framing + tools ===")
 chk("Q5 framing tells executor to mark [UNSURE: reason]", "[UNSURE: reason]" in fr)
 chk("Q5 cverify/cjudge check UNSURE (live copies)",
