@@ -4693,6 +4693,23 @@ _WIZARD_ROLE_LOCK = (
 def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
                          super_result: bool = False, fanout: bool = False,
                          fanout_n: int = 3) -> str:
+    # Q3 (acceptance-tests-first): when the setting is on, the spec stage owns an
+    # executable acceptance/ suite + RUN.md — the deterministic contract the
+    # implementer makes pass and the verifier re-runs. _repair_workflow appends
+    # the same requirement deterministically so it binds even if the model omits
+    # it; this is the planning-side hint.
+    tests_first = db.get_setting("pipeline.tests_first", "1") == "1"
+    tf_spec = (" The SPEC deliverable ALSO includes an executable acceptance/ suite "
+               "(tests derived from the acceptance criteria — one test per requirement, "
+               "runnable red before implementation) plus acceptance/RUN.md with the exact "
+               "commands to run them, and records the SHA-256 of each acceptance/ file so "
+               "later stages can detect tampering." if tests_first else "")
+    tf_impl = (" The acceptance/ suite from the SPEC is the CONTRACT: make every acceptance "
+               "test pass. You MAY add your own tests, but you MUST NOT modify or delete "
+               "anything under acceptance/." if tests_first else "")
+    tf_ver = (" FIRST re-verify the SHA-256 of every acceptance/ file against the SPEC's "
+              "recorded hashes (tampering = automatic FAIL), THEN run acceptance/RUN.md "
+              "exactly as written." if tests_first else "")
     # Super Result fan-out (SUPER-RESULT-PLAN §6 Step 7b): planning-time shape,
     # per goal family — independent perspectives cross-check, then reconcile.
     sr_block = ""
@@ -4776,13 +4793,13 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
         "R1..Rn, each independently testable and falsifiable / files & interfaces with exact "
         "paths / out of scope / verification: exact commands + expected results) followed by "
         "an ordered PLAN with per-item acceptance criteria and edge cases. Unfalsifiable "
-        "wording ('fast', 'robust', 'handles gracefully') is a defect. Writes NO code.\n"
+        "wording ('fast', 'robust', 'handles gracefully') is a defect. Writes NO code." + tf_spec + "\n"
         "  1 'Implement + tests: <goal>' — code-implementer, depends_on [0], budget null — "
         "implement against the SPEC in the INPUT; code + tests in the same pass, test names "
         "map to requirement numbers, tests run red→green; NEVER weaken, skip or delete a "
         "test to make it pass. Deliverable = evidence report: files changed, exact test/build "
         "commands and their real output. Design-changing ambiguity → write 'BLOCKED: <why>' "
-        "and stop; low-risk ambiguity → state 'ASSUMPTION:' and proceed.\n"
+        "and stop; low-risk ambiguity → state 'ASSUMPTION:' and proceed." + tf_impl + "\n"
         "  2 'Code review: <goal>' — code-reviewer, depends_on [0,1], budget 3000000 — "
         "fresh-context review of the CODE against the SPEC (review the files, never the "
         "implementer's self-assessment): severity-ranked findings (CRITICAL/HIGH/MEDIUM/LOW, "
@@ -4797,7 +4814,7 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
         "FULL suite to green. Fix blocking findings only — log minors.\n"
         "  4 'Acceptance verification: <goal>' — acceptance-verifier, depends_on [0,2,3], "
         "budget 3000000, high_stakes TRUE always — fresh-context final gate: run the SPEC's "
-        "verification commands exactly as written; verdict PASS (per-requirement command + "
+        "verification commands exactly as written;" + tf_ver + " verdict PASS (per-requirement command + "
         "output evidence — no evidence, no PASS) or FAIL ('close' = FAIL). Also check: no "
         "skipped tests covering a requirement, no scope creep. high_stakes parks it for "
         "human approval + frontier judge — that IS the final review; add nothing after it.\n"
@@ -4953,6 +4970,39 @@ def _verify_gate_task(goal: str) -> dict:
         "high_stakes": True, "model": None, "priority": 2,
         "budget_tokens": 3000000, "tags": ["verify", "quality-gate"],
     }
+
+
+# Q3 (acceptance-tests-first): deterministic contract text _repair_workflow
+# appends so the requirement binds even when the LLM omits it. Sentinel-guarded
+# against double-append across the edit → revalidate round-trip.
+_TF_MARK = "ACCEPTANCE-TESTS-FIRST:"
+_TF_SPEC = ("\n\n" + _TF_MARK + " your SPEC deliverable MUST include an executable acceptance/ "
+            "suite (one test per requirement, derived from the acceptance criteria, runnable and "
+            "RED before implementation) plus acceptance/RUN.md with the exact commands, and MUST "
+            "record the SHA-256 of every acceptance/ file (e.g. `sha256sum acceptance/* > "
+            "acceptance/HASHES.txt`) so later stages detect tampering.")
+_TF_IMPL = ("\n\n" + _TF_MARK + " the acceptance/ suite from the SPEC is the CONTRACT — make every "
+            "acceptance test pass. You MAY add tests, but you MUST NOT modify or delete anything "
+            "under acceptance/.")
+_TF_VER = ("\n\n" + _TF_MARK + " FIRST re-verify the SHA-256 of every acceptance/ file against the "
+           "SPEC's recorded hashes (`sha256sum -c acceptance/HASHES.txt`) — any mismatch is an "
+           "automatic FAIL — THEN run acceptance/RUN.md exactly as written as the primary evidence.")
+
+
+def _apply_tests_first(tasks: list, impl: list, spec_i, ver_task: dict, repairs: list):
+    """Q3: append the acceptance-tests-first contract to the spec, implementers,
+    and verifier of a coding pipeline (setting-gated, sentinel-guarded)."""
+    if db.get_setting("pipeline.tests_first", "1") != "1":
+        return
+    if spec_i is not None and _TF_MARK not in (tasks[spec_i].get("description") or ""):
+        tasks[spec_i]["description"] = (tasks[spec_i].get("description") or "") + _TF_SPEC
+        repairs.append("spec stage now owns the acceptance/ test suite (tests-first)")
+    for i in impl:
+        if _TF_MARK not in (tasks[i].get("description") or ""):
+            tasks[i]["description"] = (tasks[i].get("description") or "") + _TF_IMPL
+    if ver_task is not None and _TF_MARK not in (ver_task.get("description") or ""):
+        ver_task["description"] = (ver_task.get("description") or "") + _TF_VER
+        repairs.append("verifier now checks acceptance-file hashes before running them")
 
 
 def _clamp_wizard_questions(data: dict) -> list:
@@ -5127,6 +5177,9 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
                 sinks | set(rev_is) | ({spec_i} if spec_i is not None else set()))
             if ver_deps_before is not None and ver_task["depends_on_idx"] != ver_deps_before:
                 repairs.append("acceptance verification now gates on review + every open task")
+            # Q3: bind the acceptance-tests-first contract deterministically before
+            # the verifier is appended (impl indices are still valid here).
+            _apply_tests_first(tasks, impl, spec_i, ver_task, repairs)
             tasks.append(ver_task)
         # Reconciler enforcement (§7d): a Super Result fan-out (≥2 parallel
         # investigators/drafts, no coding pipeline) needs exactly one

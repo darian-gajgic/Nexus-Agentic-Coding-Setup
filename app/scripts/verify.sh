@@ -365,6 +365,11 @@ chk "Q5 cverify UNSURE-first"        "grep -q 'UNSURE' ../setup/bin/cverify && g
 chk "Q5 cjudge UNSURE line"          "grep -q 'UNSURE' ../setup/bin/cjudge && grep -q 'UNSURE' \$HOME/.local/bin/cjudge"
 chk "Q5 INVESTIGATION rubric note"   "grep -q 'UNSURE' ../setup/knowledge/rubrics/INVESTIGATION.md"
 chk "Q5 UI amber highlight"          "grep -q 'function highlightUnsure' static/app.js && grep -q 'unsure-tag' static/style.css"
+# Q3 — acceptance-tests-first
+chk "Q3 tests_first setting"         "grep -q 'pipeline.tests_first' settings_registry.py"
+chk "Q3 repair enforcement"          "grep -q 'def _apply_tests_first' server.py && grep -q '_apply_tests_first(tasks, impl' server.py"
+chk "Q3 acceptance contract text"    "grep -q 'ACCEPTANCE-TESTS-FIRST' server.py"
+chk "Q3 verifier hash-check"         "grep -q 'sha256sum -c acceptance' server.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"

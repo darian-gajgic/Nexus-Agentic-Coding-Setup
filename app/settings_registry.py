@@ -118,6 +118,13 @@ SECTIONS = [
                      "DECISION LOG for cross-stage context instead of a longer reading list "
                      "(only their direct predecessors' deliverables are injected either way). "
                      "Saves tokens on long projects."},
+            {"key": "pipeline.tests_first", "label": "Acceptance-tests-first (coding)", "type": "bool",
+             "default": "1",
+             "help": "Q3: coding pipelines have the spec stage deliver an executable "
+                     "acceptance/ suite + RUN.md derived from the acceptance criteria; the "
+                     "implementer must make them pass without editing acceptance/, and the "
+                     "verifier checks the acceptance-file hashes before running them. Buys the "
+                     "oracle once — the tests, not prose, are the contract."},
         ],
     },
     {
