@@ -56,7 +56,7 @@ const J = {
   pointer: { x: 0, y: 0 }, pointerHandler: null,
   // research-grounded animation state (docs/JARVIS-VOICE.md §0)
   env: 0, levelHF: 0, blinkAt: 2, blinkT: -1,
-  utterQ: [], utterCtx: null,
+  utterQ: [], utterCtx: null, gaze: null,
   // memory galaxy + static matrix + camera modes
   mem: emptyMem(), matrix: null, galaxyMode: false, fly: null,
   gCam: { theta: Math.PI / 2, phi: 1.35, dist: 700 }, lookCur: null,
@@ -470,6 +470,75 @@ function updateVisemes(put) {
     for (const name in m) put(name, m[name] * w * gate);
   }
   return any;
+}
+
+/* ── GazeController: saccade/fixation state machine ──
+   Camera-dominant (~75% of fixations lock onto the camera and then TRACK
+   it — the camera rides the pointer, so the eyes subtly follow the user),
+   with occasional offset fixations; 60–90 ms saccades with slight
+   overshoot, microsaccadic jitter during fixations, and mode postures
+   (thinking → up-aside, listening → locked on camera). Drives the eye
+   pivot groups (the glints ride along) + eyeLook* morphs as lid follow. */
+function updateGaze(t, put) {
+  if (!J.holo || !J.holo.eyePivots) return;
+  if (!J.gaze) {
+    J.gaze = { yaw: 0, pitch: 0, fromY: 0, fromP: 0, tY: 0, tP: 0,
+               lock: 'cam', until: 0, sacT: -1, sacDur: 0.07 };
+  }
+  const g = J.gaze;
+  const thinking = J.mode === 'thinking', listening = J.mode === 'listening';
+  if (t >= g.until) {           // pick the next fixation
+    let ty, tp, dur;
+    if (thinking) {             // gaze drifts up-aside while working
+      g.lock = 'off';
+      ty = (Math.random() < 0.5 ? -1 : 1) * (5 + Math.random() * 4) * D2R;
+      tp = -(6 + Math.random() * 5) * D2R;   // negative rotation.x = up
+      dur = 0.7 + Math.random() * 1.2;
+    } else if (listening || Math.random() < 0.75) {
+      g.lock = 'cam';           // target refreshed every frame below
+      ty = g.tY; tp = g.tP;
+      dur = listening ? 1.5 + Math.random() * 1.5 : 0.8 + Math.random() * 1.7;
+    } else {
+      g.lock = 'off';           // brief natural glance away
+      ty = (Math.random() * 2 - 1) * 8 * D2R;
+      tp = (Math.random() * 2 - 1) * 5 * D2R;
+      dur = 0.4 + Math.random() * 0.8;
+    }
+    g.fromY = g.yaw; g.fromP = g.pitch;
+    g.tY = ty; g.tP = tp;
+    g.sacT = t; g.sacDur = 0.06 + Math.random() * 0.03;
+    g.until = t + dur;
+    // blink probability doubles around saccade onset
+    if (J.blinkT < 0 && Math.random() < 0.15) J.blinkAt = Math.min(J.blinkAt, t + 0.04);
+  }
+  if (g.lock === 'cam' && J.camera && !J.galaxyMode) {
+    // track the (pointer-driven) camera; compensate the head sway so the
+    // fixation holds like a real one. Eye midpoint sits at ≈ (0, EYE_Y, EYE_Z).
+    const dz = Math.max(10, J.camera.position.z - EYE_Z);
+    g.tY = Math.atan2(J.camera.position.x, dz) - J.headGroup.rotation.y;
+    g.tP = -Math.atan2(J.camera.position.y - EYE_Y, dz) - J.headGroup.rotation.x;
+  }
+  let e = 1;
+  if (g.sacT >= 0) {
+    const k = Math.min(1, (t - g.sacT) / g.sacDur);
+    e = ss01(k) * (1 + 0.05 * Math.sin(k * Math.PI));   // ~5% overshoot
+    if (k >= 1) g.sacT = -1;
+  }
+  g.yaw = g.fromY + (g.tY - g.fromY) * e;
+  g.pitch = g.fromP + (g.tP - g.fromP) * e;
+  // microsaccadic jitter during fixation (sub-degree)
+  const my = Math.sin(t * 13.7) * 0.15 * D2R;
+  const mp = Math.sin(t * 17.3 + 1.0) * 0.12 * D2R;
+  const yaw = Math.max(-0.22, Math.min(0.22, g.yaw + my));
+  const pitch = Math.max(-0.20, Math.min(0.20, g.pitch + mp));
+  J.holo.eyePivots.L.rotation.set(pitch, yaw, 0);
+  J.holo.eyePivots.R.rotation.set(pitch, yaw, 0);
+  // eyeLook* morphs at partial weight — the lids/socket follow the gaze
+  const h = yaw / (12 * D2R), v = -pitch / (12 * D2R);
+  if (v > 0) { put('eyeLookUp_L', 0.6 * Math.min(1, v)); put('eyeLookUp_R', 0.6 * Math.min(1, v)); }
+  else { put('eyeLookDown_L', 0.6 * Math.min(1, -v)); put('eyeLookDown_R', 0.6 * Math.min(1, -v)); }
+  if (h > 0) { put('eyeLookIn_L', 0.6 * Math.min(1, h)); put('eyeLookOut_R', 0.6 * Math.min(1, h)); }
+  else { put('eyeLookOut_L', 0.6 * Math.min(1, -h)); put('eyeLookIn_R', 0.6 * Math.min(1, -h)); }
 }
 
 // degraded-but-visible stand-in if the GLB can't load: ellipsoid lattice
@@ -942,9 +1011,13 @@ function tick() {
     put('eyeBlink_L', lid);
     put('eyeBlink_R', lid);
 
-    // mode postures (P4 adds the full saccade/fixation gaze machine)
+    // gaze — saccade/fixation machine (pivots + eyeLook lid-follow)
+    updateGaze(t, put);
+
+    // mode postures
     if (J.mode === 'thinking') put('browInnerUp', 0.35);
     if (listening) { put('eyeWide_L', 0.12); put('eyeWide_R', 0.12); }
+    if (J.mode === 'talking') put('browInnerUp', 0.12 * Math.min(1, J.env));
 
     // uniforms: time, glitch flicker, mode tint ease, size pulse
     const u = J.head.material.uniforms;
@@ -962,7 +1035,7 @@ function tick() {
 
     // the glints slip under the closing lid
     const gvis = (1 - lid) * (1 - lid);
-    for (const g of J.glints) g.material.opacity = 0.45 * gvis;
+    for (const g of J.glints) g.material.opacity = 0.6 * gvis;
   }
 
   if (J.matrix) J.matrix.rotation.y = Math.sin(t * 0.02) * 0.03;
@@ -1205,9 +1278,9 @@ async function mount(container, opts) {
         // the pivot, so the eyes visibly move even as a dot lattice
         const sp = new THREE.Sprite(new THREE.SpriteMaterial({
           map: glowTexture(), color: HOLO_GLINT, transparent: true,
-          opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false,
+          opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false,
         }));
-        sp.scale.set(1.0, 1.0, 1);
+        sp.scale.set(1.5, 1.5, 1);
         sp.position.copy(corneaOf(e.geo)).multiplyScalar(1.03);
         sp.renderOrder = 3;
         pv.add(sp);
@@ -1338,7 +1411,7 @@ function dispose() {
   for (const g of J.glints) { try { g.material.dispose(); } catch { } }
   J.glints = []; J.headGroup = null;
   J.renderer = null; J.scene = null;
-  J.utterQ = []; J.utterCtx = null;
+  J.utterQ = []; J.utterCtx = null; J.gaze = null;
 }
 
 function setMode(mode) {
