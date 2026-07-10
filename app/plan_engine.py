@@ -499,6 +499,63 @@ def parse_turn(text: str) -> dict:
     }
 
 
+# the family's primary list slot — the "acceptance criteria" distributed onto
+# tasks as "Done when: …" lines (Step 6) and checked for orphans (Step 7).
+_CRITERIA_SLOT = {
+    "software": "acceptance_criteria",
+    "analysis-audit": "questions_to_answer",
+    "research": "research_questions",
+    "content": None,
+}
+
+
+def criteria_slot(family: str) -> str | None:
+    return _CRITERIA_SLOT.get(family)
+
+
+def list_criteria(spec: dict, family: str) -> list:
+    slot = criteria_slot(family)
+    if not slot:
+        return []
+    v = (spec or {}).get(slot) or []
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
+def stub_plan(spec: dict, family: str, goal: str) -> dict:
+    """Deterministic canned DRAFT plan for the verify gate (plan.stub). Produces
+    a raw wizard plan (before _repair_workflow) with the acceptance criteria
+    distributed onto the build task as 'Done when: …' lines — so the gate can
+    exercise the real repair + criteria-distribution path without a model call."""
+    crit = list_criteria(spec, family)
+    done_when = "".join(f"\nDone when: {c}" for c in crit)
+    g = (goal or "goal").strip()[:120]
+    if family == "software":
+        return {"type": "workflow", "workflow": {
+            "name": g, "goal": g, "domain": "software-engineering", "tasks": [
+                {"title": f"Spec & plan: {g}", "specialist": "tech-lead-orchestrator",
+                 "domain": "software-engineering", "depends_on": [],
+                 "description": f"Produce the SPEC & plan for: {g}. {(spec or {}).get('stack_platform','')}"},
+                {"title": f"Implement + tests: {g}", "specialist": "code-implementer",
+                 "domain": "software-engineering", "depends_on": [0],
+                 "description": f"Implement {g} against the SPEC.{done_when}"},
+            ]}}
+    if family == "analysis-audit":
+        return {"type": "task", "task": {
+            "title": f"Analyze: {g}", "domain": "general", "specialist": None,
+            "deliverable_type": "analysis",
+            "description": f"Analysis of: {g}. Scope: {(spec or {}).get('scope','')}.{done_when}"}}
+    if family == "research":
+        return {"type": "task", "task": {
+            "title": f"Research: {g}", "domain": "research-learning", "specialist": "web-researcher",
+            "deliverable_type": "research",
+            "description": f"Research: {g}. Source standard: {(spec or {}).get('source_standard','')}.{done_when}"}}
+    return {"type": "task", "task": {
+        "title": f"Create: {g}", "domain": "content-creation", "specialist": None,
+        "deliverable_type": "content",
+        "description": f"Create: {g}. Audience: {(spec or {}).get('audience','')}. "
+                       f"Core message: {(spec or {}).get('core_message','')}.{done_when}"}}
+
+
 def stub_turn(spec: dict, family: str, user_message: str, turns_so_far: int,
               max_turns: int) -> dict:
     """Deterministic canned interviewer for the verify gate (plan.stub) — mirrors
