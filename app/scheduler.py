@@ -175,6 +175,12 @@ def scheduler_loop(stop_event: threading.Event):
                                         f"Swept {n} stale critic sandbox(es)")
                 except Exception as e:
                     print(f"[scheduler] sandbox sweep error: {e}", file=sys.stderr)
+                # Deep Plan hygiene (Phase 5): sweep stale plan sessions hourly.
+                try:
+                    import server as _srv
+                    _srv.sweep_stale_plan_sessions()
+                except Exception as e:
+                    print(f"[scheduler] plan-session sweep error: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[scheduler] error: {e}", file=sys.stderr)
         stop_event.wait(15)
