@@ -125,6 +125,8 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 - **L2 for PLAYBOOK/RUBRIC:** the read-path overlay (`_knowledge_paths`) covers BUSINESS-CONTEXT + STYLE-VOICE only, so a user_overlay classification meaningfully routes STYLE-VOICE to the member overlay; PLAYBOOK/RUBRIC user_overlay deltas fall back to canonical (there is no executor read-path for a per-user PLAYBOOK). Recorded, not hidden.
 - **Rule 10 / Phase-8 measurement:** Eco's "same answer, cheaper" and Optimal's thresholds ship HEURISTIC and unmeasured, per the operator's deferral. The Eco preset card body ("Heuristic — not yet benchmark-validated") and the spend `?` explainer ("Eco's 'same answer for less' … NOT yet benchmark-validated — the deferred measurement campaign confirms it or raises Eco's floor") now say so out loud (added in the 3rd judge pass — the earlier report claim that this was "documented in the Eco card copy" was false until then, finding 4); the final campaign validates or raises the floor.
 - **Q7a plan-time derivation in the wizard entry flow:** the profile fully governs at CREATE time (loop knobs, budget, cascade, judge scope, round caps) and at revalidate (Eco collapse); a fresh wizard *plan* is produced before the proposal-modal profile pick, so plan-time SR/fan-out/depth from the profile apply on the direct create + revalidate paths, not the very first wizard draft. Noted.
+- **L3 rubric-fingerprint re-scoring of exemplar candidates — DEFERRED (silent partial made explicit, 3rd judge finding 5).** The plan's L3 says "re-score candidates when the domain RUBRIC changes (fingerprint delta)" in addition to the pool cap + age-out. `golden_exemplars` implements the pool cap (`max×3`) and the age-out (`exemplars.max_age_months`), and selects on the STORED self-score (`rubric_score` parsed at completion), but it does NOT re-score a candidate against the current RUBRIC fingerprint — a deliverable that scored well under an old rubric keeps that score until it ages out. Deferred deliberately: re-scoring means a fresh judge pass per candidate, which would break Q1's "deterministic SQL, no model calls" contract and pull frontier cost into every dispatch's framing build (P1 backpressure). The age-out + the min-score floor already bound stale "excellence"; a true fingerprint-delta re-score belongs with the Phase-8 measurement campaign (which re-runs the judge with the config fingerprint anyway, L4). Recorded, not hidden.
+- **Rule-7 profile-aware Decisions cost hints — DEFERRED (silent partial made explicit, 3rd judge finding 5).** The plan's rule 7 says the Decisions-inbox cost hints "become profile-aware ('another round ≈ $0.40 — within Optimal')". Every producer today emits a STATIC string (`loop_engine` "another rework round runs the grounded critic again", `routing` "these are heuristic proposals…", `lessons` "no model cost to apply…", the `_DECISION_FALLBACKS` empties) — none reads the task's `spend_profile` or budget. Deferred because the "≈ $0.40" figure needs a validated per-model cost model, which ships in the same deferred measurement campaign as rule 10 (Eco/Optimal thresholds are HEURISTIC until then); a profile-named suffix without a real number would be theatre. The card still shows whatever static hint the producer set; profile-aware costing lands with the Phase-8 cost ledger. Recorded, not hidden.
 
 ## Judge review — REVISE → all three blockers addressed (2026-07-10)
 
@@ -352,3 +354,26 @@ granularly. The tree is fully committed.
    The rule-10 row and Deviations note above are corrected to point at the real copy. `app.js?v=84`.
    **Regression:** `verify.sh` "rule3/10 Eco unvalidated caveat" asserts both marker phrases are
    present in `app.js`.
+
+5. **Two silent partials neither delivered nor recorded — now recorded as explicit deviations.**
+   Confirmed at HEAD: (a) L3's rubric-fingerprint re-scoring of exemplar candidates (plan L3:
+   "re-score candidates when the domain RUBRIC changes") is absent — `golden_exemplars` ships the
+   pool cap + age-out and selects on the STORED self-score only; (b) rule-7's profile-aware
+   Decisions cost hints (plan rule 7: cost hints "become profile-aware") are absent — every
+   producer emits a static string. Neither appeared in the report's Deviations. **Resolution
+   (record, per the judge's "record or implement"):** both are added to the Deviations section
+   above with the honest rationale for deferral — L3 re-scoring would require a per-candidate
+   judge pass (breaking Q1's deterministic no-model-call contract and pulling P1 frontier cost
+   into every framing build), and profile-aware cost figures need the validated per-model cost
+   model that ships with the same deferred Phase-8 measurement campaign as the rule-10/rule-3
+   Eco thresholds. Both are bounded today (age-out + min-score floor for L3; the static hint still
+   renders for rule 7) and land with the measurement campaign. No code change; the deviation
+   record is the deliverable.
+
+**Gates re-run after the five fixes** (real, against the live service after `systemctl --user restart nexus`):
+
+```
+$ bash app/scripts/verify.sh                              → ALL CHECKS PASSED: 381/381   (+P10a, +Q7a defaults-wired, +Q7b one-badge, +Eco caveat)
+$ app/.venv/bin/python scripts/verify_autopilot_e2e.py    → 56 passed, 0 failed   (50 base + 6 across findings 1/2/3)
+$ app/.venv/bin/python scripts/verify_autopilot_ui.py     → 18 passed, 0 failed   (17 + apprBadge-absorbed check)
+```
