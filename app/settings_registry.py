@@ -19,9 +19,13 @@ PURPOSES = {
     "easy": "Easy tasks — light/simple work",
     "mechanical": "Mechanical tasks — formatting, extraction, conversions",
     "frontier_judge": "Frontier judge — scores high-stakes deliverables and eval runs against the domain rubric",
+    "spec_model": "Plan premortem — an external judgment-tier verifier that critiques a Deep Plan before it runs (defaults to the frontier judge)",
 }
 
 WORKER_PURPOSES = ("complicated", "easy", "mechanical")
+# Purposes that run through the headless-CLI path (judge.cmd / cverify / the
+# plan premortem) rather than a Hermes session — they need a route='cli' model.
+CLI_PURPOSES = ("frontier_judge", "spec_model")
 
 SECTIONS = [
     {
@@ -115,6 +119,54 @@ SECTIONS = [
              "help": "Global cap on simultaneous Claude-CLI runs (grounded critic + frontier "
                      "judge) — one subscription with hard usage ceilings. Excess calls wait; "
                      "rate-limit/quota failures back off and requeue instead of escalating."},
+        ],
+    },
+    {
+        "id": "plan", "title": "Deep Plan (conversational planning)",
+        "desc": "For complex/ambiguous goals: detect them, recommend a short scaffolded "
+                "interview that builds a persistent SPEC, draft the DAG from it, and verify "
+                "the plan structurally + with an external-model premortem. All default to "
+                "today's quick-wizard behaviour on simple goals.",
+        "items": [
+            {"key": "plan.deep_enabled", "label": "Deep Plan enabled", "type": "bool",
+             "default": "1",
+             "help": "Master switch for the conversational planning phase. Off = the quick "
+                     "wizard is the only path (no triage, no recommendation banner)."},
+            {"key": "plan.recommend", "label": "When to recommend Deep Plan", "type": "str",
+             "default": "auto",
+             "help": "auto (default) = recommend only when triage detects a complex/ambiguous "
+                     "goal; always = offer it for every goal; never = never surface the banner "
+                     "(the manual ✦ button still starts one). Once spend profiles are attached "
+                     "to an item this is DERIVED from it (Eco→never, Optimal→auto, Smart→always) "
+                     "and this setting is the fallback for un-profiled items."},
+            {"key": "plan.triage_samples", "label": "Triage draft-plan samples", "type": "int",
+             "default": "2", "min": 0, "max": 3,
+             "help": "How many cheap draft plans to sample for divergence when heuristics land "
+                     "in the uncertain band. 0 = heuristics only (no sampling). Sampling runs "
+                     "asynchronously and never blocks the wizard's questions round."},
+            {"key": "plan.max_turns", "label": "Max interview turns", "type": "int",
+             "default": "3", "min": 1, "max": 8,
+             "help": "After this many turns the planner must offer to draft the plan instead of "
+                     "asking more questions (the operator can draft at any time)."},
+            {"key": "plan.max_questions_per_turn", "label": "Max questions per turn", "type": "int",
+             "default": "3", "min": 1, "max": 6,
+             "help": "The interviewer asks at most this many targeted questions per turn, each "
+                     "with 3–5 options and a ★ recommended default."},
+            {"key": "plan.critique_enabled", "label": "Premortem plan critique", "type": "bool",
+             "default": "1",
+             "help": "After the first draft, run ONE premortem critique on the spec_model "
+                     "(external judgment-tier verifier via the frontier CLI): what fails, "
+                     "what's missing, which criteria are untestable. Findings are advisory "
+                     "annotations — they never block approval."},
+            {"key": "plan.critique_timeout_s", "label": "Premortem critique timeout (s)",
+             "type": "int", "default": "600", "min": 60, "max": 3600,
+             "help": "Hard cap on one premortem critique run (headless CLI, minutes are normal)."},
+            {"key": "plan.stub", "label": "Stub the planning model (gate hook)", "type": "bool",
+             "default": "0",
+             "help": "Verify-gate hook: short-circuit the Hermes planning-session turn with "
+                     "canned slot-filling replies (mirrors evals.stub). Leave OFF in normal "
+                     "use — the judge/critic command stubs do NOT cover session turns, so the "
+                     "e2e gate flips this instead."},
         ],
     },
     {

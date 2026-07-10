@@ -572,10 +572,32 @@ def init_db():
                 "route, enabled, created_at, updated_at) VALUES (?,NULL,?,?,?,?,1,?,?)",
                 (mid, prov, model_id, label, route, now, now))
         for purpose, mid in (("complicated", "mdl-glm52"), ("easy", "mdl-glm51"),
-                             ("mechanical", "mdl-glm45air"), ("frontier_judge", "mdl-opus48")):
+                             ("mechanical", "mdl-glm45air"), ("frontier_judge", "mdl-opus48"),
+                             # Deep Plan (Phase 5): spec_model runs the premortem plan
+                             # critique — an EXTERNAL judgment-tier verifier, seeded to
+                             # the same frontier judge as frontier_judge (rotate later).
+                             ("spec_model", "mdl-opus48")):
             conn.execute(
                 "INSERT OR IGNORE INTO model_assignments (user_id, purpose, model_row_id, "
                 "updated_at) VALUES ('global',?,?,?)", (purpose, mid, now))
+
+    # Deep Plan mode (Phase 5): conversational planning sessions. Resumable —
+    # no boot-reset; stale 'active' rows are swept >7 days by the plan engine
+    # at startup and on the scheduler.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS plan_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        goal TEXT,
+        family TEXT,
+        spec_json TEXT,
+        transcript TEXT,
+        hermes_session_id TEXT,
+        status TEXT DEFAULT 'active',
+        triage_json TEXT,
+        created_at REAL,
+        updated_at REAL
+    )""")
 
     # One-time addition (2026-07-08): glm-5-turbo, the peak-hours overload
     # fallback (settings dispatch.fallback_model) — pre-existing installs
@@ -588,6 +610,23 @@ def init_db():
             "route, enabled, created_at, updated_at) VALUES ('mdl-glm5turbo',NULL,'zai',"
             "'glm-5-turbo','GLM 5 Turbo (peak-hours fallback)','hermes',1,?,?)", (now, now))
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated.glm5turbo','1')")
+
+    # One-time addition (2026-07-10, Deep Plan Phase 5): the spec_model purpose —
+    # the external judgment-tier verifier for plan premortem critique. Existing
+    # installs (non-empty user_models, so the seed block above was skipped) get
+    # the global row here, defaulting to whatever frontier_judge currently
+    # resolves to (fallback mdl-opus48). Marker-guarded so a deliberate later
+    # deletion stays deleted (same contract as the blocks above).
+    if not conn.execute("SELECT 1 FROM settings WHERE key='migrated.spec_model'").fetchone():
+        now = time.time()
+        fj = conn.execute(
+            "SELECT model_row_id FROM model_assignments WHERE user_id='global' "
+            "AND purpose='frontier_judge'").fetchone()
+        seed_mid = (fj[0] if fj else None) or "mdl-opus48"
+        conn.execute(
+            "INSERT OR IGNORE INTO model_assignments (user_id, purpose, model_row_id, "
+            "updated_at) VALUES ('global','spec_model',?,?)", (seed_mid, now))
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated.spec_model','1')")
 
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
@@ -667,7 +706,7 @@ def set_setting(key, value):
 
 # --- Model registry helpers (Settings v2 — shared by server, dispatch, evals) ---
 
-MODEL_PURPOSES = ("complicated", "easy", "mechanical", "frontier_judge")
+MODEL_PURPOSES = ("complicated", "easy", "mechanical", "frontier_judge", "spec_model")
 
 
 def visible_models(user_id: str | None, enabled_only: bool = False) -> list:
