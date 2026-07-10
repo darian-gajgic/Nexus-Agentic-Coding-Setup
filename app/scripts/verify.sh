@@ -352,6 +352,15 @@ chk "meetings tab frontend"          "grep -q 'function viewMeetings' static/app
 chk "STT e2e gate exists"            "[ -f scripts/verify_stt_e2e.py ]"
 
 echo ""
+echo -e "${YELLOW}═══ 19. QUALITY AUTOPILOT (QUALITY-AUTOPILOT-PLAN-2026-07-10) ═══${NC}"
+# Q4 — project decision log + running brief
+chk "Q4 decisions harvest"           "grep -q 'def harvest_decisions' hermes_dispatch.py && grep -q 'def parse_decisions_section' hermes_dispatch.py"
+chk "Q4 decisions contract in framing" "grep -q 'END your deliverable with a .## Decisions' hermes_dispatch.py"
+chk "Q4 decision log injected"        "grep -q 'PROJECT DECISION LOG' hermes_dispatch.py"
+chk "Q4 harvest called on finalize"   "grep -q 'harvest_decisions(task, content)' hermes_dispatch.py"
+chk "Q4 brief_mode setting"           "grep -q 'framing.brief_mode' settings_registry.py"
+
+echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then
   echo -e "  ${GREEN}ALL CHECKS PASSED: $PASS/$PASS${NC}"
