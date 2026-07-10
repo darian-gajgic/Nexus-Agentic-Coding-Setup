@@ -272,7 +272,7 @@ sending, or state explicitly in the delivery why it ships anyway.
 
 - [ ] Re-read the original request: every part addressed or explicitly declared out of scope?
 - [ ] Every DONE WHEN criterion from the FRAME block met?
-- [ ] Every factual claim sourced this session, or marked unverified?
+- [ ] Every factual claim sourced this session, or marked `[UNSURE: reason]`?
 - [ ] An `EVIDENCE:` line behind every "works / done" claim?
 - [ ] Was there a real revision pass after the first full draft?
 - [ ] (Business) Rubric self-scored with lines cited; must-passes green; **Learn:** footer present?

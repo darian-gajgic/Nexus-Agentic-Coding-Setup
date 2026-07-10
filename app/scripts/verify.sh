@@ -426,6 +426,9 @@ chk "B4 job UI template fields"      "grep -q 'jbSuper' static/app.js && grep -q
 chk "Q7c explainers + handler"       "grep -q 'const EXPLAINERS' static/app.js && grep -q 'function showExplainer' static/app.js && grep -q 'qmark' static/style.css"
 chk "Q7c house metaphor"             "grep -q 'the house metaphor' static/app.js && grep -q 'you are the client' static/app.js"
 chk "Q7c manual autopilot section"   "grep -q 'Autopilot — two simple dials' static/app.js && grep -q 'Your Decisions inbox' static/app.js"
+# Rule 11 — specialist sweep (18 defs aligned to the [UNSURE] contract, in sync)
+chk "rule11 specialists use [UNSURE]"  "[ \$(grep -rl '\[UNSURE: reason\]' \$HOME/.hermes/agents/*.md | wc -l) -eq 18 ] && [ \$(grep -rl 'mark anything unchecked as' \$HOME/.hermes/agents/*.md | wc -l) -eq 0 ]"
+chk "rule11 vendored copies synced"    "for f in ../setup/hermes/agents/*.md; do cmp -s \"\$f\" \"\$HOME/.hermes/agents/\$(basename \$f)\" || exit 1; done"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
