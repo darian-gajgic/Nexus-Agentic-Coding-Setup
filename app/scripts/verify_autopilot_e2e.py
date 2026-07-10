@@ -103,7 +103,7 @@ chk("Q5 cverify/cjudge check UNSURE (live copies)",
     "UNSURE" in open(os.path.expanduser("~/.local/bin/cverify")).read()
     and "UNSURE" in open(os.path.expanduser("~/.local/bin/cjudge")).read())
 
-print("=== Q1 — golden-exemplar selection (SQL guards + L3 age-out) ===")
+print("=== Q1 — golden-exemplar selection (SQL guards + L3 age-out + own-work reservation) ===")
 uid = "u_owner"
 ex_ws = hd.WORKSPACES / "exmpl-ws"; ex_ws.mkdir(parents=True, exist_ok=True)
 (ex_ws / "deliverable.md").write_text("An excellent past marketing deliverable.")
@@ -121,18 +121,45 @@ db.execute("INSERT OR REPLACE INTO tasks (id, title, status, domain, user_id, ju
            "VALUES ('ex-old','Old past','done','marketing',?, 'SHIP','4/4',?,?, 'content')",
            (uid, time.time() - 400 * 86400, str(ex_ws)))
 _cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE id IN ('ex-good','ex-low','ex-old')"))
-_old_max = db.get_setting("exemplars.max", "2")
-db.set_setting("exemplars.max", "5")  # room past the curated examples that win ties
-_cleanup.append(lambda: db.set_setting("exemplars.max", _old_max or "2"))
+# Scratch knowledge root with TWO curated marketing files — the live-default shape
+# (2-3 curated exemplars per domain). finding-2 regression: at the DEFAULT
+# exemplars.max=2 these must NOT crowd the operator's own SHIP'd work out (a slot
+# is reserved), and curated files must be labelled own=False. onboarding.root is
+# restored at the END of this block so the Q2 section still saves the true default.
+q1root = tempfile.mkdtemp(prefix="q1-know-")
+_cleanup.append(lambda: shutil.rmtree(q1root, ignore_errors=True))
+os.makedirs(os.path.join(q1root, "domains", "marketing", "examples"), exist_ok=True)
+open(os.path.join(q1root, "domains", "marketing", "RUBRIC.md"), "w").write("# R\n")
+open(os.path.join(q1root, "domains", "marketing", "examples", "curated_a.md"), "w").write("curated A")
+open(os.path.join(q1root, "domains", "marketing", "examples", "curated_b.md"), "w").write("curated B")
+_q1_old_root = db.get_setting("onboarding.root", "")
+_q1_old_max = db.get_setting("exemplars.max", "2")
+db.set_setting("onboarding.root", q1root)
+db.set_setting("exemplars.max", "2")  # DEFAULT — no room-making workaround
 ex = hd.golden_exemplars({"id": "cur", "domain": "marketing", "user_id": uid,
                           "deliverable_type": "content"})
-chk("Q1 selects the SHIP'd high-score exemplar", any("exmpl-ws" in p for p in ex))
+paths = [e["path"] for e in ex]
+chk("Q1 selects the SHIP'd high-score exemplar", any("exmpl-ws" in p for p in paths))
+chk("Q1 finding-2: own work survives at DEFAULT max=2 despite 2 curated files (reserved slot)",
+    any(e.get("own") and "exmpl-ws" in e["path"] for e in ex))
+chk("Q1 curated files labeled own=False (not the operator's own work)",
+    any("curated_" in p for p in paths) and all(not e.get("own") for e in ex if "curated_" in e["path"]))
 chk("Q1 excludes below-min-score + aged-out (L3) + code_change guard",
     hd.golden_exemplars({"id": "cur", "domain": "marketing", "user_id": uid,
                          "deliverable_type": "code_change"}) == [])
 chk("Q1 skips a retry round", hd.golden_exemplars(
     {"id": "cur", "domain": "marketing", "user_id": uid, "deliverable_type": "content",
      "retry_feedback": "fix"}) == [])
+# Honest framing labels: own work under the OWN header, curated under the reference header.
+q1ws = hd.WORKSPACES / "q1fr-ws"; q1ws.mkdir(parents=True, exist_ok=True)
+_cleanup.append(lambda: shutil.rmtree(q1ws, ignore_errors=True))
+q1fr = hd.build_framing({"id": "q1fr", "title": "New marketing task", "domain": "marketing",
+                         "user_id": uid, "deliverable_type": "content"}, q1ws)
+chk("Q1 framing labels own past work honestly (own vs curated split, no false 'OWN' claim on curated)",
+    "operator's OWN past deliverables" in q1fr and "Curated reference exemplars" in q1fr
+    and str(ex_ws / "deliverable.md") in q1fr)
+db.set_setting("onboarding.root", _q1_old_root or "")
+db.set_setting("exemplars.max", _q1_old_max or "2")
 
 print("=== Q2 — edit distillation (stubbed) → admin card → apply (L2) ===")
 scratch = tempfile.mkdtemp(prefix="apqa-know-")
@@ -244,16 +271,28 @@ coding = [{"title": "Spec", "specialist": "tech-lead-orchestrator", "domain": "s
            "depends_on_idx": [], "spend_profile": "eco"},
           {"title": "Impl", "specialist": "code-implementer", "domain": "software-engineering",
            "depends_on_idx": [0], "spend_profile": "eco"}]
+# REALISTIC-SHAPE fixture (regression, finding 1): the wizard's own coding
+# template ALWAYS emits an acceptance-verifier with high_stakes TRUE, so the
+# risk-floor scan must EXCLUDE gate stages — otherwise the mandatory verifier
+# defeats the Eco collapse on every real plan. The thin fixture above (no
+# verifier in the input) masked this, so exercise the realistic shape too.
+coding_real = coding + [{"title": "Acceptance verification", "specialist": "acceptance-verifier",
+                         "domain": "software-engineering", "high_stakes": True,
+                         "depends_on_idx": [0, 1], "spend_profile": "eco"}]
 try:
     r = post("/api/tasks/wizard/revalidate", json={"name": "Eco proj", "spend_profile": "eco", "tasks": coding})
     tasks = r.json().get("tasks", [])
     specs = [t.get("specialist") for t in tasks]
     chk("rule5 Eco collapses: no code-reviewer auto-inserted",
         "code-reviewer" not in specs and "acceptance-verifier" in specs)
-    coding_hs = [dict(coding[0]), dict(coding[1], high_stakes=True)]
+    rr = post("/api/tasks/wizard/revalidate", json={"name": "Eco real", "spend_profile": "eco", "tasks": coding_real})
+    specs_r = [t.get("specialist") for t in rr.json().get("tasks", [])]
+    chk("rule5 Eco STILL collapses when the always-high-stakes verifier is already in the plan",
+        "code-reviewer" not in specs_r and specs_r.count("acceptance-verifier") == 1)
+    coding_hs = [dict(coding[0], high_stakes=True), dict(coding[1])] + coding_real[2:]
     r2 = post("/api/tasks/wizard/revalidate", json={"name": "Eco HS", "spend_profile": "eco", "tasks": coding_hs})
     specs2 = [t.get("specialist") for t in r2.json().get("tasks", [])]
-    chk("rule2+5 high-stakes re-inserts the review gate even under Eco", "code-reviewer" in specs2)
+    chk("rule2+5 a high-stakes WORK stage re-inserts the review gate even under Eco", "code-reviewer" in specs2)
 except Exception:
     chk("rule5 revalidate reachable", False)
 
