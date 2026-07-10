@@ -108,8 +108,12 @@ def create_session(title: str, model: str | None = None,
     """Create a fresh persistent Hermes session; returns its api_* id.
     model: per-task override (e.g. glm-5.1 for lighter work — Z.ai's concurrency
     limit is PER MODEL, so extra models are extra parallel capacity).
-    system_prompt: PERSISTENT session-level system prompt (stronger than the
-    per-turn ephemeral system_message — used to role-lock wizard sessions).
+    system_prompt: stored by the upstream api_server but NEVER injected into
+    chat turns (verified 2026-07-11 — same upstream flaw class as the
+    session-model core-mod). It only seeds the session title and a metadata
+    flag. ANY role lock must ALSO ride every turn as the per-turn ephemeral
+    system_message, or it silently never reaches the model (the Deep Plan
+    interviewer executed its goal with tools because of exactly this).
     Hermes enforces UNIQUE titles — on a collision (e.g. a retried task whose
     old session still exists) retry once with a short unique suffix."""
     payload = {"title": title}

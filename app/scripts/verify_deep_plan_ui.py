@@ -49,8 +49,17 @@ REC_RESP = {
 }
 
 
+# Fable-5 checker finding N1: scope deletes to THIS gate's session goal — a full
+# table wipe destroys the operator's real planning history mid-interview.
+GATE_GOAL = "build a webshop and deploy it"
+
+
+def _wipe_gate_sessions():
+    db.execute("DELETE FROM plan_sessions WHERE goal=?", (GATE_GOAL,))
+
+
 async def main():
-    db.execute("DELETE FROM plan_sessions")
+    _wipe_gate_sessions()
     stub0 = db.get_setting("plan.stub", "0")
     db.set_setting("plan.stub", "1")
     try:
@@ -117,7 +126,7 @@ async def main():
             ok("no console errors", not console_errors, str(console_errors[:2]))
             await browser.close()
     finally:
-        db.execute("DELETE FROM plan_sessions")
+        _wipe_gate_sessions()
         db.set_setting("plan.stub", stub0)
 
     print(f"\n{'='*44}")
