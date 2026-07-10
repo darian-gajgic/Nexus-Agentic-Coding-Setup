@@ -379,6 +379,17 @@ chk "Q1 exemplar selection"          "grep -q 'def golden_exemplars' hermes_disp
 chk "Q1 exemplar injection"          "grep -q 'QUALITY BAR' hermes_dispatch.py && grep -q 'golden_exemplars(task)' hermes_dispatch.py"
 chk "Q1 exemplar settings"           "grep -q 'exemplars.enabled' settings_registry.py && grep -q 'exemplars.min_score' settings_registry.py && grep -q 'exemplars.max' settings_registry.py"
 chk "L3 exemplar age-out"            "grep -q 'exemplars.max_age_months' settings_registry.py && grep -q 'max_age_days' hermes_dispatch.py"
+# Q2 — operator-edit distillation (N8 upgraded) + L2
+chk "Q2 edit_evidence table"         "grep -q 'CREATE TABLE IF NOT EXISTS edit_evidence' database.py"
+chk "Q2 lessons module"              "[ -f lessons.py ] && grep -q 'def run_distillation' lessons.py && grep -q 'def apply_deltas' lessons.py && grep -q 'def gather_evidence_text' lessons.py"
+chk "Q2 accept-diff capture"         "grep -q 'def _capture_accept_diff' server.py && grep -q \"record_evidence.*feedback\" server.py"
+chk "Q2 lesson_deltas approval"      "grep -q '\"lesson_deltas\"' server.py && grep -q 'lesson_deltas' lessons.py"
+chk "Q2 distill endpoint"            "grep -q '/api/lessons/distill' server.py && grep -q '/api/lessons/evidence' server.py"
+chk "Q2 distillation sweep hook"     "grep -q 'sweep_distillation' loop_engine.py && grep -q 'def sweep_distillation' lessons.py"
+chk "Q2 settings"                    "grep -q 'lessons.auto_distill' settings_registry.py && grep -q 'lessons.min_evidence' settings_registry.py && grep -q 'lessons.cmd' settings_registry.py"
+chk "Q2 cdistill vendored+installed" "[ -f ../setup/bin/cdistill ] && [ -f \$HOME/.local/bin/cdistill ] && grep -q 'NEXUS_LESSONS_JSON_BEGIN' ../setup/bin/cdistill"
+chk "P7 approvals scope column"      "grep -q \"ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'\" database.py"
+chk "L2 overlay-vs-canonical"        "grep -q 'user_overlay' lessons.py && grep -q 'def _delta_path' lessons.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# cdistill — LESSONS DISTILLATION: frontier Claude reads a domain's accumulated
+# operator corrections (rejection feedback, user review comments, accept-diffs,
+# and the judges'/critic's learning notes) and proposes a FEW durable deltas to
+# the domain's STYLE-VOICE / PLAYBOOK / RUBRIC.
+# Part of Nexus Quality Autopilot Q2 / N8 (QUALITY-AUTOPILOT-PLAN-2026-07-10).
+#
+# Usage: cdistill <domain> <evidence_file>
+#   <domain>         domain slug (its knowledge files under ~/knowledge/domains/<d>/)
+#   <evidence_file>  a text file of collected evidence (built by lessons.py)
+#
+# Emits prose, then exactly one sentinel-fenced JSON object. Parsed by
+# lessons.parse_lesson_deltas; on parse failure the caller drops the run.
+set -euo pipefail
+
+KNOW="$HOME/knowledge"
+DOMAIN="${1:-}"; EVID="${2:-}"
+
+if [ -z "$DOMAIN" ] || [ -z "$EVID" ]; then
+  echo "usage: cdistill <domain> <evidence_file>" >&2
+  exit 1
+fi
+EVID="$(realpath "$EVID")"
+[ -f "$EVID" ] || { echo "cdistill: no such evidence file: $EVID" >&2; exit 1; }
+
+DDIR="$KNOW/domains/$DOMAIN"
+FILE_LINES=""
+for f in STYLE-VOICE.md PLAYBOOK.md RUBRIC.md; do
+  [ -f "$DDIR/$f" ] && FILE_LINES="$FILE_LINES $DDIR/$f"
+  [ -f "$KNOW/$f" ] && FILE_LINES="$FILE_LINES $KNOW/$f"
+done
+
+PROMPT="You are distilling durable CRAFT LESSONS for the '$DOMAIN' domain of a small business's knowledge base. The operator has been correcting the AI's deliverables; your job is to turn those corrections into a few permanent improvements to the knowledge files so the mistakes stop repeating.
+
+READ the evidence file first: $EVID — it contains rejection feedback, the operator's own review comments, unified diffs between rejected and accepted versions (the strongest signal — what the human actually changed), and the judges' learning notes.
+THEN read the current knowledge files you may amend:$FILE_LINES
+
+Propose AT MOST 5 deltas. Each delta is a concrete, durable edit to ONE knowledge file — a rule to ADD to a PLAYBOOK checklist, a gate to TIGHTEN in a RUBRIC, a voice guideline for STYLE-VOICE. NOT a one-off fix for a single deliverable. Every delta MUST cite the evidence line(s) that justify it. Classify each delta:
+- target 'canonical' (universal craft — applies to everyone) or 'user_overlay' (this operator's personal taste).
+
+OUTPUT: narrate briefly if you wish, then END with exactly one JSON object between these sentinel lines, nothing after the closing sentinel:
+NEXUS_LESSONS_JSON_BEGIN
+{\"deltas\": [{
+   \"file\": \"PLAYBOOK.md|RUBRIC.md|STYLE-VOICE.md\",
+   \"target\": \"canonical|user_overlay\",
+   \"kind\": \"add|tighten|reword\",
+   \"before\": \"<the current text this replaces, or '' for a pure addition> (<=500)\",
+   \"after\": \"<the exact new/edited text> (<=800)\",
+   \"rationale\": \"<why — cite the evidence> (<=400)\"
+}]}
+NEXUS_LESSONS_JSON_END
+
+RULES: at most 5 deltas; each must be independently defensible from the evidence; prefer tightening an existing gate over adding a vague new one; if the evidence supports no durable lesson, return an empty deltas array. Do NOT modify any files yourself — you only PROPOSE."
+
+# Nexus Settings v2 hooks (both optional, absent = original behavior):
+#   JUDGE_MODEL / JUDGE_ANTHROPIC_API_KEY — frontier-judge model + per-user key
+MODEL_ARGS=()
+if [ -n "${JUDGE_MODEL:-}" ]; then MODEL_ARGS=(--model "$JUDGE_MODEL"); fi
+
+KEY_ENV=(-u ANTHROPIC_API_KEY)
+if [ -n "${JUDGE_ANTHROPIC_API_KEY:-}" ]; then
+  KEY_ENV=(ANTHROPIC_API_KEY="$JUDGE_ANTHROPIC_API_KEY")
+fi
+
+# Read-only proposal: no Edit/Write tools — the operator approves, then Nexus applies.
+exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES -u ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
+  -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_SUBAGENT_MODEL -u CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY \
+  -u CLAUDE_CODE_EFFORT_LEVEL -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u CLAUDE_CODE_WORKFLOWS \
+  -u CLAUDE_CODE_ALWAYS_ENABLE_EFFORT -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC -u API_TIMEOUT_MS \
+  -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+  "${KEY_ENV[@]}" \
+  claude "${MODEL_ARGS[@]}" \
+    --permission-mode acceptEdits \
+    --allowedTools "Read" "Grep" "Glob" \
+    --disallowedTools "Bash" "Edit" "Write" "Bash(git push:*)" "Bash(gh:*)" \
+    -p "$PROMPT"
