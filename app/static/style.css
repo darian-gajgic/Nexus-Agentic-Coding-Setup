@@ -190,6 +190,7 @@ code, pre, .mono { font-family: var(--font-mono); }
   display:inline-flex; align-items:center; gap:6px;
 }
 .btn-ghost:hover { color:var(--text); border-color:var(--accent); background:var(--accent-glow); }
+.btn-ghost:disabled, .btn-sm:disabled { opacity:.45; cursor:not-allowed; pointer-events:none; }
 .btn-sm {
   background:var(--panel-2); color:var(--text-dim);
   border:1px solid var(--border);
