@@ -26,6 +26,14 @@ Base commit: `23f24d6`. Phase commits (granular, one per step, tree fully commit
 UI steps 3/5 so the UI wired against a complete, already-tested backend and no commit left a
 dangling reference. All plan steps are implemented; the numeric order is preserved in intent.
 
+**REVISE pass (independent judge, 2026-07-10)** — the judge returned REVISE with two blocking
+findings; both re-verified against HEAD (reproduced), fixed, and covered by a new regression check:
+
+| Commit | Judge finding | Fix |
+|---|---|---|
+| `1e23351` | 1 — JARVIS DEEP PLAN framing omitted `/attach`; voice path stranded the session at `drafted` with its Hermes session never freed (sweep covered `active` only) | Framing now documents the REQUIRED attach call after create; `sweep_stale_plan_sessions()` covers `drafted` too. Regression: verify.sh (`sessions/ID/attach`, `status IN ('active','drafted')`) + a drafted-sweep e2e check (now 21/21) |
+| `09bf2a0` | 2 — Step 7's "re-run premortem" button and "flag changed/added/removed cards" were unimplemented and undocumented | **Implemented** (chosen over recording a deviation — both are locked Step 7 requirements): `🔍 Re-run premortem` button + `planEdComputeDiff` flagging ＋added/✎changed/removed cards after revalidate. Regression: verify.sh + a UI button check (now 10/10) |
+
 ---
 
 ## 1. What each step delivers (grounded, by symbol)
@@ -62,9 +70,11 @@ dangling reference. All plan steps are implemented; the numeric order is preserv
   `stub_turn` (deterministic slot-filling, mirrors `evals.stub`).
 - Endpoints: `POST /api/plan/sessions` (row + dedicated Hermes session + opening turn), `/turn`,
   `PATCH /spec`, `GET` list/one (resume), `DELETE` (abandon). Owner-scoped (`_owned_plan_session`).
-- **Session hygiene (premortem-fix):** `sweep_stale_plan_sessions()` abandons active >7d + deletes
-  their Hermes sessions, wired at **startup** (`server.py`) AND **hourly on the scheduler**
-  (`scheduler.py`); create→`_plan_start_session`, abandon/created→`delete_session`.
+- **Session hygiene (premortem-fix; REVISE finding 1):** `sweep_stale_plan_sessions()` abandons
+  stale **`active` OR `drafted`** sessions >7d + deletes their Hermes sessions, wired at **startup**
+  (`server.py`) AND **hourly on the scheduler** (`scheduler.py`); create→`_plan_start_session`,
+  abandon/attach(created)→`delete_session`. `drafted` is covered because only `/attach` reaches
+  `created` — a drafted-but-unattached session (the JARVIS voice/API path) would otherwise strand.
 
 **Step 6 — Draft from spec** (`server.py`, `plan_engine.py`)
 - `_task_wizard_framing` gains an optional `spec_block`; `POST /…/draft` seeds it with the rendered
@@ -83,6 +93,11 @@ dangling reference. All plan steps are implemented; the numeric order is preserv
   short-circuits; optional `plan.critique_cmd` override. `spec_model_for` mirrors `judge_model_for`.
   `POST /…/critique` runs validators + premortem via `run_in_threadpool`; findings render as ⚠
   annotations on task cards (`planEd.annotations`). Approval is never blocked.
+- **Re-run + diff flags (REVISE finding 2):** the premortem auto-runs on first draft AND is
+  re-runnable via the `🔍 Re-run premortem` button (`wfRerunCritique` → `deepPlanRunCritique`).
+  When the plan checker changes an edited plan, `planEdComputeDiff` (compare by index+title) flags
+  ＋added / ✎changed cards and reports the removed count, so the operator never plays
+  spot-the-difference. Advisory — approval still never blocked.
 
 **Step 8 — Spec travels downstream** (`server.py`, `evals.py`, `setup/bin/cjudge`)
 - `POST /…/attach` writes `SPEC.md` + `spec.json` into the workflow/task `attachments/` (existing
@@ -109,8 +124,12 @@ dangling reference. All plan steps are implemented; the numeric order is preserv
 **Step 9 — JARVIS + entry points** (`server.py`)
 - The JARVIS system-control framing documents the Deep Plan surface (a `DEEP PLAN:` block +
   triage in the `PLAN WELL` line + PROACTIVE ADVISOR offer) so "plan a project with me" starts a
-  session with voice answers as turns (rule 12). Deck's "Hand a task to the fleet" routes through
-  `describeTaskUI` → the banner (honored). Scheduler tasks bypass the wizard → skip triage (B4).
+  session with voice answers as turns (rule 12). **REVISE finding 1:** the block now documents the
+  full lifecycle through the REQUIRED `POST /…/attach {kind, new id}` after create — the step that
+  writes the SPEC into the project and closes the session — so the voice/API path no longer strands
+  the session or drops the SPEC (the UI path already attached; the framing had omitted it). Deck's
+  "Hand a task to the fleet" routes through `describeTaskUI` → the banner (honored). Scheduler tasks
+  bypass the wizard → skip triage (B4).
 
 **Step 10 — Gates + docs** (`verify.sh` §20, `verify_deep_plan_e2e.py`, `verify_deep_plan_ui.py`, `CLAUDE.md`)
 
@@ -181,15 +200,18 @@ critic context + judge token + replan seed). 8. Approve-with-edits (existing pla
 
 From the repo root / `app/`:
 
-- `bash app/scripts/verify.sh` → **408/408 PASS** (Deep Plan = §20, 27 checks).
-- `app/.venv/bin/python app/scripts/verify_deep_plan_e2e.py` → **20/20 PASS** (plan.stub-driven,
+- `bash app/scripts/verify.sh` → **409/409 PASS** (Deep Plan = §20, 27 checks — incl. the two
+  REVISE regressions: "session hygiene sweep (+drafted)", "JARVIS knows Deep Plan (+attach)", and
+  the new "Step7 re-run premortem + diff flags").
+- `app/.venv/bin/python app/scripts/verify_deep_plan_e2e.py` → **21/21 PASS** (plan.stub-driven,
   self-cleaning): triage heuristics + recommendation payload + spend override + divergence; session
   CRUD/resume/READY stop rule/spec edit; draft phase-2 + family type + criteria distribution;
   orphan-criterion validator + premortem-stub annotations; SPEC attachment + critic context; stale
-  sweep.
-- `app/.venv/bin/python app/scripts/verify_deep_plan_ui.py` → **9/9 PASS** (Playwright): banner
+  **active AND drafted** sweep (REVISE finding 1).
+- `app/.venv/bin/python app/scripts/verify_deep_plan_ui.py` → **10/10 PASS** (Playwright): banner
   accept/deny, two-pane modal + family switcher, a turn, a persisting spec edit, Draft → proposal
-  with the Deep Plan banner + a ⚠ premortem annotation; zero console errors.
+  with the Deep Plan banner + a ⚠ premortem annotation + the re-run premortem button (REVISE
+  finding 2); zero console errors.
 - `app/.venv/bin/python app/scripts/check_async_blocking.py` → PASS (B7).
 
 Working tree: fully committed, clean.

@@ -236,17 +236,18 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   the Q7a two-axis preset cards mount in BOTH the project proposal wizard and the task-create
   wizard. 17 checks, self-cleaning (seeded approval/task removed).
 - **Runtime gate — Deep Plan (DEEP-PLAN-MODE-PLAN):** `.venv/bin/python scripts/verify_deep_plan_e2e.py` —
-  20 checks with the PLANNING model stubbed via `plan.stub`: triage heuristics (simple vs
+  21 checks with the PLANNING model stubbed via `plan.stub`: triage heuristics (simple vs
   complex) + recommendation payload + spend-profile override + divergence math; session CRUD +
   resume + slot-fill READY stop rule + direct spec edit; draft seeds phase-2 + family→
   deliverable_type + criteria distribution; orphan-criterion validator + premortem-stub
-  annotations; SPEC lands as attachment + in the critic context; stale-session sweep.
+  annotations; SPEC lands as attachment + in the critic context; stale-session sweep (both
+  `active` AND `drafted` — the voice/API path can draft then never attach).
   Self-cleaning (restores plan.stub).
 - **Runtime gate — Deep Plan UI (Playwright):** `.venv/bin/python scripts/verify_deep_plan_ui.py` —
-  9 checks (plan.stub-driven): the recommendation banner accept/deny over the wizard flow, the
+  10 checks (plan.stub-driven): the recommendation banner accept/deny over the wizard flow, the
   two-pane Deep Plan modal (conversation + spec), family switcher, a turn, a direct spec edit
   persisting, and Draft → the proposal modal with the Deep Plan banner + a premortem ⚠
-  annotation on a task card; asserts zero console errors. Self-cleaning.
+  annotation on a task card + the re-run premortem button; asserts zero console errors. Self-cleaning.
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
@@ -540,7 +541,9 @@ core (families, triage, divergence, spec templates, stubs); model calls live in 
   sanity) + ONE external premortem on the `spec_model` purpose (`evals.run_plan_critique`,
   through the SAME `_FRONTIER_GATE` semaphore as the judge/critic — premortem P1; quota-
   classified; `plan.stub`/`plan.critique_cmd` stub it). Findings render as ⚠ annotations on
-  the plan-editor task cards (`planEd.annotations`) — advisory, never block approval.
+  the plan-editor task cards (`planEd.annotations`) — advisory, never block approval. Auto-runs on
+  first draft; re-runnable via the `🔍 Re-run premortem` button (`wfRerunCritique`). When the plan
+  checker changes an edited plan, `planEdComputeDiff` flags ＋added/✎changed/removed cards.
 - **Downstream** (`/attach`, Step 8): on create, `SPEC.md` + `spec.json` are written into the
   workflow/task `attachments/` (MUST-READ framing); `evals.build_critic_sandbox` copies
   `spec.json` into `_critic_context` (`ctx["spec"]`); `cjudge` reads `JUDGE_SPEC`; `replan_draft`
@@ -548,7 +551,7 @@ core (families, triage, divergence, spec templates, stubs); model calls live in 
   `db.MODEL_PURPOSES` + `sreg.PURPOSES`/`CLI_PURPOSES` + the assignment API/UI).
 - Settings section `plan` (`deep_enabled/recommend/triage_samples/max_turns/
   max_questions_per_turn/critique_enabled/critique_timeout_s/critique_cmd/stub`). Gate:
-  `scripts/verify_deep_plan_e2e.py` (20 checks). Step 11 (deep-plan-vs-quick benchmark) is
+  `scripts/verify_deep_plan_e2e.py` (21 checks). Step 11 (deep-plan-vs-quick benchmark) is
   deferred to the one Phase-8 measurement campaign.
 
 ### Block 3 (2026-07-08, docs/SPEC-BLOCK3.md is source of truth)
