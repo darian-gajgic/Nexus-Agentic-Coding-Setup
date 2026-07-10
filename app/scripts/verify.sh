@@ -395,6 +395,7 @@ chk "L2 overlay-vs-canonical"        "grep -q 'user_overlay' lessons.py && grep 
 chk "Q7a autopilot module"           "[ -f autopilot.py ] && grep -q 'def derive' autopilot.py && grep -q 'INVOLVEMENTS' autopilot.py && grep -q 'SPEND_PROFILES' autopilot.py"
 chk "Q7a task+wf columns"            "grep -q '(\"autopilot\", \"TEXT\")' database.py && grep -q 'ADD COLUMN autopilot TEXT' database.py && grep -q 'ADD COLUMN spend_profile TEXT' database.py"
 chk "Q7a settings defaults"          "grep -q 'autopilot.default_involvement' settings_registry.py && grep -q 'autopilot.default_spend' settings_registry.py"
+chk "Q7a defaults wired (not dead)"  "grep -q '/api/autopilot/defaults' server.py && grep -q '/api/autopilot/defaults' static/app.js && grep -q 'AUTOPILOT_DEFAULTS.involvement =' static/app.js"
 chk "Q7a design_loop derivation"     "grep -q 'import autopilot as _ap' loop_engine.py && grep -q 'round_cap' loop_engine.py"
 chk "rule1 preference absorbed"      "grep -q 'spend absorbs' loop_engine.py || grep -q \"preference = .speed. if sp == .eco\" autopilot.py"
 chk "rule2 risk hard floor"          "grep -q 'risk hard floor' loop_engine.py && grep -q 'risk_floor' autopilot.py"

@@ -246,6 +246,16 @@ async function init() {
     updateQuotaBanner();
     updateModelStrip();
   } catch { }
+  // Q7a: preselect the operator's configured autopilot default on every preset
+  // card (task-create + wizard). Without this the seeded settings
+  // autopilot.default_involvement/default_spend were dead — the UI hardcoded
+  // assisted/optimal (3rd judge finding 1). Mutating the shared defaults object
+  // makes autopilotCardsHTML/selectedAutopilot honour the operator's choice.
+  try {
+    const apd = await api('GET', '/api/autopilot/defaults');
+    if (apd && apd.involvement) AUTOPILOT_DEFAULTS.involvement = apd.involvement;
+    if (apd && apd.spend) AUTOPILOT_DEFAULTS.spend = apd.spend;
+  } catch { }
   loadKnownIssues();
 }
 
