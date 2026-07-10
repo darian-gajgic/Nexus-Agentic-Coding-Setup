@@ -242,6 +242,11 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   deliverable_type + criteria distribution; orphan-criterion validator + premortem-stub
   annotations; SPEC lands as attachment + in the critic context; stale-session sweep.
   Self-cleaning (restores plan.stub).
+- **Runtime gate — Deep Plan UI (Playwright):** `.venv/bin/python scripts/verify_deep_plan_ui.py` —
+  9 checks (plan.stub-driven): the recommendation banner accept/deny over the wizard flow, the
+  two-pane Deep Plan modal (conversation + spec), family switcher, a turn, a direct spec edit
+  persisting, and Draft → the proposal modal with the Deep Plan banner + a premortem ⚠
+  annotation on a task card; asserts zero console errors. Self-cleaning.
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env

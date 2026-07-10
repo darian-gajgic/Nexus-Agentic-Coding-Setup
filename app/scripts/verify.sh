@@ -480,8 +480,9 @@ chk "deep plan UI"                   "grep -q 'function startDeepPlan' static/ap
 chk "premortem annotations in editor" "grep -q 'planEd.annotations' static/app.js && grep -q 'planEd.planSessionId' static/app.js"
 # Step 9 — JARVIS framing (rule 12)
 chk "JARVIS knows Deep Plan"         "grep -q 'DEEP PLAN:' server.py && grep -q '/api/plan/sessions' server.py"
-# Step 10 — e2e gate
+# Step 10 — gates
 chk "deep plan e2e gate exists"      "[ -f scripts/verify_deep_plan_e2e.py ]"
+chk "deep plan UI gate exists"       "[ -f scripts/verify_deep_plan_ui.py ]"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
