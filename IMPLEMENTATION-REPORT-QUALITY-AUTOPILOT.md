@@ -26,6 +26,9 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 | 12 | `chore(quality): rule 11` | Specialist sweep (18 defs) |
 | 13 | `feat(quality): rule 12` | JARVIS advisor + surface |
 | 14 | `test(quality): verify_autopilot_e2e` | Gate + this report |
+| 15 | `fix(quality): rule 5 Eco collapse…` | Judge finding 1 — gate-stage exclusion |
+| 16 | `fix(quality): Q1 reserves a slot…` | Judge finding 2 — own-work reservation + honest labels |
+| 17 | `test(quality): Part 5 Playwright gate…` | Judge finding 3 — `verify_autopilot_ui.py` |
 
 ---
 
@@ -48,10 +51,10 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 - Deterministic binding in `_repair_workflow` via `_apply_tests_first()` (setting `pipeline.tests_first`, sentinel-guarded against the revalidate round-trip) so it holds even when the planner omits it.
 - **Gate:** verify.sh §19 Q3 (4 checks).
 
-### Q1 — Golden-exemplar retrieval (+ L3) — **BUILT**
-- `golden_exemplars()`: deterministic SQL — SHIP'd, self-score ≥ `exemplars.min_score`, same owner/domain (+client when set), freshest first, unioned with curated `~/knowledge/domains/<d>/examples` (curated wins ties). Injected as MUST-READ paths in `build_framing` (P10a: after DECISIONS, before predecessors).
+### Q1 — Golden-exemplar retrieval (+ L3) — **BUILT** (judge finding 2 fixed 2026-07-10)
+- `golden_exemplars()`: deterministic SQL — SHIP'd, self-score ≥ `exemplars.min_score`, same owner/domain (+client when set), freshest first, unioned with curated `~/knowledge/domains/<d>/examples`. Returns `[{"path","own"}]` and **RESERVES one slot for the operator's own past work** when both kinds exist (curated lead for reading priority but cannot fill every slot — see the judge-review section). `build_framing` labels the two kinds honestly (own vs curated reference). Injected as MUST-READ paths (P10a: after DECISIONS, before predecessors).
 - Guards verified: never `code_change`, never a retry round, never the task's own versions. L3 lifecycle: candidate pool capped at `exemplars.max×3`, age-out past `exemplars.max_age_months`.
-- **Gate:** verify.sh §19 Q1/L3 (4 checks); e2e Q1 group (selects the high-score SHIP'd exemplar; excludes below-min/aged-out/code_change; skips retry).
+- **Gate:** verify.sh §19 Q1/L3 (4 checks); e2e Q1 group — now at the DEFAULT `exemplars.max=2` against a 2-curated-file scratch root: selects the high-score SHIP'd exemplar, own work survives the reservation, curated is labeled `own=False`, framing splits the labels; excludes below-min/aged-out/code_change; skips retry.
 
 ### Q2 — Operator-edit distillation / N8 upgraded (+ L2, P7) — **BUILT**
 - `edit_evidence` table + capture: rejection feedback and the rejected→accepted diff (`_capture_accept_diff`) at approve/reject time; user review comments + judge/critic learning notes folded in at distillation time (B6).
@@ -101,7 +104,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 | 2 risk is an independent hard floor | BUILT | high_stakes forces auto-judge even under Eco (`design_loop`); auto-approve never touches high-stakes/SR/escalations (`_sweep_auto_approve_ship`) |
 | 3 Eco ships STAGED | BUILT | model-floor derivation gated behind `_feature_present("model_floor")` → "staged" until Phase 7 |
 | 4 profiles scale budgets | BUILT | `_autopilot_fields` × 0.5/1/2 on the default budget |
-| 5 profiles shape pipeline depth | BUILT | wizard `pipeline_depth` note + `_repair_workflow` Eco collapse (review re-inserted when high-stakes — rule 2 wins) |
+| 5 profiles shape pipeline depth | BUILT (judge finding 1 fixed 2026-07-10) | wizard `pipeline_depth` note + `_repair_workflow` Eco collapse. Risk-floor scan now EXCLUDES quality-gate stages (`_GATE_SPECIALISTS`) so the always-high-stakes verifier doesn't defeat the collapse on real plans; review still re-inserted when a genuine WORK stage is high-stakes — rule 2 wins |
 | 6 Smart round cap = 3 | BUILT | `derive` round_cap; `design_loop` clamps every trigger |
 | 7 scheduler/JARVIS passthrough | BUILT | B4 template + JARVIS framing carry both axes |
 | 8 adaptive early-exit (P6) | BUILT | `early_exit` flag + reconciler framing computes agreement first, re-verifies only disagreements |
@@ -122,6 +125,46 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 - **Rule 10 / Phase-8 measurement:** Eco's "same answer, cheaper" and Optimal's thresholds ship HEURISTIC and unmeasured, per the operator's deferral — the Eco card copy says so and the final campaign validates or raises the floor.
 - **Q7a plan-time derivation in the wizard entry flow:** the profile fully governs at CREATE time (loop knobs, budget, cascade, judge scope, round caps) and at revalidate (Eco collapse); a fresh wizard *plan* is produced before the proposal-modal profile pick, so plan-time SR/fan-out/depth from the profile apply on the direct create + revalidate paths, not the very first wizard draft. Noted.
 
+## Judge review — REVISE → all three blockers addressed (2026-07-10)
+
+The independent judge returned **REVISE** with three blocking findings. Each was re-verified
+against HEAD first (live-reproduced), fixed, and given a regression check. Commits are granular
+(one per finding); the tree is fully committed.
+
+1. **Eco pipeline collapse (rule 5) never fired on real wizard plans.** `_repair_workflow`
+   (`app/server.py`) computed `eco_collapse = spend_profile=="eco" and not any(high_stakes)` over
+   the RAW plan. Real coding plans always carry the acceptance-verifier with `high_stakes=True`
+   (wizard template "high_stakes TRUE always"), so `any(high_stakes)` was always True → the
+   review/fix gates were never collapsed under Eco. **Live-reproduced** via `/api/tasks/wizard/revalidate`
+   with a realistic-shape plan (verifier present) — the reviewer + fix stages were inserted; the
+   thin fixture (no verifier) that the old test used had masked it.
+   **Fix:** exclude quality-gate stages (`_GATE_SPECIALISTS = {code-reviewer, acceptance-verifier}`)
+   from the risk-floor scan; only a genuine spec/impl stage being high-stakes re-inserts the gates.
+   **Re-verified:** realistic Eco plan now collapses (no reviewer); an Eco plan with a high-stakes
+   IMPL still re-inserts the reviewer (rule 2 beats rule 5). **Regression:** `verify_autopilot_e2e.py`
+   rule-5 group now includes a realistic-shape fixture (verifier in the input) + the high-stakes-work case.
+
+2. **Q1 own-work exemplars never selected under live defaults; framing mislabeled curated files.**
+   `golden_exemplars` did `curated + paths` capped at `exemplars.max` (default 2); with the
+   live-default 2–3 curated files per domain, the operator's OWN SHIP'd work was always crowded
+   out. `build_framing` then labeled the whole list "the operator's OWN past deliverables", so
+   stock curated files were presented as the operator's own excellence. **Live-reproduced** with a
+   3.9/4 SHIP'd fixture at `exemplars.max=2`: own work absent, framing block falsely OWN-labeling curated.
+   **Fix:** `golden_exemplars` returns `[{"path","own"}]` and reserves one own-work slot when both
+   kinds exist; `build_framing` splits the block into an OWN header and a "Curated reference
+   exemplars … (not the operator's own)" header. **Regression:** `verify_autopilot_e2e.py` Q1 group
+   runs at the DEFAULT max=2 against a 2-curated-file scratch root and asserts own-work survival +
+   `own=False` labels + honest framing split (the old `max=5` room-making workaround removed).
+
+3. **Part 5 Playwright gate not delivered / not recorded.** The plan's Part 5 lists a Playwright
+   row ("Decisions view renders cards + badge; manual view sections; preset cards in wizard").
+   **Delivered:** new `app/scripts/verify_autopilot_ui.py` (14 checks, no LLM) driving all three
+   surfaces in a real headless browser — a seeded pending high-risk approval renders as a Decisions
+   card + lights the `#decBadge`; the User Manual renders its plain-language sections (autopilot
+   dials + Decisions inbox + chapter TOC); and the Q7a two-axis preset cards mount in BOTH the
+   project proposal wizard and the task-create wizard. Registered in `verify.sh` ("autopilot UI
+   gate exists") and `app/CLAUDE.md`.
+
 ## Gate outputs (real)
 
 All run on 2026-07-10 against the live service (restarted via `systemctl --user restart nexus`
@@ -129,16 +172,15 @@ first — it booted clean, ran every new migration, and answered `/api/decisions
 `/api/loop/design` (Smart→quality/closed/cap3) and `/api/lessons/evidence` with 200).
 
 ```
-$ bash app/scripts/verify.sh                              → ALL CHECKS PASSED: 372/372
-$ app/.venv/bin/python scripts/verify_autopilot_e2e.py    → 36 passed, 0 failed   (NEW gate)
+$ bash app/scripts/verify.sh                              → ALL CHECKS PASSED: 373/373   (+ autopilot UI gate)
+$ app/.venv/bin/python scripts/verify_autopilot_e2e.py    → 40 passed, 0 failed   (36 + 4 judge-finding regression checks)
+$ app/.venv/bin/python scripts/verify_autopilot_ui.py     → 14 passed, 0 failed   (NEW Part-5 Playwright gate; judge finding 3)
 $ app/.venv/bin/python scripts/verify_super_result_e2e.py → 46 passed, 0 failed   (regression: loop_engine/decide_approval/repair)
 $ app/.venv/bin/python scripts/verify_block3_e2e.py       → 33 passed, 0 failed   (regression: _repair_workflow/replan/wizard)
 $ app/.venv/bin/python scripts/verify_settings_e2e.py     → 62 passed, 0 failed   (regression: settings registry + judge plumbing)
 $ app/.venv/bin/python scripts/verify_jarvis_e2e.py       → ALL CHECKS PASS       (rule 12b: JARVIS boots + streams + no page errors with the new advisor framing)
 ```
 
-Total: **249 checks green, 0 failed** across the static gate + five runtime suites (three of them
-pre-existing regression suites over the subsystems this phase touched most). The independent judge
-should re-run all of the above personally; `verify_jarvis_v2_backend.py` (heavy SDXL/vision, GPU
--contended) was not run in this headless pass — the framing change was verified via clean boot +
-the lighter Playwright JARVIS gate instead (recorded honestly).
+The independent judge should re-run all of the above personally; `verify_jarvis_v2_backend.py`
+(heavy SDXL/vision, GPU-contended) was not run in this headless pass — the framing change was
+verified via clean boot + the lighter Playwright JARVIS gate instead (recorded honestly).
