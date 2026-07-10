@@ -45,6 +45,8 @@ CRITIC_JSON_BEGIN = "NEXUS_CRITIC_JSON_BEGIN"
 CRITIC_JSON_END = "NEXUS_CRITIC_JSON_END"
 JUDGE_JSON_BEGIN = "NEXUS_JUDGE_JSON_BEGIN"  # N2: cjudge's structured tail
 JUDGE_JSON_END = "NEXUS_JUDGE_JSON_END"
+PLAN_JSON_BEGIN = "NEXUS_PLAN_JSON_BEGIN"    # Deep Plan premortem critique tail
+PLAN_JSON_END = "NEXUS_PLAN_JSON_END"
 DELIVERABLE_TYPES = ("analysis", "code_change", "content", "research")
 
 
@@ -261,6 +263,18 @@ def judge_model_for(user_id: str | None) -> tuple[str | None, str | None]:
     credential for the judge model's provider — None keeps the CLI default."""
     import secrets_store
     row = db.resolve_assignment(user_id, "frontier_judge")
+    if not row or row["route"] != "cli":
+        return None, None
+    key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
+    return row["model_id"], key
+
+
+def spec_model_for(user_id: str | None) -> tuple[str | None, str | None]:
+    """Deep Plan premortem model: the owner's 'spec_model' purpose → (model_id,
+    api_key). No assignment / non-cli route → (None, None) = the CLI's saved
+    default (subscription auth). Mirrors judge_model_for."""
+    import secrets_store
+    row = db.resolve_assignment(user_id, "spec_model")
     if not row or row["route"] != "cli":
         return None, None
     key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
@@ -677,6 +691,141 @@ def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
     finally:
         if sreg.conf("super.keep_sandbox", "0") != "1":
             shutil.rmtree(sandbox, ignore_errors=True)
+
+
+# ─────────────────────────── Deep Plan premortem critique (Phase 5, Step 7) ───────────────────────────
+# LOCKED §3.5/§3.6: plan verification is structural first, then ONE premortem by
+# a DIFFERENT model (the spec_model purpose, an EXTERNAL judgment-tier verifier) —
+# never the planner grading itself. The frontier call goes through the SAME
+# _FRONTIER_GATE semaphore as the judge/critic (premortem P1).
+
+def run_plan_critique(spec_text: str, plan_text: str, model: str | None = None,
+                      api_key: str | None = None, timeout_s: int = 600) -> str:
+    """Premortem: an external model assumes the plan FAILED and lists causes,
+    missing tasks/deps, untestable criteria, and unowned risks as sentinel-fenced
+    JSON. Mirrors run_judge_cmd's machinery (frontier gate, quota classification,
+    cwd under knowledge). plan.stub short-circuits with a canned finding so the
+    verify gate needs no frontier tokens (mirrors evals.stub)."""
+    import shlex
+    import shutil
+    import subprocess as sp
+    if db.get_setting("plan.stub", "0") == "1":
+        return (f"[PLAN STUB — premortem stubbed for the gate]\n{PLAN_JSON_BEGIN}\n"
+                '{"findings":[{"target":"task_0","kind":"missing",'
+                '"problem":"[stub] a load-bearing dependency is unstated",'
+                '"fix":"[stub] add the dependency edge"}]}\n' + PLAN_JSON_END + "\n")
+    tmpdir = Path(KNOWLEDGE_DIR) / ".nexus-plan-tmp"
+    spec_fp = plan_fp = None
+    try:
+        tmpdir.mkdir(exist_ok=True)
+        tag = uuid.uuid4().hex[:8]
+        spec_fp = tmpdir / f"spec-{tag}.md"
+        plan_fp = tmpdir / f"plan-{tag}.md"
+        spec_fp.write_text(spec_text or "(no spec)")
+        plan_fp.write_text(plan_text or "(no plan)")
+        prompt = (
+            "You are the plan premortem reviewer — a second, stronger model checking a plan "
+            "produced by a weaker one BEFORE it runs. Assume this plan has already FAILED.\n"
+            f"Read the SPEC at {spec_fp.name} and the PLAN at {plan_fp.name} (both in your CWD).\n"
+            "List the most likely causes of failure: missing tasks or dependencies; acceptance "
+            "criteria that are not testable AS WRITTEN; scope the plan silently drops; risks with "
+            "no owner. Be concrete and specific to THIS plan — no generic advice.\n"
+            "Do NOT rewrite the plan. Do NOT modify any files. At most 8 findings.\n"
+            "END the reply with exactly one JSON object between these sentinel lines, nothing "
+            f"after the closing sentinel:\n{PLAN_JSON_BEGIN}\n"
+            '{"findings": [{"target": "task_<idx> | spec_<slot> | plan", '
+            '"kind": "missing|untestable|risk|dependency|scope", '
+            '"problem": "what fails (<=300)", "fix": "concrete change (<=300)"}]}\n'
+            f"{PLAN_JSON_END}")
+        # settings override (stub/customization) mirrors judge.cmd; default = the
+        # headless claude CLI directly on the spec_model.
+        tmpl = (db.get_setting("plan.critique_cmd", "") or "").strip()
+        if tmpl:
+            tokens = [t.replace("{spec}", str(spec_fp)).replace("{plan}", str(plan_fp))
+                       .replace("{model}", model or "") for t in shlex.split(tmpl)]
+            tokens = [t for t in tokens if t != ""]
+        else:
+            tokens = ["claude"] + (["--model", model] if model else []) + ["-p", prompt]
+        if tokens and not shutil.which(tokens[0]):
+            cand = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+            if os.path.isfile(cand):
+                tokens[0] = cand
+        # env scrub identical in spirit to cjudge: drop CLI-config vars, honour
+        # a per-user key, else fall through to the subscription auth.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR",
+                            "CLAUDE_CODE_SUBAGENT_MODEL")}
+        if api_key:
+            env["ANTHROPIC_API_KEY"] = api_key
+        try:
+            with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
+                r = sp.run(tokens, capture_output=True, text=True, timeout=timeout_s,
+                           cwd=str(tmpdir), env=env)
+            out = (r.stdout or "")
+            if r.returncode != 0:
+                out += f"\n[premortem exited {r.returncode}] {(r.stderr or '')[-800:]}"
+        except sp.TimeoutExpired:
+            out = f"[premortem timed out after {timeout_s}s]"
+        except Exception as e:
+            out = f"[premortem failed to run: {e}]"
+        return out
+    finally:
+        for fp in (spec_fp, plan_fp):
+            try:
+                if fp:
+                    fp.unlink()
+            except Exception:
+                pass
+
+
+def parse_plan_critique(text: str, max_findings: int = 8) -> list:
+    """Extract the premortem's sentinel-fenced findings → advisory annotations.
+    Never raises — a malformed reply yields []."""
+    t = text or ""
+    raw = None
+    b = t.rfind(PLAN_JSON_BEGIN)
+    if b != -1:
+        e = t.find(PLAN_JSON_END, b)
+        if e != -1:
+            raw = t[b + len(PLAN_JSON_BEGIN):e].strip()
+    if raw is None:
+        end = t.rfind("}")
+        if end != -1:
+            depth = 0
+            for i in range(end, -1, -1):
+                if t[i] == "}":
+                    depth += 1
+                elif t[i] == "{":
+                    depth -= 1
+                    if depth == 0:
+                        raw = t[i:end + 1]
+                        break
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    findings = []
+    for f in (data.get("findings") or [])[:max_findings] if isinstance(data, dict) else []:
+        if not isinstance(f, dict):
+            continue
+        target = str(f.get("target") or "plan").strip()[:40]
+        task_idx = None
+        slot = None
+        m = re.match(r"task[_\s]*(\d+)", target, re.I)
+        if m:
+            task_idx = int(m.group(1))
+        elif target.lower().startswith("spec_"):
+            slot = target[5:]
+        findings.append({
+            "target": target, "task_idx": task_idx, "slot": slot,
+            "kind": str(f.get("kind") or "risk").strip().lower()[:20],
+            "problem": _clip(f.get("problem"), 300),
+            "fix": _clip(f.get("fix") or f.get("concrete_fix"), 300),
+        })
+    return findings
 
 
 def _clip(v, n: int) -> str:

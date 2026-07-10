@@ -6319,6 +6319,125 @@ async def plan_session_spec_edit(sid: str, body: dict):
     return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
 
 
+def _validate_plan(tasks: list, family: str, spec: dict) -> list:
+    """Deterministic structural validators (Step 7) — advisory WARNINGS, never
+    blockers. Returns [{scope, task_idx?, slot?, level, message}]: orphan
+    acceptance criteria, cross-task output references without a dependency edge
+    (noun-match heuristic), duplicate/near-duplicate titles, per-task budget
+    sanity. The verifier/reconciler sink is already enforced by _repair_workflow."""
+    import re
+    import plan_engine as _pe
+    warnings: list = []
+    tasks = tasks or []
+    descs = [((t.get("description") or "") + " " + (t.get("title") or "")).lower() for t in tasks]
+
+    # 1. Orphan acceptance criterion — every criterion owned by ≥1 task.
+    slot = _pe.criteria_slot(family)
+    for crit in _pe.list_criteria(spec, family):
+        key = crit.lower()[:50]
+        if key and not any(key in d for d in descs):
+            warnings.append({"scope": "spec", "slot": slot, "level": "warn",
+                             "message": f"acceptance criterion not covered by any task: "
+                                        f"\"{crit[:80]}\""})
+
+    def _toks(s):
+        return {w for w in re.findall(r"[a-z0-9]{5,}", (s or "").lower())
+                if w not in ("build", "implement", "create", "review", "verify",
+                             "acceptance", "project", "task", "against", "deliverable")}
+
+    # 2. Output reference without a dependency edge (WARN, noun-match heuristic).
+    for i, ti in enumerate(tasks):
+        deps = set(ti.get("depends_on_idx") or [])
+        for j, tj in enumerate(tasks):
+            if i == j or j in deps or i in set(tj.get("depends_on_idx") or []):
+                continue
+            jt = _toks(tj.get("title"))
+            if jt and len(jt & _toks(ti.get("description"))) >= 2 and j > i:
+                warnings.append({"scope": "task", "task_idx": i, "level": "warn",
+                                 "message": f"task '{(ti.get('title') or '')[:40]}' seems to "
+                                            f"reference '{(tj.get('title') or '')[:40]}' but "
+                                            "doesn't depend on it"})
+                break
+
+    # 3. Duplicate / near-duplicate titles.
+    for i in range(len(tasks)):
+        for j in range(i + 1, len(tasks)):
+            a, b = _toks(tasks[i].get("title")), _toks(tasks[j].get("title"))
+            # ≥2 distinctive tokens each side, so "Spec: X" vs "Implement: X" (one
+            # shared noun) never false-positives after stopword stripping.
+            if len(a) >= 2 and len(b) >= 2 and len(a & b) / max(1, len(a | b)) >= 0.8:
+                warnings.append({"scope": "task", "task_idx": j, "level": "warn",
+                                 "message": f"near-duplicate title of task {i+1} "
+                                            f"('{(tasks[j].get('title') or '')[:40]}')"})
+
+    # 4. Per-task budget sanity vs the default.
+    try:
+        default_budget = int(db.get_setting("dispatch.default_task_budget", "5000000"))
+    except Exception:
+        default_budget = 5_000_000
+    for i, t in enumerate(tasks):
+        b = t.get("budget_tokens")
+        if isinstance(b, int) and b > default_budget * 4:
+            warnings.append({"scope": "task", "task_idx": i, "level": "warn",
+                             "message": f"budget {b:,} is >4× the default — likely a typo"})
+    return warnings[:20]
+
+
+def _plan_text(tasks: list) -> str:
+    """Render the task plan for the premortem reviewer (index + title + deps +
+    brief)."""
+    lines = ["# PLAN", ""]
+    for i, t in enumerate(tasks or []):
+        deps = t.get("depends_on_idx")
+        if deps is None:
+            deps = t.get("depends_on") or []
+        lines.append(f"## task_{i}: {(t.get('title') or '').strip()[:120]}")
+        lines.append(f"specialist: {t.get('specialist') or 'auto'} · depends_on: {list(deps)} · "
+                     f"deliverable_type: {t.get('deliverable_type') or '-'}")
+        lines.append((t.get("description") or "").strip()[:1200])
+        lines.append("")
+    return "\n".join(lines)
+
+
+@app.post("/api/plan/sessions/{sid}/critique")
+async def plan_session_critique(sid: str, body: dict):
+    """Premortem plan critique (Step 7): ONE external-model call on the spec_model
+    (via the frontier semaphore) + the deterministic structural validators.
+    Findings render as ⚠ annotations on task cards / spec slots. Advisory —
+    approval is never blocked."""
+    import evals as _ev
+    import plan_engine as _pe
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    family = row.get("family") or "content"
+    spec = json.loads(row.get("spec_json") or "{}")
+    tasks = body.get("tasks") if isinstance(body.get("tasks"), list) else []
+    # normalize deps the editor speaks (depends_on_idx) for the validators
+    for t in tasks:
+        if isinstance(t, dict) and t.get("depends_on_idx") is None:
+            t["depends_on_idx"] = t.get("depends_on") or []
+    warnings = _validate_plan(tasks, family, spec)
+    findings = []
+    if db.get_setting("plan.critique_enabled", "1") == "1":
+        model, key = _ev.spec_model_for(row.get("user_id"))
+        try:
+            timeout_s = int(sreg.conf("plan.critique_timeout_s", "600") or 600)
+        except Exception:
+            timeout_s = 600
+        spec_md = _pe.render_spec_md(spec, family, row.get("goal") or "")
+        plan_md = _plan_text(tasks)
+        try:
+            raw = await run_in_threadpool(_ev.run_plan_critique, spec_md, plan_md,
+                                          model, key, timeout_s)
+            findings = _ev.parse_plan_critique(raw)
+        except Exception as e:
+            db.log_activity("warn", "plan", f"Premortem critique failed: {str(e)[:120]}",
+                            user_id=row.get("user_id"))
+    return {"findings": findings, "warnings": warnings,
+            "critique_enabled": db.get_setting("plan.critique_enabled", "1") == "1"}
+
+
 def _plan_draft_raw(spec: dict, family: str, goal: str, uid: str | None,
                     super_result: bool) -> dict:
     """Turn the SPEC into a raw wizard plan (before _repair_workflow). Plain def
@@ -6439,6 +6558,11 @@ async def plan_session_draft(sid: str, body: dict):
     out["plan_session_id"] = sid
     out["spec_md"] = spec_md
     out["family"] = family
+    # structural validators run now (deterministic); the UI auto-runs the
+    # premortem critique after draft when plan.critique_enabled (Step 7).
+    plan_tasks = out["workflow"]["tasks"] if out["type"] == "workflow" else [out["task"]]
+    out["warnings"] = _validate_plan(plan_tasks, family, spec)
+    out["critique_enabled"] = db.get_setting("plan.critique_enabled", "1") == "1"
     try:
         out["triage"] = json.loads(row.get("triage_json") or "null")
     except Exception:

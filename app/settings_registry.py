@@ -161,6 +161,11 @@ SECTIONS = [
             {"key": "plan.critique_timeout_s", "label": "Premortem critique timeout (s)",
              "type": "int", "default": "600", "min": 60, "max": 3600,
              "help": "Hard cap on one premortem critique run (headless CLI, minutes are normal)."},
+            {"key": "plan.critique_cmd", "label": "Premortem command (override)", "type": "command",
+             "default": "",
+             "help": "Optional override for the premortem call. Tokens: {spec} {plan} and "
+                     "optional {model} (the resolved spec_model). Empty = the built-in headless "
+                     "claude call on the spec_model. plan.stub already stubs this for the gate."},
             {"key": "plan.stub", "label": "Stub the planning model (gate hook)", "type": "bool",
              "default": "0",
              "help": "Verify-gate hook: short-circuit the Hermes planning-session turn with "
