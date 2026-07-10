@@ -51,7 +51,7 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 
 ## JARVIS v2 (2026-07-08) — particle avatar, WS TTS, vision, files, control
 **Full docs: `docs/JARVIS-VOICE.md` §0 — READ IT before editing JARVIS code.**
-- **Avatar (v7 hologram, 2026-07-10)**: cyan point-lattice hologram bust (head + procedural torso)
+- **Avatar (v7 hologram, 2026-07-10)**: cyan point-lattice hologram bust (head + scan-bust torso)
   (`static/jarvis3d.js`): the three.js "facecap" model (52 ARKit blendshapes, credit
   Face Cap/bannaflak.com; KTX2 texture stripped offline by
   `scripts/build_facecap_hologram.py` → `static/avatar/facecap_hologram.glb`) rendered

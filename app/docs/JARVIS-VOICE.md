@@ -77,15 +77,15 @@ but nothing reaches it). The v2 stack:
   Fit anchors on the EYE PIVOTS (grp_eyeLeft/Right), NOT the bbox — the
   cranium is deep/tall and bbox-anchoring drops the face out of frame
   (HEAD_H 53, eye mid → (0, −2, +3), face +z, auto-flip if authored -z).
-  The head sits ON a PROCEDURAL TORSO (buildTorso: neck tucked inside the
-  jaw + superellipse trapezius shoulders, sized off the head half-width;
-  dense dot grids + coarser wireframe grids; own points material synced to
-  the head uniforms each tick) that rises from the frame bottom and
-  dissolves at the lower edge (FADE_Y). Eyes are separate meshes under
-  rotatable pivot Groups; glints are pivot children (they ride the gaze).
+  The head sits ON the Lee Perry-Smith SCAN BUST torso (the pre-v7
+  anatomy, CC-BY 3.0): scripts/build_torso_from_scan.py slices the scan
+  below mid-neck, normalized to head-width units → torso_scan.glb; runtime
+  scales it 0.75× the head half-width, anchors it at the neck-stub ring and
+  fades the head’s stub out under the chin (per-material uFade) while the
+  torso fades at the frame bottom — the seam-hiding overlap. Eyes are separate meshes under rotatable pivot Groups; glints ride the pivots.
   Avatar→memory links: 3-strand beams, BOTH ends tinted per memory node
-  hue, ×1.5 spread. Fallback = procedural ellipsoid lattice + torso
-  (no morphs) + console.warn if the GLB fails.
+  hue, ×1.5 spread. Fallback = procedural ellipsoid lattice, head-only
+  (no morphs) + console.warn if a GLB fails.
   **Lip sync = TEXT-ALIGNED VISEMES (no backend change):** app.js keeps a
   LIVE per-sentence utterance record {text,start,end,done} on the
   AudioContext clock (first PCM chunk fixes start, every chunk extends
