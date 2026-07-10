@@ -235,6 +235,13 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   Manual renders its plain-language sections (autopilot dials + Decisions inbox chapters), and
   the Q7a two-axis preset cards mount in BOTH the project proposal wizard and the task-create
   wizard. 17 checks, self-cleaning (seeded approval/task removed).
+- **Runtime gate — Deep Plan (DEEP-PLAN-MODE-PLAN):** `.venv/bin/python scripts/verify_deep_plan_e2e.py` —
+  20 checks with the PLANNING model stubbed via `plan.stub`: triage heuristics (simple vs
+  complex) + recommendation payload + spend-profile override + divergence math; session CRUD +
+  resume + slot-fill READY stop rule + direct spec edit; draft seeds phase-2 + family→
+  deliverable_type + criteria distribution; orphan-criterion validator + premortem-stub
+  annotations; SPEC lands as attachment + in the critic context; stale-session sweep.
+  Self-cleaning (restores plan.stub).
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
@@ -492,7 +499,52 @@ Phase 3 of the quality program — compounding quality levers + full automation.
 - **N5** `judge.auto_scope=all_quality`, **N6** `replan.auto_draft`, **N7** `judge.on_blind_reject`,
   **B4** `scheduled_jobs.task_template` (SR/type/preset passthrough).
 - Settings section `quality` + `judge.auto_scope`/`on_blind_reject`. Gate:
-  `scripts/verify_autopilot_e2e.py`. Deep Plan + Appendix C + Phase-8 benchmarks are LATER phases.
+  `scripts/verify_autopilot_e2e.py`. Appendix C + Phase-8 benchmarks are LATER phases.
+
+### Deep Plan mode (2026-07-10, DEEP-PLAN-MODE-PLAN-2026-07-10.md is source of truth)
+Phase 5 — a conversational planning phase for complex/ambiguous goals: read-only
+triage → soft-gated recommendation → scaffolded interview → editable SPEC artifact →
+draft the DAG → structural + external-model premortem → the SPEC travels downstream.
+Extends the wizard; the quick path stays default. `plan_engine.py` is the deterministic
+core (families, triage, divergence, spec templates, stubs); model calls live in `server.py`.
+- **Triage** (`server._wizard_triage`, `plan_engine.triage_heuristics`/`divergence`/`recommend`):
+  the wizard reply carries `triage {complexity, ambiguity, recommend_deep_plan,
+  recommend_super_result, reasons[], family}`. Signals are DETERMINISTIC heuristics
+  (length/vague-referent/artifact-count/cross-domain/dependency/blast-radius) + divergence
+  across N cheap draft plans on the easy model — NEVER LLM self-rating (locked §3.1).
+  Heuristics are synchronous; divergence sampling runs in a background thread cached per
+  goal-hash so it never blocks the questions round (premortem fix). Spend profile overrides
+  `plan.recommend` (eco→never/optimal→auto/smart→always).
+- **Sessions** (`plan_sessions` table, `/api/plan/sessions` CRUD): start creates the row + a
+  dedicated Hermes planning session (scaffolded per-family system framing) and runs the
+  opening turn; `/turn` fills slots (≤`plan.max_questions_per_turn` questions, 3–5 ★ options,
+  READY once required slots filled or `plan.max_turns`); PATCH `/spec` edits slots directly;
+  GET list/one resume; DELETE abandons. Owner-scoped. Every model-calling endpoint ships its
+  blocking work to `run_in_threadpool` (B7; `check_async_blocking.py` enforces it). `plan.stub`
+  short-circuits SESSION turns with canned slot-filling (mirrors `evals.stub`; the judge/critic
+  command stubs do NOT reach session turns). Hygiene: `sweep_stale_plan_sessions()` abandons
+  actives >7d + deletes their Hermes sessions, at startup + hourly on the scheduler; create/
+  abandon delete the Hermes session too.
+- **Draft** (`/draft`): seeds the phase-2 wizard framing with the rendered SPEC (an optional
+  `spec_block` on `_task_wizard_framing`), runs `_repair_workflow`, sets `deliverable_type`
+  from the family map (software→`code_change`/analysis-audit→`analysis`/content→`content`/
+  research→`research` — `plan_engine.FAMILY_DELIVERABLE_TYPE`) on every task, distributes
+  acceptance criteria as `Done when:` lines, status→`drafted`. Reuses the wizard proposal modal.
+- **Verify** (`server._validate_plan` + `/critique`): deterministic structural validators
+  (orphan criterion, output-ref-without-dep noun-match WARN, near-duplicate titles, budget
+  sanity) + ONE external premortem on the `spec_model` purpose (`evals.run_plan_critique`,
+  through the SAME `_FRONTIER_GATE` semaphore as the judge/critic — premortem P1; quota-
+  classified; `plan.stub`/`plan.critique_cmd` stub it). Findings render as ⚠ annotations on
+  the plan-editor task cards (`planEd.annotations`) — advisory, never block approval.
+- **Downstream** (`/attach`, Step 8): on create, `SPEC.md` + `spec.json` are written into the
+  workflow/task `attachments/` (MUST-READ framing); `evals.build_critic_sandbox` copies
+  `spec.json` into `_critic_context` (`ctx["spec"]`); `cjudge` reads `JUDGE_SPEC`; `replan_draft`
+  seeds from the SPEC. `spec_model` registry purpose (default = frontier judge, in
+  `db.MODEL_PURPOSES` + `sreg.PURPOSES`/`CLI_PURPOSES` + the assignment API/UI).
+- Settings section `plan` (`deep_enabled/recommend/triage_samples/max_turns/
+  max_questions_per_turn/critique_enabled/critique_timeout_s/critique_cmd/stub`). Gate:
+  `scripts/verify_deep_plan_e2e.py` (20 checks). Step 11 (deep-plan-vs-quick benchmark) is
+  deferred to the one Phase-8 measurement campaign.
 
 ### Block 3 (2026-07-08, docs/SPEC-BLOCK3.md is source of truth)
 - **Plan editor in the proposal modal (R1)**: every wizard-proposed task is editable in place
