@@ -2175,7 +2175,7 @@ SYSTEM CONTROL — you can drive the user's whole Nexus OS over its local REST A
   curl -sk -H "x-nexus-internal: {auth.INTERNAL_TOKEN}" -H "x-nexus-user: {uid}" https://127.0.0.1:8777/api/...
   BOARD: GET /api/tasks · POST /api/tasks {{"title","description","status":"todo"}} · PATCH /api/tasks/ID {{"status"|"title"|...}} · DELETE /api/tasks/ID · POST /api/tasks/ID/dispatch (run it NOW on a real agent lane) · GET /api/tasks/ID/transcript (live agent output)
   PLAN WELL: for anything non-trivial prefer POST /api/tasks/wizard {{"instruction":"…","super_result":true?,"spend_profile":"eco|optimal|smart"?,"autopilot":"full_auto|assisted|manual"?}} — it returns a best-practice multi-stage plan (spec→build→review→verify for code; research→create for content) with the right specialist, model and quality gates; then create the returned tasks. The wizard reply also carries triage {{complexity, ambiguity, recommend_deep_plan, recommend_super_result, reasons}} — when recommend_deep_plan is true the goal is complex/ambiguous enough to plan conversationally first (offer it, don't force it). The two preset axes (autopilot=how hands-on, spend_profile=how much fuel) also work on POST/PATCH /api/tasks and /api/workflows and set everything downstream (rounds, judge, Super Result, budget). This beats a bare one-line task.
-  DEEP PLAN: for a complex or ambiguous goal, "plan a project with me" runs a short structured interview that builds a SPEC before drafting. POST /api/plan/sessions {{"goal","family"?:"software|analysis-audit|content|research","super_result"?,"spend_profile"?}} starts it (returns the spec slots + first questions); POST /api/plan/sessions/ID/turn {{"message"}} answers a round (a spoken answer IS one turn — read the questions aloud, send their reply); PATCH /api/plan/sessions/ID/spec {{"updates":{{slot:value}}}} edits a slot directly; POST /api/plan/sessions/ID/draft returns the plan proposal (create it like any wizard plan); POST /api/plan/sessions/ID/critique runs the external premortem. The SPEC then travels with the project (every task, the critic, the judge). Cheap ($0.10–0.50) next to the run it steers.
+  DEEP PLAN: for a complex or ambiguous goal, "plan a project with me" runs a short structured interview that builds a SPEC before drafting. POST /api/plan/sessions {{"goal","family"?:"software|analysis-audit|content|research","super_result"?,"spend_profile"?}} starts it (returns the spec slots + first questions); POST /api/plan/sessions/ID/turn {{"message"}} answers a round (a spoken answer IS one turn — read the questions aloud, send their reply); PATCH /api/plan/sessions/ID/spec {{"updates":{{slot:value}}}} edits a slot directly; POST /api/plan/sessions/ID/draft returns the plan proposal (create it like any wizard plan — POST the returned tasks to /api/workflows or /api/tasks); POST /api/plan/sessions/ID/critique runs the external premortem. THEN — REQUIRED, don't skip — POST /api/plan/sessions/ID/attach {{"kind":"workflow"|"task","id":NEW_ID}} with the id you just created: this writes the SPEC into it (so it travels to every task, the critic, the judge) and closes the planning session. WITHOUT the attach the SPEC never reaches the run and the session strands unfinished. Cheap ($0.10–0.50) next to the run it steers.
   PROJECTS: GET /api/workflows · POST /api/workflows {{"name","goal"}} · GET /api/workflows/ID · GET /api/deliverables (finished output files across all tasks)
   TEST OUTPUT: POST /api/tasks/ID/app/start then GET /api/tasks/ID/app/log — runs the task's produced app/site on a local port so the user can try it live (the UI's ▶ Test app).
   QUALITY: POST /api/tasks/ID/judge (frontier-judge a deliverable) · POST /api/verify {{"task_id","command"}} (run a check) · GET /api/tasks/ID/review (diff review)
@@ -6197,13 +6197,17 @@ def _plan_start_session(uid: str | None, family: str, goal: str) -> str | None:
 
 
 def sweep_stale_plan_sessions(max_age_days: float = 7.0):
-    """Session hygiene (premortem fix): abandon 'active' plan sessions older than
-    max_age_days and delete their Hermes sessions. Run at startup AND on the
-    scheduler, not only lazily. Safe to call from any thread."""
+    """Session hygiene (premortem fix): abandon stale 'active' OR 'drafted' plan
+    sessions older than max_age_days and delete their Hermes sessions. 'drafted'
+    is covered too: only the /attach step (called on create) moves a session to
+    'created' and deletes its Hermes session — the JARVIS voice/API path can draft
+    and then never attach, so a drafted-but-unattached session would otherwise
+    strand with a live Hermes session forever. Run at startup AND on the scheduler,
+    not only lazily. Safe to call from any thread."""
     cutoff = time.time() - max_age_days * 86400
     stale = db.query_all(
         "SELECT id, hermes_session_id FROM plan_sessions "
-        "WHERE status='active' AND (updated_at IS NULL OR updated_at < ?)", (cutoff,))
+        "WHERE status IN ('active','drafted') AND (updated_at IS NULL OR updated_at < ?)", (cutoff,))
     for row in stale:
         if row.get("hermes_session_id"):
             try:

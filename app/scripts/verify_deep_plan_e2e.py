@@ -157,6 +157,16 @@ srv.sweep_stale_plan_sessions()
 chk("stale active session swept → abandoned",
     (db.query_one("SELECT status FROM plan_sessions WHERE id=?", (r2["id"],)) or {})
     .get("status") == "abandoned")
+# 'drafted' hygiene: a drafted-but-never-attached session (the JARVIS voice/API
+# path never calls /attach) must also be swept — else it strands with a live
+# Hermes session forever (attach is the only path to 'created').
+r3 = post("/api/plan/sessions", json={"goal": "drafted goal", "family": "content"}).json()
+db.execute("UPDATE plan_sessions SET status='drafted', updated_at=? WHERE id=?",
+           (time.time() - 8 * 86400, r3["id"]))
+srv.sweep_stale_plan_sessions()
+chk("stale drafted session swept → abandoned",
+    (db.query_one("SELECT status FROM plan_sessions WHERE id=?", (r3["id"],)) or {})
+    .get("status") == "abandoned")
 
 # ── cleanup ──
 for wid in _created_wf:
