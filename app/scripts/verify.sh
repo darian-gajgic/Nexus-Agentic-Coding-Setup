@@ -434,6 +434,7 @@ chk "rule12 JARVIS advisor stance"   "grep -q 'PROACTIVE ADVISOR' server.py && g
 chk "rule12 JARVIS knows decisions"  "grep -q 'DECISIONS INBOX: GET /api/decisions' server.py"
 chk "rule12 JARVIS knows presets"    "grep -q 'spend_profile.*eco|optimal|smart' server.py"
 chk "autopilot e2e gate exists"      "[ -f scripts/verify_autopilot_e2e.py ]"
+chk "autopilot UI gate exists"       "[ -f scripts/verify_autopilot_ui.py ]"
 chk "autopilot module + routing/lessons" "[ -f autopilot.py ] && [ -f routing.py ] && [ -f lessons.py ]"
 
 echo ""

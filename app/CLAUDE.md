@@ -230,6 +230,11 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   capture + L4 fingerprint invalidation + rule-9 collapse monitor, Q7b auto-approve-ship
   guard + /api/decisions, rule-5 Eco collapse + high-stakes re-insertion, rule-7 scheduler
   template. Self-cleaning; restores settings.
+- **Runtime gate — Quality Autopilot UI (Playwright):** `.venv/bin/python scripts/verify_autopilot_ui.py` —
+  Part-5 UI row: the Decisions inbox renders a seeded card + lights the nav badge, the User
+  Manual renders its plain-language sections (autopilot dials + Decisions inbox chapters), and
+  the Q7a two-axis preset cards mount in BOTH the project proposal wizard and the task-create
+  wizard. 14 checks, self-cleaning (seeded approval/task removed).
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
