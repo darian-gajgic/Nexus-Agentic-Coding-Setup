@@ -104,6 +104,21 @@ systemctl --user enable --now hermes-gateway.service hermes-guardian.timer \
     hermes-reflect.timer hermes-prune.timer nexus.service
 ```
 
+### Step 7b — Dictation (system-wide voice typing; optional, degrades gracefully)
+Since 2026-07-10 Nexus includes dictation (hotkey → shared faster-whisper large-v3 →
+LLM cleanup → layout-aware typing into the focused window) + MeetingMode transcripts.
+All pieces fail soft — skip any of this and the rest of Nexus still works.
+```bash
+sudo apt install python3-tk python3-dev libportaudio2 ydotool wl-clipboard ffmpeg pipewire-utils
+sudo usermod -aG input $USER          # hotkey (evdev) — needs a re-login
+systemctl --user enable --now ydotool # typing injection (ydotoold)
+systemctl --user enable --now nexus-cleanup-llm   # isolated ollama :11435 (unit installed in Step 4)
+OLLAMA_HOST=127.0.0.1:11435 ollama pull gemma3:4b # transcript-cleanup model
+```
+Settings live under `dictation.*` in the Nexus Settings tab (hotkey keycode default 425 =
+KEY_PRESENTATION; find yours with `evtest`). The STT model (`voice.stt_model`, default
+large-v3, ~2.9GB) downloads from HuggingFace on first use.
+
 ### Step 8 — Verify and report
 ```bash
 "$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/hermes-guardian/guardian.py"   # expect overall=OK, core-mods = the count in guardian/core-mods.json (6 today)

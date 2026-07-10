@@ -5,6 +5,22 @@
 
 ---
 
+## 0.-1 STT CONSOLIDATION (2026-07-10) — supersedes every STT detail below
+
+STT no longer runs in-process. The machine's ONE faster-whisper (**large-v3,
+int8_float16, ~2GB VRAM**) lives in the killable subprocess `stt_worker.py`;
+`voice.py` is its CLIENT (`transcribe()` async for the browser path,
+`transcribe_pcm()`/`warm_stt()` sync for dictation + meetings — every caller
+serializes on the worker pipe). GPU discipline: loads wait ≤45s on the
+cross-process gpu_lock, evict idle :11434 ollama models when VRAM is short,
+CPU only on a real CUDA failure (worker-lifetime flip + 600s parent cooldown).
+Idle: the worker is **killed** after `voice.stt_idle_timeout` (300s) — full
+VRAM reclaim incl. the CUDA context; TTS has its own separate 300s timer.
+`POST /api/jarvis/stt/warm` (fired on mic-press) hides the ~4-8s cold load.
+System-wide dictation + MeetingMode were absorbed from WisprFlow into
+`dictation*.py` (see app/CLAUDE.md + the Meetings tab). STT references below
+(medium.en, shared idle timer, "60s"/"300s" unload numbers) are historical.
+
 ## 0.0 v2.1 CAPABILITY + ROBUSTNESS PASS (2026-07-08)
 
 Additive; the pipeline below is unchanged. New:

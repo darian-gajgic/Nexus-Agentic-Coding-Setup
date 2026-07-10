@@ -511,6 +511,7 @@ const VIEW_META = {
   kanban: ['Tasks', 'The task board: plan, assign and track every unit of work'],
   workflows: ['Workflows', 'Rounds of work: multi-task runs that visit your projects — dependencies run in order, outputs feed forward'],
   deliverables: ['Deliverables', 'Every agent output in one place — read, download, chain'],
+  meetings: ['Meetings', 'Dictation MeetingMode transcripts — watch them live, read, manage'],
   agents: ['Agent Fleet', 'Click any agent for memory, messages & cost'],
   agentic: ['Agentic Capabilities', 'Approvals · verification · scheduling · self-healing · cost control'],
   specialists: ['Specialist Agents', 'Reusable experts — and how each one learns'],
@@ -578,6 +579,7 @@ function render() {
   else if (currentView === 'agentic') { c.innerHTML = wrapView(viewAgentic()); bindAgentic(); }
   else if (currentView === 'workflows') { c.innerHTML = wrapView(viewWorkflows()); bindWorkflows(); }
   else if (currentView === 'deliverables') { c.innerHTML = wrapView(viewDeliverables()); bindDeliverables(); }
+  else if (currentView === 'meetings') { c.innerHTML = wrapView(viewMeetings()); bindMeetings(); }
   else if (currentView === 'jarvis') { renderJarvisView(); }
   updateSidebarMini();
 }
@@ -6189,7 +6191,9 @@ let jarvisState = {
 // ── WS TTS pipeline: server streams raw PCM (16-bit mono 22050) per sentence;
 //    chunks are scheduled gaplessly on an AudioContext; an AnalyserNode on the
 //    SAME graph feeds the avatar's mouth = native-timing lip-sync. ──
-const jTTS = { ws: null, connecting: null, nextTime: 0, sources: [], pending: 0, analyser: null, data: null };
+// uq = per-sentence LIVE utterance records for the avatar's viseme lip sync:
+// {text, start, end, done} on the AudioContext clock (see Jarvis3D.speak)
+const jTTS = { ws: null, connecting: null, nextTime: 0, sources: [], pending: 0, analyser: null, data: null, uq: [] };
 
 function jarvisAudioCtx() {
   if (!jarvisState.audioContext) {
@@ -6227,8 +6231,14 @@ function jarvisTTSWs() {
       if (typeof e.data === 'string') {
         let d = {};
         try { d = JSON.parse(e.data); } catch { }
-        if (d.done) { jTTS.pending = Math.max(0, jTTS.pending - 1); jarvisTTSMaybeFinish(); }
-        if (d.error) { jTTS.pending = Math.max(0, jTTS.pending - 1); jarvisTTSMaybeFinish(); }
+        if (d.done || d.error) {
+          // sentences are FIFO on this socket: the first not-done utterance
+          // record is the one that just finished synthesizing
+          const cur = jTTS.uq.find(u => !u.done);
+          if (cur) cur.done = true;
+          jTTS.pending = Math.max(0, jTTS.pending - 1);
+          jarvisTTSMaybeFinish();
+        }
         return;
       }
       // A chunk with no outstanding utterance is a straggler from a stopped /
@@ -6249,6 +6259,17 @@ function jarvisTTSWs() {
       const at = Math.max(jTTS.nextTime, ctx.currentTime + 0.06);
       src.start(at);
       jTTS.nextTime = at + buf.duration;
+      // viseme lip sync: bind this chunk to its sentence (FIFO). The first
+      // chunk fixes the start; every chunk extends the end — the avatar
+      // holds the LIVE record and re-stretches its timeline each frame.
+      const cur = jTTS.uq.find(u => !u.done);
+      if (cur) {
+        if (cur.start < 0) {
+          cur.start = at;
+          if (window.Jarvis3D && window.Jarvis3D.speak) window.Jarvis3D.speak(cur, ctx);
+        }
+        cur.end = at + buf.duration;
+      }
       jTTS.sources.push(src);
       src.onended = () => {
         jTTS.sources = jTTS.sources.filter(s => s !== src);
@@ -6298,6 +6319,8 @@ function jarvisTTSReset() {
   jTTS.sources = [];
   jTTS.pending = 0;
   jTTS.nextTime = 0;
+  jTTS.uq = [];
+  if (window.Jarvis3D && window.Jarvis3D.stopSpeech) window.Jarvis3D.stopSpeech();
   jarvisState.ttsAnimating = false;
   jarvisBargeMonitorStop();
   if (window.Jarvis3D) window.Jarvis3D.setLevel(0);
@@ -6314,6 +6337,7 @@ async function jarvisSpeak(text) {
   if (!ws) { jarvisSpeakFallback(sentences); return; }
   for (const s of sentences) {
     jTTS.pending++;
+    jTTS.uq.push({ text: s, start: -1, end: -1, done: false });
     ws.send(JSON.stringify({ text: s }));
   }
 }
@@ -6343,6 +6367,15 @@ async function jarvisSpeakFallback(sentences) {
       const a = jarvisState.ttsAudioEl;
       a.src = URL.createObjectURL(blob);
       a.onended = a.onerror = () => { URL.revokeObjectURL(a.src); res(); };
+      // no analyser on this path — hand the avatar a fixed-window utterance
+      // on the performance clock (strictly better than the old static mouth)
+      a.onloadedmetadata = () => {
+        if (isFinite(a.duration) && window.Jarvis3D && window.Jarvis3D.speak) {
+          const t0 = performance.now() / 1000;
+          window.Jarvis3D.speak(
+            { text: s, start: t0, end: t0 + a.duration, done: true }, null);
+        }
+      };
       a.play().catch(() => res());
     });
   }
@@ -6357,6 +6390,8 @@ function jarvisStopTTS() {
   for (const s of jTTS.sources) { try { s.stop(); } catch { } }
   jTTS.sources = [];
   jTTS.nextTime = 0;
+  jTTS.uq = [];
+  if (window.Jarvis3D && window.Jarvis3D.stopSpeech) window.Jarvis3D.stopSpeech();
   if (jarvisState.ttsAudioEl) { try { jarvisState.ttsAudioEl.pause(); } catch { } }
   jarvisState.ttsAnimating = false;
   jarvisBargeMonitorStop();
@@ -7087,6 +7122,9 @@ async function jarvisStartRecording() {
     jarvisAddMessage('error', 'Microphone needs a secure context. Open https://localhost:8777 or use HTTPS.');
     return;
   }
+  // warm the shared STT worker while the user speaks — large-v3 loads in
+  // ~4-8s, which the utterance + VAD hangover fully hides (fire-and-forget)
+  fetch('/api/jarvis/stt/warm', { method: 'POST' }).catch(() => { });
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -8593,6 +8631,110 @@ async function previewDeliverable(taskId, name) {
         <button class="btn-primary" onclick="closeModal()">Close</button>
       </div>`);
   } catch (e) { toast('Preview failed: ' + e.message, 'err'); }
+}
+
+// ═══════════════════ MEETINGS (dictation MeetingMode transcripts) ═══════════════════
+const meetState = { list: null, fetched: false, live: null, dir: '', _poll: null };
+
+async function loadMeetings(renderIfChanged = false) {
+  const before = JSON.stringify([meetState.list, meetState.live]);
+  try {
+    const r = await api('GET', '/api/meetings');
+    meetState.list = r.meetings || [];
+    meetState.live = r.live || null;
+    meetState.dir = r.dir || '';
+  } catch { meetState.list = []; meetState.live = null; }
+  meetState.fetched = true;
+  if (currentView !== 'meetings') return;
+  if (!renderIfChanged) { render(); return; }
+  // poll path: repaint only on real change and never under an open modal
+  if (JSON.stringify([meetState.list, meetState.live]) !== before && !uiLocked()) render();
+}
+
+const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+
+function viewMeetings() {
+  if (!meetState.fetched) { loadMeetings(); return skeletonView(); }
+  const live = meetState.live;
+  const rows = (meetState.list || []).map(m => `
+    <div class="agentic-row">
+      <div><strong>${esc(m.title || m.name)}</strong>
+        ${m.name === live ? '<span class="chip c-red">● LIVE</span>' : ''}</div>
+      <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
+        ${fmtAgo(m.mtime)} · ${fmtBytes(m.size)} · ${esc(m.name)}</div>
+      <div class="row-actions">
+        <button class="btn-sm" onclick="previewMeeting('${esc(m.name)}')">📄 Read${m.name === live ? ' live' : ''}</button>
+        ${m.name === live ? '' : `<button class="btn-sm" onclick="deleteMeeting('${esc(m.name)}')">🗑 Delete</button>`}
+      </div>
+    </div>`).join('');
+  return `
+    <div class="view-intro" style="margin-bottom:12px">Dual-channel meeting transcripts — 🎤 <strong>Me</strong> (your mic) and 🔊 <strong>Client</strong> (whatever is playing, e.g. the call) — from dictation's MeetingMode. Start one here, from the overlay button, or with the dictation hotkey during a meeting. Files live in <code>${esc(meetState.dir)}</code>.</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+      <button class="${live ? 'btn-ghost' : 'btn-primary'}" id="meetToggleBtn">${live ? '⏹ Stop meeting' : '● Start meeting'}</button>
+      ${live ? `<span class="chip c-red">recording → ${esc(live)}</span>` : ''}
+      <button class="btn-ghost" onclick="meetState.fetched=false;render()">↻ Refresh</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${rows || '<div class="empty"><span class="e-ico">🎙</span>No meeting transcripts yet — start a meeting and its live transcript appears here.</div>'}
+    </div>`;
+}
+
+function bindMeetings() {
+  const b = $('#meetToggleBtn');
+  if (b) b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const r = await api('POST', '/api/dictation/meeting');
+      toast(r.reply === 'meeting' ? 'Meeting started — transcript appears live' : ('Meeting: ' + (r.reply || 'ok')), 'ok');
+      // the meeting session takes a moment to open its transcript file
+      setTimeout(() => { if (currentView === 'meetings') loadMeetings(); }, 1200);
+    } catch (e) { toast('Meeting toggle failed: ' + e.message, 'err'); }
+    if (b.isConnected) b.disabled = false;
+  };
+  // while a meeting is live, keep the list fresh (self-clearing poller)
+  if (meetState.live && !meetState._poll) {
+    meetState._poll = setInterval(() => {
+      if (currentView !== 'meetings' || !meetState.live) {
+        clearInterval(meetState._poll); meetState._poll = null; return;
+      }
+      loadMeetings(true);
+    }, 5000);
+  }
+}
+
+async function previewMeeting(name) {
+  try {
+    const r = await api('GET', `/api/meetings/${encodeURIComponent(name)}`);
+    showModal(`
+      <h2>🎙 ${esc(name)} ${r.live ? '<span class="chip c-red">● LIVE</span>' : ''}</h2>
+      <pre id="meetPreviewBody" style="max-height:60vh;overflow-y:auto;white-space:pre-wrap;font-size:12.5px;font-family:var(--font-ui);line-height:1.55">${esc(r.content)}</pre>
+      <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+    if (r.live) {
+      // follow the growing transcript; self-clears when the modal closes or
+      // the meeting ends (the element check makes leaks impossible)
+      const t = setInterval(async () => {
+        const el = document.getElementById('meetPreviewBody');
+        if (!el) { clearInterval(t); return; }
+        try {
+          const u = await api('GET', `/api/meetings/${encodeURIComponent(name)}`);
+          const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+          el.textContent = u.content;
+          if (atBottom) el.scrollTop = el.scrollHeight;
+          if (!u.live) clearInterval(t);
+        } catch { clearInterval(t); }
+      }, 4000);
+    }
+  } catch (e) { toast('Preview failed: ' + e.message, 'err'); }
+}
+
+async function deleteMeeting(name) {
+  if (!confirm(`Delete ${name}? This cannot be undone.`)) return;
+  try {
+    await api('DELETE', `/api/meetings/${encodeURIComponent(name)}`);
+    toast('Deleted', 'ok');
+    meetState.fetched = false;
+    if (currentView === 'meetings') render();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
 // ═══════════════════ TASK WIZARD (describe → clarify → parameterized task/project) ═══════════════════

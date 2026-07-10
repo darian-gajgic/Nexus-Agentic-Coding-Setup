@@ -3,14 +3,20 @@ Description=NEXUS Agent OS (Agentic OS dashboard)
 # User units cannot order against system units (docker.service) and user-scope
 # network-online.target has no wait service — only the gateway ordering below
 # is real. Nexus itself is fail-soft toward qdrant/Langfuse/gateway anyway.
-After=hermes-gateway.service
-Wants=hermes-gateway.service
+# ydotool.service (dictation typing) and nexus-cleanup-llm.service (transcript
+# polish, isolated ollama :11435) are fail-soft too: without ydotoold dictation
+# degrades to clipboard, without the cleanup LLM it types the raw transcript.
+After=hermes-gateway.service ydotool.service nexus-cleanup-llm.service
+Wants=hermes-gateway.service ydotool.service nexus-cleanup-llm.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/sinep/nexus-agent-os
 ExecStart=/home/sinep/nexus-agent-os/start.sh
 Restart=on-failure
+# Graceful shutdown is bounded app-side (uvicorn timeout_graceful_shutdown=8);
+# 25s here is the belt-and-braces ceiling instead of the 90s default.
+TimeoutStopSec=25
 RestartSec=5
 
 [Install]

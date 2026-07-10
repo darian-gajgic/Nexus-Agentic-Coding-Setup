@@ -15,7 +15,22 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   random tokens (verify.sh enforces this). A lane exits when its agent is retired/stopped.
 - `scripts/migrate_real_agents.py` — one-time migration (ran 2026-07-06): archived sim data,
   retired the SelfHealTest zombie, deleted seed demo agents/tasks, flipped dispatch.enabled=1.
-- `voice.py` — GPU TTS (Piper, incl. streaming synthesize_stream) and STT (faster-whisper)
+- `voice.py` — TTS (Piper CPU, incl. streaming synthesize_stream) + the STT worker CLIENT:
+  the machine's ONE faster-whisper (large-v3) lives in the killable subprocess
+  `stt_worker.py` (JSON-lines protocol, gpu_lock'd loads, ollama eviction via _ensure_vram,
+  OOM→CPU self-heal; stderr → logs/stt_worker.log). All STT callers — JARVIS mic, dictation,
+  meetings — serialize on its pipe. `transcribe_pcm()` (sync) + `warm_stt()` are the entry
+  points for dictation/meeting threads.
+- `dictation.py` (+ `dictation_layout.py`, `dictation_overlay.py`, `dictation_meeting.py`)
+  — system-wide voice typing ABSORBED FROM WisprFlow (2026-07-10, STT consolidation):
+  evdev hotkey (keycode 425, two-device dedup) → segmented recording (max_seconds is a
+  CHAIN boundary, never a silent cap) → shared STT → gemma3:4b cleanup on the isolated
+  ollama :11435 (`nexus-cleanup-llm.service`, f16 KV) → layout-aware ydotool typing +
+  tkinter overlay pill. Control socket: `$XDG_RUNTIME_DIR/nexus-dictation.sock`
+  (toggle/cancel/status/meeting/note/lang). MeetingMode writes speaker-labeled transcripts
+  to `~/wf-meetings` (Meetings tab reads them; supervised ffmpeg channels, temporal-overlap
+  bleed dedup). Settings: `dictation.*`. `~/local-wisprflow` stays on disk as the rollback
+  (re-enable wf-* units + set dictation.enabled=0).
 - `vision.py` — JARVIS visual memory (SigLIP+OCR frames in qdrant `jarvis_vision`), local
   VLM describe (ollama qwen3-vl:8b), SDXL-Turbo image generation
 - `vision_worker.py` — persistent ml-env subprocess hosting SigLIP/RapidOCR/SDXL (JSON-lines
@@ -88,19 +103,30 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   ⚡ note. Details in docs/JARVIS-VOICE.md §5 + the Real Dispatch quota bullet below.
 - **Extras**: daily spoken briefing, spoken task completion/failure callbacks (12s polling),
   `/find` + `/imagine` intents (typed or spoken), per-message copy buttons.
-- **STT robustness (2026-07-08)**: `voice.py` STT self-heals — a CUDA hiccup under VRAM
-  contention (was a silent 500, e.g. cudaErrorInvalidDevice) now logs a traceback, reloads the
-  model and retries once, then falls back to a CPU int8 model and blocks the GPU for 600s
-  (`voice.stt_gpu_block_until`). Model/device/language are settings (`voice.stt_model` default
-  medium.en — set `large-v3-turbo` for multilingual+accuracy; `voice.stt_device` auto|cuda|cpu;
-  `voice.stt_language`). A CPU-only fallback still failing is logged to the activity feed.
-- **Idle model unloading:** Piper+Whisper unload after `voice.py IDLE_TIMEOUT` (300s) idle;
-  the vision worker (SigLIP/SDXL) is killed after 10min idle — both via the server's 15s
-  unloader thread. **The ollama VLM (qwen3-vl, ~6-8GB) frees promptly (2026-07-08):** describe
-  calls use a short keep_alive (setting `vision.vlm_keep_alive`, default 30s — was ollama's 5min
-  default) and the chat turn calls `vision.unload_vlm()` (keep_alive:0) the moment a look-turn
-  ends, so the local model doesn't camp the shared 12GB card once JARVIS is done seeing (the
-  chat model is cloud). SDXL imagine already evicts the VLM first.
+- **STT consolidation (2026-07-10)**: ONE whisper for the whole machine. `stt_worker.py`
+  (spawned by voice.py, app venv) owns faster-whisper **large-v3 int8_float16 (~2GB)**;
+  JARVIS mic, system dictation and meetings all go through it. GPU-first: loads wait up to
+  45s on the cross-process gpu_lock (the GPU waiting line), evict idle :11434 ollama models
+  when VRAM is short (`_ensure_vram`), and only fall back to CPU on a real CUDA failure
+  (worker flips to CPU for its life + parent blocks CUDA spawns 600s). Warm-on-mic-press /
+  warm-on-hotkey (`POST /api/jarvis/stt/warm`, `voice.warm_stt()`) hides the ~4-8s cold
+  load. Settings: `voice.stt_model|stt_device|stt_compute|stt_language|stt_idle_timeout`.
+  WisprFlow's adaptive GPU↔CPU demote loop was deliberately NOT ported — its two
+  disagreeing probes thrashed placement every ~10s and OOM-killed the old daemon
+  (journal-proven 2026-07-08). The user's WisprFlow services (wf-daemon/wf-keylistener/
+  wf-cleanup-llm) are disabled; `wf-cleanup-llm` was renamed → `nexus-cleanup-llm.service`
+  (same ~/.ollama-wf models dir, keep_alive 5m→2m).
+- **Idle model unloading (all guaranteed):** the STT worker is **killed** after
+  `voice.stt_idle_timeout` (300s) of STT inactivity — process death reclaims 100% of VRAM
+  incl. the ~158MiB CUDA context; Piper drops after 300s of TTS inactivity (timers are
+  SEPARATE since 2026-07-10 — CPU TTS use no longer pins the GPU whisper); the vision
+  worker is killed after `vision.idle_timeout` (default 600s); all via the server's 15s
+  unloader thread. **The ollama VLM (qwen3-vl, ~6-8GB) frees promptly:** describe calls
+  use a short keep_alive (setting `vision.vlm_keep_alive`, default 60s); SDXL imagine
+  evicts the VLM first (keep_alive:0). (`vision.unload_vlm()` exists but has no chat-turn
+  call site — VLM VRAM is freed by keep_alive expiry, not per-turn eviction.) Dictation's
+  cleanup gemma3:4b frees after 2m (`dictation.llm_keep_alive` + the unit's
+  OLLAMA_KEEP_ALIVE).
 - **Graceful shutdown (2026-07-08)**: the dashboard always holds a `/ws` socket + SSE streams,
   so uvicorn's default unbounded graceful shutdown hung until systemd's 90s SIGKILL (every
   restart lost in-flight state + spammed the journal). Fixed: `uvicorn.Config(timeout_graceful_
@@ -127,7 +153,10 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - Start server with `bash start.sh` (sets LD_LIBRARY_PATH for CUDA, then runs main.py)
 - HTTPS: if `cert.pem` + `cert.key` exist, server auto-enables HTTPS (needed for mic on non-localhost)
 - Piper TTS model at `models/piper_voice.onnx`
-- faster-whisper (medium.en, CUDA) uses CUDA libs from `/usr/local/lib/ollama/cuda_v12/`
+- faster-whisper (large-v3) runs in the `stt_worker.py` subprocess (app venv); CUDA libs
+  preloaded from `/usr/local/lib/ollama/cuda_v12/` + LD_LIBRARY_PATH (start.sh / _worker_env)
+- Dictation deps in the app venv: sounddevice + evdev (requirements.txt); the overlay needs
+  a tkinter-capable python (apt `python3-tk`; auto-probes fallbacks incl. the old wf venv)
 
 ## Test / Verify (canonical commands)
 - **Static gate (fast, every edit):** `bash scripts/verify.sh` — JS/Python syntax, no debug leftovers, function integrity, Agentic capabilities integrity, + real-dispatch/judge/health integrity incl. sim-is-dead negatives (the gate prints its own count — 256 checks as of 2026-07-09). Must pass before commit; the git pre-commit hook enforces it.
@@ -147,6 +176,11 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   23 checks: frame indexing (SigLIP+OCR, dedup), hybrid search ranking, VLM describe, SDXL
   imagine, file exchange, sessions v2 (fresh/switch/foreign-404/title), briefing, events,
   WS TTS streaming + first-chunk latency. Self-cleaning.
+- **Runtime gate — STT consolidation:** `.venv/bin/python scripts/verify_stt_e2e.py` —
+  21 checks: TTS→STT round trip through the shared worker, warm endpoint, SIGKILL→respawn,
+  idle-kill frees ALL whisper VRAM, cpu-force round trip, dictation/meetings API + filename
+  validation. Self-cleaning (settings PATCHed back). Dictation smoke without the hotkey:
+  `printf status | nc -U "$XDG_RUNTIME_DIR/nexus-dictation.sock"` (toggle/cancel/lang/note).
 - **Runtime gate — Block 3 (replanning/evals/plan-editor):** `.venv/bin/python scripts/verify_block3_e2e.py` —
   revalidate round-trip, replan detect→dismiss→re-arm→apply (archival, rewiring, loop reset,
   approval expiry), eval run lifecycle on a scratch corpus with stubbed generation+judge,
