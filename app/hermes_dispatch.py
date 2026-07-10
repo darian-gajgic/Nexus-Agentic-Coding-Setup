@@ -721,6 +721,92 @@ def _knowledge_paths(task: dict) -> dict:
             "style": str(root / "STYLE-VOICE.md")}
 
 
+_EXEMPLAR_TYPES = ("content", "research", "analysis")
+
+
+def _exemplar_score(rubric_text: str | None) -> float | None:
+    """Parse the numeric self-score out of a deliverable's rubric line
+    (e.g. 'Rubric self-score: 3.8/4' → 3.8). Best-effort — the score line is
+    free text; the number before any '/' is the score on its own scale."""
+    if not rubric_text:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*/\s*\d+", rubric_text) or \
+        re.search(r"(\d+(?:\.\d+)?)", rubric_text)
+    try:
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def golden_exemplars(task: dict) -> list[str]:
+    """Q1: the operator's own best past work as few-shot exemplars — deterministic
+    SQL, no embeddings. Past tasks of the same domain (+ same client when set)
+    that the frontier judge SHIP'd and that self-scored at/above the threshold,
+    same owner, freshest first; unioned with curated ~/knowledge examples
+    (curated wins ties). Guards: never for code_change, never on a retry round,
+    never the task's own earlier versions. Returns deliverable PATHS (token-cheap
+    — the executor reads them via file tools). L3 lifecycle: pool capped at
+    max×3, age-out past exemplars.max_age_months."""
+    if db.get_setting("exemplars.enabled", "1") != "1":
+        return []
+    dtype = (task.get("deliverable_type") or "").strip()
+    if dtype not in _EXEMPLAR_TYPES:  # never for code_change (repo context suffices) / untyped
+        return []
+    if (task.get("retry_feedback") or "").strip():
+        return []  # a retry round: the feedback matters more than exemplars
+    domain = (task.get("domain") or "").strip()
+    if not domain or domain == "general":
+        return []
+    root = Path(db.get_setting("onboarding.root", "") or os.path.expanduser("~/knowledge"))
+    if not (root / "domains" / domain / "RUBRIC.md").is_file():
+        return []  # only judgeable domains
+    try:
+        max_n = max(1, int(db.get_setting("exemplars.max", "2") or 2))
+        min_score = float(db.get_setting("exemplars.min_score", "3.5") or 3.5)
+        max_age_days = max(1, int(db.get_setting("exemplars.max_age_months", "12") or 12)) * 30.4
+    except Exception:
+        max_n, min_score, max_age_days = 2, 3.5, 365.0
+    uid = task.get("user_id")
+    client = (task.get("client") or "").strip()
+    cutoff = time.time() - max_age_days * 86400
+    # Fetch a bounded candidate pool (top-K = max×3), freshest first. client
+    # narrows when the current task names one; otherwise any client of the domain.
+    sql = ("SELECT id, rubric_score, completed_at, workspace_path, client, title "
+           "FROM tasks WHERE judge_verdict='SHIP' AND domain=? AND user_id IS ? "
+           "AND id != ? AND workspace_path IS NOT NULL AND completed_at >= ?")
+    params = [domain, uid, task.get("id"), cutoff]
+    if client:
+        sql += " AND client=?"
+        params.append(client)
+    sql += " ORDER BY completed_at DESC LIMIT ?"
+    params.append(max_n * 3)
+    picks = []
+    for r in db.query_all(sql, tuple(params)):
+        sc = _exemplar_score(r.get("rubric_score"))
+        if sc is None or sc < min_score:
+            continue
+        p = os.path.join(r.get("workspace_path") or "", "deliverable.md")
+        if os.path.isfile(p):
+            picks.append((sc, r.get("completed_at") or 0, p))
+    picks.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    paths = [p for _, _, p in picks[:max_n]]
+    # Curated examples win ties — prepend, dedup, then cap at max_n.
+    curated_dir = root / "domains" / domain / "examples"
+    curated = []
+    try:
+        if curated_dir.is_dir():
+            curated = [str(f) for f in sorted(curated_dir.iterdir())
+                       if f.is_file() and f.suffix.lower() in (".md", ".txt")]
+    except Exception:
+        curated = []
+    out, seen = [], set()
+    for p in curated + paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out[:max_n]
+
+
 def _attachment_lines(task: dict, workspace: Path) -> list[str]:
     """Operator-attached input files: the task's own + its project's."""
     dirs = [workspace / "attachments"]
@@ -844,6 +930,15 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             "that later stages of this project must respect (naming, structure, stack, "
             "tone, key trade-offs) — one line each, with the reason. Omit it only if you "
             "genuinely made no such choice.")
+    # Q1 (golden exemplars): the operator's own best past work as the quality bar
+    # (P10a order — after DECISIONS, before predecessor deliverables).
+    exemplars = golden_exemplars(task)
+    if exemplars:
+        parts.append(
+            "QUALITY BAR — these are the operator's OWN past deliverables rated excellent "
+            "for this business; read them FIRST and match their quality bar, voice, depth "
+            "and structure. Do NOT copy their content — this is a different task:\n"
+            + "\n".join(f"- {p}" for p in exemplars))
     deps = [d for d in task_dependencies(task) if d.get("status") == "done"]
     if deps:
         # framing.brief_mode (token saver): only DIRECT predecessors' deliverables

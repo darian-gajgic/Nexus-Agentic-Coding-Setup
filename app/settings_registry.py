@@ -142,6 +142,23 @@ SECTIONS = [
                      "inspection fails with no automatic fix round left), draft the recovery "
                      "plan automatically so it is already waiting when you open the project. "
                      "APPLY still needs your approval — only the wait in the middle disappears."},
+            {"key": "exemplars.enabled", "label": "Golden-exemplar retrieval", "type": "bool",
+             "default": "1",
+             "help": "Q1: inject the operator's own best past work (SHIP'd, high-scoring, same "
+                     "domain/client) as MUST-READ few-shot exemplars for content/research/"
+                     "analysis deliverables — the quality bar to match. Never for code."},
+            {"key": "exemplars.min_score", "label": "Exemplar minimum self-score", "type": "float",
+             "default": "3.5", "min": 0, "max": 10,
+             "help": "Q1: a past deliverable qualifies as an exemplar only at/above this "
+                     "self-score (parsed from its rubric self-score line)."},
+            {"key": "exemplars.max", "label": "Exemplars per task", "type": "int",
+             "default": "2", "min": 1, "max": 5,
+             "help": "Q1: how many exemplar paths to inject (curated examples win ties)."},
+            {"key": "exemplars.max_age_months", "label": "Exemplar max age (months)", "type": "int",
+             "default": "12", "min": 1, "max": 60,
+             "help": "L3 lifecycle: past-work exemplars older than this age out (unless "
+                     "re-confirmed by a newer SHIP); the candidate pool is capped at "
+                     "exemplars.max×3 so stale 'excellence' can't anchor new work."},
         ],
     },
     {
