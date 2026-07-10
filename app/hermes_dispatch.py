@@ -738,15 +738,19 @@ def _exemplar_score(rubric_text: str | None) -> float | None:
         return None
 
 
-def golden_exemplars(task: dict) -> list[str]:
+def golden_exemplars(task: dict) -> list[dict]:
     """Q1: the operator's own best past work as few-shot exemplars — deterministic
     SQL, no embeddings. Past tasks of the same domain (+ same client when set)
     that the frontier judge SHIP'd and that self-scored at/above the threshold,
     same owner, freshest first; unioned with curated ~/knowledge examples
-    (curated wins ties). Guards: never for code_change, never on a retry round,
-    never the task's own earlier versions. Returns deliverable PATHS (token-cheap
-    — the executor reads them via file tools). L3 lifecycle: pool capped at
-    max×3, age-out past exemplars.max_age_months."""
+    (curated lead for reading priority, but a slot is RESERVED for the operator's
+    own work so curated files can't crowd it out of exemplars.max). Guards: never
+    for code_change, never on a retry round, never the task's own earlier
+    versions. Returns [{"path", "own"}] dicts (own=True → the operator's own
+    SHIP'd deliverable; own=False → a curated reference exemplar) so the framing
+    can label them honestly; token-cheap — the executor reads them via file
+    tools. L3 lifecycle: pool capped at max×3, age-out past
+    exemplars.max_age_months."""
     if db.get_setting("exemplars.enabled", "1") != "1":
         return []
     dtype = (task.get("deliverable_type") or "").strip()
@@ -789,8 +793,10 @@ def golden_exemplars(task: dict) -> list[str]:
         if os.path.isfile(p):
             picks.append((sc, r.get("completed_at") or 0, p))
     picks.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    paths = [p for _, _, p in picks[:max_n]]
-    # Curated examples win ties — prepend, dedup, then cap at max_n.
+    paths = [p for _, _, p in picks[:max_n]]  # the operator's OWN past work, best first
+    # Curated reference exemplars shipped with the domain — NOT the operator's own
+    # work (labelled honestly in build_framing so the executor isn't told a stock
+    # example is the operator's own excellence).
     curated_dir = root / "domains" / domain / "examples"
     curated = []
     try:
@@ -799,11 +805,21 @@ def golden_exemplars(task: dict) -> list[str]:
                        if f.is_file() and f.suffix.lower() in (".md", ".txt")]
     except Exception:
         curated = []
+    # Reserve at least one slot for the operator's OWN past work when both kinds
+    # exist, so a domain's 2-3 curated files can't crowd it out of exemplars.max
+    # (default 2) — the operator's own SHIP'd deliverable is the more authentic
+    # quality bar. Curated still LEAD (they "win ties" for reading priority), but
+    # only up to the budget that leaves room for the reserved own-work slot.
+    reserve_own = 1 if (paths and curated and max_n >= 2) else 0
+    cur_budget = max_n - reserve_own
+    ordered = ([(p, False) for p in curated[:cur_budget]]
+               + [(p, True) for p in paths]
+               + [(p, False) for p in curated[cur_budget:]])
     out, seen = [], set()
-    for p in curated + paths:
+    for p, own in ordered:
         if p not in seen:
             seen.add(p)
-            out.append(p)
+            out.append({"path": p, "own": own})
     return out[:max_n]
 
 
@@ -934,11 +950,18 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
     # (P10a order — after DECISIONS, before predecessor deliverables).
     exemplars = golden_exemplars(task)
     if exemplars:
-        parts.append(
-            "QUALITY BAR — these are the operator's OWN past deliverables rated excellent "
-            "for this business; read them FIRST and match their quality bar, voice, depth "
-            "and structure. Do NOT copy their content — this is a different task:\n"
-            + "\n".join(f"- {p}" for p in exemplars))
+        own = [e["path"] for e in exemplars if e.get("own")]
+        curated = [e["path"] for e in exemplars if not e.get("own")]
+        bar = ["QUALITY BAR — read these FIRST and match their quality bar, voice, depth and "
+               "structure. Do NOT copy their content — this is a different task:"]
+        if own:
+            bar.append("The operator's OWN past deliverables for this business, rated excellent:")
+            bar += [f"- {p}" for p in own]
+        if curated:
+            bar.append("Curated reference exemplars of excellent work in this domain (not the "
+                       "operator's own — treat as the craft bar to meet):")
+            bar += [f"- {p}" for p in curated]
+        parts.append("\n".join(bar))
     deps = [d for d in task_dependencies(task) if d.get("status") == "done"]
     if deps:
         # framing.brief_mode (token saver): only DIRECT predecessors' deliverables
