@@ -433,6 +433,8 @@ chk "rule11 vendored copies synced"    "for f in ../setup/hermes/agents/*.md; do
 chk "rule12 JARVIS advisor stance"   "grep -q 'PROACTIVE ADVISOR' server.py && grep -q 'INSPECTOR' server.py"
 chk "rule12 JARVIS knows decisions"  "grep -q 'DECISIONS INBOX: GET /api/decisions' server.py"
 chk "rule12 JARVIS knows presets"    "grep -q 'spend_profile.*eco|optimal|smart' server.py"
+chk "autopilot e2e gate exists"      "[ -f scripts/verify_autopilot_e2e.py ]"
+chk "autopilot module + routing/lessons" "[ -f autopilot.py ] && [ -f routing.py ] && [ -f lessons.py ]"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
