@@ -135,6 +135,20 @@ async def main():
         ok("task preset radios wired (m-task prefix)",
            await page.locator('input[name="m-task-inv"]').count() == 3
            and await page.locator('input[name="m-task-spend"]').count() == 3)
+        # rule 1 (2nd judge pass, finding 2): quality/speed is DERIVED read-only, never
+        # an editable control — the duplicate `m-task-loop-pref` radio group is gone,
+        # and the Advanced expander shows a single derived chip that follows the spend dial.
+        ok("no editable loop-pref radios anywhere (deduped + read-only, rule 1)",
+           await page.locator('input[name="m-task-loop-pref"]').count() == 0)
+        ok("task Advanced shows the derived quality/speed chip (read-only)",
+           await page.locator('#m-task-pref-derived').count() == 1)
+        # textContent (not inner_text) — the chip lives inside a collapsed <details>,
+        # whose rendered text is empty until expanded; we test the reactive wiring.
+        deriv = await page.evaluate(
+            "() => { const r = document.querySelector('input[name=\"m-task-spend\"][value=\"eco\"]');"
+            " r.checked = true; r.dispatchEvent(new Event('change', {bubbles: true}));"
+            " return (document.getElementById('m-task-pref-derived') || {}).textContent || ''; }")
+        ok("derived chip reacts to the spend dial (Eco → Speed)", "Speed" in deriv, deriv.strip())
         await page.evaluate("() => closeModal()")
 
         real_errors = [e for e in console_errors if "favicon" not in e]

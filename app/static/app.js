@@ -3284,25 +3284,18 @@ const LOOP_INTRO_SHORT =
   'back to be fixed and re-checked a few rounds before involving you — like a good team that ' +
   'checks its own work. You choose whether that happens automatically (closed) or only on your click (open).';
 
-function loopPrefCardsHTML(prefix, current) {
-  const card = (val, icon, title, body, checked) => `
-    <label style="flex:1;display:block;padding:10px 12px;border:1px solid ${checked ? 'var(--accent)' : 'rgba(255,255,255,.1)'};border-radius:10px;cursor:pointer">
-      <input type="radio" name="${prefix}-loop-pref" value="${val}" ${checked ? 'checked' : ''}> <strong>${icon} ${title}</strong>
-      <div style="font-size:11.5px;color:var(--text-dim);margin-top:4px">${body}</div>
-    </label>`;
-  return `<div style="display:flex;gap:8px">
-    ${card('quality', '🏆', 'Maximum quality',
-    'More checking rounds, and the frontier judge runs automatically on important work. Slower and uses more tokens — the result gets several chances to be improved before you see it.',
-    (current || 'quality') === 'quality')}
-    ${card('speed', '⚡', 'Speed / token efficiency',
-    'At most one automatic fix round, no automatic judging. Faster and cheaper — small flaws may reach you that quality mode would have caught.',
-    current === 'speed')}
-  </div>`;
+// rule 1 — quality/speed is DERIVED from the spend profile, never independently
+// editable (eco → speed, else quality). ONE source of truth for the read-only
+// label wherever the loop preference is shown. `spend absorbs preference`.
+function derivedPref(spend) { return spend === 'eco' ? 'speed' : 'quality'; }
+function derivedPrefLabel(spend) {
+  return derivedPref(spend) === 'speed' ? '⚡ Speed / token efficiency' : '🏆 Maximum quality';
 }
-
-function selectedLoopPref(prefix) {
-  const el = document.querySelector(`input[name="${prefix}-loop-pref"]:checked`);
-  return el ? el.value : 'quality';
+// Live-update the read-only derived-preference chip when the spend dial moves.
+function updateDerivedPref(prefix) {
+  const sp = document.querySelector(`input[name="${prefix}-spend"]:checked`);
+  const el = document.getElementById(`${prefix}-pref-derived`);
+  if (el) el.textContent = derivedPrefLabel(sp ? sp.value : 'optimal');
 }
 
 // Q7a — Autopilot presets: two orthogonal axes as plain-language radio cards.
@@ -3327,7 +3320,7 @@ function autopilotCardsHTML(prefix, inv, spend) {
         ${card('inv', 'manual', '🎛', 'Manual', 'I only flag problems and recommend — you press the button on every step.', inv === 'manual')}
       </div>
     </div>
-    <div class="ap-axis" data-help="autopilot-spend" style="margin-top:8px">
+    <div class="ap-axis" data-help="autopilot-spend" style="margin-top:8px" onchange="updateDerivedPref('${prefix}')">
       <div style="font-size:11.5px;font-weight:600;margin-bottom:4px">How much should this cost? <span class="qmark" data-help="autopilot-spend" title="Click for a plain-language explainer">?</span></div>
       <div style="display:flex;gap:7px">
         ${card('spend', 'eco', '🌱', 'Eco', 'Cheapest that still works — fewest rounds, no fan-out, lean pipeline. ~½ the fuel.', spend === 'eco')}
@@ -3338,8 +3331,11 @@ function autopilotCardsHTML(prefix, inv, spend) {
     <details style="margin-top:8px">
       <summary style="cursor:pointer;font-size:11.5px;color:var(--text-dim)">Advanced — raw knobs (for professionals)</summary>
       <div style="margin-top:6px">
-        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">Quality/speed is DERIVED from the spending profile (Eco → speed, else quality) and shown here read-only — changing a raw knob marks the loop "customized (based on your preset)".</div>
-        ${loopPrefCardsHTML(prefix)}
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">Quality/speed is DERIVED from the spending profile (Eco → speed, else quality) and shown here <strong>read-only</strong> — it follows the spend dial above, not a separate switch (rule 1). Changing a raw knob marks the loop "customized (based on preset)".</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:11px;color:var(--text-faint)">Quality/speed (derived):</span>
+          <span class="chip" id="${prefix}-pref-derived" title="derived from the spend profile — not separately editable (rule 1)">${derivedPrefLabel(spend)}</span>
+        </div>
       </div>
     </details>`;
 }
@@ -3413,13 +3409,15 @@ function loopBadgeHTML(cfg) {
 let loopEdit = null; // {kind, id, title, cfg}
 
 async function loopViewerModal(kind, id, title) {
-  let raw = null;
+  let raw = null, spendProfile = null;
   try {
     if (kind === 'task') {
       state.tasks = await api('GET', '/api/tasks');
-      raw = ((state.tasks || []).find(t => t.id === id) || {}).loop_config;
+      const t = (state.tasks || []).find(t => t.id === id) || {};
+      raw = t.loop_config; spendProfile = t.spend_profile || null;
     } else {
-      raw = (await api('GET', `/api/workflows/${id}`)).loop_config;
+      const w = await api('GET', `/api/workflows/${id}`);
+      raw = w.loop_config; spendProfile = w.spend_profile || null;
     }
   } catch (e) { toast('Load failed: ' + e.message, 'err'); return; }
   let cfg = parseLoopCfg(raw);
@@ -3427,7 +3425,10 @@ async function loopViewerModal(kind, id, title) {
     cfg = await designLoop(kind, { id, preference: 'quality', mode: 'closed' });
     cfg.enabled = false; // designed as a proposal — enabling stays the user's call
   }
-  loopEdit = { kind, id, title, cfg };
+  // rule 1: when a spend profile governs the item, the loop preference is DERIVED
+  // read-only (the server re-derives it on every regenerate regardless of any
+  // editable control) — carry it so the modal shows read-only, not an editable select.
+  loopEdit = { kind, id, title, cfg, spendProfile };
   renderLoopModal();
 }
 
@@ -3482,11 +3483,19 @@ function renderLoopModal() {
           <option value="closed" ${closed ? 'selected' : ''}>Closed — fix rounds run automatically, then I'm asked</option>
           <option value="open" ${!closed ? 'selected' : ''}>Open — every checkpoint waits for my click</option>
         </select></div>
+      ${loopEdit.spendProfile ? `
+      <div class="form-group"><label class="form-label">Optimize for</label>
+        <div class="chip" id="lp-pref" data-derived="1" style="display:inline-block"
+          title="derived from the ${esc(loopEdit.spendProfile)} spend profile — change the profile on the item to change this (rule 1)">
+          ${cfg.preference === 'speed' ? '⚡ Speed / token efficiency' : '🏆 Maximum quality'}</div>
+        <div class="form-hint" style="margin-top:3px">Derived read-only from the <strong>${esc(loopEdit.spendProfile)}</strong> spend profile — customized (based on preset), not separately editable.</div>
+      </div>`
+      : `
       <div class="form-group"><label class="form-label">Optimize for</label>
         <select class="form-select" id="lp-pref">
           <option value="quality" ${cfg.preference !== 'speed' ? 'selected' : ''}>🏆 Maximum quality (slower, more tokens)</option>
           <option value="speed" ${cfg.preference === 'speed' ? 'selected' : ''}>⚡ Speed / token efficiency (lower quality)</option>
-        </select></div>
+        </select></div>`}
     </div>
     <div class="form-group"><label class="form-label">Checkpoints this loop watches</label>
       <div style="display:flex;flex-direction:column;gap:6px">${trigRows}</div></div>
@@ -4719,8 +4728,8 @@ function showTaskModal(status) {
       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
       <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="m-task-loop"
         onchange="const o=$('#m-task-loop-opts'); if(o) o.style.display=this.checked?'block':'none'"> Enable looping for this task</label>
-      <div id="m-task-loop-opts" style="display:none;margin-top:8px">${loopPrefCardsHTML('m-task')}
-        <div class="form-hint" style="margin-top:4px">The loop itself is designed automatically for this exact task when you press Create — you can view, understand and change it afterwards via the task's 🔁 Loop settings.</div>
+      <div id="m-task-loop-opts" style="display:none;margin-top:8px">
+        <div class="form-hint">Quality/speed for the loop is set by the <strong>Autopilot spend dial</strong> above (Eco → speed, else quality) — no separate switch (rule 1). The loop itself is designed automatically for this exact task when you press Create; view and change it afterwards via the task's 🔁 Loop settings.</div>
       </div>
     </div>
     <div class="form-group">
@@ -4817,7 +4826,7 @@ async function submitTask() {
   if ($('#m-task-loop') && $('#m-task-loop').checked) {
     try {
       loopCfg = await designLoop('task', {
-        preference: selectedLoopPref('m-task'),
+        preference: derivedPref(ap.spend_profile),  // rule 1: derived from the spend dial
         mode: 'closed',
         meta: {
           title,
@@ -9441,8 +9450,8 @@ function proposeWorkflowModal(wf, meta) {
       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
       <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-loop" ${isCoding ? 'checked' : ''}
         onchange="const o=$('#wf-loop-opts'); if(o) o.style.display=this.checked?'block':'none'"> Enable looping for this project${isCoding ? ' <span class="chip c-cyan">recommended — this project has a final inspection stage</span>' : ''}</label>
-      <div id="wf-loop-opts" style="display:${isCoding ? 'block' : 'none'};margin-top:8px">${loopPrefCardsHTML('wf')}
-        <div class="form-hint" style="margin-top:4px">The loop is designed automatically for this exact project when you press Create — inspect and change it later via the project's 🔁 Loop settings.</div>
+      <div id="wf-loop-opts" style="display:${isCoding ? 'block' : 'none'};margin-top:8px">
+        <div class="form-hint">Quality/speed for the loop is set by the <strong>Autopilot spend dial</strong> above (Eco → speed, else quality) — no separate switch (rule 1). The loop is designed automatically for this exact project when you press Create; inspect and change it later via the project's 🔁 Loop settings.</div>
       </div>
     </div>
     <div class="form-group" style="margin-top:8px">
@@ -9527,7 +9536,7 @@ function proposeWorkflowModal(wf, meta) {
     if ($('#wf-loop') && $('#wf-loop').checked) {
       try {
         wfLoop = await designLoop('workflow', {
-          preference: selectedLoopPref('wf'),
+          preference: derivedPref(projAp.spend_profile),  // rule 1: derived from the spend dial
           mode: 'closed',
           meta: {
             title: wf.name, domain: wf.domain,

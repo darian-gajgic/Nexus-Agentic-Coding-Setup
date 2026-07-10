@@ -100,7 +100,7 @@ Protocol followed: `bash app/scripts/verify.sh` green after every step; one comm
 
 | Rule | Status | Where |
 |---|---|---|
-| 1 spend absorbs preference | BUILT | `autopilot.derive` (eco→speed else quality); loop-modal quality/speed under Advanced, derived read-only |
+| 1 spend absorbs preference | BUILT (loop UI made read-only — 2nd judge pass) | `autopilot.derive` + `design_loop` (eco→speed else quality; the server re-derives on every regenerate regardless of any control). UI now shows quality/speed **derived read-only**: one reactive chip in the Autopilot Advanced expander (follows the spend dial live) and, in the loop-detail modal, a read-only chip whenever a spend profile governs (legacy no-profile items keep the editable select). The duplicate `*-loop-pref` radio group was removed entirely — no editable loop-pref builder remains |
 | 2 risk is an independent hard floor | BUILT | high_stakes forces auto-judge even under Eco (`design_loop`); auto-approve never touches high-stakes/SR/escalations (`_sweep_auto_approve_ship`) |
 | 3 Eco ships STAGED | BUILT | model-floor derivation gated behind `_feature_present("model_floor")` → "staged" until Phase 7 |
 | 4 profiles scale budgets | BUILT | `_autopilot_fields` × 0.5/1/2 on the default budget |
@@ -228,3 +228,22 @@ evidence), given a regression check, and committed granularly. The tree is fully
    whose framing is agreement-first / re-verify-only-DISAGREEMENTS. `verify.sh` adds a rule-8
    static check (no `early_exit` in autopilot.py; "rule 8 early-exit" in server.py; "Stops on
    SHIP" in loop_engine.py). Rule-8 row above corrected.
+
+2. **`app/static/app.js` loop quality/speed was a first-class editable control (rule-1 violation) +
+   a double-rendered `m-task-loop-pref` radio group.** Confirmed at HEAD: the loop-detail modal
+   (`renderLoopModal`) had a top-level editable `<select id="lp-pref">`, and `autopilotCardsHTML`'s
+   Advanced expander plus the task-create/project Looping sections BOTH rendered `loopPrefCardsHTML`
+   with the same `${prefix}-loop-pref` radio name — so in the task-create modal two radio groups
+   shared `name="m-task-loop-pref"` (a real DOM collision), while the "read-only" note was false.
+   The server already re-derives `preference` from the spend profile on every `design_loop` call, so
+   the editable value was silently overridden — cosmetically misleading and contrary to binding rule 1
+   ("preference derived-not-editable"). **Fix:** one source of truth (`derivedPref`/`derivedPrefLabel`)
+   drives a **read-only** derived chip: the Autopilot Advanced expander shows a reactive `#${prefix}-pref-derived`
+   chip wired to the spend dial (`updateDerivedPref` on the spend axis' `onchange`); the loop-detail
+   modal shows a read-only chip whenever the item carries a `spend_profile` (captured in `loopViewerModal`)
+   and keeps the editable select only for legacy no-profile items; the separate Looping sections drop the
+   duplicate radios for a "set by the Autopilot spend dial above" note; and `loopPrefCardsHTML`/`selectedLoopPref`
+   were removed entirely (no editable loop-pref builder can be reintroduced). Submit paths now source the
+   preference from `derivedPref(spend_profile)`. `app.js?v=81`. **Regression:** `verify_autopilot_ui.py`
+   asserts zero `m-task-loop-pref` radios, a present `#m-task-pref-derived` chip, and that the chip
+   reacts to the Eco spend selection (Eco → Speed). Rule-1 row above corrected.
