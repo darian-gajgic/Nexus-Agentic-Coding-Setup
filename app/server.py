@@ -3117,6 +3117,17 @@ def _lessons_apply(domain: str, deltas: list, user_id, username: str):
     return _lessons_safe("apply_deltas", domain, deltas, user_id, username)
 
 
+def _record_routing_outcome(task_id):
+    """L1: best-effort capture of a task's routing outcome at a terminal state."""
+    if not task_id:
+        return
+    try:
+        import routing as _routing
+        _routing.record_outcome(task_id)
+    except Exception:
+        pass
+
+
 def _capture_accept_diff(task: dict):
     """Q2: when a deliverable is finally accepted after ≥1 rejection, the diff
     between the last rejected version (deliverable.vN.md, highest N) and the
@@ -3197,6 +3208,7 @@ async def decide_approval(approval_id: str, body: dict):
                 # (snapshots the workspace — copytree — so off the loop)
                 await run_in_threadpool(_retry_task, task_id, fb)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            _record_routing_outcome(task_id)  # L1
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
     # Super Result checkpoint (open mode / escalation): approve = accept the
     # current version and end the loop; reject = drain the (possibly edited)
@@ -3221,6 +3233,7 @@ async def decide_approval(approval_id: str, body: dict):
                 await run_in_threadpool(_retry_task, task_id, fb)
                 _loop.bump_super_round(task_id)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            _record_routing_outcome(task_id)  # L1: reject→overridden / approve→terminal
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
     # Q2/L2: an admin-scoped lesson_deltas card — approve applies the (possibly
     # edited) deltas to the knowledge base + git-commits; reject with feedback
@@ -3262,6 +3275,8 @@ _DECISION_FALLBACKS = {
                      "recommendation": "Review the inspector's findings", "cost_hint": ""},
     "lesson_deltas": {"headline": "New lessons distilled from your corrections.",
                       "recommendation": "Review & apply", "cost_hint": ""},
+    "routing_tuning": {"headline": "The router has learning to review.",
+                       "recommendation": "Review routing suggestions", "cost_hint": ""},
 }
 
 

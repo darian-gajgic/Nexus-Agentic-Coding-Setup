@@ -342,6 +342,37 @@ def init_db():
     if "scope" not in _appr_cols0:
         conn.execute("ALTER TABLE approvals ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'")
 
+    # L1 (outcome-driven routing tuning, premortem P4 schema): one row per task at
+    # its terminal state — the routing decision + what actually happened. A
+    # deterministic stats job (NO LLM) reads these to propose threshold tweaks.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS routing_outcomes (
+        id TEXT PRIMARY KEY,
+        task_id TEXT UNIQUE,
+        user_id TEXT,
+        triage_json TEXT DEFAULT '{}',
+        spend_profile TEXT,
+        autopilot TEXT,
+        rounds_used INTEGER DEFAULT 0,
+        fanout_used INTEGER DEFAULT 0,
+        final_verdicts TEXT DEFAULT '{}',
+        escalated INTEGER DEFAULT 0,
+        overridden INTEGER DEFAULT 0,
+        created_at REAL
+    )""")
+    # L4 (fingerprint-tagged learned parameters): tuned thresholds (triage,
+    # escalation, profile bands) are MODEL-SPECIFIC → stored with the config
+    # fingerprint and auto-invalidated on tier rotation (revert to heuristic
+    # defaults until re-tuned). Distilled CRAFT lessons live in ~/knowledge and
+    # survive rotations — two stores, never mixed.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS learned_params (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        fingerprint TEXT,
+        updated_at REAL
+    )""")
+
     # Migrate workflows columns (looping v3.2)
     existing_wf_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)").fetchall()}
     if "loop_config" not in existing_wf_cols:
