@@ -53,42 +53,65 @@ and `/lipsync` return **410 Gone** since 2026-07-09 — they were still live and
 loaded Wav2Lip onto the shared 12 GB GPU when hit; lipsync.py stays on disk
 but nothing reaches it). The v2 stack:
 
-- **Avatar (v9, 2026-07-08)** = generic male particle bust from a REAL head
-  scan: "Head (Lee Perry-Smith)" by Lee Perry-Smith / Infinite-Realities
-  (ir-ltd.net), **CC Attribution 3.0 Unported**, self-hosted at
-  static/avatar/male_head.glb. `scripts/build_avatar_from_glb.py` samples it
-  into static/avatar/head_points.json incl. the opaque head-occluder mesh;
-  jarvis3d.js loads that (procedural sculpt = fallback). The v8 procedural
-  torso is GONE: the bust is anchored at the frame BOTTOM so the scan's open
-  neck/shoulder cut stays below the visible edge. v12: MODEL_H 44.1 (crown
-  y=3.6, cut −40.5 — off-frame), face-weighted sampling + sculpted two-key
-  shading, eye-glint positions MEASURED from the scan ("glints" in the JSON).
-  **v13 (2026-07-08): the bust is 7,000 DISCRETE memory-node dots animated
-  100% ON THE GPU.** A custom ShaderMaterial Points renders each dot as a
-  bright core + soft halo from gl_PointCoord with MANUAL size attenuation
-  (gl_PointSize = uSize·aSize·uScale/−mv.z; uScale from drawing-buffer
-  height + fov, updated on resize). Per-particle data is uploaded ONCE as
-  attributes (aB brightness, aW white-mix, aSeed, aSize, aMouthVec = baked
-  jaw-drop displacement at open=1, aLid = baked lid sweep at lid=1, aEye);
-  per frame ONLY uniforms change (uOpen/uLid/uTint/uTime/uSize) — per-frame
-  JS attribute writes (the old approach) are the documented anti-pattern
-  for particle morphing. Organic per-dot micro-drift runs in the vertex
-  shader off aSeed. The blink/lip-sync CURVES (Disney blink dynamics,
-  attack/release envelope, sibilance narrowing) are unchanged — they just
-  drive uniforms now.
-  **Animations are research-grounded (2026-07-08):** blink follows measured
-  human dynamics (Trutoiu et al., Disney Research, ACM TAP 2011 — fast
-  accelerating ~80ms close, brief closure, slow asymptotic ~220ms reopen;
-  symmetric blinks read sleepy) with randomized 2–6s intervals + occasional
-  double blinks, and the lid is GEOMETRIC (eye-band points sweep down over
-  the eye; glints slip under the lid). Lip-sync per real-time practice:
-  fast-attack/slow-release amplitude envelope (never lags audio, settles
-  through pauses), jaw-drop weighting (lower lip works, upper barely moves,
-  corners sealed), STABLE per-point jitter seeds (frame-random boiled), and
-  a two-band spectral hint from app.js (sibilance narrows the aperture —
-  Jarvis3D.setLevel(v, hf)). Thinking tint is lit-up electric CYAN (not
-  amber) — MODE_TINT values >1 amplify.
-  NOTE: the GLB faces +z as authored — do NOT "fix" its orientation.
+- **Avatar (v7 HOLOGRAM, 2026-07-10 — HOLOGRAM-AVATAR-PLAN-2026-07-09.md)**
+  = violet point-lattice hologram head: the three.js "facecap" model with
+  ALL 52 ARKit blendshapes (model by Face Cap — bannaflak.com/face-cap, no
+  explicit upstream model license; credit kept in jarvis3d.js + the build
+  script; clean-license drop-in = a Ready Player Me GLB). The upstream GLB
+  requires a KTX2 texture loader at parse time — `scripts/
+  build_facecap_hologram.py` strips images/textures/animations offline →
+  `static/avatar/facecap_hologram.glb` (meshopt stays; decoded at runtime).
+  **Rendering** — ONE shared baked-Float32 geometry, three renderables:
+  near-black occluder Mesh (+teeth — hides the far side, reads solid),
+  faint additive wireframe lattice, and morph-aware ShaderMaterial Points
+  (fresnel rim, per-dot twinkle via aSeed, scanline shimmer, rare glitch
+  flicker, density-compensated brightness aB — dense lip/eye loops would
+  blow out white otherwise, neck fade via uFade, manual size attenuation
+  uScale). Points layer is midpoint-subdivided (2.7k → ~10.4k dots,
+  POINT_SUBDIV). All three renderables share ONE morphTargetInfluences
+  array (r160 texture-based morphs bind per object automatically — works
+  for Points + ShaderMaterial via the morphtarget_* shader chunks). Post:
+  EffectComposer (MSAA HalfFloat RT) → UnrealBloomPass half-res, strength
+  .45/radius .30/threshold .85 (HIGH on purpose: additive dots sum past
+  1.0 — a low threshold blooms the head to a white ball) → OutputPass.
+  Fit anchors on the EYE PIVOTS (grp_eyeLeft/Right), NOT the bbox — the
+  cranium is deep/tall and bbox-anchoring drops the face out of frame
+  (HEAD_H 44, eye mid → (0, 0, +3), face +z, auto-flip if authored -z).
+  Eyes are separate meshes under rotatable pivot Groups; glints are pivot
+  children (they ride the gaze). Fallback = procedural ellipsoid lattice
+  (no morphs) + console.warn if the GLB fails.
+  **Lip sync = TEXT-ALIGNED VISEMES (no backend change):** app.js keeps a
+  LIVE per-sentence utterance record {text,start,end,done} on the
+  AudioContext clock (first PCM chunk fixes start, every chunk extends
+  end, WS {done}/{error} closes FIFO) and registers it via
+  `Jarvis3D.speak(rec, ctx)`; barge-in/stop/reset clear via
+  `stopSpeech()`. jarvis3d stretches the Oculus-viseme timeline
+  (vendored MIT `static/vendor/lipsync/lipsync-en.mjs`,
+  wordsToVisemes → relative times/durations) over the REAL audio window —
+  self-corrects as chunks land — evaluates 50ms-attack/120ms-release
+  envelopes, maps visemes → ARKit weights (VISEME_ARKIT table), gates by
+  the live RMS envelope (real pauses close the mouth) and keeps the
+  sibilance narrowing (Jarvis3D.setLevel(v, hf) unchanged). No timed
+  utterance (mic mouthing) → amplitude fallback on jawOpen. The
+  analyser-less HTTP WAV fallback passes a fixed-window record on the
+  performance clock (gate = 1).
+  **Eyes/idle are research-grounded:** blink keeps the measured human
+  dynamics (Trutoiu et al., ACM TAP 2011 — ~80ms accelerating close,
+  brief closure, ~220ms asymptotic reopen, 2–6s randomized, 12% doubles)
+  on eyeBlink_L/R; gaze = saccade/fixation state machine (75%
+  camera-locked fixations that TRACK the pointer-driven camera with
+  head-sway compensation, 60–90ms saccades + overshoot, microsaccades,
+  blink coupling at saccade onset), driving the eye pivots + eyeLook*
+  morphs as lid follow; thinking = up-aside gaze + browInnerUp,
+  listening = locked-on + eyeWide + roll tilt, talking = env-correlated
+  micro-nods + brow pulses. Idle = breathing + subtle sway, ALWAYS faces
+  the user (no turntable — operator decision 2026-07-09). MODE_TINT are
+  multipliers on the violet base uBase #8a6bff (>1 amplifies into bloom).
+  **Vendored runtime deps (no build step):** `static/vendor/threejsm/`
+  (13 r160 jsm addons, bare 'three' rewritten to the exact core CDN URL —
+  ONE shared THREE instance; never /+esm) + `static/vendor/lipsync/` —
+  see `static/vendor/_VENDORING.md`. Old head_points.json/male_head.glb/
+  2D-frame assets + their build scripts are DELETED (git history has them).
 - **Memory galaxy in the JARVIS scene (v10, 2026-07-08)** — the old node
   streams/pulse sprites are GONE. jarvis3d.js now embeds the Memory tab's
   real 3D map (`/api/memory3d`: PCA positions, similarity links, identity
