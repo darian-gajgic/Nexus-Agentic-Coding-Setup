@@ -359,6 +359,12 @@ chk "Q4 decisions contract in framing" "grep -q 'END your deliverable with a .##
 chk "Q4 decision log injected"        "grep -q 'PROJECT DECISION LOG' hermes_dispatch.py"
 chk "Q4 harvest called on finalize"   "grep -q 'harvest_decisions(task, content)' hermes_dispatch.py"
 chk "Q4 brief_mode setting"           "grep -q 'framing.brief_mode' settings_registry.py"
+# Q5 — uncertainty tagging
+chk "Q5 framing contract"            "grep -q 'UNCERTAINTY TAGGING' hermes_dispatch.py && grep -q 'UNSURE: reason' hermes_dispatch.py"
+chk "Q5 cverify UNSURE-first"        "grep -q 'UNSURE' ../setup/bin/cverify && grep -q 'UNSURE' \$HOME/.local/bin/cverify"
+chk "Q5 cjudge UNSURE line"          "grep -q 'UNSURE' ../setup/bin/cjudge && grep -q 'UNSURE' \$HOME/.local/bin/cjudge"
+chk "Q5 INVESTIGATION rubric note"   "grep -q 'UNSURE' ../setup/knowledge/rubrics/INVESTIGATION.md"
+chk "Q5 UI amber highlight"          "grep -q 'function highlightUnsure' static/app.js && grep -q 'unsure-tag' static/style.css"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"

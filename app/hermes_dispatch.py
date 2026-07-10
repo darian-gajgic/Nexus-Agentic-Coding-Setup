@@ -787,6 +787,13 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             f"Python playwright from that same interpreter; the npm 'playwright' package is NOT "
             "installed globally.")
     parts.append(
+        "UNCERTAINTY TAGGING: mark every claim you could NOT verify against a primary "
+        "source inline as `[UNSURE: reason]` (e.g. a number you estimated, a fact you "
+        "could not confirm, an inference you drew). Unmarked claims are treated as "
+        "verified assertions — the grounded critic and judge check unmarked claims to "
+        "that standard and treat an unmarked-but-false claim as a critical failure, so "
+        "flagging honest uncertainty PROTECTS your score.")
+    parts.append(
         "When the task needs a STRUCTURED FACT — exchange rates, weather, country/market "
         "data, public holidays, economic indicators, paper/package/repo metadata, "
         "naming/word ideas, product barcodes, webshop seed data, music metadata/BPM — "

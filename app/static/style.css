@@ -1697,3 +1697,7 @@ code, pre, .mono { font-family: var(--font-mono); }
   .stat-grid { grid-template-columns:1fr 1fr; gap:8px; }
   #spawnBtn { display:none; }  /* fleet management is a desktop task */
 }
+
+/* Q5 (uncertainty tagging): amber marker for [UNSURE: …] spans in deliverable previews */
+.unsure-tag { background:rgba(251,191,36,.18); color:#fbbf24; border-bottom:1px dotted #fbbf24;
+  border-radius:3px; padding:0 2px; font-weight:600; cursor:help; }

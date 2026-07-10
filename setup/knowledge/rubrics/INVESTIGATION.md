@@ -18,7 +18,10 @@ dimensions 0–4.
   as inference ("inferred from X; not directly verified"). A proxy inference
   presented as fact — "tests pass, therefore the code is healthy", "no error in
   the logs, therefore no failure" — is an unlabeled inference. **Any unlabeled
-  inference presented as fact = FAIL.**
+  inference presented as fact = FAIL.** An inline `[UNSURE: reason]` tag COUNTS as
+  an explicit inference label — a marked claim that turns out wrong is a scored
+  deduction, not an A1 gate FAIL; an UNMARKED claim presented as fact and found
+  false is the A1 violation this gate exists to catch.
 - **A2 ALTERNATIVES-RULED-OUT** — competing explanations for the central
   conclusion are enumerated, and each is excluded with evidence, not with
   plausibility ("unlikely because…" without a check = FAIL). If only one
