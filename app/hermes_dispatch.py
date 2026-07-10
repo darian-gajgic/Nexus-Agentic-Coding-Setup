@@ -819,14 +819,40 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             f"Delegate the whole task to the specialist '{specialist}' using your delegate_task "
             "tool (it runs synchronously here) and incorporate its full result into the deliverable."
         )
+    # Q4 (project decision log): every workflow member reads the running brief of
+    # binding choices earlier stages made — before its predecessor deliverables
+    # (P10a framing order) — and ends its own deliverable with a ## Decisions
+    # section that _finalize_result harvests back into it. ~Zero extra tokens,
+    # coherence across the whole project.
+    if task.get("workflow_id"):
+        dpath = WORKSPACES / f"workflow-{task['workflow_id']}" / "DECISIONS.md"
+        if dpath.is_file():
+            parts.append(
+                f"PROJECT DECISION LOG — read {dpath} FIRST: it records the binding "
+                "choices earlier stages of this project already made (naming, structure, "
+                "stack, tone, scope). Respect every one unless this task's brief overrides "
+                "it; if you must deviate, say so explicitly and why.")
+        parts.append(
+            "END your deliverable with a `## Decisions` section: every choice you made "
+            "that later stages of this project must respect (naming, structure, stack, "
+            "tone, key trade-offs) — one line each, with the reason. Omit it only if you "
+            "genuinely made no such choice.")
     deps = [d for d in task_dependencies(task) if d.get("status") == "done"]
     if deps:
+        # framing.brief_mode (token saver): only DIRECT predecessors' deliverables
+        # are ever injected (task_dependencies resolves the direct depends_on list),
+        # so in brief mode a member deep in the DAG leans on the DECISIONS.md brief
+        # above for cross-stage context instead of a longer reading list.
+        brief_mode = db.get_setting("framing.brief_mode", "0") == "1"
         lines = "\n".join(
             f"- {d['workspace_path'] or 'workspaces/' + d['id']}/deliverable.md "
             f"(output of '{d['title']}')" for d in deps)
         parts.append(
             "This task builds on completed predecessor tasks in the same workflow. "
-            "FIRST read their deliverables with your file tools — they are your input:\n" + lines)
+            "FIRST read their deliverables with your file tools — they are your input:\n"
+            + lines
+            + ("\n(Cross-stage decisions live in the project DECISION LOG above — you "
+               "need only these direct inputs plus that log.)" if brief_mode else ""))
     if task.get("retry_feedback"):
         parts.append(
             "This is a RETRY: a previous attempt was rejected. Address every point of this "
@@ -835,6 +861,46 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
     parts.append("Finally, reply in chat with the complete final deliverable text — the reply is "
                  "stored as the task result.")
     return "\n\n".join(parts)
+
+
+_DECISIONS_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s*Decisions\s*$(.*?)(?=^\s{0,3}#{1,6}\s|\Z)",
+    re.I | re.M | re.S)
+
+
+def parse_decisions_section(text: str) -> str | None:
+    """Q4: pull the `## Decisions` section body out of a deliverable (any
+    heading level). Returns the trimmed bullet block or None."""
+    m = _DECISIONS_RE.search(text or "")
+    if not m:
+        return None
+    body = m.group(1).strip()
+    return body[:4000] or None
+
+
+def harvest_decisions(task: dict, content: str):
+    """Q4 harvest (deterministic, no LLM): append this task's `## Decisions`
+    lines to its project's running DECISIONS.md so every later stage reads a
+    coherent log of the choices already made."""
+    wid = task.get("workflow_id")
+    if not wid:
+        return
+    body = parse_decisions_section(content)
+    if not body:
+        return
+    try:
+        wdir = WORKSPACES / f"workflow-{wid}"
+        wdir.mkdir(parents=True, exist_ok=True)
+        path = wdir / "DECISIONS.md"
+        stamp = time.strftime("%Y-%m-%d")
+        header = "# Project decisions\n\nThe binding choices each stage made. Later stages MUST respect these.\n"
+        if not path.exists():
+            path.write_text(header)
+        with path.open("a") as f:
+            f.write(f"\n### {(task.get('title') or task['id'])[:120]} ({stamp})\n{body}\n")
+    except Exception as e:
+        db.log_activity("warn", "dispatch",
+                        f"decision-log harvest failed for {task.get('id')}: {str(e)[:80]}")
 
 
 def parse_deliverable_meta(text: str) -> tuple[str | None, str | None]:
@@ -990,6 +1056,7 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     deliverable = workspace / "deliverable.md"
     if not deliverable.exists() and content:
         deliverable.write_text(content)
+    harvest_decisions(task, content)  # Q4: append this stage's ## Decisions to the project log
     rubric, learn = parse_deliverable_meta(content)
     new_status = "review" if task.get("high_stakes") else "done"
     fields = dict(dispatch_state="completed", result_summary=content[:4000],

@@ -107,6 +107,20 @@ SECTIONS = [
         ],
     },
     {
+        "id": "quality", "title": "Quality autopilot",
+        "desc": "Compounding quality levers (QUALITY-AUTOPILOT-PLAN-2026-07-10): golden "
+                "exemplars, the project decision log, operator-edit distillation, and the "
+                "two-axis autopilot presets. All default to today's behavior.",
+        "items": [
+            {"key": "framing.brief_mode", "label": "Brief mode (project running-brief)", "type": "bool",
+             "default": "0",
+             "help": "Q4: when on, workflow members deep in the pipeline lean on the project "
+                     "DECISION LOG for cross-stage context instead of a longer reading list "
+                     "(only their direct predecessors' deliverables are injected either way). "
+                     "Saves tokens on long projects."},
+        ],
+    },
+    {
         "id": "integrations", "title": "Services & integrations",
         "desc": "Where Nexus finds its companion services. Values apply after a service restart.",
         "items": [
