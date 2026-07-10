@@ -5127,7 +5127,13 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
         for i, t in enumerate(tasks):
             t["depends_on_idx"] = [i - 1] if i > 0 else []
         repairs.append(f"repair fallback: sequential chain ({str(e)[:60]})")
-    return tasks[:7], repairs
+    # The RAW input is already capped at max_raw (top of this function); every
+    # task added since is a MANDATORY quality gate (review / fix / verifier /
+    # reconciler), appended AFTER that cap. A second hard cap here silently
+    # dropped the last-appended gate — e.g. a fan-out with max_raw=7 raw tasks
+    # puts the appended reconciler at index 8, which `tasks[:7]` discarded, so
+    # the critic reviewed an unreconciled fan-out. Never truncate the gates.
+    return tasks, repairs
 
 
 @app.post("/api/loop/design")
