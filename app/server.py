@@ -164,6 +164,12 @@ def startup():
             db.log_activity("info", "system", f"Swept {n} stale critic sandbox(es) at boot")
     except Exception as _e:
         print(f"[startup] critic-sandbox sweep failed: {_e}", flush=True)
+    # Deep Plan hygiene (Phase 5): abandon plan sessions idle >7 days + delete
+    # their Hermes sessions (repeated on the scheduler, not only lazily).
+    try:
+        sweep_stale_plan_sessions()
+    except Exception as _e:
+        print(f"[startup] plan-session sweep failed: {_e}", flush=True)
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
@@ -6075,6 +6081,260 @@ async def task_wizard_revalidate(body: dict):
         db.log_activity("info", "system",
                         f"Plan editor auto-repair on '{name[:40]}': " + " · ".join(repairs)[:300])
     return {"tasks": tasks, "repairs": repairs}
+
+
+# ── Deep Plan sessions (Phase 5, Steps 4-8) ──
+# A conversational planning phase for complex goals: a plan_sessions row + a
+# dedicated Hermes planning session run a short scaffolded interview that fills a
+# per-family SPEC, then draft/verify/create seed from it. Owner-scoped, resumable.
+
+def _owned_plan_session(sid: str):
+    return db.query_one("SELECT * FROM plan_sessions WHERE id=? AND user_id=?",
+                        (sid, auth.current_user_id()))
+
+
+def _plan_transcript(row: dict) -> list:
+    try:
+        return json.loads(row.get("transcript") or "[]")
+    except Exception:
+        return []
+
+
+def _plan_public(row: dict) -> dict:
+    import plan_engine as _pe
+    family = row.get("family") or "content"
+    spec = {}
+    try:
+        spec = json.loads(row.get("spec_json") or "{}")
+    except Exception:
+        spec = {}
+    transcript = _plan_transcript(row)
+    last = next((t for t in reversed(transcript) if t.get("role") == "assistant"), {})
+    triage = None
+    try:
+        triage = json.loads(row.get("triage_json") or "null")
+    except Exception:
+        triage = None
+    return {
+        "id": row["id"], "goal": row.get("goal") or "", "family": family,
+        "family_label": _pe.FAMILY_LABELS.get(family, family),
+        "families": [{"key": k, "label": _pe.FAMILY_LABELS[k]} for k in _pe.FAMILIES],
+        "status": row.get("status") or "active",
+        "spec": _pe.spec_public(spec, family),
+        "spec_raw": spec,
+        "required_filled": _pe.required_filled(spec, family),
+        "empty_required": _pe.empty_required(spec, family),
+        "turns": sum(1 for t in transcript if t.get("role") == "user"),
+        "message": last.get("content") or "",
+        "questions": last.get("questions") or [],
+        "ready": bool(last.get("ready")),
+        "triage": triage,
+        "created_at": row.get("created_at"), "updated_at": row.get("updated_at"),
+    }
+
+
+def _plan_turn_message(spec: dict, family: str, user_message: str) -> str:
+    """Per-turn context: the model always sees the current spec state (esp. after
+    direct slot edits it never saw) plus the operator's message."""
+    import plan_engine as _pe
+    filled = [f"- {s['label']}: {s['value'] if s['kind']=='text' else '; '.join(s['value'])}"
+              for s in _pe.spec_public(spec, family) if s["filled"]]
+    empty_req = _pe.empty_required(spec, family)
+    parts = ["CURRENT SPEC STATE:"]
+    parts += filled or ["(nothing filled yet)"]
+    if empty_req:
+        parts.append("EMPTY REQUIRED SLOTS: " + ", ".join(empty_req))
+    parts.append("\nOPERATOR: " + (user_message or "").strip())
+    return "\n".join(parts)
+
+
+def _plan_run_turn(uid: str | None, hermes_sid: str | None, family: str,
+                   spec: dict, user_message: str, turns: int) -> dict:
+    """Run ONE interview turn (model or stub) and return the parsed reply. Plain
+    def — always shipped to a threadpool by the async endpoints (B7 no-block rule).
+    plan.stub short-circuits the Hermes turn with canned slot-filling (mirrors
+    evals.stub; the judge/critic command stubs do NOT reach session turns)."""
+    import plan_engine as _pe
+    try:
+        max_turns = int(sreg.conf("plan.max_turns", "3") or 3)
+    except Exception:
+        max_turns = 3
+    if db.get_setting("plan.stub", "0") == "1":
+        return _pe.stub_turn(spec, family, user_message, turns, max_turns)
+    msg = _plan_turn_message(spec, family, user_message)
+    res = hd.stream_turn(hermes_sid, msg, max_seconds=180)
+    if res.get("error"):
+        raise RuntimeError(str(res["error"])[:200])
+    return _pe.parse_turn(res.get("content") or "")
+
+
+def _plan_start_session(uid: str | None, family: str, goal: str) -> str | None:
+    """Create the dedicated Hermes planning session (None under plan.stub).
+    Plain def — called via threadpool."""
+    import plan_engine as _pe
+    if db.get_setting("plan.stub", "0") == "1":
+        return None
+    try:
+        max_q = int(sreg.conf("plan.max_questions_per_turn", "3") or 3)
+        max_turns = int(sreg.conf("plan.max_turns", "3") or 3)
+    except Exception:
+        max_q, max_turns = 3, 3
+    framing = _pe.interview_framing(family, max_q, max_turns, goal)
+    sid = hd.create_session(f"nexus:plan:{uuid.uuid4().hex[:8]}",
+                            model=db.default_task_model(uid), system_prompt=framing)
+    hd.publish_session_scope(sid, user=uid)
+    hd.publish_session_key(sid, uid, db.default_task_model(uid))
+    return sid
+
+
+def sweep_stale_plan_sessions(max_age_days: float = 7.0):
+    """Session hygiene (premortem fix): abandon 'active' plan sessions older than
+    max_age_days and delete their Hermes sessions. Run at startup AND on the
+    scheduler, not only lazily. Safe to call from any thread."""
+    cutoff = time.time() - max_age_days * 86400
+    stale = db.query_all(
+        "SELECT id, hermes_session_id FROM plan_sessions "
+        "WHERE status='active' AND (updated_at IS NULL OR updated_at < ?)", (cutoff,))
+    for row in stale:
+        if row.get("hermes_session_id"):
+            try:
+                hd.delete_session(row["hermes_session_id"])
+            except Exception:
+                pass
+        db.execute("UPDATE plan_sessions SET status='abandoned', updated_at=? WHERE id=?",
+                   (time.time(), row["id"]))
+    if stale:
+        db.log_activity("info", "plan", f"Swept {len(stale)} stale plan session(s)")
+    return len(stale)
+
+
+@app.get("/api/plan/sessions")
+async def plan_sessions_list():
+    uid = auth.current_user_id()
+    rows = db.query_all(
+        "SELECT * FROM plan_sessions WHERE user_id=? AND status IN ('active','drafted') "
+        "ORDER BY updated_at DESC LIMIT 20", (uid,))
+    return {"sessions": [_plan_public(r) for r in rows]}
+
+
+@app.get("/api/plan/sessions/{sid}")
+async def plan_session_get(sid: str):
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    return _plan_public(row)
+
+
+@app.post("/api/plan/sessions")
+async def plan_session_start(body: dict):
+    """Start a Deep Plan session: create the row + a dedicated Hermes planning
+    session, then run the opening interview turn from the goal."""
+    import plan_engine as _pe
+    if db.get_setting("plan.deep_enabled", "1") != "1":
+        return JSONResponse(status_code=403, content={"error": "Deep Plan is disabled"})
+    uid = auth.current_user_id()
+    goal = (body.get("goal") or body.get("instruction") or "").strip()
+    if not goal:
+        return JSONResponse(status_code=400, content={"error": "describe the goal to plan"})
+    family = body.get("family") if body.get("family") in _pe.FAMILIES else _pe.detect_family(goal)
+    spec = _pe.new_spec(family, goal)
+    sid = f"plan-{uuid.uuid4().hex[:8]}"
+    now = time.time()
+    # carry the triage recommendation (and SR/preset intent) onto the session
+    triage = _wizard_triage(goal, uid, (body.get("spend_profile") or "").strip() or None)
+    try:
+        hermes_sid = await run_in_threadpool(_plan_start_session, uid, family, goal)
+        parsed = await run_in_threadpool(_plan_run_turn, uid, hermes_sid, family, spec, goal, 0)
+    except hd.QuotaError:
+        return JSONResponse(status_code=503, content={
+            "error": "GLM is load-shedding right now — try again in a minute"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    spec = _pe.merge_spec(spec, parsed.get("spec_updates"), family)
+    transcript = [
+        {"role": "user", "content": goal, "ts": now},
+        {"role": "assistant", "content": parsed.get("message") or "",
+         "questions": parsed.get("questions") or [], "ready": bool(parsed.get("ready")), "ts": now},
+    ]
+    db.execute(
+        "INSERT INTO plan_sessions (id, user_id, goal, family, spec_json, transcript, "
+        "hermes_session_id, status, triage_json, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (sid, uid, goal, family, json.dumps(spec), json.dumps(transcript), hermes_sid,
+         "active", json.dumps(triage) if triage else None, now, now))
+    db.log_activity("info", "plan", f"Deep Plan session started ({family})", user_id=uid)
+    return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
+
+
+@app.post("/api/plan/sessions/{sid}/turn")
+async def plan_session_turn(sid: str, body: dict):
+    import plan_engine as _pe
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    if row.get("status") != "active":
+        return JSONResponse(status_code=409, content={"error": f"session is {row.get('status')}"})
+    message = (body.get("message") or "").strip()
+    if not message:
+        return JSONResponse(status_code=400, content={"error": "message required"})
+    family = row.get("family") or "content"
+    spec = json.loads(row.get("spec_json") or "{}")
+    transcript = _plan_transcript(row)
+    turns = sum(1 for t in transcript if t.get("role") == "user")
+    try:
+        parsed = await run_in_threadpool(_plan_run_turn, row.get("user_id"),
+                                         row.get("hermes_session_id"), family, spec, message, turns)
+    except hd.QuotaError:
+        return JSONResponse(status_code=503, content={
+            "error": "GLM is load-shedding right now — try again in a minute"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    spec = _pe.merge_spec(spec, parsed.get("spec_updates"), family)
+    now = time.time()
+    transcript.append({"role": "user", "content": message, "ts": now})
+    transcript.append({"role": "assistant", "content": parsed.get("message") or "",
+                       "questions": parsed.get("questions") or [],
+                       "ready": bool(parsed.get("ready")), "ts": now})
+    db.execute("UPDATE plan_sessions SET spec_json=?, transcript=?, updated_at=? WHERE id=?",
+               (json.dumps(spec), json.dumps(transcript), now, sid))
+    return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
+
+
+@app.patch("/api/plan/sessions/{sid}/spec")
+async def plan_session_spec_edit(sid: str, body: dict):
+    """Direct slot edits from the live spec pane — no model call."""
+    import plan_engine as _pe
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    family = body.get("family") if body.get("family") in _pe.FAMILIES else (row.get("family") or "content")
+    spec = json.loads(row.get("spec_json") or "{}")
+    updates = body.get("updates") if isinstance(body.get("updates"), dict) else (
+        body.get("spec") if isinstance(body.get("spec"), dict) else {})
+    spec = _pe.merge_spec(spec, updates, family)
+    db.execute("UPDATE plan_sessions SET spec_json=?, family=?, updated_at=? WHERE id=?",
+               (json.dumps(spec), family, time.time(), sid))
+    return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
+
+
+@app.delete("/api/plan/sessions/{sid}")
+async def plan_session_abandon(sid: str):
+    """Abandon a session (session hygiene: delete the Hermes session too)."""
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    if row.get("hermes_session_id"):
+        await run_in_threadpool(_plan_delete_hermes, row["hermes_session_id"])
+    db.execute("UPDATE plan_sessions SET status='abandoned', updated_at=? WHERE id=?",
+               (time.time(), sid))
+    return {"ok": True}
+
+
+def _plan_delete_hermes(hermes_sid: str):
+    try:
+        hd.delete_session(hermes_sid)
+    except Exception:
+        pass
 
 
 # ── Workflows: multi-task projects/campaigns with dependencies (v2.1) ──

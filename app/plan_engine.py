@@ -289,3 +289,243 @@ def recommend(heur: dict, div: dict | None = None,
 
 def goal_hash(goal: str, uid: str | None = None) -> str:
     return hashlib.sha1(f"{uid or '-'}|{(goal or '').strip()}".encode()).hexdigest()[:16]
+
+
+# ─────────────────────────── Spec templates (scaffold the interview) ───────────────────────────
+# LOCKED §3.4: the interview is scaffolded by a per-family spec template; the
+# conversation fills slots, free-form chat is allowed but answers always map back
+# into the spec. Each slot: (key, label, kind 'text'|'list', required, hint).
+SPEC_TEMPLATES: dict = {
+    "software": [
+        ("goal", "Goal", "text", True, "what the software must do, in one or two sentences"),
+        ("stack_platform", "Stack / platform", "text", True, "language, framework, runtime, target"),
+        ("acceptance_criteria", "Acceptance criteria", "list", True,
+         "each independently testable (\"the API returns 401 for an expired token\")"),
+        ("users", "Users", "text", False, "who uses it and how"),
+        ("constraints", "Constraints", "text", False, "performance, security, compatibility, deadlines"),
+        ("data_integrations", "Data / integrations", "text", False, "stores, external services, APIs"),
+        ("out_of_scope", "Out of scope", "text", False, "what this explicitly does NOT do"),
+        ("risks", "Risks", "text", False, "what could go wrong; blast radius"),
+    ],
+    "analysis-audit": [
+        ("scope", "Scope", "text", True, "the subsystems / artifacts to examine, enumerated"),
+        ("questions_to_answer", "Questions to answer", "list", True,
+         "the specific questions the analysis must resolve"),
+        ("evidence_standard", "Evidence standard", "text", True,
+         "what counts as proof (re-run commands, primary sources, A-gates)"),
+        ("deliverable_format", "Deliverable format", "text", False, "report shape, length, audience"),
+        ("out_of_scope", "Out of scope", "text", False, "what is explicitly NOT examined"),
+    ],
+    "content": [
+        ("audience", "Audience", "text", True, "who reads it and what they already know"),
+        ("channel_format", "Channel / format", "text", True, "where it runs and in what form"),
+        ("core_message", "Core message", "text", True, "the one thing it must land"),
+        ("voice", "Voice", "text", False, "tone; STYLE-VOICE reference"),
+        ("success_metric", "Success metric", "text", False, "what a win looks like"),
+        ("length", "Length", "text", False, "word/section budget"),
+        ("mandatories_taboos", "Mandatories / taboos", "text", False, "must-include and never-say"),
+    ],
+    "research": [
+        ("research_questions", "Research questions", "list", True,
+         "the questions the research must answer"),
+        ("source_standard", "Source standard", "text", True,
+         "what sources qualify; how claims are verified"),
+        ("output_format", "Output format", "text", True, "report shape, length, citations"),
+        ("depth_breadth", "Depth / breadth", "text", False, "how wide vs how deep"),
+        ("decision_it_informs", "Decision it informs", "text", False,
+         "the decision this research feeds"),
+    ],
+}
+
+
+def spec_slots(family: str) -> list:
+    return SPEC_TEMPLATES.get(family, SPEC_TEMPLATES["content"])
+
+
+def required_slots(family: str) -> list:
+    return [s[0] for s in spec_slots(family) if s[3]]
+
+
+def new_spec(family: str, goal: str = "") -> dict:
+    """An empty spec skeleton for the family, goal pre-filled where the slot
+    exists (software has a 'goal' slot)."""
+    spec = {s[0]: ([] if s[2] == "list" else "") for s in spec_slots(family)}
+    if "goal" in spec and goal:
+        spec["goal"] = goal.strip()[:2000]
+    return spec
+
+
+def _is_filled(value, kind: str) -> bool:
+    if kind == "list":
+        return bool(isinstance(value, list) and any(str(x).strip() for x in value))
+    return bool(str(value or "").strip())
+
+
+def merge_spec(spec: dict, updates: dict, family: str) -> dict:
+    """Merge model/user slot updates into the spec, clamped to the family's
+    known slots and types. List slots accept a list OR a newline/semicolon
+    string; text slots are trimmed."""
+    out = dict(spec or {})
+    kinds = {s[0]: s[2] for s in spec_slots(family)}
+    for k, v in (updates or {}).items():
+        if k not in kinds:
+            continue
+        if kinds[k] == "list":
+            if isinstance(v, str):
+                v = [p.strip() for p in re.split(r"[\n;]+", v) if p.strip()]
+            elif isinstance(v, list):
+                v = [str(x).strip()[:400] for x in v if str(x).strip()][:20]
+            else:
+                continue
+            out[k] = v
+        else:
+            out[k] = str(v or "").strip()[:2000]
+    return out
+
+
+def required_filled(spec: dict, family: str) -> bool:
+    kinds = {s[0]: s[2] for s in spec_slots(family)}
+    return all(_is_filled((spec or {}).get(k), kinds[k]) for k in required_slots(family))
+
+
+def empty_required(spec: dict, family: str) -> list:
+    kinds = {s[0]: s[2] for s in spec_slots(family)}
+    return [k for k in required_slots(family)
+            if not _is_filled((spec or {}).get(k), kinds[k])]
+
+
+def spec_public(spec: dict, family: str) -> list:
+    """Slot rows for the live spec pane: label, value, filled, required, kind."""
+    out = []
+    for key, label, kind, req, hint in spec_slots(family):
+        v = (spec or {}).get(key, [] if kind == "list" else "")
+        out.append({"key": key, "label": label, "kind": kind, "required": bool(req),
+                    "hint": hint, "value": v, "filled": _is_filled(v, kind)})
+    return out
+
+
+def render_spec_md(spec: dict, family: str, goal: str = "") -> str:
+    """The on-disk SPEC.md that travels downstream (Step 8)."""
+    lines = [f"# SPEC — {FAMILY_LABELS.get(family, family)}", ""]
+    if goal:
+        lines += [f"**Goal:** {goal.strip()}", ""]
+    for key, label, kind, req, _hint in spec_slots(family):
+        v = (spec or {}).get(key, [] if kind == "list" else "")
+        star = " *(required)*" if req else ""
+        lines.append(f"## {label}{star}")
+        if kind == "list":
+            items = [str(x).strip() for x in (v or []) if str(x).strip()]
+            lines += ([f"- {it}" for it in items] if items else ["_(not specified)_"])
+        else:
+            lines.append(str(v).strip() or "_(not specified)_")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ─────────────────────────── Interview framing + turn parsing ───────────────────────────
+def interview_framing(family: str, max_q: int, max_turns: int, goal: str) -> str:
+    """Scaffolded system framing for the planning session (LOCKED §3.3/§3.4).
+    The model interviews the operator to fill the template; it asks ONLY for
+    empty/ambiguous required slots, ≤max_q questions/turn with 3–5 ★-marked
+    options, and says READY once required slots are filled."""
+    slots = spec_slots(family)
+    slot_lines = "\n".join(
+        f"- {key} ({'list' if kind == 'list' else 'text'}"
+        f"{', REQUIRED' if req else ', optional'}): {hint}"
+        for key, _label, kind, req, hint in slots)
+    return (
+        "You are the Deep Plan interviewer for the Nexus agent control plane. The operator "
+        f"has a {FAMILY_LABELS.get(family, family)} goal and you are filling a structured SPEC "
+        "by interviewing them — you NEVER do the work, you only elicit requirements and map "
+        "answers into spec slots.\n\n"
+        f"OPERATOR GOAL: {goal.strip()[:1500]}\n\n"
+        "SPEC SLOTS (fill these — required slots gate readiness):\n" + slot_lines + "\n\n"
+        "EVERY reply is ONLY a JSON object, no prose outside it, no code fences:\n"
+        '{"message": "<one short line to the operator>",\n'
+        ' "spec_updates": {"<slot>": <text or list of strings>, ...},\n'
+        f' "questions": [{{"id":"q1","question":str,"why":str,'
+        '"slot":"<which slot this fills>",'
+        '"options":[{"label":str,"recommended":bool}, 3-5 of these]}}],\n'
+        ' "ready": false}\n\n'
+        "RULES:\n"
+        f"- Ask at most {max_q} questions per turn, ONLY for empty or ambiguous REQUIRED "
+        "slots (optional slots: infer a sensible default into spec_updates, don't ask).\n"
+        "- Each question offers 3–5 concrete options; mark EXACTLY ONE recommended:true "
+        "(the best-practice default). The operator may also answer freely.\n"
+        "- Fold everything the operator tells you (this turn and before) into spec_updates, "
+        "mapping each answer to its slot. acceptance_criteria / questions_to_answer / "
+        "research_questions are LISTS of independently-testable strings.\n"
+        f"- After at most {max_turns} turns, OR as soon as every REQUIRED slot is filled, set "
+        '"ready": true, ask NO more questions, and let "message" say the plan is ready to draft.\n'
+        "- Never invent facts the operator must decide (names, prices, dates) — ask or leave "
+        "the slot for them.")
+
+
+def parse_turn(text: str) -> dict:
+    """Extract the interviewer's JSON reply → {message, spec_updates, questions, ready}.
+    Defensive: a non-JSON reply becomes a plain message with no updates."""
+    t = text or ""
+    s, e = t.find("{"), t.rfind("}")
+    data = {}
+    if s != -1 and e != -1:
+        import json as _json
+        try:
+            data = _json.loads(t[s:e + 1])
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    questions = []
+    for q in (data.get("questions") or [])[:6]:
+        if not isinstance(q, dict):
+            continue
+        opts = [{"label": str(o.get("label") or "").strip()[:200],
+                 "recommended": bool(o.get("recommended"))}
+                for o in (q.get("options") or []) if isinstance(o, dict)
+                and str(o.get("label") or "").strip()][:5]
+        if not any(o["recommended"] for o in opts) and opts:
+            opts[0]["recommended"] = True
+        questions.append({
+            "id": str(q.get("id") or f"q{len(questions)+1}")[:20],
+            "question": str(q.get("question") or "").strip()[:400],
+            "why": str(q.get("why") or "").strip()[:300],
+            "slot": str(q.get("slot") or "").strip()[:60],
+            "options": opts})
+    return {
+        "message": str(data.get("message") or (t.strip()[:400] if not data else "")).strip()[:600],
+        "spec_updates": data.get("spec_updates") if isinstance(data.get("spec_updates"), dict) else {},
+        "questions": questions,
+        "ready": bool(data.get("ready")),
+    }
+
+
+def stub_turn(spec: dict, family: str, user_message: str, turns_so_far: int,
+              max_turns: int) -> dict:
+    """Deterministic canned interviewer for the verify gate (plan.stub) — mirrors
+    evals.stub's generation short-circuit. Fills the first empty required slot
+    from the user's message each turn and asks about the next; once all required
+    slots are filled (or the turn cap is hit) it declares READY. No model call."""
+    empties = empty_required(spec, family)
+    updates = {}
+    kinds = {s[0]: s[2] for s in spec_slots(family)}
+    if empties:
+        slot = empties[0]
+        val = (user_message or "").strip() or f"[stub value for {slot}]"
+        updates[slot] = [val] if kinds[slot] == "list" else val
+        remaining = empties[1:]
+    else:
+        remaining = []
+    ready = not remaining or (turns_so_far + 1) >= max_turns
+    if remaining and not ready:
+        nxt = remaining[0]
+        label = next((s[1] for s in spec_slots(family) if s[0] == nxt), nxt)
+        questions = [{"id": "q1", "question": f"[stub] What is the {label}?",
+                      "why": "stub", "slot": nxt,
+                      "options": [{"label": "Option A", "recommended": True},
+                                  {"label": "Option B", "recommended": False}]}]
+        message = f"[PLAN STUB] recorded {list(updates)}, asking about {nxt}"
+    else:
+        questions = []
+        message = "[PLAN STUB] all required slots filled — ready to draft"
+    return {"message": message, "spec_updates": updates,
+            "questions": questions, "ready": bool(ready)}
