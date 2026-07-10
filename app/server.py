@@ -5094,7 +5094,8 @@ _WIZARD_ROLE_LOCK = (
 
 def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
                          super_result: bool = False, fanout: bool = False,
-                         fanout_n: int = 3, pipeline_depth: str = "standard") -> str:
+                         fanout_n: int = 3, pipeline_depth: str = "standard",
+                         spec_block: str = "") -> str:
     # Q3 (acceptance-tests-first): when the setting is on, the spec stage owns an
     # executable acceptance/ suite + RUN.md — the deterministic contract the
     # implementer makes pass and the verifier re-runs. _repair_workflow appends
@@ -5200,6 +5201,7 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
         "- priority: 0 critical, 1 high, 2 normal, 3 low (one value for a whole project)\n"
         "- budget_tokens: null for default (1M); set lower (e.g. 200000) for small tasks\n"
         "- tags: 1-3 short lowercase tags\n\n"
+        + spec_block +
         "PIPELINE TEMPLATES (use the matching one):\n\n"
         "SOFTWARE / CODING (domain software-engineering). Any non-trivial coding goal — a new "
         "app or feature, or anything touching money, auth, or stored data — MUST become this "
@@ -6315,6 +6317,133 @@ async def plan_session_spec_edit(sid: str, body: dict):
     db.execute("UPDATE plan_sessions SET spec_json=?, family=?, updated_at=? WHERE id=?",
                (json.dumps(spec), family, time.time(), sid))
     return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
+
+
+def _plan_draft_raw(spec: dict, family: str, goal: str, uid: str | None,
+                    super_result: bool) -> dict:
+    """Turn the SPEC into a raw wizard plan (before _repair_workflow). Plain def
+    — shipped to a threadpool. plan.stub short-circuits with a canned DAG that
+    still flows through the real repair + criteria-distribution path."""
+    import plan_engine as _pe
+    if db.get_setting("plan.stub", "0") == "1":
+        return _pe.stub_plan(spec, family, goal)
+    spec_md = _pe.render_spec_md(spec, family, goal)
+    spec_block = (
+        "SPEC CONTRACT — this plan MUST satisfy the SPEC below. Distribute EACH "
+        "acceptance criterion onto exactly ONE task as a 'Done when: …' line in that "
+        "task's description; respect out_of_scope; add nothing the SPEC excludes.\n"
+        "<<<SPEC\n" + spec_md + "\nSPEC>>>\n\n")
+    framing = _task_wizard_framing(allow_questions=False, uid=uid,
+                                   super_result=super_result,
+                                   fanout=bool(super_result and sreg.conf("super.fanout_default", "1") == "1"),
+                                   fanout_n=int(sreg.conf("super.fanout_n", "3") or 3),
+                                   spec_block=spec_block)
+    user_msg = ("PLANNING REQUEST. Turn the SPEC in your instructions into the task plan for "
+                "this goal. Reply with ONLY the required JSON object.\n<<<GOAL\n"
+                + goal + "\nGOAL>>>")
+    sid = hd.create_session("nexus:plan-draft", model=db.default_task_model(uid),
+                            system_prompt=_WIZARD_ROLE_LOCK)
+    hd.publish_session_scope(sid, user=uid)
+    hd.publish_session_key(sid, uid, db.default_task_model(uid))
+    try:
+        for _ in (0, 1):
+            res = hd.stream_turn(sid, user_msg, system_message=framing, max_seconds=300)
+            raw = (res.get("content") or "").strip()
+            if res.get("error") or not raw:
+                raise RuntimeError(res.get("error") or "the model returned nothing")
+            s, e = raw.find("{"), raw.rfind("}")
+            if s == -1 or e == -1:
+                continue
+            try:
+                return json.loads(raw[s:e + 1])
+            except Exception:
+                continue
+        raise RuntimeError("draft did not converge on a plan")
+    finally:
+        hd.delete_session(sid)
+
+
+@app.post("/api/plan/sessions/{sid}/draft")
+async def plan_session_draft(sid: str, body: dict):
+    """Draft the DAG from the session's SPEC (Step 6). Seeds the phase-2 wizard
+    framing with the spec, runs _repair_workflow, sets deliverable_type from the
+    family on every task, and returns the proposal for the plan editor (Step 7
+    then annotates it). The proposal reuses the wizard modal — same shape."""
+    import plan_engine as _pe
+    import autopilot as _ap
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    if row.get("status") == "abandoned":
+        return JSONResponse(status_code=409, content={"error": "session was abandoned"})
+    family = row.get("family") or "content"
+    spec = json.loads(row.get("spec_json") or "{}")
+    goal = row.get("goal") or ""
+    uid = row.get("user_id")
+    body = body or {}
+    super_result = bool(body.get("super_result"))
+    spend = _ap.norm_spend(body.get("spend_profile")) if (body.get("spend_profile") or "").strip() else None
+    involvement = _ap.norm_involvement(body.get("autopilot")) if (body.get("autopilot") or "").strip() else None
+    fanout = bool(super_result and sreg.conf("super.fanout_default", "1") == "1")
+    dtype = _pe.FAMILY_DELIVERABLE_TYPE.get(family)
+    try:
+        data = await run_in_threadpool(_plan_draft_raw, spec, family, goal, uid, super_result)
+    except hd.QuotaError:
+        return JSONResponse(status_code=503, content={
+            "error": "GLM is load-shedding right now — try again in a minute"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+
+    spec_md = _pe.render_spec_md(spec, family, goal)
+    if data.get("type") == "workflow" and isinstance(data.get("workflow"), dict):
+        wf = data["workflow"]
+        name = str(wf.get("name") or "").strip()[:120] or (goal[:80] or "Deep Plan project")
+        tasks, repairs = _repair_workflow(wf.get("tasks") or [], name,
+                                          max_raw=(7 if fanout else 5), uid=uid,
+                                          spend_profile=spend)
+        if super_result:
+            incoming = {d for t in tasks for d in (t.get("depends_on_idx") or [])}
+            for i, t in enumerate(tasks):
+                if i not in incoming:
+                    t["super_result"] = True
+        for t in tasks:
+            if dtype and not t.get("deliverable_type"):
+                t["deliverable_type"] = dtype   # family → deliverable_type on every task
+            if involvement:
+                t["autopilot"] = involvement
+            if spend:
+                t["spend_profile"] = spend
+        out = {"type": "workflow", "workflow": {
+            "name": name, "goal": (goal[:500] or name),
+            "domain": wf.get("domain") if wf.get("domain") in _TASK_DOMAINS else None,
+            "super_result": super_result,
+            "autopilot": involvement, "spend_profile": spend,
+            "tasks": tasks}, "assumptions": [], "repairs": repairs}
+    else:
+        repairs = []
+        t = _clamp_wizard_task(data.get("task") or data, repairs, _specialist_names(), uid=uid)
+        if dtype and not t.get("deliverable_type"):
+            t["deliverable_type"] = dtype
+        if super_result:
+            t["super_result"] = True
+        if involvement:
+            t["autopilot"] = involvement
+        if spend:
+            t["spend_profile"] = spend
+        out = {"type": "task", "task": t, "assumptions": [], "repairs": repairs}
+
+    db.execute("UPDATE plan_sessions SET status='drafted', updated_at=? WHERE id=?",
+               (time.time(), sid))
+    for r in repairs:
+        db.log_activity("info", "plan", f"Deep Plan draft auto-repair: {r}", user_id=uid)
+    out["plan_session_id"] = sid
+    out["spec_md"] = spec_md
+    out["family"] = family
+    try:
+        out["triage"] = json.loads(row.get("triage_json") or "null")
+    except Exception:
+        out["triage"] = None
+    return out
 
 
 @app.delete("/api/plan/sessions/{sid}")
