@@ -411,6 +411,7 @@ chk "Q7a UI card rows + expander"    "grep -q 'function autopilotCardsHTML' stat
 chk "Q7b decisions endpoint"         "grep -q '/api/decisions' server.py && grep -q 'def _decision_card_from_approval' server.py"
 chk "Q7b producers attach fields"    "grep -q '\"recommendation\":' hermes_dispatch.py && grep -q 'payload\[.recommendation.\]' loop_engine.py"
 chk "Q7b decisions view + badge"     "grep -q 'function viewDecisions' static/app.js && grep -q 'function updateDecisionBadge' static/app.js && grep -q 'decBadge' static/index.html"
+chk "Q7b one badge + deck + briefing" "grep -q \"loadDecisions(currentView === 'decisions')\" static/app.js && grep -q 'const decisionsSec' static/app.js && grep -q 'def _collect_decision_cards' server.py && grep -q '_collect_decision_cards(uid' server.py"
 chk "Q7b decisions nav item"         "grep -q 'data-view=\"decisions\"' static/index.html"
 chk "Q7b auto-approve-ship guard"    "grep -q 'def _sweep_auto_approve_ship' loop_engine.py && grep -q 'auto_approve_ship_hours' loop_engine.py"
 chk "Q7b P7 admin scope in decisions" "grep -q \"scope='admin'\" server.py"

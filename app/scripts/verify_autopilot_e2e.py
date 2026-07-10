@@ -334,6 +334,24 @@ try:
 except Exception as e:
     chk("Q7b /api/decisions reachable", False)
 
+print("=== Q7b — briefing reads the Decisions surface (3rd judge finding 2) ===")
+# The briefing used to count raw pending approvals; it now reuses
+# _collect_decision_cards (blocking count + headlines). Seed the OLDEST blocking
+# decision so its headline is guaranteed into the briefing's top-2.
+db.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
+           "risk_level, requested_at, user_id) VALUES "
+           "('brf-appr','a','super_result','SR checkpoint',?,'pending','high',?,?)",
+           (json.dumps({"task_id": "brf-t",
+                        "headline": "Super Result checkpoint on Briefing probe alpha."}),
+            1000, uid))
+_cleanup.append(lambda: db.execute("DELETE FROM approvals WHERE id='brf-appr'"))
+try:
+    brf = get("/api/jarvis/briefing").json().get("text", "")
+    chk("Q7b briefing speaks 'decision(s)' + surfaces a blocking headline",
+        "decision" in brf.lower() and "Briefing probe alpha" in brf)
+except Exception:
+    chk("Q7b briefing reachable", False)
+
 print("=== rule 5 — Eco pipeline collapse + high-stakes re-insertion (HTTP) ===")
 coding = [{"title": "Spec", "specialist": "tech-lead-orchestrator", "domain": "software-engineering",
            "depends_on_idx": [], "spend_profile": "eco"},

@@ -306,6 +306,25 @@ granularly. The tree is fully committed.
    reflects them (full_auto/eco) and normalizes a bogus value; `verify.sh` "Q7a defaults wired
    (not dead)" asserts the endpoint + the app.js reader/mutation both exist.
 
+2. **Q7b's binding sentence ("one badge, deck reuses the cards, briefing reads the blocking
+   count + headlines") was undelivered on all three counts.** Confirmed at HEAD:
+   (a) the Agentic nav `#apprBadge` still lit its own approvals count alongside the Decisions
+   `#decBadge` (`updateApprovalBadge` in `app.js` set it from `state.approvals.length`) — two
+   competing human-attention numbers; (b) `jarvisLoadDeck` fetched `/api/approvals?status=pending`
+   and rendered a raw "Approvals · N" section, not the decision cards; (c) `jarvis_briefing`
+   counted raw pending approvals (`SELECT COUNT(*) … approvals`) and never read the Decisions
+   aggregation. **Fix — all three implemented:** (a) `updateApprovalBadge` now keeps `#apprBadge`
+   hidden (element retained for backward-compat) and refreshes the single `#decBadge` whenever
+   approvals change — the Decisions badge is the one number; (b) the deck fetches `/api/decisions`
+   and renders decision cards (blocking dot + headline + ★recommendation; approval-kind cards keep
+   inline ✓/✕, replan-kind cards link into the inbox) under a "Decisions · N" header;
+   (c) the endpoint's aggregation is extracted to `server._collect_decision_cards(uid, admin)`
+   and the briefing now reuses it, speaking the blocking count + top-2 headlines. `app.js?v=83`.
+   **Regression:** `verify_autopilot_e2e.py` "briefing reads the Decisions surface" seeds the
+   oldest blocking decision and asserts the briefing speaks "decision" + surfaces its headline;
+   `verify_autopilot_ui.py` asserts `#apprBadge` never lights while a pending approval shows on
+   `#decBadge`; `verify.sh` "one badge + deck + briefing" asserts the three code markers.
+
 3. **P10(a) binding framing order violated — operator attachments injected before
    DECISIONS/exemplars/predecessors.** Confirmed at HEAD: in `hermes_dispatch.build_framing`
    the `_attachment_lines` block sat right after the STRUCTURED-FACT paragraph (~line 906) —
