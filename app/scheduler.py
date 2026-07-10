@@ -105,13 +105,32 @@ def _trigger(job: dict):
     try:
         tid = f"task-{uuid.uuid4().hex[:8]}"
         now = time.time()
+        # B4: apply the job's task template (Super Result / deliverable type /
+        # autopilot preset / high-stakes / domain) so recurring high-value jobs
+        # get the quality machinery automatically.
+        try:
+            tmpl = json.loads(job.get("task_template") or "{}") or {}
+        except Exception:
+            tmpl = {}
+        dtype = tmpl.get("deliverable_type")
         db.execute(
             "INSERT INTO tasks (id, title, description, status, priority, "
-            "assignee_id, created_at, updated_at, tags, position, user_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "assignee_id, created_at, updated_at, tags, position, user_id, "
+            "super_result, deliverable_type, high_stakes, domain, autopilot, spend_profile) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (tid, f"[scheduled] {job['name']}", job["action"], "todo", 2,
              job.get("agent_id") or None, now, now, json.dumps(["scheduled"]), 0,
-             auth.DEFAULT_USER_ID))
+             auth.DEFAULT_USER_ID,
+             1 if tmpl.get("super_result") else 0, dtype if dtype else None,
+             1 if tmpl.get("high_stakes") else 0, tmpl.get("domain"),
+             tmpl.get("autopilot"), tmpl.get("spend_profile")))
+        if tmpl.get("super_result"):
+            # give the recurring task its Super Result loop, exactly like the API path
+            try:
+                import server as _srv
+                _srv._sync_super_result_loop("task", db.query_one("SELECT * FROM tasks WHERE id=?", (tid,)))
+            except Exception as e:
+                db.log_activity("warn", "scheduler", f"SR loop sync failed for {tid}: {str(e)[:80]}")
         if job.get("agent_id"):
             db.execute("UPDATE agents SET current_task = ? WHERE id = ?",
                        (f"[scheduled] {job['name']}: {job['action']}", job["agent_id"]))
