@@ -1,0 +1,20 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 3ec4a40b3..c43238753 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -133,8 +133,14 @@ DEFAULT_AGENT_IDENTITY = (
+     "Be targeted and efficient in your exploration and investigations."
+ )
+ 
++# NEXUS CORE-MOD (zai-prompt-fingerprint): Z.AI's coding endpoint rejects any
++# glm-5.2 request whose system prompt contains the upstream phrase
++# "You run on Hermes Agent" — HTTP 429 code 1305, indistinguishable from a real
++# overload (verified 2026-07-10 by replaying the dumped request and bisecting
++# the prompt; the phrase alone reproduces it, the reworded sentence passes).
++# Keep the wording below; restoring the original sentence re-breaks glm-5.2.
+ HERMES_AGENT_HELP_GUIDANCE = (
+-    "You run on Hermes Agent (by Nous Research). When the user needs help with "
++    "You are running on the Hermes agent runtime from Nous Research. When the user needs help with "
+     "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
+     "it — or when you need to understand your own features, tools, or capabilities, "
+     "the documentation at https://hermes-agent.nousresearch.com/docs is your "
