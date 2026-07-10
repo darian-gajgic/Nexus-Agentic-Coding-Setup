@@ -190,6 +190,21 @@ function subdivideForPoints(geo) {
   }
   const pairs = [...edges.values()];
   const n = n0 + pairs.length;
+  // density compensation: dots in dense topology regions (lips, eyes, nose)
+  // stack additively and blow out white — dim by local mean edge length
+  const pp = geo.attributes.position.array;
+  const acc = new Float32Array(n0), cnt = new Float32Array(n0);
+  const lens = new Float32Array(pairs.length);
+  pairs.forEach(([a, b], e) => {
+    const l = Math.hypot(pp[a * 3] - pp[b * 3], pp[a * 3 + 1] - pp[b * 3 + 1],
+                         pp[a * 3 + 2] - pp[b * 3 + 2]);
+    lens[e] = l; acc[a] += l; cnt[a]++; acc[b] += l; cnt[b]++;
+  });
+  const med = Float32Array.from(lens).sort()[lens.length >> 1] || 1;
+  const dens = (l) => Math.min(1.2, Math.max(0.3, Math.pow(l / med, 0.8)));
+  const aD = new Float32Array(n);
+  for (let i = 0; i < n0; i++) aD[i] = dens(acc[i] / (cnt[i] || 1));
+  pairs.forEach((_, e) => { aD[n0 + e] = dens(lens[e]); });
   const avg3 = (src) => {
     const out = new Float32Array(n * 3);
     out.set(src.array.subarray(0, n0 * 3));
@@ -209,6 +224,7 @@ function subdivideForPoints(geo) {
     nn[o] /= l; nn[o + 1] /= l; nn[o + 2] /= l;
   }
   out.setAttribute('normal', new THREE.BufferAttribute(nn, 3));
+  out.setAttribute('aD', new THREE.BufferAttribute(aD, 1));
   out.morphAttributes.position = (geo.morphAttributes.position || []).map(
     (m) => new THREE.BufferAttribute(avg3(m), 3));
   out.morphTargetsRelative = true;
@@ -291,12 +307,14 @@ function hologramPointsMaterial() {
 // a single controller write per frame drives occluder + wireframe + dots
 function assembleHologram(baseGeo, ptsGeo, dict) {
   const N = ptsGeo.attributes.position.count;
+  const dA = ptsGeo.attributes.aD;   // density compensation (subdivided path)
   const aSeed = new Float32Array(N), aSize = new Float32Array(N), aB = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     aSeed[i] = Math.random();
     aSize[i] = 0.55 + Math.random() * 0.4;
-    aB[i] = 0.5 + Math.random() * 0.3;
+    aB[i] = (0.5 + Math.random() * 0.3) * (dA ? dA.array[i] : 1);
   }
+  if (dA) ptsGeo.deleteAttribute('aD');
   ptsGeo.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 1));
   ptsGeo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
   ptsGeo.setAttribute('aB', new THREE.BufferAttribute(aB, 1));
@@ -366,6 +384,92 @@ async function buildHologramHead(A) {
     eyes[k] = { geo: bakeGeometry(mesh, toLocal), pos: pvPos };
   }
   return { baseGeo, teethGeo, eyes, dict };
+}
+
+/* ── VisemeController: text-aligned lip sync ──
+   app.js registers a LIVE utterance record per spoken sentence via
+   speak({text,start,end,done}, audioCtx): start/end are AudioContext-clock
+   seconds (or performance-clock when audioCtx is null, e.g. the HTTP WAV
+   fallback) and .end keeps growing as PCM chunks are scheduled. Each frame
+   the Oculus-viseme timeline (vendor lipsync-en, relative units) is
+   stretched over the REAL audio window — it self-corrects as chunks land —
+   and evaluated with attack/release envelopes, then mapped to ARKit
+   blendshapes and gated by the live RMS envelope so true pauses close the
+   mouth even if the text timing drifts. */
+const VISEME_ARKIT = {
+  sil: {},
+  aa: { jawOpen: 0.50 },
+  E:  { jawOpen: 0.22, mouthStretch_L: 0.30, mouthStretch_R: 0.30,
+        mouthSmile_L: 0.12, mouthSmile_R: 0.12 },
+  I:  { jawOpen: 0.12, mouthSmile_L: 0.30, mouthSmile_R: 0.30,
+        mouthStretch_L: 0.20, mouthStretch_R: 0.20 },
+  O:  { jawOpen: 0.40, mouthFunnel: 0.50 },
+  U:  { jawOpen: 0.12, mouthPucker: 0.60, mouthFunnel: 0.20 },
+  PP: { mouthClose: 0.70, mouthPress_L: 0.40, mouthPress_R: 0.40, jawOpen: 0.08 },
+  FF: { mouthRollLower: 0.45, mouthShrugUpper: 0.15, jawOpen: 0.08 },
+  TH: { tongueOut: 0.35, jawOpen: 0.14 },
+  DD: { jawOpen: 0.15, mouthShrugUpper: 0.10 },
+  kk: { jawOpen: 0.14, mouthShrugLower: 0.08 },
+  CH: { mouthFunnel: 0.35, mouthPucker: 0.25, mouthShrugUpper: 0.20, jawOpen: 0.10 },
+  SS: { jawOpen: 0.06, mouthStretch_L: 0.25, mouthStretch_R: 0.25,
+        mouthSmile_L: 0.15, mouthSmile_R: 0.15, mouthPress_L: 0.15, mouthPress_R: 0.15 },
+  nn: { jawOpen: 0.12, mouthPress_L: 0.10, mouthPress_R: 0.10 },
+  RR: { jawOpen: 0.12, mouthPucker: 0.25, mouthFunnel: 0.15 },
+};
+const VIS_ATTACK = 0.05, VIS_RELEASE = 0.12;   // seconds (co-articulation)
+const ss01 = (x) => {
+  const c = Math.min(1, Math.max(0, x));
+  return c * c * (3 - 2 * c);
+};
+
+function utterClock(rec) {
+  return rec.ctx ? rec.ctx.currentTime : performance.now() / 1000;
+}
+
+// returns true when a timed utterance drove the mouth this frame
+function updateVisemes(put) {
+  const q = J.utterQ;
+  if (!q.length || !J.holo || !J.holo.lip) return false;
+  while (q.length) {          // drop finished sentences
+    const r = q[0];
+    if (r.done && (r.start < 0 || utterClock(r) > r.end + 0.3)) q.shift();
+    else break;
+  }
+  const rec = q.find((r) => r.start >= 0 && utterClock(r) >= r.start - VIS_ATTACK
+    && (!r.done || utterClock(r) <= r.end + VIS_RELEASE + 0.1));
+  if (!rec) return false;
+  if (!rec.vt) {
+    try {
+      const lp = J.holo.lip;
+      const vt = lp.wordsToVisemes(lp.preProcessText(rec.text));
+      const n = (vt.visemes || []).length;
+      rec.vt = n ? { v: vt.visemes, ts: vt.times, ds: vt.durations,
+                     total: Math.max(1e-3, vt.times[n - 1] + vt.durations[n - 1]) }
+                 : { v: [] };
+    } catch { rec.vt = { v: [] }; }
+  }
+  const vt = rec.vt;
+  if (!vt.v.length || !(rec.end > rec.start)) return false;
+  const now = utterClock(rec);
+  const scale = (rec.end - rec.start) / vt.total;
+  // live-audio gate: analyser-driven when on the WS graph, full otherwise
+  const gate = rec.ctx ? 0.25 + 0.75 * Math.min(1, J.env) : 1;
+  let any = false;
+  for (let k = 0; k < vt.v.length; k++) {
+    const a = rec.start + vt.ts[k] * scale;
+    const b = a + vt.ds[k] * scale;
+    if (now < a - VIS_ATTACK) break;         // times sorted — rest is future
+    if (now > b + VIS_RELEASE) continue;
+    let w;
+    if (now < a) w = ss01((now - (a - VIS_ATTACK)) / VIS_ATTACK);
+    else if (now <= b) w = 1;
+    else w = 1 - ss01((now - b) / VIS_RELEASE);
+    const m = VISEME_ARKIT[vt.v[k]];
+    if (!m || w <= 0) continue;
+    any = true;
+    for (const name in m) put(name, m[name] * w * gate);
+  }
+  return any;
 }
 
 // degraded-but-visible stand-in if the GLB can't load: ellipsoid lattice
@@ -805,14 +909,20 @@ function tick() {
       if (ix !== undefined) inf[ix] = Math.max(inf[ix], Math.min(1, v));
     };
 
-    // mouth — amplitude envelope on jawOpen (fast attack / slow release,
-    // sibilance narrows); the viseme timeline replaces this in P3
+    // mouth — text-aligned visemes when a timed utterance is active; pure
+    // amplitude fallback otherwise (mic mouthing, unknown text). The RMS
+    // envelope keeps its fast-attack/slow-release shape either way.
     const target = Math.min(1.6, J.level) * (J.mode === 'talking' ? 1 : 0.12)
       * (1 - 0.35 * J.levelHF);
     J.env += (target - J.env) * (target > J.env ? 0.55 : 0.10);
-    put('jawOpen', 0.5 * J.env * (1 - 0.5 * J.levelHF));
-    put('mouthStretch_L', 0.2 * J.levelHF * J.env);
-    put('mouthStretch_R', 0.2 * J.levelHF * J.env);
+    if (!updateVisemes(put)) {
+      put('jawOpen', 0.5 * J.env);
+      put('mouthStretch_L', 0.2 * J.levelHF * J.env);
+      put('mouthStretch_R', 0.2 * J.levelHF * J.env);
+    }
+    // sibilance narrows the aperture on s/sh/f regardless of the driver
+    const jx = dict.jawOpen;
+    if (jx !== undefined) inf[jx] *= 1 - 0.45 * J.levelHF;
 
     // blink — measured human dynamics (Trutoiu et al., Disney Research /
     // ACM TAP 2011): ~80ms accelerating close, brief closure, ~220ms
@@ -1248,4 +1358,20 @@ function setAnimations(on) {
   else if (!on && J.raf) { cancelAnimationFrame(J.raf); J.raf = null; }
 }
 
-window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations, toggleGalaxy };
+// register a LIVE utterance record {text, start, end, done} for viseme lip
+// sync — the caller keeps mutating start/end as audio chunks are scheduled.
+// audioCtx = the WebAudio context whose clock start/end live on (null →
+// performance.now()/1000, used by the HTTP WAV fallback).
+function speak(rec, audioCtx) {
+  if (!rec || !rec.text) return;
+  rec.ctx = audioCtx || null;
+  if (!J.utterQ.includes(rec)) J.utterQ.push(rec);
+}
+// barge-in / stop: drop every queued utterance (the mouth eases shut via
+// the RMS envelope, which collapses when the audio stops)
+function stopSpeech() {
+  J.utterQ = [];
+}
+
+window.Jarvis3D = { mount, dispose, setMode, setLevel, setAnimations,
+                    toggleGalaxy, speak, stopSpeech };
