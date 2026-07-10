@@ -261,3 +261,114 @@ output (verdict REWRITE, valid sentinel JSON, learning_note present).
   tokens + multiple frontier critic runs).
 - **`docs/` spec file**: the plan itself (repo root) is the spec; no separate
   SPEC-SUPER-RESULT.md was created (the plan doesn't ask for one).
+
+---
+
+## Fixes 2026-07-10 — the 9-finding quality batch
+
+Phase 1 of the quality program (`QUALITY-PROGRAM-MASTER-PLAN-2026-07-10.md` §4).
+All 9 findings were re-confirmed present at HEAD before patching. Each fix adds a
+regression check to `app/scripts/verify_super_result_e2e.py` (now **46 checks**,
+was 31). Gates re-run green after the batch: `verify.sh` 300/300 · SR e2e 46/46 ·
+block2 48/48 · block3 33/33.
+
+**BLOCKERS**
+
+1. **Critic reviewed the wrong branch for repo tasks — CONFIRMED, FIXED.**
+   `evals.build_critic_sandbox`: `git clone --local` brings the task branch in
+   only as `refs/remotes/origin/nexus/<slug>` (the branch is born in a linked
+   worktree; the source HEAD stays on base), so `git rev-parse --verify
+   nexus/<slug>` missed it and `git remote remove origin` then discarded the only
+   refs — the critic silently reviewed BASE. Now: verify
+   `refs/remotes/origin/<branch>`, `git checkout -B <branch> origin/<branch>` to
+   materialize a local branch, and record `repo_branch`/`repo_note` correctly —
+   all BEFORE removing the remote. Covered by an UNSTUBBED sandbox test against a
+   scratch repo whose task branch exists only as `origin/nexus/sandbox01`
+   (asserts the sandbox tree contains the branch-only file + `repo_branch`).
+
+2. **`_critic_thread` stranded `critic_verdict='running'` — CONFIRMED, FIXED.**
+   `judge_model_for` ran before any try; the parse block caught only
+   `ValueError`; the comment insert + final UPDATE were unguarded. Now the whole
+   thread body is wrapped in a catch-all that stores `'error'` (guarded `WHERE
+   critic_verdict IS NULL OR ='running'` so a post-store failure keeps the real
+   verdict), and the verdict UPDATE is persisted BEFORE `_insert_critic_comments`.
+   Covered by: content-error → terminal `'error'` (never stranded) + a
+   source-level guard for the catch-all and the verdict-before-insert ordering.
+
+**CRITICAL (premortem P1)**
+
+3. **No frontier backpressure — CONFIRMED, FIXED.** The only headless-Claude
+   spawn sites (`run_judge_cmd`, `run_critic_cmd`) ran unbounded against one
+   subscription. Added `evals._FrontierGate` — a global concurrency cap (new
+   registered setting `frontier.max_concurrent`, default 2; re-reads the limit
+   each acquisition) wrapping both `sp.run` sites — plus quota-vs-content
+   classification (`is_frontier_quota_error`, consulted only when no usable
+   output) and an exponential frontier backoff (`frontier.quota_backoff_until` /
+   `.quota_consecutive`, mirroring `dispatch.*`). On quota: `_critic_thread`
+   clears the verdict (re-critiquable, **never** `'error'`, **never** escalates)
+   and arms the backoff; `_judge_thread` stores `'interrupted'` (re-judgeable)
+   not `'error'`; the loop sweeps skip critic/auto-judge dispatch while the
+   backoff is active. Covered by: 3 parallel critic POSTs observe peak
+   concurrency == 2; an in-process `_FrontierGate` never exceeds its limit; a
+   simulated 429 leaves the task queued (not `'error'`), arms the backoff, and
+   raises no escalation.
+
+**CORRECTNESS**
+
+4. **Truncation dropped the appended reconciler — CONFIRMED, FIXED.**
+   `_repair_workflow` returned `tasks[:7]` AFTER the reconciler/gate appends; a
+   fan-out with `max_raw=7` put the appended reconciler at index 8 → silently
+   dropped, so the critic saw an unreconciled fan-out. The raw input is already
+   capped at `max_raw` at the top of the function, so the second hard cap is
+   removed entirely (`return tasks, repairs`) — mandatory quality gates are never
+   truncated. Covered by: 7 raw fan-out tasks → the appended reconciler survives
+   as the unique sink depending on all 7.
+
+5. **Tasks attached to a super_result workflow inherited no flag — CONFIRMED,
+   FIXED (both doors).** `create_task` inserted only `body.super_result`;
+   `update_task` cascaded only when the flag was explicitly set. Since the
+   inherited-loop sweep requires `tasks.super_result=1`, a member created/attached
+   without the flag never looped. New `_inherit_super_result` helper: when
+   `workflow_id` points at a `super_result=1` workflow and the body doesn't set
+   the flag, the task inherits it (and `_sync_super_result_loop` ensures the
+   project loop carries the trigger). Wired into BOTH `create_task` and
+   `update_task`'s `workflow_id` path. Written fresh — there is NO high_stakes
+   inheritance pattern to mirror. Covered by: create-into-SR-workflow and
+   PATCH-workflow_id-into-SR-workflow both inherit the flag.
+   *Follow-up observation (NOT changed in this batch):* **high_stakes has the
+   symmetric gap** — a task created into / attached to a `high_stakes=1` workflow
+   does not inherit `high_stakes`; only the workflow-PATCH→members cascade
+   (`server.py`, `UPDATE tasks SET high_stakes=? WHERE workflow_id=?`) sets it.
+   Worth fixing the same way in a later batch.
+
+6. **Empty-findings REVISE retried instead of escalating — CONFIRMED, FIXED.**
+   `loop_engine._sweep_super_result`: the `keys and set(keys) <= set(prev)`
+   convergence guard let an empty-`keys` (no findings) REVISE fall through to a
+   retry on an empty brief. Added an explicit branch: empty findings + a
+   non-SHIP verdict is a contradiction → escalate to a human checkpoint. Covered
+   by: an empty-findings REVISE escalates (reason contains "no findings"), no
+   auto-retry.
+
+**POLISH**
+
+7. **No WS broadcast on verdict transitions — CONFIRMED, FIXED.** Added
+   `server.broadcast_threadsafe` (schedules `mgr.broadcast` onto the event loop
+   captured at startup) + `server._broadcast_task_row`, and
+   `loop_engine._broadcast_task`. `_critic_thread` broadcasts `task_updated` on
+   every stored-verdict transition (quota/error/normal/crash); the sweep
+   broadcasts on SHIP; `_escalate_super` broadcasts on every escalation. Covered
+   by a source-level wiring check (WS delivery itself is exercised by the JARVIS
+   UI gate).
+
+8. **Critic endpoint 409 was check-then-act — CONFIRMED, FIXED.** `run_critic`
+   now flips to `'running'` with a CAS `UPDATE ... WHERE id=? AND (critic_verdict
+   IS NULL OR critic_verdict!='running')` and 409s on `rowcount==0`, mirroring
+   `claim_task`. Covered by: two concurrent POSTs → exactly one 200, one 409.
+
+9. **False "Speed mode" reasoning line — CONFIRMED, FIXED.**
+   `loop_engine.design_loop`: when `super_result` suppressed auto-judge, the
+   `elif judge_ok and high_stakes` branch wrongly claimed "Speed mode" even
+   though the user chose quality. Added a super_result-specific branch that says
+   the grounded critic replaces the document-only judge. (Text-only; verified by
+   the existing `super_result flag designed its loop trigger` check exercising
+   the same `design_loop` path.)
