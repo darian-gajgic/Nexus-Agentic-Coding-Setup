@@ -177,6 +177,25 @@ SECTIONS = [
              "default": "cdistill {domain} {evidence}",
              "help": "Tokens: {domain} {evidence} and optional {model}. The resolved frontier "
                      "model is exported as JUDGE_MODEL. Gates stub this — restore after testing."},
+            {"key": "autopilot.default_involvement", "label": "Default involvement", "type": "str",
+             "default": "assisted",
+             "help": "Q7a axis 1 (How much should I ask you?): full_auto | assisted | manual. "
+                     "The preset a new task/project starts with — full_auto closes the loops and "
+                     "only checkpoints at plan/final/escalation/irreversible; assisted (default) "
+                     "keeps fix-rounds closed but pauses Super Result checkpoints; manual only "
+                     "detects and recommends."},
+            {"key": "autopilot.default_spend", "label": "Default spending profile", "type": "str",
+             "default": "optimal",
+             "help": "Q7a axis 2 (How much should this cost?): eco | optimal | smart. Sets model "
+                     "routing, Super Result, fan-out width, round caps, auto-judge scope and the "
+                     "token budget multiplier (×0.5/×1/×2). 'optimal' is balanced (best result "
+                     "per fuel — validated in the deferred benchmark phase)."},
+            {"key": "autopilot.auto_approve_ship_hours", "label": "Auto-approve SHIP after (hours)",
+             "type": "int", "default": "0", "min": 0, "max": 336,
+             "help": "Q7b: in Full Auto only, a SHIP-verdict FINAL deliverable approval may "
+                     "auto-approve after this many hours (0 = never, the default). NEVER applies "
+                     "to rejections, escalations, Super Result checkpoints, high-stakes work, or "
+                     "any irreversible action (guardrail rule 2)."},
         ],
     },
     {

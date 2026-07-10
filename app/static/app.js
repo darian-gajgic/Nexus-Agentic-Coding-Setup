@@ -3263,6 +3263,52 @@ function selectedLoopPref(prefix) {
   return el ? el.value : 'quality';
 }
 
+// Q7a — Autopilot presets: two orthogonal axes as plain-language radio cards.
+// Presets SET the raw knobs; the "Advanced" expander below exposes them and any
+// manual change flips the label to "customized (based on <preset>)". The
+// derived quality/speed preference shows read-only under Advanced (rule 1).
+const AUTOPILOT_DEFAULTS = { involvement: 'assisted', spend: 'optimal' };
+function autopilotCardsHTML(prefix, inv, spend) {
+  inv = inv || AUTOPILOT_DEFAULTS.involvement;
+  spend = spend || AUTOPILOT_DEFAULTS.spend;
+  const card = (name, val, icon, title, body, checked) => `
+    <label class="ap-card" style="flex:1;display:block;padding:9px 11px;border:1px solid ${checked ? 'var(--accent)' : 'rgba(255,255,255,.1)'};border-radius:10px;cursor:pointer">
+      <input type="radio" name="${prefix}-${name}" value="${val}" ${checked ? 'checked' : ''}> <strong>${icon} ${title}</strong>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:3px">${body}</div>
+    </label>`;
+  return `
+    <div class="ap-axis" data-help="autopilot-involvement">
+      <div style="font-size:11.5px;font-weight:600;margin-bottom:4px">How much should I ask you? <span class="qmark" data-help="autopilot-involvement" title="Click for a plain-language explainer">?</span></div>
+      <div style="display:flex;gap:7px">
+        ${card('inv', 'full_auto', '🚀', 'Full Auto', 'I run the loops and only ask you at the big moments (plan, final, escalations, anything irreversible).', inv === 'full_auto')}
+        ${card('inv', 'assisted', '🤝', 'Assisted', 'I close the fix-rounds but pause the inspector checkpoints so you can look before each re-run.', inv === 'assisted')}
+        ${card('inv', 'manual', '🎛', 'Manual', 'I only flag problems and recommend — you press the button on every step.', inv === 'manual')}
+      </div>
+    </div>
+    <div class="ap-axis" data-help="autopilot-spend" style="margin-top:8px">
+      <div style="font-size:11.5px;font-weight:600;margin-bottom:4px">How much should this cost? <span class="qmark" data-help="autopilot-spend" title="Click for a plain-language explainer">?</span></div>
+      <div style="display:flex;gap:7px">
+        ${card('spend', 'eco', '🌱', 'Eco', 'Cheapest that still works — fewest rounds, no fan-out, lean pipeline. ~½ the fuel.', spend === 'eco')}
+        ${card('spend', 'optimal', '⚖', 'Balanced', 'Best result per fuel — checking scaled to the stakes. The sensible default.', spend === 'optimal')}
+        ${card('spend', 'smart', '🧠', 'Smart', 'Spare no fuel — maximum checking, fan-out, the works. ~2× the fuel.', spend === 'smart')}
+      </div>
+    </div>
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer;font-size:11.5px;color:var(--text-dim)">Advanced — raw knobs (for professionals)</summary>
+      <div style="margin-top:6px">
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">Quality/speed is DERIVED from the spending profile (Eco → speed, else quality) and shown here read-only — changing a raw knob marks the loop "customized (based on your preset)".</div>
+        ${loopPrefCardsHTML(prefix)}
+      </div>
+    </details>`;
+}
+
+function selectedAutopilot(prefix) {
+  const inv = document.querySelector(`input[name="${prefix}-inv"]:checked`);
+  const sp = document.querySelector(`input[name="${prefix}-spend"]:checked`);
+  return { autopilot: inv ? inv.value : AUTOPILOT_DEFAULTS.involvement,
+           spend_profile: sp ? sp.value : AUTOPILOT_DEFAULTS.spend };
+}
+
 async function designLoop(kind, opts) {
   const r = await api('POST', '/api/loop/design', Object.assign({ kind }, opts));
   return r.loop_config;
@@ -4573,6 +4619,10 @@ function showTaskModal(status) {
         it verifies. ~5–10× tokens — for work worth being right.</div>
     </div>
     <div class="form-group">
+      <label class="form-label">🎚 Autopilot — how hands-on, and how much to spend</label>
+      ${autopilotCardsHTML('m-task')}
+    </div>
+    <div class="form-group">
       <label class="form-label">Tags (comma-separated)</label>
       <input class="form-input" id="m-task-tags" placeholder="bug, urgent">
     </div>
@@ -4679,6 +4729,7 @@ async function submitTask() {
   const title = $('#m-task-title').value.trim();
   if (!title) return;
   const tags = ($('#m-task-tags').value || '').split(',').map(t => t.trim()).filter(Boolean);
+  const ap = selectedAutopilot('m-task');
   let loopCfg = null;
   if ($('#m-task-loop') && $('#m-task-loop').checked) {
     try {
@@ -4691,6 +4742,7 @@ async function submitTask() {
           specialist: $('#m-task-specialist') ? ($('#m-task-specialist').value || null) : null,
           high_stakes: $('#m-task-highstakes') ? $('#m-task-highstakes').checked : false,
           super_result: $('#m-task-super') ? $('#m-task-super').checked : false,
+          autopilot: ap.autopilot, spend_profile: ap.spend_profile,
         },
       });
     } catch (e) { toast('Loop design failed (task created without loop): ' + e.message, 'err'); }
@@ -4710,6 +4762,7 @@ async function submitTask() {
     specialist: $('#m-task-specialist') ? ($('#m-task-specialist').value || null) : null,
     high_stakes: $('#m-task-highstakes') ? $('#m-task-highstakes').checked : false,
     super_result: $('#m-task-super') ? $('#m-task-super').checked : false,
+    autopilot: ap.autopilot, spend_profile: ap.spend_profile,
     budget_tokens: $('#m-task-budget') && $('#m-task-budget').value ? parseInt($('#m-task-budget').value) : null,
     model: $('#m-task-model') ? ($('#m-task-model').value || null) : null,
     // exactly once (a duplicate key silently overwrote the focused project
@@ -9177,6 +9230,10 @@ function proposeWorkflowModal(wf, meta) {
         ~5–10× tokens: independent verification rounds + fan-out. ${tasks.some(t => t.super_result) ? 'This plan already fans out with a reconciler where useful.' : ''}</div>
     </div>
     <div class="form-group" style="margin-top:8px">
+      <label class="form-label">🎚 Autopilot — how hands-on, and how much to spend</label>
+      ${autopilotCardsHTML('wf', wf.autopilot, wf.spend_profile)}
+    </div>
+    <div class="form-group" style="margin-top:8px">
       <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
       <div class="form-hint" style="margin-bottom:6px">${LOOP_INTRO_SHORT}</div>
       <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="wf-loop" ${isCoding ? 'checked' : ''}
@@ -9260,6 +9317,7 @@ function proposeWorkflowModal(wf, meta) {
     if (!projSuper) finalTasks.forEach(t => { t.super_result = false; });
     const projClient = $('#wf-client') ? ($('#wf-client').value.trim().toLowerCase() || null) : null;
     const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
+    const projAp = selectedAutopilot('wf');  // Q7a: two preset axes for the project
     const DEV_SPECIALISTS = new Set(['code-implementer', 'tech-lead-orchestrator',
       'code-reviewer', 'acceptance-verifier', 'debugger']);
     let wfLoop = null;
@@ -9273,6 +9331,7 @@ function proposeWorkflowModal(wf, meta) {
             specialists: finalTasks.map(t => t.specialist).filter(Boolean),
             high_stakes: projHigh || finalTasks.some(t => t.high_stakes),
             super_result: projSuper,
+            autopilot: projAp.autopilot, spend_profile: projAp.spend_profile,
           },
         });
       } catch (e) { toast('Loop design failed (project created without loop): ' + e.message, 'err'); }
@@ -9281,6 +9340,7 @@ function proposeWorkflowModal(wf, meta) {
       const w = await api('POST', '/api/workflows',
         { name: wf.name, goal: wf.goal, domain: wf.domain, loop_config: wfLoop,
           high_stakes: projHigh, client: projClient, super_result: projSuper,
+          autopilot: projAp.autopilot, spend_profile: projAp.spend_profile,
           project_path: repo || (focusCtx.project && focusCtx.project.path) || null });
       const ids = [];
       for (const t of finalTasks) {
@@ -9290,6 +9350,7 @@ function proposeWorkflowModal(wf, meta) {
           high_stakes: projHigh || !!t.high_stakes, model: t.model || null,
           super_result: !!t.super_result,
           deliverable_type: t.deliverable_type || null,
+          autopilot: projAp.autopilot, spend_profile: projAp.spend_profile,
           budget_tokens: t.budget_tokens || null, tags: t.tags || [],
           workflow_id: w.id,
           // repo-native: coding stages work inside the chosen repo (they
