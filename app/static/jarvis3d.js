@@ -1,12 +1,12 @@
 /* JARVIS 3D v7 — holographic head (2026-07-10).
 
-   A violet point-lattice hologram in the style of the operator's reference
+   A cyan point-lattice hologram bust (head + neck/shoulder torso) in the style of the operator's reference
    clip: the three.js "facecap" head (model by Face Cap —
    bannaflak.com/face-cap; texture + baked clips stripped offline by
    scripts/build_facecap_hologram.py) with all 52 ARKit blendshapes,
    rendered three ways off ONE shared geometry:
      occluder  — near-black Mesh (+teeth): hides the far side → reads solid
-     wireframe — faint additive violet lattice (the hologram "grid")
+     wireframe — faint additive cyan lattice (the hologram "grid")
      points    — morph-aware ShaderMaterial dots: fresnel rim, per-dot
                  twinkle, scanline shimmer, rare glitch flicker
    All three share ONE morphTargetInfluences array (r160 texture-based
@@ -71,12 +71,12 @@ function emptyMem() {
            marker: null, panel: null, hint: null };
 }
 
-// RGB multipliers on the violet hologram base (>1 amplifies into bloom)
+// RGB multipliers on the cyan hologram base (>1 amplifies into bloom)
 const MODE_TINT = {
-  idle:      [1.00, 0.95, 1.15],
-  listening: [0.75, 1.15, 1.05],   // toward --accent-2 teal
-  thinking:  [1.25, 1.10, 1.45],   // lit-up electric violet
-  talking:   [1.10, 1.00, 1.30],
+  idle:      [1.00, 0.98, 1.05],
+  listening: [0.85, 1.12, 0.92],   // toward --accent-2 teal
+  thinking:  [1.30, 1.15, 1.30],   // lit-up electric cyan
+  talking:   [1.15, 1.05, 1.15],   // cyan-white
 };
 
 let _glowTex = null;
@@ -98,16 +98,16 @@ function glowTexture() {
 /* ═══════════ hologram head (facecap GLB, ARKit-52 morphs) ═══════════ */
 
 const D2R = Math.PI / 180;
-const HOLO_WIRE = 0x5b3fd6, HOLO_OCC = 0x05060f, HOLO_EYE = 0x0b0e1f,
-      HOLO_GLINT = 0xb9a5ff, HOLO_BG = 0x05050c;
+const HOLO_WIRE = 0x1595b0, HOLO_OCC = 0x05060f, HOLO_EYE = 0x0b0e1f,
+      HOLO_GLINT = 0x9df5ff, HOLO_BG = 0x05050c;
 // the fit anchors on the EYES (the perceptual center of a face), not the
 // bbox: facecap's cranium is deep and tall, so bbox-anchoring drops the
-// face out of frame. Fitted: crown ≈ +13, mouth ≈ −12, neck cut ≈ −21
-// (the dots fade out above the cut — floating-head hologram, like the
-// reference clip; frame shows y ≈ −33..41 at z=0)
-const HEAD_H = 44;          // world height of the fitted head bbox
-const EYE_Y = 0, EYE_Z = 3;   // world anchor for the eye midpoint
-const FADE_Y = [-23, -14];  // dot brightness fades to 0 toward the neck cut
+// face out of frame. The head sits ON a procedural torso (neck+shoulders)
+// that rises from the frame bottom and dissolves at the lower edge
+// (frame shows y ≈ −33..41 at z=0)
+const HEAD_H = 53;          // world height of the fitted head bbox
+const EYE_Y = -2, EYE_Z = 3;  // world anchor for the eye midpoint
+const FADE_Y = [-40, -33];  // the bust dissolves at the frame bottom edge
 const POINT_SUBDIV = true;  // midpoint-subdivide the dot lattice (2.7k → ~10.4k)
 
 let addonsPromise = null;
@@ -237,8 +237,11 @@ function deindexForPoints(geo) {
   const out = new THREE.BufferGeometry();
   out.setAttribute('position', geo.attributes.position);
   out.setAttribute('normal', geo.attributes.normal);
-  out.morphAttributes.position = geo.morphAttributes.position || [];
-  out.morphTargetsRelative = true;
+  const mp = geo.morphAttributes.position;
+  if (mp && mp.length) {   // an EMPTY morph array still trips USE_MORPHTARGETS
+    out.morphAttributes.position = mp;
+    out.morphTargetsRelative = true;
+  }
   return out;
 }
 
@@ -260,8 +263,8 @@ function hologramPointsMaterial() {
     uniforms: {
       uTime: { value: 0 }, uSize: { value: 1.05 }, uScale: { value: 1000 },
       uOpacity: { value: 0.8 }, uGlitch: { value: 1 },
-      // base hologram violet (#8a6bff); MODE_TINT multiplies on top
-      uBase: { value: new THREE.Vector3(0.54, 0.42, 1.0) },
+      // base hologram cyan (the pre-v7 avatar color); MODE_TINT multiplies
+      uBase: { value: new THREE.Vector3(0.30, 0.85, 1.0) },
       uTint: { value: new THREE.Vector3(...MODE_TINT.idle) },
       uFade: { value: new THREE.Vector2(FADE_Y[0], FADE_Y[1]) },
     },
@@ -303,21 +306,26 @@ function hologramPointsMaterial() {
   });
 }
 
-// the three renderables off one geometry, sharing ONE influences array —
-// a single controller write per frame drives occluder + wireframe + dots
-function assembleHologram(baseGeo, ptsGeo, dict) {
+// per-dot attributes for the hologram point shader (dim = brightness scale)
+function dressPoints(ptsGeo, dim) {
   const N = ptsGeo.attributes.position.count;
   const dA = ptsGeo.attributes.aD;   // density compensation (subdivided path)
   const aSeed = new Float32Array(N), aSize = new Float32Array(N), aB = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     aSeed[i] = Math.random();
     aSize[i] = 0.55 + Math.random() * 0.4;
-    aB[i] = (0.5 + Math.random() * 0.3) * (dA ? dA.array[i] : 1);
+    aB[i] = (0.5 + Math.random() * 0.3) * (dA ? dA.array[i] : 1) * (dim || 1);
   }
   if (dA) ptsGeo.deleteAttribute('aD');
   ptsGeo.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 1));
   ptsGeo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
   ptsGeo.setAttribute('aB', new THREE.BufferAttribute(aB, 1));
+}
+
+// the three renderables off one geometry, sharing ONE influences array —
+// a single controller write per frame drives occluder + wireframe + dots
+function assembleHologram(baseGeo, ptsGeo, dict) {
+  dressPoints(ptsGeo, 1);
   const occ = new THREE.Mesh(baseGeo, new THREE.MeshBasicMaterial({
     color: HOLO_OCC, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
   }));
@@ -383,7 +391,8 @@ async function buildHologramHead(A) {
       .makeTranslation(-pvPos.x, -pvPos.y, -pvPos.z).multiply(fit);
     eyes[k] = { geo: bakeGeometry(mesh, toLocal), pos: pvPos };
   }
-  return { baseGeo, teethGeo, eyes, dict };
+  const halfW = (bb.max.x - bb.min.x) / 2 * s;   // head half-width, world
+  return { baseGeo, teethGeo, eyes, dict, halfW };
 }
 
 /* ── VisemeController: text-aligned lip sync ──
@@ -541,6 +550,70 @@ function updateGaze(t, put) {
   else { put('eyeLookOut_L', 0.6 * Math.min(1, -h)); put('eyeLookIn_R', 0.6 * Math.min(1, -h)); }
 }
 
+/* ── procedural torso: neck + shoulders under the head (hologram bust) ──
+   Parametric grids in the old sculpt's proportions, sized off the fitted
+   head half-width; each surface renders as occluder + wireframe lattice +
+   dots like the head (static — no morphs). The dots share the head's fade
+   so the bust dissolves at the frame bottom. */
+function torsoSurfaceGeo(fn, nu, nv) {
+  const pos = [];
+  for (let i = 0; i <= nu; i++) {
+    for (let j = 0; j <= nv; j++) pos.push(...fn(i / nu, j / nv));
+  }
+  const idx = [];
+  for (let i = 0; i < nu; i++) {
+    for (let j = 0; j < nv; j++) {
+      const a = i * (nv + 1) + j, b = a + 1, c = a + nv + 1, d = c + 1;
+      idx.push(a, b, c, b, d, c);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(pos), 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function buildTorso(halfW, occMat, wireMat) {
+  const zc = -0.15 * halfW;           // torso axis sits behind the face
+  const neck = (u, v) => {            // top rim tucks INSIDE the jaw
+    const a = u * 2 * Math.PI;        // silhouette, widening downward
+    const rx = (0.33 + 0.23 * v) * halfW, rz = (0.32 + 0.19 * v) * halfW;
+    return [Math.sin(a) * rx, EYE_Y - 9 - v * 17, Math.cos(a) * rz + zc];
+  };
+  const shoulder = (u, v) => {        // superellipse slab, trapezius slope
+    const a = u * 2 * Math.PI;
+    const sl = ss01(v * 2);
+    const hw = (0.62 + 1.13 * sl) * halfW;
+    const dp = (0.50 + 0.22 * sl) * halfW;
+    const sA = Math.sin(a), cA = Math.cos(a);
+    const r = 1 / Math.max(1e-4,
+      Math.pow(Math.pow(Math.abs(sA / hw), 3) + Math.pow(Math.abs(cA / dp), 3), 1 / 3));
+    return [sA * r, EYE_Y - 22 - v * 19, cA * r * 0.92 + zc];
+  };
+  const parts = [], ptsMat = hologramPointsMaterial();
+  for (const { fn, nu, nv, wnu, wnv } of [
+    { fn: neck, nu: 30, nv: 20, wnu: 22, wnv: 12 },
+    { fn: shoulder, nu: 72, nv: 30, wnu: 48, wnv: 16 },
+  ]) {
+    // dots on a DENSE grid (the sparse torso read as a hole next to the
+    // 10k-dot head); the wireframe lattice stays coarser for the grid look
+    const dotGeo = torsoSurfaceGeo(fn, nu, nv);
+    const wireGeo = torsoSurfaceGeo(fn, wnu, wnv);
+    const occ = new THREE.Mesh(wireGeo, occMat);
+    occ.renderOrder = 0;
+    const wire = new THREE.Mesh(wireGeo, wireMat);
+    wire.renderOrder = 1;
+    const pg = deindexForPoints(dotGeo);
+    dressPoints(pg, 1.15);
+    const pts = new THREE.Points(pg, ptsMat);
+    pts.renderOrder = 2;
+    pts.userData.dotGeo = dotGeo;   // disposed with the part
+    parts.push(occ, wire, pts);
+  }
+  return { parts, ptsMat };
+}
+
 // degraded-but-visible stand-in if the GLB can't load: ellipsoid lattice
 // (no morphs — the mouth/eye controllers no-op on the empty dict)
 function buildFallbackHead() {
@@ -549,6 +622,7 @@ function buildFallbackHead() {
   geo.translate(0, -12, 0);
   geo.computeVertexNormals();
   const h = assembleHologram(geo, deindexForPoints(geo), {});
+  h.torso = buildTorso(12.5, h.occ.material, h.wire.material);
   console.warn('Jarvis3D: procedural fallback head active (GLB unavailable)');
   return h;
 }
@@ -813,7 +887,8 @@ function buildMemoryGalaxy(data) {
       for (let s = 0; s < 3; s++) {
         const dimS = s === 1 ? 1 : 0.55;         // soft beam edges
         const o = k * 18 + s * 6;
-        acol[o] = 0.14 * dimS; acol[o + 1] = 0.50 * dimS; acol[o + 2] = 0.62 * dimS;
+        // BOTH ends carry the memory node's identity hue (head end dimmer)
+        acol[o] = c.r * 0.6 * dimS; acol[o + 1] = c.g * 0.6 * dimS; acol[o + 2] = c.b * 0.6 * dimS;
         acol[o + 3] = c.r * dimS; acol[o + 4] = c.g * dimS; acol[o + 5] = c.b * dimS;
       }
     });
@@ -1030,8 +1105,16 @@ function tick() {
     tc.z += (tint[2] - tc.z) * 0.05;
     u.uSize.value = 1.05 + Math.min(0.35, J.level * 0.25)
       + (J.mode === 'thinking' ? Math.sin(t * 5) * 0.07 : 0);
-    // the wireframe lattice follows the tint (#5b3fd6 × tint)
-    J.holo.wire.material.color.setRGB(0.357 * tc.x, 0.247 * tc.y, 0.839 * tc.z);
+    // the wireframe lattice follows the tint (dim cyan × tint)
+    J.holo.wire.material.color.setRGB(0.082 * tc.x, 0.513 * tc.y, 0.578 * tc.z);
+    // the torso dots ride the same uniforms (separate material — no morphs)
+    if (J.holo.torso) {
+      const tm = J.holo.torso.ptsMat.uniforms;
+      tm.uTime.value = t;
+      tm.uGlitch.value = u.uGlitch.value;
+      tm.uSize.value = u.uSize.value;
+      tm.uTint.value.copy(tc);
+    }
 
     // the glints slip under the closing lid
     const gvis = (1 - lid) * (1 - lid);
@@ -1103,12 +1186,12 @@ function tick() {
         for (let s = 0; s < 3; s++) {
           const off = s - 1;                     // −1, 0, +1
           const o = k * 18 + s * 6;
-          ap[o]     = anchor.x + off * 0.6 * px;
-          ap[o + 1] = anchor.y + off * 0.6;
-          ap[o + 2] = anchor.z + off * 0.6 * pz;
-          ap[o + 3] = w[0] + off * 55 * px;
-          ap[o + 4] = w[1] + off * 55;
-          ap[o + 5] = w[2] + off * 55 * pz;
+          ap[o]     = anchor.x + off * 0.9 * px;   // ×1.5 beam thickness
+          ap[o + 1] = anchor.y + off * 0.9;
+          ap[o + 2] = anchor.z + off * 0.9 * pz;
+          ap[o + 3] = w[0] + off * 82 * px;
+          ap[o + 4] = w[1] + off * 82;
+          ap[o + 5] = w[2] + off * 82 * pz;
         }
       });
       mem.avatarLinks.geometry.attributes.position.needsUpdate = true;
@@ -1288,6 +1371,9 @@ async function mount(container, opts) {
         holo.eyePivots[k] = pv;
       }
       holo.lip = new A.LipsyncEn();
+      // the head sits ON a torso rising from the frame bottom (like the
+      // pre-v7 bust); occluder + wireframe share the head materials
+      holo.torso = buildTorso(built.halfW, holo.occ.material, holo.wire.material);
       J.holo = holo;
     } catch (e) {
       console.warn('Jarvis3D: hologram head failed — using fallback lattice', e);
@@ -1303,8 +1389,9 @@ async function mount(container, opts) {
   // are sized in device pixels from the drawing-buffer height and the fov
   J.setPtScale = () => {
     if (!J.head || !J.renderer) return;
-    J.head.material.uniforms.uScale.value =
-      J.renderer.domElement.height / (2 * Math.tan(23 * D2R));
+    const sc = J.renderer.domElement.height / (2 * Math.tan(23 * D2R));
+    J.head.material.uniforms.uScale.value = sc;
+    if (J.holo && J.holo.torso) J.holo.torso.ptsMat.uniforms.uScale.value = sc;
   };
   J.setPtScale();
 
@@ -1312,6 +1399,7 @@ async function mount(container, opts) {
   J.headGroup.add(J.holo.occ, J.holo.wire, J.holo.pts);
   if (J.holo.teeth) J.headGroup.add(J.holo.teeth);
   if (J.holo.eyePivots) J.headGroup.add(J.holo.eyePivots.L, J.holo.eyePivots.R);
+  if (J.holo.torso) J.headGroup.add(...J.holo.torso.parts);
   J.scene.add(J.headGroup);
 
   // post: bloom halo — RenderPass → UnrealBloomPass (half-res) → OutputPass.
@@ -1388,6 +1476,10 @@ function dispose() {
         if (pv) pv.traverse((o) => {
           try { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); } catch { }
         });
+      }
+      if (J.holo.torso) {
+        for (const o of J.holo.torso.parts) { try { o.geometry.dispose(); } catch { } }
+        try { J.holo.torso.ptsMat.dispose(); } catch { }
       }
     } catch { }
     J.holo = null;

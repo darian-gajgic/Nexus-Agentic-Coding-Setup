@@ -1510,7 +1510,7 @@ code, pre, .mono { font-family: var(--font-mono); }
 }
 .jv2-chip.mode-listening { color:var(--accent-2); border-color:var(--accent-2); }
 .jv2-chip.mode-thinking { color:#fbbf24; border-color:#fbbf24; }
-.jv2-chip.mode-talking { color:#c4b5fd; border-color:#7c5cff; }
+.jv2-chip.mode-talking { color:#9df5ff; border-color:#22d3ee; }
 .jv2-btn {
   font-size:11px; padding:4px 10px; border-radius:12px; border:1px solid var(--border);
   background:rgba(10,10,22,.55); color:var(--text-dim); cursor:pointer;
