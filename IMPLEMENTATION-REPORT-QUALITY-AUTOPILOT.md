@@ -184,3 +184,24 @@ $ app/.venv/bin/python scripts/verify_jarvis_e2e.py       → ALL CHECKS PASS   
 The independent judge should re-run all of the above personally; `verify_jarvis_v2_backend.py`
 (heavy SDXL/vision, GPU-contended) was not run in this headless pass — the framing change was
 verified via clean boot + the lighter Playwright JARVIS gate instead (recorded honestly).
+
+## Post-verification fix (Block 2 regression caught by the full gate sweep)
+
+The program runner's end-of-phase sweep ran the fuller gate suite (which the recorded run above
+did not include) and `verify_block2_e2e.py` came back **47 passed, 1 failed** on the check
+*"owner list: own + shared visible, foreign invisible."* Root cause was a **pre-existing latent
+bug, not a Quality Autopilot regression**: `GET /api/memory` scrolled qdrant with a single fixed
+`limit=500` page and never followed `next_page_offset`, so once the live `mem0` collection grew
+past 500 points (now 760) any memory whose id landed in the untouched tail silently vanished from
+the list. The gate's freshly-seeded probe points (random UUIDs) fell into that tail ~a third of
+the time, and needing *both* the owned and the shared probe visible made the failure land reliably.
+
+**Fix** (`server.py::get_memory`, commit `77b8fe5`): paginate the scroll — follow
+`next_page_offset` to the end, hard-stopped at 200 pages (100k points) against a runaway cursor.
+Strictly additive to the response (returns all memories instead of the first page); the per-user
+tag filter is unchanged. Verified:
+
+```
+$ app/.venv/bin/python scripts/verify_block2_e2e.py      → 48 passed, 0 failed   (stable across repeated runs)
+$ bash app/scripts/verify.sh                             → ALL CHECKS PASSED: 373/373   (pre-commit hook)
+```
