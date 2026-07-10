@@ -539,9 +539,19 @@ def _sweep_super_result(actions_left: int) -> int:
         except Exception:
             ck = {}
         keys, prev = ck.get("keys") or [], ck.get("prev") or []
+        # An empty-findings REVISE/REWRITE is a contradiction: the critic asked
+        # for rework but named nothing to act on, so a retry would loop on an
+        # empty brief. Escalate rather than burn rounds. (The old convergence
+        # guard's `keys and …` let empty findings fall through to retry — §7.)
+        if not keys:
+            if _escalate_super(t, trig, per_task,
+                               "critic did not SHIP but returned no findings — "
+                               "contradiction; human judgment needed"):
+                _save_cfg(owner_kind, owner_id, cfg)
+            continue
         # keys ⊆ prev also catches "critic repeats itself because the executor
         # failed to fix it" — correct behavior is a human checkpoint (§7).
-        if int(t.get("critic_round") or 0) > 1 and keys and set(keys) <= set(prev):
+        if int(t.get("critic_round") or 0) > 1 and set(keys) <= set(prev):
             if _escalate_super(t, trig, per_task,
                                "no new findings — the rework did not resolve them; "
                                "human judgment needed"):
