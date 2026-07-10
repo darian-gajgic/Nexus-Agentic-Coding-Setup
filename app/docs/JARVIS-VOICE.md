@@ -54,7 +54,7 @@ loaded Wav2Lip onto the shared 12 GB GPU when hit; lipsync.py stays on disk
 but nothing reaches it). The v2 stack:
 
 - **Avatar (v7 HOLOGRAM, 2026-07-10 — HOLOGRAM-AVATAR-PLAN-2026-07-09.md)**
-  = violet point-lattice hologram head: the three.js "facecap" model with
+  = cyan point-lattice hologram head: the three.js "facecap" model with
   ALL 52 ARKit blendshapes (model by Face Cap — bannaflak.com/face-cap, no
   explicit upstream model license; credit kept in jarvis3d.js + the build
   script; clean-license drop-in = a Ready Player Me GLB). The upstream GLB
@@ -76,9 +76,15 @@ but nothing reaches it). The v2 stack:
   1.0 — a low threshold blooms the head to a white ball) → OutputPass.
   Fit anchors on the EYE PIVOTS (grp_eyeLeft/Right), NOT the bbox — the
   cranium is deep/tall and bbox-anchoring drops the face out of frame
-  (HEAD_H 44, eye mid → (0, 0, +3), face +z, auto-flip if authored -z).
-  Eyes are separate meshes under rotatable pivot Groups; glints are pivot
-  children (they ride the gaze). Fallback = procedural ellipsoid lattice
+  (HEAD_H 53, eye mid → (0, −2, +3), face +z, auto-flip if authored -z).
+  The head sits ON a PROCEDURAL TORSO (buildTorso: neck tucked inside the
+  jaw + superellipse trapezius shoulders, sized off the head half-width;
+  dense dot grids + coarser wireframe grids; own points material synced to
+  the head uniforms each tick) that rises from the frame bottom and
+  dissolves at the lower edge (FADE_Y). Eyes are separate meshes under
+  rotatable pivot Groups; glints are pivot children (they ride the gaze).
+  Avatar→memory links: 3-strand beams, BOTH ends tinted per memory node
+  hue, ×1.5 spread. Fallback = procedural ellipsoid lattice + torso
   (no morphs) + console.warn if the GLB fails.
   **Lip sync = TEXT-ALIGNED VISEMES (no backend change):** app.js keeps a
   LIVE per-sentence utterance record {text,start,end,done} on the
@@ -106,7 +112,7 @@ but nothing reaches it). The v2 stack:
   listening = locked-on + eyeWide + roll tilt, talking = env-correlated
   micro-nods + brow pulses. Idle = breathing + subtle sway, ALWAYS faces
   the user (no turntable — operator decision 2026-07-09). MODE_TINT are
-  multipliers on the violet base uBase #8a6bff (>1 amplifies into bloom).
+  multipliers on the cyan base uBase (0.30, 0.85, 1.0) (>1 amplifies into bloom).
   **Vendored runtime deps (no build step):** `static/vendor/threejsm/`
   (13 r160 jsm addons, bare 'three' rewritten to the exact core CDN URL —
   ONE shared THREE instance; never /+esm) + `static/vendor/lipsync/` —
