@@ -382,22 +382,10 @@ def _derive_client(client, repo_path):
 
 def _autopilot_fields(autopilot, spend_profile, high_stakes: bool,
                       explicit_budget: Optional[int]):
-    """Q7a: normalise the two preset axes and apply the budget multiplier (rule 4).
-    Returns (autopilot|None, spend_profile|None, effective_budget). NULL axes =
-    legacy behaviour (P10b): no derivation, explicit budget untouched."""
+    """Q7a rule-4 derivation — delegates to autopilot.preset_fields (D5), the
+    single implementation shared with scheduler._trigger's B4 template jobs."""
     import autopilot as _ap
-    inv = _ap.norm_involvement(autopilot) if (autopilot or "").strip() else None
-    sp = _ap.norm_spend(spend_profile) if (spend_profile or "").strip() else None
-    budget = explicit_budget
-    if sp and explicit_budget is None:
-        # rule 4: scale the per-task DEFAULT budget with the profile (the hard
-        # cost backstop must move with the spend axis).
-        try:
-            base = int(db.get_setting("dispatch.default_task_budget", "5000000") or 5000000)
-            budget = _ap.derive(inv, sp, high_stakes=bool(high_stakes), base_budget=base)["budget"]
-        except Exception:
-            budget = explicit_budget
-    return inv, sp, budget
+    return _ap.preset_fields(autopilot, spend_profile, high_stakes, explicit_budget)
 
 
 class TaskUpdate(BaseModel):
@@ -7319,6 +7307,14 @@ async def update_workflow(wf_id: str, body: dict):
         db.log_activity("info", "system",
                         f"Workflow {wf_id}: autopilot preset applied to all member tasks")
         _regen_loop_for_profile("workflow", db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+        # [11]: members carrying their OWN loop_config re-derive too — the
+        # task-PATCH path does this, and without it a Smart→Eco project switch
+        # left member loops burning Smart-level rounds/judge scope. Budgets are
+        # NOT re-derived (rule 4 is creation-only, matching the task-PATCH path).
+        for _member in db.query_all(
+                "SELECT * FROM tasks WHERE workflow_id=? AND loop_config IS NOT NULL",
+                (wf_id,)):
+            _regen_loop_for_profile("task", _member)
     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
 
 
