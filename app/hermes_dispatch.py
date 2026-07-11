@@ -1197,8 +1197,15 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     harvest_decisions(task, content)  # Q4: append this stage's ## Decisions to the project log
     rubric, learn = parse_deliverable_meta(content)
     new_status = "review" if task.get("high_stakes") else "done"
+    # The completed rework consumed its feedback — clear it. Left set, a later
+    # unrelated re-dispatch still opens with a stale "This is a RETRY" block,
+    # exemplar injection stays suppressed for the task's lifetime, and (since
+    # previous feedback outranks judge findings in _retry_task) a reject
+    # without comment would resend THIS round's feedback instead of the newest
+    # judge report. Failed dispatches keep it: their next attempt needs it.
     fields = dict(dispatch_state="completed", result_summary=content[:4000],
-                  rubric_score=rubric, learn_section=learn, status=new_status)
+                  rubric_score=rubric, learn_section=learn, status=new_status,
+                  retry_feedback=None)
     if new_status == "done":
         fields["completed_at"] = time.time()
     _set_task(task_id, **fields)
