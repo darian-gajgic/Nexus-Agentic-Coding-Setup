@@ -277,6 +277,33 @@ chk("L2 user_overlay delta routed to the user's overlay dir",
     and "Warmer tone" in open(os.path.join(scratch, "users", "u_member", "STYLE-VOICE.md")).read())
 chk("Q2 consumed evidence marked distilled", lessons_mod.count_new_evidence("marketing") == 0)
 
+# [20] bugfix 2026-07-12: lessons.last_run defaulted to 0, which next_run treats
+# as "now" — sweep_distillation early-returned before its own setter (the ONLY
+# writer of lessons.last_run), so weekly auto-distillation NEVER fired. A
+# never-ran sweep must be due immediately and seed the marker. Runs while
+# lessons.cmd is still stubbed; skipped if any real domain could distill.
+_hot = db.query_one("SELECT domain FROM edit_evidence WHERE distilled=0 "
+                    "GROUP BY domain HAVING COUNT(*) >= 5")
+if _hot:
+    print(f"  SKIP  [20] sweep dry-run (live domain '{_hot['domain']}' has >=5 undistilled items)")
+else:
+    _old_lr = db.get_setting("lessons.last_run", "")
+    _old_ad = db.get_setting("lessons.auto_distill", "")
+    db.execute("DELETE FROM settings WHERE key='lessons.last_run'")
+    db.set_setting("lessons.auto_distill", "1")
+    lessons_mod.sweep_distillation()
+    _lr1 = float(db.get_setting("lessons.last_run", "0") or 0)
+    chk("[20] never-ran sweep fires and seeds lessons.last_run (setter reachable)", _lr1 > 0)
+    lessons_mod.sweep_distillation()
+    chk("[20] second sweep inside the cron window is a no-op",
+        float(db.get_setting("lessons.last_run", "0") or 0) == _lr1)
+    if _old_ad:
+        db.set_setting("lessons.auto_distill", _old_ad)
+    else:
+        db.execute("DELETE FROM settings WHERE key='lessons.auto_distill'")
+    if _old_lr:
+        db.set_setting("lessons.last_run", _old_lr)
+
 print("=== L1/L4 — routing outcomes + fingerprint invalidation + rule 9 ===")
 db.execute("INSERT OR REPLACE INTO tasks (id, title, status, user_id, domain, spend_profile, "
            "autopilot, judge_verdict) VALUES ('ro-t','RO','done',?, 'marketing','optimal','assisted','SHIP')", (uid,))
