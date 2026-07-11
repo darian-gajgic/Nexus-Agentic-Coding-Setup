@@ -3,6 +3,10 @@
 # shape (verdict line + learning note) without spending frontier tokens.
 # Usage: judge_stub.sh <file> <domain>
 cat <<'EOF'
+⚠ STUB JUDGE (CI gate fixture) — NOT a real verdict. If this appears on a live
+task, judge.cmd leaked from a crashed gate run: clear it in Settings → Judge
+(empty = back to the real cjudge default).
+
 Must-pass gates:
 1. Voice matches STYLE-VOICE.md — PASS
 2. Headline states a concrete outcome — FAIL: headline is category-generic
