@@ -17,6 +17,15 @@ context) is also at `~/.claude/plans/we-have-to-make-eventual-sketch.md`.
 - Never mix clusters in a commit or leave mixed uncommitted work. On a usage-limit or
   repeated API failure mid-cluster: `git stash push -m "wip-<cluster>"`, note it here,
   stop cleanly. Resume re-does that cluster from scratch (never half-trust a stash).
+- **A HARD quota cutoff cannot run the stash step** (no tool calls left) — so EVERY
+  session (fresh or `claude --continue`) starts with resume hygiene: `git status` +
+  `git stash list`; if uncommitted changes or a `wip-*` stash exist, `git checkout -- .`
+  (and/or review-then-drop the stash), find the first unticked cluster in the checklist,
+  and re-do it from scratch. This makes resume deterministic whether or not the protocol ran.
+- **User note for a quota pause:** don't restart nexus or reboot while a cluster is
+  half-applied — `app/` is the LIVE tree; the running process is unaffected until restart,
+  but a restart would load partial edits. Resume the session first (it commits or reverts),
+  or run `git -C ~/Nexus-Agentic-Coding-Setup checkout -- app/` yourself before restarting.
 - Do NOT redesign what §Decisions fixes unless the code contradicts it — then STOP and ask.
 - server.py changes: verify per the app:verify skill (restart service, drive HTTP, loop probe).
 
@@ -183,8 +192,10 @@ this checklist make any resume (`claude --continue` or a fresh session) lossless
 
 ## Session prompts
 
-**Session 1:** Read `BUGFIX-CAMPAIGN-2026-07-12.md` in the repo root. Record the pre-session
-sha. Execute Session 1 exactly as specified: clusters C1→C8 in order; per cluster re-verify
+**Session 1:** Read `BUGFIX-CAMPAIGN-2026-07-12.md` in the repo root. FIRST: resume hygiene
+(`git status` + `git stash list`; revert any uncommitted/wip-* leftovers; find the first
+unticked cluster). Record the pre-session sha. Execute Session 1 exactly as specified:
+clusters C1→C8 in order; per cluster re-verify
 each finding against HEAD, implement the pre-made design (§Decisions), run the named gate,
 commit with a `fix(<area>):` message naming the finding indices, tick the checklist with the
 sha. ONE commit per cluster. On usage-limit mid-cluster: stash as `wip-<cluster>`, note it
@@ -192,7 +203,8 @@ here, stop. Do not redesign §Decisions unless the code contradicts it — then 
 Finish with the batch checkpoint (full gate sweep + /code-review at medium effort scoped to
 `git diff <pre-session-sha>..HEAD`) and a per-finding fixed/skipped table.
 
-**Session 2:** Read `BUGFIX-CAMPAIGN-2026-07-12.md`. Confirm Session 1 complete via git log.
+**Session 2:** Read `BUGFIX-CAMPAIGN-2026-07-12.md`. FIRST: the same resume hygiene as
+Session 1. Confirm Session 1 complete via git log.
 Execute the S2 table in 2-3 grouped commits, same re-verify→fix→gate→commit rhythm, then the
 S2 exit sweep and a final /code-review on the combined campaign diff. Report per-finding
 outcomes and update the program memory files.
