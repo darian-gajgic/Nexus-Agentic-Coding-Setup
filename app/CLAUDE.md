@@ -143,6 +143,19 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   restart lost in-flight state + spammed the journal). Fixed: `uvicorn.Config(timeout_graceful_
   shutdown=8)` + a `handle_exit` that sets `watchdog.SHUTTING_DOWN` FIRST (so the watchdog stops
   respawning SIGTERM'd workers mid-stop) + `TimeoutStopSec=25` in the unit. Restart is now ~1s.
+- **Restart preparation + manual-start posture (2026-07-11)**: the topbar ⏻ →
+  `POST /api/system/prepare-restart` pauses dispatch (`dispatch.enabled=0`; the previous
+  value is stored in the `system.restart_prep` marker — deliberately OUTSIDE the settings
+  registry) and the modal polls `GET /api/system/restart-prep` until in-flight work
+  (dispatches + finalizing + judge + critic + evals) drains → "safe to restart".
+  `POST .../cancel` or the next server start restores dispatch.enabled and clears the
+  marker (startup(), before the boot reconcile). worker.py maps SIGTERM →
+  KeyboardInterrupt so systemd stops/reboots exit lanes cleanly (orphaned Hermes runs
+  harvest on resume). The MACHINE POSTURE is manual-start BY DESIGN: all user units +
+  docker.service + ollama.service are disabled at boot (docker.socket stays enabled for
+  lazy activation; containers restart=no) — `nexus-up` (setup/bin, on PATH) or the
+  "Start Nexus" desktop icon starts the whole stack. Do NOT "fix" this by re-enabling
+  units, and nexus-up needs the `/etc/sudoers.d/nexus-stack` rule to start ollama.
 - **Cache-busting:** when editing `app.js`, `style.css`, `jarvis3d.js` etc., bump `?v=N` in
   `index.html` or the browser serves stale cached code.
 - TTS voice: swappable via setting `voice.tts_voice` (path to a 22050 Hz Piper .onnx; empty =

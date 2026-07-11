@@ -239,6 +239,16 @@ def main():
 
 
 if __name__ == "__main__":
+    import signal
+
+    def _sigterm(_sig, _frm):
+        # systemd stop / PC reboot: route into the same clean-exit path as
+        # Ctrl-C (KeyboardInterrupt skips both `except Exception` handlers, so
+        # no spurious "worker process died" rows). A mid-dispatch interrupt
+        # leaves the Hermes run finishing gateway-side — harvested on resume.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _sigterm)
     try:
         main()
     except KeyboardInterrupt:

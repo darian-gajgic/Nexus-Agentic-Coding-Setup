@@ -1294,6 +1294,16 @@ code, pre, .mono { font-family: var(--font-mono); }
 }
 .help-btn:hover { color:#fff; border-color:var(--accent); box-shadow:0 0 12px rgba(124,92,255,.4); }
 
+/* Restart preparation (topbar ⏻): amber = draining, green = safe to reboot */
+#powerBtn.prep-active { color:#fbbf24; border-color:rgba(251,191,36,.45); box-shadow:0 0 10px rgba(251,191,36,.35); }
+#powerBtn.prep-safe { color:var(--green,#34d399); border-color:rgba(52,211,153,.45); box-shadow:0 0 10px rgba(52,211,153,.3); }
+.rp-spin {
+  width:16px; height:16px; border:2px solid rgba(255,255,255,.15);
+  border-top-color:var(--accent); border-radius:50%; flex-shrink:0;
+  animation:rp-spin .8s linear infinite;
+}
+@keyframes rp-spin { to { transform:rotate(360deg); } }
+
 /* ═══ Manual tab ═══ */
 .manual-wrap { max-width:980px; }
 .manual-toc { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }

@@ -141,6 +141,18 @@ def startup():
         "ended_at=? WHERE status IN ('running','cancelling')", (time.time(),)).rowcount
     if orphaned:
         db.log_activity("warn", "evals", f"Cleared {orphaned} eval run(s) orphaned by restart")
+    # Restart-prep marker (set by POST /api/system/prepare-restart before a PC
+    # reboot): restore the operator's dispatch.enabled and clear the marker —
+    # BEFORE the reconcile below, so lanes resume/harvest on their first tick.
+    # Also self-heals a prep that was armed but never followed by a reboot.
+    try:
+        _prep_m = _restart_prep_marker()
+        if _prep_m:
+            _restart_prep_restore(_prep_m)
+            db.log_activity("info", "system",
+                            "Restart preparation complete — dispatch restored after restart")
+    except Exception as _e:
+        print(f"[startup] restart-prep restore failed: {_e}", flush=True)
     # Dispatch rows stranded in an active state with a dead heartbeat (a worker
     # died, or a task's kanban status drifted so it matches no lane query) match
     # neither the resume nor the auto-claim path — they strand the task and any
@@ -5081,6 +5093,142 @@ async def quota_status():
         "per_model_cap": int(db.get_setting("dispatch.max_concurrent_per_model", "8")),
         "total_cap": int(db.get_setting("dispatch.max_concurrent_total", "8")),
     }
+
+
+# ── restart preparation (clean PC reboot) ──────────────────────────────────
+# "Prepare for restart" (topbar ⏻) pauses dispatch (dispatch.enabled=0) so no
+# lane claims new work, then the UI polls until in-flight work drains. The
+# marker stores the operator's previous dispatch.enabled; startup() restores
+# it after the reboot. The key deliberately lives OUTSIDE settings_registry —
+# /api/settings can never expose or clobber it.
+_RESTART_PREP_KEY = "system.restart_prep"
+_RESTART_PREP_GRACE_S = 5.0  # > 2× worker POLL_S: a lane that read
+# dispatch_on=1 in the same tick prepare flipped it has a visible dispatch
+# row by the time the grace window closes.
+
+
+def _restart_prep_marker() -> dict | None:
+    try:
+        m = json.loads(db.get_setting(_RESTART_PREP_KEY) or "null")
+    except Exception:
+        m = None
+    return m if isinstance(m, dict) else None
+
+
+def _restart_prep_busy() -> dict:
+    """Everything a reboot would cut mid-flight. Queued tasks do NOT count —
+    with dispatch.enabled=0 no lane claims or executes them; they wait through
+    the reboot. Finalizing is counted from tasks because the harvest path can
+    finalize a dispatch whose row never reached 'streaming' (invisible to
+    slots_in_use). Judge/critic/eval threads count too: startup() discards
+    their work as 'interrupted', so waiting for them saves real spend."""
+    per_model = hd.slots_in_use()
+    busy = {
+        "dispatches": sum(per_model.values()),
+        "finalizing": db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE dispatch_state='finalizing'")["n"],
+        "judges": db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE judge_verdict='running'")["n"],
+        "critics": db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE critic_verdict='running'")["n"],
+        "evals": db.query_one(
+            "SELECT COUNT(*) AS n FROM eval_runs "
+            "WHERE status IN ('running','cancelling')")["n"],
+        "in_flight_by_model": per_model,
+    }
+    busy["total"] = (busy["dispatches"] + busy["finalizing"] + busy["judges"]
+                     + busy["critics"] + busy["evals"])
+    return busy
+
+
+def _restart_prep_status() -> dict:
+    m = _restart_prep_marker()
+    busy = _restart_prep_busy()
+    grace_left = max(0.0, _RESTART_PREP_GRACE_S - (time.time() - m["ts"])) if m else 0.0
+    return {
+        "active": bool(m),
+        "prepared_at": (m or {}).get("ts"),
+        "prev_dispatch_enabled": (m or {}).get("prev_dispatch_enabled"),
+        "dispatch_enabled": db.get_setting("dispatch.enabled"),
+        "busy": busy,
+        "safe": bool(m) and busy["total"] == 0 and grace_left <= 0,
+        "grace_remaining_s": round(grace_left, 1),
+    }
+
+
+def _restart_prep_restore(m: dict):
+    prev = m.get("prev_dispatch_enabled")
+    if prev is None:
+        # no row existed before prep — remove ours so code/registry fallbacks apply
+        db.execute("DELETE FROM settings WHERE key='dispatch.enabled'")
+    else:
+        db.set_setting("dispatch.enabled", prev)
+    db.execute("DELETE FROM settings WHERE key=?", (_RESTART_PREP_KEY,))
+
+
+@app.get("/api/system/restart-prep")
+async def restart_prep_status():
+    """Live drain status for the topbar ⏻ modal (admin-only)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    st = await run_in_threadpool(_restart_prep_status)
+    if st["active"] and st["safe"]:
+        # Writers are quiet — fold the WAL into the main db file so the
+        # upcoming reboot has nothing to replay.
+        await run_in_threadpool(db.execute, "PRAGMA wal_checkpoint(TRUNCATE)")
+    return st
+
+
+@app.post("/api/system/prepare-restart")
+async def prepare_restart():
+    """Pause dispatch + start draining before a PC reboot. Idempotent: a
+    second press reports the EXISTING prep — re-saving prev_dispatch_enabled
+    would capture the already-'0' value and turn the boot restore into a
+    permanent no-op."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+
+    def _prep() -> bool:
+        if _restart_prep_marker():
+            return True
+        prev = db.get_setting("dispatch.enabled")  # raw row; None = no row
+        # Marker FIRST — a crash between the two writes must still restore.
+        db.set_setting(_RESTART_PREP_KEY,
+                       json.dumps({"prev_dispatch_enabled": prev, "ts": time.time()}))
+        db.set_setting("dispatch.enabled", "0")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        busy = _restart_prep_busy()
+        db.log_activity("info", "system",
+                        "Restart preparation started — dispatch paused, "
+                        f"draining {busy['total']} in-flight run(s)")
+        return False
+
+    already = await run_in_threadpool(_prep)
+    st = await run_in_threadpool(_restart_prep_status)
+    if already:
+        st["already_prepared"] = True
+    return st
+
+
+@app.post("/api/system/prepare-restart/cancel")
+async def cancel_restart_prep():
+    """Abort restart preparation and resume normal dispatch."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+
+    def _cancel() -> bool:
+        m = _restart_prep_marker()
+        if not m:
+            return False
+        _restart_prep_restore(m)
+        db.log_activity("info", "system",
+                        "Restart preparation cancelled — dispatch resumed")
+        return True
+
+    cancelled = await run_in_threadpool(_cancel)
+    st = await run_in_threadpool(_restart_prep_status)
+    st["cancelled"] = cancelled
+    return st
 
 
 _USER_TEMPLATES = Path(__file__).parent / "templates.user.json"

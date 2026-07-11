@@ -67,11 +67,28 @@ done
 # without these on PATH, judging fails with command-not-found on a fresh box.
 # They additionally need the `claude` CLI installed and logged in.
 if [ -d "$REPO/bin" ]; then
-  say "Installing frontier bridge scripts (cspec/creview/cjudge/cverify/cdistill) into ~/.local/bin"
+  say "Installing frontier bridge scripts (cspec/creview/cjudge/cverify/cdistill) + nexus-up into ~/.local/bin"
   mkdir -p "$HOME/.local/bin"
   cp -a "$REPO"/bin/. "$HOME/.local/bin/"
-  chmod +x "$HOME/.local/bin/cspec" "$HOME/.local/bin/creview" "$HOME/.local/bin/cjudge" "$HOME/.local/bin/cverify" "$HOME/.local/bin/cdistill" 2>/dev/null || true
+  chmod +x "$HOME/.local/bin/cspec" "$HOME/.local/bin/creview" "$HOME/.local/bin/cjudge" "$HOME/.local/bin/cverify" "$HOME/.local/bin/cdistill" "$HOME/.local/bin/nexus-up" 2>/dev/null || true
   command -v claude >/dev/null 2>&1 || warn "the 'claude' CLI is not installed — cjudge/cspec/creview need it (npm i -g @anthropic-ai/claude-code, then 'claude' to log in)"
+fi
+
+# 5d. "Start Nexus" desktop launcher (manual-start posture) ------------------
+# Nothing autostarts at boot; nexus-up starts the whole stack (ollama, the
+# qdrant/langfuse containers, gateway, nexus) and opens the dashboard.
+if [ -f "$REPO/desktop/nexus-start.desktop" ]; then
+  say "Installing the Start Nexus desktop launcher"
+  mkdir -p "$HOME/.local/share/applications"
+  sed "s|/home/sinep|$HOME|g" "$REPO/desktop/nexus-start.desktop" \
+    > "$HOME/.local/share/applications/nexus-start.desktop"
+  chmod 755 "$HOME/.local/share/applications/nexus-start.desktop"
+  if [ -d "$HOME/Desktop" ]; then
+    cp "$HOME/.local/share/applications/nexus-start.desktop" "$HOME/Desktop/"
+    chmod 755 "$HOME/Desktop/nexus-start.desktop"
+    # headless installs have no session bus — gio is best-effort
+    gio set "$HOME/Desktop/nexus-start.desktop" metadata::trusted true 2>/dev/null || true
+  fi
 fi
 
 # 5c. Business Brain (knowledge base) ---------------------------------------
@@ -107,8 +124,12 @@ Next:
   1. cp .env.example ~/.hermes/.env   &&   edit it (GLM_API_KEY is required)
   2. Start qdrant:   docker compose -f infra/qdrant-docker-compose.yml up -d
   3. Nexus venv:     (cd $NEXUS_DIR && python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt)
-  4. systemctl --user daemon-reload
-     systemctl --user enable --now hermes-gateway.service hermes-guardian.timer hermes-reflect.timer hermes-prune.timer nexus.service
+  4. systemctl --user daemon-reload     # units stay DISABLED — manual-start posture:
+     nexus-up                           # starts ollama + containers + gateway + nexus, opens the dashboard
+     # optional, lets nexus-up start ollama without a password prompt
+     # (VALIDATE with visudo -c BEFORE installing — a broken sudoers.d kills sudo):
+     #   printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start ollama.service\n' "\$USER" > /tmp/nexus-stack.sudoers
+     #   visudo -c -f /tmp/nexus-stack.sudoers && sudo install -o root -g root -m 0440 /tmp/nexus-stack.sudoers /etc/sudoers.d/nexus-stack
 
 Verify:  $PY $GUARDIAN_DIR/guardian.py   (expect overall=OK, 5 core-mods)
 EOF
