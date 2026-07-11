@@ -4490,6 +4490,19 @@ def _critic_thread(task_id: str):
         _broadcast_task_row(task_id, owner)
 
 
+def _drop_snapshot(path):
+    """Remove a deliverable.v<N>.md snapshot a failed/deferred rework left behind:
+    it just duplicates the unchanged deliverable and would confuse the next
+    critic's version diff (judge phase7 finding 2). Never raises."""
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def _escalation_thread(task_id: str):
     """Appendix C1c — escalated rework: the escalation_model rewrites the
     deliverable IN THE REAL WORKSPACE, handed the full dossier (brief, verified
@@ -4498,6 +4511,7 @@ def _escalation_thread(task_id: str):
     quota is classified like the critic (backoff + requeue, never 'error' or a
     human escalation — premortem P1). Blocking work stays in this thread (B7)."""
     import shutil
+    import hashlib
     import evals as _ev
     owner = None
     try:
@@ -4512,13 +4526,22 @@ def _escalation_thread(task_id: str):
             return
         emodel, ekey = _ev.escalation_model_for(owner)
         dossier = _ev.build_escalation_dossier(task)
+        # capture the pre-rework content — the version clock only advances if the
+        # frontier ACTUALLY rewrote the deliverable (judge phase7 finding 2).
+        try:
+            pre_hash = hashlib.sha256(open(deliv, "rb").read()).hexdigest()
+        except Exception:
+            pre_hash = ""
         # snapshot the failing version as evidence BEFORE the rewrite (the critic
-        # diffs against deliverable.v<N>.md on the next round)
+        # diffs against deliverable.v<N>.md on the next round). Keep the path so a
+        # FAILED rework can restore the deliverable + drop the redundant snapshot.
+        snap = None
         try:
             n = 1 + len([f for f in os.listdir(ws) if _re.match(r"deliverable\.v\d+\.md$", f)])
-            shutil.copy2(deliv, os.path.join(ws, f"deliverable.v{n}.md"))
+            snap = os.path.join(ws, f"deliverable.v{n}.md")
+            shutil.copy2(deliv, snap)
         except Exception:
-            pass
+            snap = None
         sink: dict = {}
         out = _ev.run_escalation_cmd(task, dossier, model=emodel, api_key=ekey, usage_sink=sink)
         _ev.record_frontier_spend(sink, out, "escalation", emodel or db.fallback_model("escalation_model"),
@@ -4529,6 +4552,7 @@ def _escalation_thread(task_id: str):
         # so a rework log that merely mentions rate limits can't false-positive)
         if not sink and _ev.is_frontier_quota_error(out):
             wait = _ev.note_frontier_quota_hit()
+            _drop_snapshot(snap)  # nothing was reworked → don't inflate snapshots
             db.execute("UPDATE tasks SET critic_verdict=NULL, critic_ts=NULL WHERE id=?", (task_id,))
             db.log_activity("warn", "critic",
                             f"Escalated rework on {task_id} deferred — frontier quota/rate-limit, "
@@ -4536,6 +4560,54 @@ def _escalation_thread(task_id: str):
             _broadcast_task_row(task_id, owner)
             return
         _ev.note_frontier_quota_ok()
+        # judge phase7 finding 2: a NON-quota failure — exit 127 (claude
+        # unresolvable), a timeout, a crash, or a byte-identical deliverable — must
+        # NEVER be booked as success. Consuming the open comments + advancing the
+        # version clock on an unimproved draft strands the loop (the critic then
+        # re-runs on the SAME text with its comments already gone). The rework
+        # counts only when the deliverable was ACTUALLY rewritten AND
+        # run_escalation_cmd reported no failure marker.
+        try:
+            post_hash = hashlib.sha256(open(deliv, "rb").read()).hexdigest()
+        except Exception:
+            post_hash = pre_hash
+        changed = bool(pre_hash) and post_hash != pre_hash
+        failed = any(m in (out or "") for m in
+                     ("[escalation exited", "[escalation timed out",
+                      "[escalation failed to run", "[escalation skipped"))
+        if failed or not changed:
+            # revert any partial/timed-out write to the pre-rework version, drop the
+            # now-redundant snapshot, KEEP the open comments, and hand off to the
+            # human checkpoint via the sweep's 'error' branch (never a false SHIP).
+            if snap and os.path.isfile(snap):
+                try:
+                    shutil.copy2(snap, deliv)
+                except Exception:
+                    pass
+            _drop_snapshot(snap)
+            why = "run did not complete" if failed else "byte-identical deliverable"
+            db.execute("UPDATE tasks SET critic_verdict='error', "
+                       "critic_output=COALESCE(critic_output,'')||? WHERE id=?",
+                       (f"\n[escalated rework produced no new version — {why}]\n"
+                        f"{(out or '')[-800:]}", task_id))
+            # re-arm the loop-engine super-state so _sweep_super_result re-evaluates
+            # this critique (verdict 'error' → human checkpoint) instead of skipping
+            # it as already-handled by the dispatched-rework marker.
+            try:
+                import loop_engine as _le
+                loc = _le._locate_super_cfg(task_id)
+                if loc:
+                    _ok_kind, _ok_id, _cfg, _trig, _per_task = loc
+                    _le._set_super_state(_trig, _per_task, None)
+                    _le._save_cfg(_ok_kind, _ok_id, _cfg)
+            except Exception:
+                pass
+            db.log_activity("error", "critic",
+                            f"Escalated rework on {task_id} produced no new version "
+                            f"({why}) — comments kept, routing to the human checkpoint",
+                            user_id=owner)
+            _broadcast_task_row(task_id, owner)
+            return
         # the rework addressed the open comments → consume them; advance the
         # version clock (completed_at) + clear the verdict so the sweep runs the
         # critic fresh on the rewritten deliverable.
