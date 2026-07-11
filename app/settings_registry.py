@@ -62,7 +62,10 @@ SECTIONS = [
                      "(big test suites, long builds)."},
             {"key": "dispatch.resume_quiet_s", "label": "Resume quiet window (s)", "type": "int",
              "default": "600", "min": 30, "max": 7200,
-             "help": "After a worker crash, wait this long for the orphaned Hermes run to finish before re-engaging."},
+             "help": "After a worker crash, wait this long for the orphaned Hermes run to finish before "
+                     "re-engaging. Effective minimum is the stall cutoff + 300s — a run surviving a "
+                     "stall-cut is already silent that long, so a smaller quiet window would misread "
+                     "live runs as dead."},
             {"key": "dispatch.fallback_enabled", "label": "Overload fallback enabled", "type": "bool",
              "default": "1",
              "help": "When a model is overloaded upstream (Z.AI 429 load-shedding at peak hours), "
