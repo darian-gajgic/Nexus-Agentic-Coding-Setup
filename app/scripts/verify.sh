@@ -508,7 +508,8 @@ chk "C1c: loop hook (REWRITE + round-cap)" "grep -q 'def _try_escalate_super' lo
 # bugfix campaign 2026-07-12 [21]: an 'interrupted' judge must clear judge_ts,
 # or judged_this_version stays true and the auto-judge never re-runs after the
 # quota window / a restart. Both writers (deferral branch + boot heal) pinned.
-chk "[21]: interrupted judge clears judge_ts (both writers)" "[ \$(grep -c 'judge_ts=NULL' server.py) -ge 2 ]"
+# (anchored per writer — a bare count was satisfiable by the explanatory comment)
+chk "[21]: interrupted judge clears judge_ts (both writers)" "grep -q 'judge_ts=NULL WHERE id=?' server.py && grep -q 'judge_ts=NULL \"' server.py"
 # bugfix campaign 2026-07-12 D3 [0][1][2]: the restart drain must see escalated
 # reworks (busy count + boot heal) and the worker must keep harvesting/waiting
 # on orphans while dispatch is paused; prepare/cancel are lock-serialized.

@@ -86,6 +86,13 @@ def _find_work(agent_id: str, auto_claim: bool, dispatch_on: bool):
         "ORDER BY claimed_at", (agent_id,))
     for t in mine:
         st = t.get("dispatch_state")
+        # Drain (D3a review K1): with dispatch off, only RESUME candidates may
+        # surface. Returning a queued/retry/claimed task that main() then skips
+        # would shadow a later streaming orphan EVERY tick (first match wins),
+        # starving its heartbeat refresh — the drain count would go falsely
+        # quiet while the orphaned run still executes upstream.
+        if not dispatch_on and st not in ("dispatching", "streaming", "finalizing"):
+            continue
         if st in (None, "", "none"):
             # MY claim with no dispatch yet: the previous worker died between
             # claim and start_dispatch (e.g. a server restart killed the lane)
@@ -137,6 +144,10 @@ def _find_work(agent_id: str, auto_claim: bool, dispatch_on: bool):
 
 
 _orphan_wait_logged: dict = {}  # task_id -> last log ts (one line per ~10 min, not per tick)
+_drain_skip: dict = {}  # task_id -> ts of the last drain-mode dead/gone verdict
+DRAIN_RECHECK_S = 60.0  # a dead orphan's transcript is re-fetched at most this
+# often during a drain (review K9: the untouched-return re-selected it every
+# 2s tick — two Hermes transcript GETs per tick per dead orphan)
 
 
 def _wait_on_active_orphan(task: dict, agent_id: str) -> bool:
@@ -192,9 +203,11 @@ def _execute(task: dict, mode: str, agent_id: str, dispatch_on: bool = True):
         # continue-turn) instead of replaying the same instructions into it.
         hd.run_task_dispatch(did, tid, agent_id, resume=bool(task.get("session_id")))
     elif mode == "resume":
+        if not dispatch_on and time.time() - _drain_skip.get(tid, 0) < DRAIN_RECHECK_S:
+            return  # recent dead/gone verdict — don't re-fetch the transcript per tick
         if _wait_on_active_orphan(task, agent_id):
             return  # run still executing upstream — heartbeat refreshed, no churn
-        if not dispatch_on and hd.orphan_run_state(task) != "finished":
+        if not dispatch_on:
             # Drain posture (D3a/[0]): dispatch paused → the resume lane only
             # HARVESTS finished orphans (pure recovery, no new tokens); active
             # ones got their heartbeat refreshed above so the drain keeps
@@ -202,7 +215,10 @@ def _execute(task: dict, mode: str, agent_id: str, dispatch_on: bool = True):
             # would spend the tokens the drain promised not to. Known-accepted
             # edge: a finished-but-failure-text reply declines harvest
             # downstream and sends ONE bounded resume_with_context turn.
-            return
+            if hd.orphan_run_state(task) != "finished":
+                _drain_skip[tid] = time.time()
+                return
+            _drain_skip.pop(tid, None)
         db.execute(
             "UPDATE dispatches SET state='failed', ended_at=?, "
             "error=COALESCE(NULLIF(error,''), "
