@@ -223,6 +223,39 @@ ok("templates carry domain+prefill", all(t.get("domain") and t.get("title") for 
 ob = get("/api/onboarding-status").json()
 ok("onboarding status counts FILL slots", "total" in ob and "done" in ob, str(ob)[:120])
 
+print("=== 8c. Orphan quiet-window floor (D1, no GLM) ===")
+# orphan_run_state must never call a run 'dead' inside the stall cutoff + margin:
+# a run surviving a stall-cut is already silent > stall at lane re-entry, so a
+# quiet window ≤ stall would continue-turn into a LIVE run. Pure function of
+# transcript age + settings — tested in-process with a stubbed transcript.
+sys.path.insert(0, str(ROOT))
+import hermes_dispatch as hd  # noqa: E402
+_prev_qs = get("/api/settings", params={"prefix": "dispatch."}).json()["settings"]
+_prev_quiet = _prev_qs.get("dispatch.resume_quiet_s", "")
+_prev_stall = _prev_qs.get("dispatch.max_turn_stall_seconds", "")
+_real_get_messages = hd.get_messages
+
+
+def _fake_transcript(age_s):
+    return [{"role": "user", "content": "working…", "timestamp": time.time() - age_s}]
+
+
+try:
+    patch("/api/settings", json={"dispatch.max_turn_stall_seconds": "900",
+                                 "dispatch.resume_quiet_s": ""})
+    hd.get_messages = lambda sid: _fake_transcript(900 - 60)
+    ok("silent stall-60s -> active", hd.orphan_run_state({"session_id": "api_e2e_d1"}) == "active")
+    hd.get_messages = lambda sid: _fake_transcript(900 + 400)
+    ok("silent stall+400s -> dead", hd.orphan_run_state({"session_id": "api_e2e_d1"}) == "dead")
+    patch("/api/settings", json={"dispatch.resume_quiet_s": "30"})
+    hd.get_messages = lambda sid: _fake_transcript(950)
+    ok("quiet=30 floored above stall (age 950 -> active)",
+       hd.orphan_run_state({"session_id": "api_e2e_d1"}) == "active")
+finally:
+    hd.get_messages = _real_get_messages
+    patch("/api/settings", json={"dispatch.resume_quiet_s": _prev_quiet,
+                                 "dispatch.max_turn_stall_seconds": _prev_stall})
+
 print("=== 9. Judge + approval flow (stubbed judge, no GLM) ===")
 # Fixture: fabricate a COMPLETED high-stakes deliverable in 'review' (the state
 # _finalize_result produces) so the R4 flow is testable at CI speed.

@@ -237,34 +237,39 @@ def stream_turn(session_id: str, input_text: str, system_message: str | None = N
                     if on_event:
                         on_event("_line", None)  # every line (incl. keepalives) = liveness
                     now = time.time()
-                    if now > deadline:
-                        error = TURN_CAP_ERROR
-                        break
-                    if stall_seconds and now - last_progress > stall_seconds:
-                        error = TURN_STALLED_ERROR
-                        break
                     if line.startswith("event: "):
                         event_name = line[7:].strip()
-                        continue
-                    if not line.startswith("data: "):
-                        continue
-                    last_progress = now  # a real event — the run is making progress
-                    try:
-                        data = json.loads(line[6:].strip())
-                    except Exception:
-                        data = {}
-                    name, event_name = event_name, ""
-                    if on_event:
-                        on_event(name, data)
-                    if name == "assistant.completed":
-                        content = data.get("content") or content
-                        partial = bool(data.get("partial") or data.get("interrupted"))
-                    elif name == "run.completed":
-                        usage = data.get("usage") or {}
-                        if not content:
-                            content = data.get("content") or ""
-                    elif name == "error":
-                        error = str(data.get("message") or data.get("error") or data)[:500]
+                        continue  # its data line is imminent — guard between complete events
+                    if line.startswith("data: "):
+                        last_progress = now  # a real event — the run is making progress
+                        try:
+                            data = json.loads(line[6:].strip())
+                        except Exception:
+                            data = {}
+                        name, event_name = event_name, ""
+                        if on_event:
+                            on_event(name, data)
+                        if name == "assistant.completed":
+                            content = data.get("content") or content
+                            partial = bool(data.get("partial") or data.get("interrupted"))
+                        elif name == "run.completed":
+                            usage = data.get("usage") or {}
+                            if not content:
+                                content = data.get("content") or ""
+                        elif name == "error":
+                            error = str(data.get("message") or data.get("error") or data)[:500]
+                    # Guards run AFTER the line is processed: a final event landing
+                    # at/past the boundary is captured, not discarded. With
+                    # run.completed already in hand the cut costs nothing — same
+                    # rule as the TransportError 'if not usage' guard below.
+                    if now > deadline:
+                        if not usage and not error:
+                            error = TURN_CAP_ERROR
+                        break
+                    if stall_seconds and now - last_progress > stall_seconds:
+                        if not usage and not error:
+                            error = TURN_STALLED_ERROR
+                        break
             except httpx.TransportError as e:
                 # The SOCKET died mid-turn (read timeout past the keepalives, a
                 # gateway hiccup) — the RUN did not: it finishes orphaned, same
@@ -1291,6 +1296,12 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
 
 _FAILURE_PREFIXES = ("API call failed", "⏳", "⚠️ The model declined")
 RESUME_QUIET_DEFAULT_S = 600  # orphan transcript silent this long = run is dead
+# Floor margin over the stall cutoff for the effective quiet window. A run that
+# survives a stall-cut is BY DEFINITION already silent > stall when the lane
+# re-enters (~stall + 90s STALE_DISPATCH_S), so any quiet ≤ stall guarantees a
+# false 'dead' verdict and a continue-turn into a live run. Covers the
+# cut→re-entry lag (90s) + the 120s read timeout + flush lag.
+RESUME_QUIET_MARGIN_S = 300
 
 
 def _final_assistant(msgs: list) -> dict | None:
@@ -1330,6 +1341,13 @@ def orphan_run_state(task: dict) -> str:
     if _final_assistant(msgs):
         return "finished"
     quiet = float(db.get_setting("dispatch.resume_quiet_s", str(RESUME_QUIET_DEFAULT_S)))
+    # Effective quiet is floored above the stall cutoff: raising the stall
+    # auto-raises quiet; lowering quiet below the floor is a no-op. Derived
+    # HERE — the single choke point shared by worker._wait_on_active_orphan,
+    # the resume path, and reconcile_stalled_dispatches.keep_session.
+    stall = float(db.get_setting("dispatch.max_turn_stall_seconds",
+                                 str(DEFAULT_TURN_STALL_SECONDS)))
+    quiet = max(quiet, stall + RESUME_QUIET_MARGIN_S)
     age = time.time() - float(msgs[-1].get("timestamp") or 0)
     return "active" if age < quiet else "dead"
 
