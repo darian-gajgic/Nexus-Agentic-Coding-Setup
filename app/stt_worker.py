@@ -171,17 +171,55 @@ def _get_model() -> WhisperModel:
     return _model
 
 
+_last_keepalive = 0.0
+
+
+def _keepalive(force: bool = False):
+    """Progress line for the parent's inactivity timer (D4/[26]): one ack on
+    request receipt, then one per decoded segment, throttled ≥2s apart. The
+    parent's read-loop skips these before any parsing side effects."""
+    global _last_keepalive
+    now = time.monotonic()
+    if not force and now - _last_keepalive < 2.0:
+        return
+    _last_keepalive = now
+    sys.stdout.write(json.dumps({"keepalive": True}) + "\n")
+    sys.stdout.flush()
+
+
+def _test_stall():
+    """Gate knob (D4): NEXUS_STT_TEST_STALL_S sleeps in 5s slices with a
+    keepalive per slice; NEXUS_STT_TEST_STALL_SILENT=1 suppresses them so the
+    parent's inactivity kill can be exercised deterministically."""
+    total = float(os.environ.get("NEXUS_STT_TEST_STALL_S", "0") or 0)
+    if total <= 0:
+        return
+    silent = os.environ.get("NEXUS_STT_TEST_STALL_SILENT") == "1"
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < total:
+        time.sleep(min(5.0, max(0.0, total - (time.monotonic() - t0))))
+        if not silent:
+            _keepalive(force=True)
+
+
 def _with_gpu_fallback(fn):
     """Run fn inside the cross-process GPU waiting line; on a CUDA failure,
-    permanently drop to CPU (for the life of this worker) and rerun."""
+    permanently drop to CPU (for the life of this worker) and rerun. Any OTHER
+    failure gets the old in-process pipeline's generic self-heal ([27]): drop
+    the model and retry ONCE — transient decode/runtime glitches (an ffmpeg
+    hiccup, ctranslate2 state) usually clear on a fresh attempt."""
     global _device, _model, _fallback_used
-    try:
+
+    def _locked():
         # 45s wait (was 20 in the old in-process path): waiting in the queue
         # beats falling back to CPU. CPU loads skip the lock entirely — the
         # emergency path must not queue behind GPU work.
         with gpu_lock.gpu_section("stt", timeout=45.0,
                                   enabled=_device == "cuda"):
             return fn()
+
+    try:
+        return _locked()
     except Exception as e:
         if _device == "cuda" and _is_gpu_failure(e):
             log(f"CUDA failure ({e!r}) — CPU for the rest of this worker's life")
@@ -191,7 +229,11 @@ def _with_gpu_fallback(fn):
             _fallback_used = True
             gc.collect()  # release the (partially) resident CUDA model
             return fn()
-        raise
+        log(f"STT failure ({e!r}) — dropping model and retrying once")
+        traceback.print_exc(file=sys.stderr)
+        _model = None
+        gc.collect()
+        return _locked()
 
 
 def op_warm(req: dict) -> dict:
@@ -203,9 +245,15 @@ def op_warm(req: dict) -> dict:
 
 
 def op_transcribe(req: dict) -> dict:
+    # D4/[26]: ack immediately — BEFORE the model load — so the parent's
+    # inactivity timer covers the gpu_lock wait + eviction + cold load
+    # without a special case.
+    _keepalive(force=True)
+
     def _run():
         global _test_oom_fired
         model = _get_model()
+        _test_stall()
         if (os.environ.get("NEXUS_STT_TEST_OOM") == "1"
                 and _device == "cuda" and not _test_oom_fired):
             _test_oom_fired = True
@@ -224,7 +272,14 @@ def op_transcribe(req: dict) -> dict:
             condition_on_previous_text=bool(
                 req.get("condition_on_previous_text", False)),
         )
-        return " ".join(s.text.strip() for s in segments).strip()
+        # D4/[26]: consume the segment generator in a loop — long decodes
+        # (dictation segments run up to dictation.max_seconds=300s of audio)
+        # emit progress per decoded segment instead of one silent block.
+        parts = []
+        for s in segments:
+            parts.append(s.text.strip())
+            _keepalive()  # ≥2s throttle inside
+        return " ".join(parts).strip()
 
     t0 = time.time()
     text = _with_gpu_fallback(_run)

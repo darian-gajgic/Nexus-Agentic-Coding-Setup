@@ -2502,11 +2502,14 @@ def _valid_meeting_name(name: str) -> bool:
 
 
 def _live_meeting_name() -> str | None:
-    if _dictation is not None and _dictation.manager._meeting is not None:
-        p = _dictation.manager._meeting.path
-        if p:
-            return os.path.basename(p)
-    return None
+    if _dictation is None:
+        return None
+    # [25]: single read — stop_meeting (a daemon thread) can NULL _meeting
+    # between a check and a .path access, 500ing the Meetings endpoints
+    # exactly during the stop transition.
+    m = _dictation.manager._meeting
+    p = m.path if m is not None else None
+    return os.path.basename(p) if p else None
 
 
 @app.get("/api/dictation/status")

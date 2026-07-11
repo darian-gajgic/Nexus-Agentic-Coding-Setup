@@ -151,14 +151,24 @@ def _kill_stt_worker(reason: str = ""):
             print(f"[voice] stt worker killed: {reason}", flush=True)
 
 
+STT_INACTIVITY_KILL_S = 180.0  # D4/[26]: kill on SILENCE, not duration — the
+# worker acks on request receipt (before the model load) and emits a keepalive
+# per decoded segment, so 180s absorbs the 45s gpu_lock wait + eviction + a
+# cold load while a hung worker still dies promptly.
+
+
 def _ask_stt_sync(req: dict, timeout: float = 90.0) -> dict:
     """One request/response on the worker pipe, serialized by _stt_io_lock.
 
-    Timeout discipline: a timer kills the worker if the response doesn't land
-    in time — pipe EOF then unblocks readline, so neither sync (dictation/
-    meeting) nor async (JARVIS) callers can hang forever, and the desynced
-    pipe is never reused (same rationale as the vision worker's
-    kill-and-respawn: a late reply would answer the NEXT request)."""
+    Timeout discipline (D4/[26]): liveness is an INACTIVITY timer
+    (STT_INACTIVITY_KILL_S), re-armed by every line the worker sends —
+    keepalive or response — so long transcriptions (a 300s dictation segment
+    decoding on CPU) are never killed while they visibly progress. `timeout`
+    is only the ABSOLUTE ceiling. A trip kills the worker; pipe EOF then
+    unblocks readline, so neither sync (dictation/meeting) nor async (JARVIS)
+    callers can hang forever, and the desynced pipe is never reused (same
+    rationale as the vision worker's kill-and-respawn: a late reply would
+    answer the NEXT request)."""
     global _stt_proc, _stt_proc_key, _stt_gpu_block_until, _stt_loaded
     with _stt_io_lock:
         key = _stt_spawn_key()
@@ -171,24 +181,47 @@ def _ask_stt_sync(req: dict, timeout: float = 90.0) -> dict:
             _stt_proc_key = key
         _touch_stt()
         op = req.get("op", "?")
-        timer = threading.Timer(
-            timeout, _kill_stt_worker, [f"{op} timed out after {timeout:.0f}s"])
-        timer.daemon = True
-        timer.start()
+        deadline = _time.time() + timeout
+
+        def _arm(seconds: float) -> threading.Timer:
+            t = threading.Timer(
+                seconds, _kill_stt_worker,
+                [f"{op} inactive {seconds:.0f}s (no keepalive/response)"])
+            t.daemon = True
+            t.start()
+            return t
+
+        timer = _arm(min(STT_INACTIVITY_KILL_S, timeout))
+        resp = None
         try:
             _stt_proc.stdin.write(json.dumps(req) + "\n")
             _stt_proc.stdin.flush()
-            line = _stt_proc.stdout.readline()
+            while True:
+                line = _stt_proc.stdout.readline()
+                timer.cancel()
+                if not line:
+                    _kill_stt_worker(f"died mid-{op}")
+                    raise RuntimeError(f"stt worker died mid-request ({op})")
+                obj = json.loads(line)
+                if not obj.get("keepalive"):
+                    resp = obj
+                    break
+                # keepalive = progress signal only — no parsing side effects;
+                # re-arm the inactivity timer within the absolute ceiling
+                left = deadline - _time.time()
+                if left <= 0:
+                    _kill_stt_worker(f"{op} exceeded the {timeout:.0f}s ceiling")
+                    raise RuntimeError(
+                        f"stt {op} exceeded the {timeout:.0f}s absolute ceiling")
+                timer = _arm(min(STT_INACTIVITY_KILL_S, left))
+        except RuntimeError:
+            raise
         except Exception as e:
             _kill_stt_worker(f"pipe error on {op}: {e!r}")
             raise RuntimeError(f"stt worker pipe error: {e}") from e
         finally:
             timer.cancel()
         _touch_stt()
-        if not line:
-            _kill_stt_worker(f"died mid-{op}")
-            raise RuntimeError(f"stt worker died mid-request ({op})")
-        resp = json.loads(line)
         if resp.get("fallback"):
             # The worker had to drop to CPU (OOM after lock-wait + eviction).
             # Block CUDA at the next spawn too, so an idle-kill + respawn
@@ -211,7 +244,7 @@ def _transcribe_path(path: str, language: Optional[str] = None,
         "beam_size": beam_size, "vad_filter": vad_filter,
         "initial_prompt": initial_prompt,
         "condition_on_previous_text": False,
-    })
+    }, timeout=1800.0)  # absolute ceiling only — liveness is the inactivity timer
     return resp.get("text", "")
 
 
