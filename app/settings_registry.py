@@ -49,8 +49,17 @@ SECTIONS = [
              "default": "8", "min": 1, "max": 32,
              "help": "Z.AI's concurrency limit is per model (~10). Per-model overrides live in Models & routing."},
             {"key": "dispatch.max_turn_seconds", "label": "Max seconds per dispatched turn", "type": "int",
-             "default": "2700", "min": 60, "max": 21600,
-             "help": "Hard wall-clock cap on one agent turn before it's cut off."},
+             "default": "14400", "min": 60, "max": 43200,
+             "help": "Wall-clock backstop per agent turn. Hitting it detaches the stream — the run "
+                     "keeps executing and is harvested when done (a run alive past 2× this is "
+                     "declared runaway and failed). Healthy long tasks are governed by the stall "
+                     "cutoff below, not by this."},
+            {"key": "dispatch.max_turn_stall_seconds", "label": "Turn stall cutoff (s)", "type": "int",
+             "default": "900", "min": 120, "max": 7200,
+             "help": "Cut a dispatched turn when its stream shows no real event for this long "
+                     "(keepalives don't count). The run is then waited on and harvested, not failed. "
+                     "Raise it if agents legitimately run single silent tools longer than this "
+                     "(big test suites, long builds)."},
             {"key": "dispatch.resume_quiet_s", "label": "Resume quiet window (s)", "type": "int",
              "default": "600", "min": 30, "max": 7200,
              "help": "After a worker crash, wait this long for the orphaned Hermes run to finish before re-engaging."},

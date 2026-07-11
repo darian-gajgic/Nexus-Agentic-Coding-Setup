@@ -40,9 +40,29 @@ WORKSPACES = BASE_DIR / "workspaces"
 HERMES_API_BASE = sreg.conf("hermes.api_base")  # setting → env → default; restart applies
 
 # SSE keepalives arrive every ~30s, so a 120s read timeout only trips when the
-# stream is genuinely dead. No overall HTTP timeout — the turn cap below rules.
+# stream is genuinely dead. No overall HTTP timeout — the turn guards below rule.
 STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
-DEFAULT_MAX_TURN_SECONDS = 2700  # 45 min hard cap per dispatched turn
+# Wall-clock backstop per dispatched turn. NOT a kill switch: run_task_dispatch
+# treats hitting it as "detach and wait" (the orphaned run keeps executing and
+# is harvested), so this only bounds a runaway run — healthy long tasks are
+# governed by the stall guard, which measures silence, not duration.
+DEFAULT_MAX_TURN_SECONDS = 14400
+# Cut the SSE stream when the run emits no real event for this long. Keepalive
+# comment lines don't count — they flow even when the run is hung. Sized to
+# clear a single silent long-running tool call (test suite, npm install).
+DEFAULT_TURN_STALL_SECONDS = 900
+# Matched by identity in run_task_dispatch — a cut turn is recoverable, so its
+# dispatch must NOT be finalized as failed (the run survives the disconnect).
+TURN_CAP_ERROR = "turn exceeded max_seconds cap; run may finish orphaned (recover via transcript)"
+TURN_STALLED_ERROR = "turn stalled — no SSE event within the stall window; run may finish orphaned (recover via transcript)"
+
+
+def is_turn_cut(err: str | None) -> bool:
+    """A cut turn (wall-clock cap / stall guard / dropped socket). The Hermes
+    RUN survives the disconnect and usually finishes orphaned — for dispatches
+    this is recoverable (wait → harvest/continue), never a terminal failure."""
+    return bool(err) and (err.startswith(TURN_CAP_ERROR)
+                          or err.startswith(TURN_STALLED_ERROR))
 
 QUOTA_SIGNATURES = ("429", "rate limit", "rate_limit", "too many concurrent", "quota")
 
@@ -81,7 +101,8 @@ def classify_failure(err) -> str:
         return "cuda-oom"
     if is_quota_error(t):
         return "quota"
-    if "timeout" in t or "timed out" in t or "exceeded max_seconds" in t:
+    if "timeout" in t or "timed out" in t or "exceeded max_seconds" in t \
+            or "turn stalled" in t:
         return "hermes-timeout"
     if "gateway did not respond" in t or "connecterror" in t or "connection refused" in t \
             or "connection reset" in t or "all connection attempts failed" in t:
@@ -177,18 +198,26 @@ def get_session(session_id: str) -> dict | None:
 
 
 def stream_turn(session_id: str, input_text: str, system_message: str | None = None,
-                on_event=None, max_seconds: int | None = None) -> dict:
+                on_event=None, max_seconds: int | None = None,
+                stall_seconds: int | None = None) -> dict:
     """Send one turn and consume its SSE stream to completion.
 
     on_event(name, data_dict) fires for every parsed event (heartbeats, live
     preview, activity). Returns {content, usage, error}. Raises QuotaError on
     rate-limit signatures so callers can back off instead of hammering.
+    max_seconds is a wall-clock cap (right for one-reply interactive chats);
+    stall_seconds cuts on SILENCE instead — no parsed event for that long
+    (keepalive comment lines don't count: they flow even when the run is hung).
+    Dispatch passes both; a cut turn returns TURN_CAP_ERROR/TURN_STALLED_ERROR
+    and the caller decides whether that is terminal (for dispatches it is NOT —
+    the orphaned run survives the disconnect and is waited on / harvested).
     """
     url = f"{HERMES_API_BASE}/api/sessions/{session_id}/chat/stream"
     payload = {"input": input_text}
     if system_message:
         payload["system_message"] = system_message
     deadline = time.time() + (max_seconds or DEFAULT_MAX_TURN_SECONDS)
+    last_progress = time.time()
     content, usage, error, partial = "", {}, None, False
 
     with httpx.Client(timeout=STREAM_TIMEOUT) as client:
@@ -203,33 +232,46 @@ def stream_turn(session_id: str, input_text: str, system_message: str | None = N
                 return {"content": "", "usage": {}, "error": f"HTTP {resp.status_code}: {body}"}
 
             event_name = ""
-            for line in resp.iter_lines():
-                if on_event:
-                    on_event("_line", None)  # every line (incl. keepalives) = liveness
-                if time.time() > deadline:
-                    error = "turn exceeded max_seconds cap; run may finish orphaned (recover via transcript)"
-                    break
-                if line.startswith("event: "):
-                    event_name = line[7:].strip()
-                    continue
-                if not line.startswith("data: "):
-                    continue
-                try:
-                    data = json.loads(line[6:].strip())
-                except Exception:
-                    data = {}
-                name, event_name = event_name, ""
-                if on_event:
-                    on_event(name, data)
-                if name == "assistant.completed":
-                    content = data.get("content") or content
-                    partial = bool(data.get("partial") or data.get("interrupted"))
-                elif name == "run.completed":
-                    usage = data.get("usage") or {}
-                    if not content:
-                        content = data.get("content") or ""
-                elif name == "error":
-                    error = str(data.get("message") or data.get("error") or data)[:500]
+            try:
+                for line in resp.iter_lines():
+                    if on_event:
+                        on_event("_line", None)  # every line (incl. keepalives) = liveness
+                    now = time.time()
+                    if now > deadline:
+                        error = TURN_CAP_ERROR
+                        break
+                    if stall_seconds and now - last_progress > stall_seconds:
+                        error = TURN_STALLED_ERROR
+                        break
+                    if line.startswith("event: "):
+                        event_name = line[7:].strip()
+                        continue
+                    if not line.startswith("data: "):
+                        continue
+                    last_progress = now  # a real event — the run is making progress
+                    try:
+                        data = json.loads(line[6:].strip())
+                    except Exception:
+                        data = {}
+                    name, event_name = event_name, ""
+                    if on_event:
+                        on_event(name, data)
+                    if name == "assistant.completed":
+                        content = data.get("content") or content
+                        partial = bool(data.get("partial") or data.get("interrupted"))
+                    elif name == "run.completed":
+                        usage = data.get("usage") or {}
+                        if not content:
+                            content = data.get("content") or ""
+                    elif name == "error":
+                        error = str(data.get("message") or data.get("error") or data)[:500]
+            except httpx.TransportError as e:
+                # The SOCKET died mid-turn (read timeout past the keepalives, a
+                # gateway hiccup) — the RUN did not: it finishes orphaned, same
+                # as a cap cut. Only a dispatch caller treats this as
+                # recoverable; interactive callers surface it as the error.
+                if not usage:  # with run.completed already seen, the drop cost nothing
+                    error = f"{TURN_STALLED_ERROR} [stream dropped: {type(e).__name__}]"
 
     if error and is_quota_error(error):
         raise QuotaError(error)
@@ -335,7 +377,7 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
             stale_s = RECONCILE_STALE_S
     now = time.time()
     cutoff = now - stale_s
-    default_budget = int(db.get_setting("dispatch.default_task_budget", "1000000"))
+    default_budget = int(sreg.conf("dispatch.default_task_budget") or 5000000)
     active = ("queued", "dispatching", "streaming", "finalizing")
     placeholders = ",".join("?" * len(active))
     reset: list[str] = []
@@ -405,7 +447,8 @@ def check_budgets(task: dict) -> str | None:
     """Return a blocked-state name if this task must NOT be dispatched now.
     Task-specific budget is checked BEFORE the global quota backoff so a budget
     verdict stays deterministic even in the middle of a 429 storm."""
-    budget = task.get("budget_tokens") or int(db.get_setting("dispatch.default_task_budget", "1000000"))
+    budget = task.get("budget_tokens") \
+        or int(sreg.conf("dispatch.default_task_budget") or 5000000)
     if (task.get("tokens_used") or 0) >= budget:
         return "blocked_budget"
     backoff_until = float(db.get_setting("dispatch.quota_backoff_until", "0") or 0)
@@ -1291,6 +1334,43 @@ def orphan_run_state(task: dict) -> str:
     return "active" if age < quiet else "dead"
 
 
+def _turn_cut_count(task_id: str) -> int:
+    """How many of this task's dispatches were cut mid-turn (cap/stall). The
+    worker's supersede preserves the cut error on the old row, so this survives
+    the lane re-entry churn. Bounds the resume budget auto-extension."""
+    row = db.query_one(
+        "SELECT COUNT(*) AS n FROM dispatches WHERE task_id=? AND "
+        "(error LIKE 'turn exceeded max_seconds cap%' OR error LIKE 'turn stalled%')",
+        (task_id,))
+    return int((row or {}).get("n") or 0)
+
+
+def _capture_repo_result(task: dict, workspace: Path, agent_id: str,
+                         repo_ctx: dict | None = None):
+    """The branch diff IS the deliverable for repo tasks: snapshot anything the
+    agent left uncommitted (never lose work), then capture the full diff vs the
+    baseline into the workspace for review/UI/judging. Called on EVERY path that
+    finalizes a repo task's result — including harvest, or changes.diff goes
+    stale at whatever the last live stream saw."""
+    repo_ctx = repo_ctx or _repo_context(task)
+    if not repo_ctx:
+        return
+    task_id = task["id"]
+    try:
+        if wt.snapshot_commit(repo_ctx["worktree"],
+                              f"nexus {task_id}: uncommitted-work snapshot"):
+            db.log_activity("warn", agent_id,
+                            f"Task {task_id}: agent left uncommitted changes — snapshot-committed")
+        diff = wt.capture_diff(repo_ctx["worktree"], repo_ctx["base"])
+        (workspace / "changes.diff").write_text(diff or "(no changes on the branch)\n")
+        db.log_activity("info", agent_id,
+                        f"Task {task_id}: captured branch diff "
+                        f"({len(diff.splitlines())} lines) from {repo_ctx['branch']}")
+    except Exception as e:
+        db.log_activity("error", agent_id,
+                        f"Task {task_id}: diff capture failed: {str(e)[:100]}")
+
+
 def _try_harvest(task: dict) -> dict | None:
     """R3.3: a dead executor's run finishes ORPHANED on the Hermes side and lands
     in state.db. If a FINAL assistant reply exists, recover it without spending
@@ -1366,6 +1446,8 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                 harvested = _try_harvest(task)
                 if harvested:
                     _set_task(task_id, dispatch_state="finalizing")
+                    if task.get("repo_path"):
+                        _capture_repo_result(task, workspace, agent_id)
                     _finalize_result(dispatch_id, task_id, agent_id, workspace,
                                      harvested["content"], harvested["usage"], None, harvested=True)
                     return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
@@ -1405,6 +1487,21 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             raise QuotaError("simulated 429 (dispatch.force_429)")
 
         blocked = check_budgets(task)
+        if blocked == "blocked_budget" and resume and 0 < _turn_cut_count(task_id) <= 3:
+            # B2: this resume finishes work the budget already paid for — parking
+            # it one step from the finish strands the whole spend. Grant the same
+            # one-slice headroom a judge retry gets (_retry_task), bounded to 3
+            # cut-turn extensions so a looping run can't mint budget forever.
+            slice_ = int(task.get("budget_tokens")
+                         or int(sreg.conf("dispatch.default_task_budget") or 5000000))
+            new_budget = int(task.get("tokens_used") or 0) + slice_
+            _set_task(task_id, budget_tokens=new_budget)
+            task["budget_tokens"] = new_budget
+            db.log_activity("info", agent_id,
+                            f"Task {task_id}: budget extended to {new_budget:,} to finish "
+                            f"a cut-turn run (cut #{_turn_cut_count(task_id)})",
+                            user_id=task.get("user_id"))
+            blocked = check_budgets(task)  # daily cap / quota backoff still bind
         if blocked:
             _set_task(task_id, dispatch_state=blocked,
                       dispatch_error=f"{blocked} at dispatch time")
@@ -1456,27 +1553,33 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             input_text = f"{task['title']}\n\n{task.get('description') or ''}".strip()
         result = stream_turn(session_id, input_text, system_message=framing, on_event=on_event,
                              max_seconds=int(db.get_setting("dispatch.max_turn_seconds",
-                                                            str(DEFAULT_MAX_TURN_SECONDS))))
+                                                            str(DEFAULT_MAX_TURN_SECONDS))),
+                             stall_seconds=int(db.get_setting(
+                                 "dispatch.max_turn_stall_seconds",
+                                 str(DEFAULT_TURN_STALL_SECONDS))))
+
+        if is_turn_cut(result.get("error")):
+            # The turn outlived its guard but the RUN is still alive upstream
+            # (a client disconnect never kills it) — failing here strands work
+            # the run will finish on its own. Record the cut on the dispatch
+            # row, keep it live, and return: the lane's stale-heartbeat check
+            # re-enters via resume, where orphan_run_state waits while it's
+            # active, harvests it for free when finished, or continue-turns a
+            # quiet one. No snapshot/diff here either — the agent is still
+            # writing; committing under it captured half-done work.
+            _set_dispatch(dispatch_id, state="streaming", heartbeat_at=time.time(),
+                          error=result["error"])
+            _set_task(task_id, dispatch_state="streaming")
+            db.log_activity("warn", agent_id,
+                            f"Task {task_id}: turn cut ({result['error'][:80]}) — run "
+                            "continues orphaned; lane will wait & harvest",
+                            user_id=task.get("user_id"))
+            return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
         _set_task(task_id, dispatch_state="finalizing")
         content = result.get("content") or ""
         if repo_ctx:
-            # The branch diff IS the deliverable: snapshot anything the agent
-            # left uncommitted (never lose work), then capture the full diff
-            # vs the baseline into the workspace for review/UI/judging.
-            try:
-                if wt.snapshot_commit(repo_ctx["worktree"],
-                                      f"nexus {task_id}: uncommitted-work snapshot"):
-                    db.log_activity("warn", agent_id,
-                                    f"Task {task_id}: agent left uncommitted changes — snapshot-committed")
-                diff = wt.capture_diff(repo_ctx["worktree"], repo_ctx["base"])
-                (workspace / "changes.diff").write_text(diff or "(no changes on the branch)\n")
-                db.log_activity("info", agent_id,
-                                f"Task {task_id}: captured branch diff "
-                                f"({len(diff.splitlines())} lines) from {repo_ctx['branch']}")
-            except Exception as e:
-                db.log_activity("error", agent_id,
-                                f"Task {task_id}: diff capture failed: {str(e)[:100]}")
+            _capture_repo_result(task, workspace, agent_id, repo_ctx)
         # Hermes surfaces upstream provider failures (e.g. Z.ai 429 after retries)
         # as assistant TEXT with no error event — a partial flag and/or the
         # "API call failed" wrapper string are the reliable signals.

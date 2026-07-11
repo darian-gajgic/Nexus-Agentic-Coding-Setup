@@ -133,6 +133,50 @@ def _find_work(agent_id: str, auto_claim: bool, dispatch_on: bool):
     return None, None
 
 
+_orphan_wait_logged: dict = {}  # task_id -> last log ts (one line per ~10 min, not per tick)
+
+
+def _wait_on_active_orphan(task: dict, agent_id: str) -> bool:
+    """A resume whose orphaned run is STILL EXECUTING upstream needs no action —
+    just keep the existing dispatch row's heartbeat fresh and check back on the
+    next stale tick. Superseding it each time minted a failed row + log line per
+    90s (observed: 17 junk rows in 25 min). Returns True when the caller should
+    wait. A run alive past 2× the turn cap is declared runaway and failed for
+    real — the ONE case where terminal-failed (and the replan checkpoint) is
+    the right outcome; token budgets can't stop it mid-run."""
+    tid = task["id"]
+    if hd.orphan_run_state(task) != "active":
+        _orphan_wait_logged.pop(tid, None)
+        return False
+    d = db.query_one(
+        "SELECT * FROM dispatches WHERE task_id=? AND state IN "
+        "('queued','dispatching','streaming') ORDER BY started_at DESC LIMIT 1", (tid,))
+    now = time.time()
+    ceiling = 2 * int(db.get_setting("dispatch.max_turn_seconds",
+                                     str(hd.DEFAULT_MAX_TURN_SECONDS)))
+    if d and now - (d.get("started_at") or now) > ceiling:
+        err = (f"orphaned run still active {int((now - d['started_at']) / 60)} min in "
+               f"(> 2× max_turn_seconds) — declared runaway")
+        db.execute(
+            "UPDATE dispatches SET state='failed', ended_at=?, error=? "
+            "WHERE task_id=? AND state IN ('queued','dispatching','streaming')",
+            (now, err, tid))
+        db.execute("UPDATE tasks SET dispatch_state='failed', dispatch_error=? WHERE id=?",
+                   (err, tid))
+        db.log_activity("error", agent_id, f"Task {tid}: {err}",
+                        user_id=task.get("user_id"))
+        _orphan_wait_logged.pop(tid, None)
+        return True  # nothing left to resume this tick
+    if d:
+        db.execute("UPDATE dispatches SET heartbeat_at=? WHERE id=?", (now, d["id"]))
+    if now - _orphan_wait_logged.get(tid, 0) > 600:
+        _orphan_wait_logged[tid] = now
+        db.log_activity("info", agent_id,
+                        f"Task {tid}: orphaned run still active — waiting, not resuming",
+                        user_id=task.get("user_id"))
+    return True
+
+
 def _execute(task: dict, mode: str, agent_id: str):
     tid = task["id"]
     if mode == "queued":
@@ -145,14 +189,17 @@ def _execute(task: dict, mode: str, agent_id: str):
         # continue-turn) instead of replaying the same instructions into it.
         hd.run_task_dispatch(did, tid, agent_id, resume=bool(task.get("session_id")))
     elif mode == "resume":
+        if _wait_on_active_orphan(task, agent_id):
+            return  # run still executing upstream — heartbeat refreshed, no churn
         db.execute(
             "UPDATE dispatches SET state='failed', ended_at=?, "
-            "error='executor died — resumed by new worker' "
+            "error=COALESCE(NULLIF(error,''), "
+            "'superseded — lane re-entered (executor died or turn cut)') "
             "WHERE task_id=? AND state IN ('queued','dispatching','streaming')",
             (time.time(), tid))
         db.log_activity("warn", agent_id,
-                        f"Task {tid}: previous executor died — resuming session",
-                        user_id=task.get("user_id"))
+                        f"Task {tid}: dispatch interrupted (executor death or cut turn) "
+                        "— resuming session", user_id=task.get("user_id"))
         did = hd.start_dispatch(tid, agent_id)
         hd.run_task_dispatch(did, tid, agent_id, resume=True)
     else:  # "retry" (block cleared) or freshly "claimed"
