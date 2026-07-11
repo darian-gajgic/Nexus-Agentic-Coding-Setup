@@ -3218,11 +3218,16 @@ async def decide_approval(approval_id: str, body: dict):
     decided_by = body.get("decided_by", "operator")
     if decision not in ("approved", "rejected"):
         return JSONResponse(status_code=400, content={"error": "status must be approved|rejected"})
-    owned = db.query_one("SELECT id FROM approvals WHERE id=? AND user_id=?",
-                         (approval_id, auth.current_user_id()))
+    # [23]: scope-aware, mirroring list_approvals — admin-scoped cards
+    # (lesson_deltas, routing_tuning) are surfaced to EVERY admin in the
+    # Decisions inbox, so any admin must be able to decide them; a plain
+    # user_id check 404'd the very audience the card targets and left it
+    # pending forever. Foreign PRIVATE approvals stay ≡ nonexistent —
+    # deciding someone else's approval would ship/retry THEIR task.
+    owned = db.query_one(
+        "SELECT id FROM approvals WHERE id=? AND (user_id=? OR (scope='admin' AND ?))",
+        (approval_id, auth.current_user_id(), 1 if auth.is_admin() else 0))
     if not owned:
-        # foreign ≡ nonexistent — deciding someone else's approval would
-        # ship/retry THEIR task
         return JSONResponse(status_code=404, content={"error": "not found"})
     cur = db.execute(
         "UPDATE approvals SET status=?, decided_at=?, decided_by=? WHERE id=? AND status='pending'",

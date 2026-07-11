@@ -67,6 +67,32 @@ ok("approval approved", r.get("status")=="approved")
 pend = get("/api/approvals", params={"status":"pending"}).json()["approvals"]
 ok("pending count decremented", not any(a["id"]==aid for a in pend))
 
+print("=== 3b. Admin-scoped approvals decidable by any admin ([23]) ===")
+# lesson_deltas / routing_tuning cards carry scope='admin': list_approvals and
+# /api/decisions show them to EVERY admin, but decide_approval used to require
+# user_id == caller — the surfaced audience got 404 on approve/reject and the
+# card sat pending forever. Seed a foreign-owned admin card + a foreign-owned
+# PRIVATE approval: the admin decides the first, still can't see the second.
+import pathlib, sqlite3, time as _t  # noqa: E402
+_con = sqlite3.connect(str(pathlib.Path(__file__).resolve().parent.parent / "nexus.db"))
+_con.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, "
+             "status, risk_level, requested_at, user_id, scope) "
+             "VALUES ('appr-e2e23a','lessons-distiller','lesson_deltas','[23] admin card',"
+             "'{}','pending','medium',?, 'u_ghost-e2e23','admin')", (_t.time(),))
+_con.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, "
+             "status, risk_level, requested_at, user_id) "
+             "VALUES ('appr-e2e23b','e2e','deploy','[23] foreign private card',"
+             "'{}','pending','high',?, 'u_ghost-e2e23')", (_t.time(),))
+_con.commit()
+r = patch("/api/approvals/appr-e2e23a", json={"status": "rejected", "decided_by": "e2e"})
+ok("[23] admin decides a foreign-owned ADMIN-scoped card", r.status_code == 200,
+   f"{r.status_code} {r.text[:120]}")
+r = patch("/api/approvals/appr-e2e23b", json={"status": "rejected", "decided_by": "e2e"})
+ok("[23] foreign PRIVATE approval still hidden (404)", r.status_code == 404,
+   str(r.status_code))
+_con.execute("DELETE FROM approvals WHERE id IN ('appr-e2e23a','appr-e2e23b')")
+_con.commit(); _con.close()
+
 print("=== 4. Watchdog status ===")
 r = get("/api/watchdog/status").json()
 ok("watchdog config returned", "config" in r and "interval_s" in r["config"])
