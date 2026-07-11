@@ -74,9 +74,11 @@ history + clipped sibling reports). Deny rules still forbid push/remote/gh/sudo.
 - Server: `_escalation_thread` + `POST /api/tasks/{id}/escalate` (CAS-guarded to
   `critic_verdict='escalating'` — no double-spawn; 409 on a lost race). It
   snapshots the failing version as `deliverable.v<N>.md` (evidence for the next
-  critic), consumes the open comments, advances the version clock, and clears the
-  verdict so the sweep re-critiques the rewritten deliverable. Frontier quota is
-  classified like the critic (backoff + requeue, never `error`/human-escalate).
+  critic) and — **only when the rework actually rewrote the deliverable** (content
+  hash changed AND no failure marker; see the phase7 judge round below) — consumes
+  the open comments, advances the version clock, and clears the verdict so the
+  sweep re-critiques the rewritten deliverable. Frontier quota is classified like
+  the critic (backoff + requeue, never `error`/human-escalate).
 - Loop hook (`loop_engine._try_escalate_super`): fires on REWRITE (closed mode)
   and on the round cap when criticals remain, bounded by `super.escalation_max`
   (default 1) — after the budget is spent it falls through to the human
@@ -144,10 +146,14 @@ dropdown rendering to support the threshold picker.)
 - **Static** `scripts/verify.sh` — **436/436** (was 409; +27 Appendix-C checks
   across C3/C1a/C1b/C1c/C2/rule3/C5/rule12).
 - **Super Result e2e** `scripts/verify_super_result_e2e.py` — full live-sweep run,
-  including 8 new C3 checks (envelope unwrap, price table, ledger math + API), 9
-  new C1c checks (dossier, endpoint gating + CAS, live escalated rework rewriting
-  the deliverable, v-snapshot, ledger booking, re-critique, comment consumption),
-  and 2 new C1b checks (patch stored + re-attached as a fenced diff). **0 failed.**
+  **79/79 (0 failed)**. Includes 8 C3 checks (envelope unwrap, price table, ledger
+  math + API), 9 C1c checks (dossier, endpoint gating + CAS, live escalated rework
+  rewriting the deliverable, v-snapshot, ledger booking, re-critique, comment
+  consumption), 2 C1b checks (patch stored + re-attached as a fenced diff), and
+  **+14 phase7 judge-REVISE regression checks** (finding 1: PATH augmentation +
+  claude resolves under a stripped service PATH; finding 2: exit-127 and
+  byte-identical reworks do not false-SHIP — comments kept, clock frozen,
+  verdict→error).
 - **Quality Autopilot e2e** `scripts/verify_autopilot_e2e.py` — **56/56**
   (rule-3 model-floor now asserts DERIVED, not staged).
 - **Deep Plan e2e** `scripts/verify_deep_plan_e2e.py` — **21/21** (spec_model /
@@ -155,6 +161,81 @@ dropdown rendering to support the threshold picker.)
 - Service restarts clean; https://127.0.0.1:8777 loads; migration is idempotent
   (new columns/table/seed applied to the live DB with no data loss;
   `nexus.db.bak-phase7` taken).
+
+---
+
+## Judge REVISE round (phase7) — blocking findings fixed (2026-07-11)
+
+The independent judge returned REVISE with two blocking findings. Both were
+re-verified against HEAD (reproduced), then fixed with a regression check each and
+a real live re-drive.
+
+### Finding 1 — service-spawned `claude` exits 127 (escalation never really ran)
+**Verified at HEAD (reproduced):** the running `nexus.service` PATH is
+`~/.local/bin:/usr/local/sbin:…:/snap/bin` — it does **not** contain
+`~/.npm-global/bin`, which is where the `claude` CLI actually lives on this
+machine (there is no `~/.local/bin/claude`). The frontier scripts
+(`cverify`/`cjudge`/`cexec`) `exec env … claude`, so under the exact service PATH
+`command -v claude` fails (exit 1) → a service-spawned escalation/critic/judge
+`env`-execs to **exit 127 in ~30 ms**. Confirmed the fault reaches four call
+sites, not just escalation: `run_critic_cmd` + `run_escalation_cmd` build env via
+`_scrubbed_env`, while **`run_judge_cmd` uses `dict(os.environ)` and
+`run_plan_critique` builds its own env** (and can invoke `claude` directly) — so
+cjudge/premortem were silently exposed too.
+
+**Fix (`app/evals.py`):** new `_augment_path_for_claude(path)` appends the common
+user CLI bin dirs (`~/.npm-global/bin`, `~/.local/bin`, `~/bin`,
+`~/.claude/local`) to PATH, idempotent and append-only (operator ordering
+preserved). Applied in **all four** frontier envs: `_scrubbed_env` (critic +
+escalation), `run_judge_cmd`, and `run_plan_critique`. Chose the
+`_scrubbed_env`-PATH option from the judge's two alternatives because it is
+central, committable through the tracked `app/` tree (live via the
+`~/nexus-agent-os` symlink), and fixes the live service without editing the
+untracked `~/.local/bin` script copies.
+
+**Regression (`verify_super_result_e2e.py`):** under a synthesized claude-less
+service PATH, assert `_scrubbed_env` re-adds the CLI bin dirs and that `claude`
+resolves via `shutil.which(path=…)` (guarded to skip if claude isn't installed);
+plus a source assert that judge + premortem envs are augmented too (`>= 2`
+`_augment_path_for_claude(env.get("PATH"…)` sites).
+
+**Live re-drive (the judge's criterion):** created a scratch task
+("capital of France is Berlin") with a REWRITE critic verdict + one open comment,
+set `super.escalation=1` and the real `cexec`, and POSTed `/escalate` through the
+running service (whose PATH lacks `~/.npm-global/bin`). Result: **real `claude`
+ran** (no exit-127 marker), rewrote the deliverable to "…is Paris.", booked a real
+envelope to the C3 ledger (`kind=escalation`, `source=envelope`, **$0.65 /
+217k tokens**), verdict cleared → re-critique, comment consumed. The
+"one escalated rework on a scratch task" criterion now passes.
+
+### Finding 2 — a failed/no-op rework was booked as success
+**Verified at HEAD (reproduced by inspection + the live finding-1 result):**
+`_escalation_thread` ran the quota check, then **unconditionally** consumed the
+open comments, advanced the version clock (`completed_at`), cleared the verdict,
+and logged "wrote the final version" — regardless of whether the rework produced
+anything. So the exit-127 above (and any timeout / crash / byte-identical
+deliverable) was treated as a successful rewrite: the critic's comments were
+thrown away and the loop advanced on an unimproved draft.
+
+**Fix (`app/server.py`):** the thread now hashes the deliverable before the rework
+and, after the quota gate, only books success when the deliverable was **actually
+rewritten** (`post_hash != pre_hash`) **and** `run_escalation_cmd` reported no
+failure marker (`[escalation exited|timed out|failed to run|skipped]`). On failure
+it reverts the deliverable to the pre-rework snapshot (undoing any partial/timeout
+write), drops the redundant `deliverable.v<N>.md` snapshot (new `_drop_snapshot`
+helper — also applied on the quota path so retries don't inflate snapshots), KEEPS
+the open comments, sets `critic_verdict='error'`, and re-arms the loop-engine
+super-state (`loop_engine._locate_super_cfg` → `_set_super_state(…, None)`) so
+`_sweep_super_result` re-evaluates the critique through its `'error'` branch and
+opens the human checkpoint instead of skipping it as already-handled.
+
+**Regression (`verify_super_result_e2e.py`):** two `/escalate` drives on a
+sweep-invisible plain task with no-op stubs — (a) `exit 127`, (b) exit 0 with a
+clean claude-JSON envelope that rewrites nothing (the exact "byte-identical
+deliverable" the judge observed live). Each asserts: verdict lands on `'error'`
+(never a false SHIP), the open comment is KEPT, the deliverable equals its
+pre-rework content, and `completed_at` is unchanged — plus a source assert that
+the failure branch re-arms the super-state and keeps the comments.
 
 ---
 
@@ -203,3 +284,12 @@ registry), `app/static/app.js` (`escalation_model` route, `enum` rendering),
 (`--output-format json`, patch field) + `~/.local/bin` copies, **new**
 `setup/bin/cexec` (+ `~/.local/bin/cexec`). Gates: `verify.sh`,
 `verify_super_result_e2e.py`, `verify_autopilot_e2e.py`.
+
+**Phase7 judge-REVISE round (2026-07-11):** `app/evals.py`
+(`_augment_path_for_claude` + PATH augmentation in `_scrubbed_env`,
+`run_judge_cmd`, `run_plan_critique` — finding 1), `app/server.py`
+(`_escalation_thread` success-verification: pre/post content hash + failure-marker
+gate, pre-rework revert, super-state re-arm → human checkpoint; new
+`_drop_snapshot` helper — finding 2), `app/scripts/verify_super_result_e2e.py`
+(+14 regression checks). No Hermes-side (`setup/bin`) change was needed: the fix
+is central in `evals`, which every frontier script inherits its env from.
