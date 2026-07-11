@@ -544,17 +544,20 @@ def run_judge_phase(state, step):
             if verdict is None:
                 escalate(state, phase, "judge produced no parsable verdict twice",
                          f"See {res['log_path']}")
+        # Judges are read-only by protocol — check the tree after EVERY verdict.
+        # (The phase7 round-3 judge left an untracked benchmarks/ tree behind on
+        # its SHIP round, which the old REVISE-only check never saw.)
+        judge_dirty = [d for d in git_dirty()
+                       if not d.split()[-1].startswith("orchestrator/")]
+        if judge_dirty:
+            escalate(state, phase, "judge session modified the working tree",
+                     "A judge must not edit. Dirty entries:\n" + "\n".join(judge_dirty[:30]))
         if verdict == "SHIP":
             log(f"{phase}: VERDICT SHIP after round {rounds}")
             state["judge_rounds"].pop(phase, None)
             save_state(state)
             return
         log(f"{phase}: VERDICT REVISE (round {rounds}/{MAX_JUDGE_ROUNDS}) — spawning fix session")
-        judge_dirty = [d for d in git_dirty()
-                       if not d.split()[-1].startswith("orchestrator/")]
-        if judge_dirty:
-            escalate(state, phase, "judge session modified the working tree",
-                     "A judge must not edit. Dirty entries:\n" + "\n".join(judge_dirty[:30]))
         fix = FIX_PROMPT.format(phase=impl, report=report or "the phase report",
                                 blocking=blocking) + IMPL_SUFFIX
         run_claude(state, f"{impl}-fix-r{rounds}", fix, IMPL_MODEL, IMPL_ALLOWED, IMPL_TIMEOUT_S)
