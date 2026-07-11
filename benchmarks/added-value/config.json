@@ -1,0 +1,44 @@
+{
+  "nexus_base_url": "https://127.0.0.1:8777",
+  "app_dir": "/home/sinep/Nexus-Agentic-Coding-Setup/app",
+  "corpus_root": "/home/sinep/knowledge/domains",
+  "knowledge_dir": "/home/sinep/knowledge",
+
+  "arm_a_mode": "task",
+  "arm_a_model": "glm-5.2",
+  "arm_a_task_timeout_s": 3600,
+  "arm_a_evals_timeout_s": 1800,
+
+  "arm_b_model": "claude-opus-4-8",
+  "arm_b_timeout_s": 900,
+
+  "arm_c_base_url": "https://api.z.ai/api/coding/paas/v4",
+  "arm_c_model": "glm-5.2",
+  "arm_c_max_tokens": 8192,
+  "arm_c_timeout_s": 600,
+  "hermes_env_file": "/home/sinep/.hermes/.env",
+  "glm_key_names": ["GLM_API_KEY", "ZAI_API_KEY"],
+
+  "judge_claude_model": "",
+  "judge_glm_model": "glm-5.2",
+  "judge_timeout_s": 600,
+  "pairwise": [["A", "B"], ["A", "C"]],
+
+  "retries": 2,
+  "quota_backoff_s": 90,
+  "shuffle_seed": 20260711,
+
+  "prices_per_mtok": {
+    "glm-5.2": {"in": 1.40, "cache": 0.26, "out": 4.40},
+    "claude-opus-4-8": {"in": 5.00, "out": 25.00}
+  },
+
+  "thresholds": {
+    "a_vs_b_win_rate_yes": 0.55,
+    "iso_quality_dim_delta": 0.3,
+    "iso_quality_cost_ratio": 0.40,
+    "a_vs_c_win_rate_yes": 0.70,
+    "falsified_b_win_rate": 0.60,
+    "max_excluded_briefs": 5
+  }
+}
