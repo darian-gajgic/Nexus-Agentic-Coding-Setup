@@ -46,6 +46,28 @@ def norm_spend(v) -> str:
     return v if v in SPEND_PROFILES else SPEND_DEFAULT
 
 
+def preset_fields(autopilot, spend, high_stakes: bool = False,
+                  explicit_budget: int | None = None):
+    """Q7a/D5: normalise the two preset axes and apply the budget multiplier
+    (rule 4). Returns (involvement|None, spend|None, effective_budget). NULL
+    axes = legacy behaviour (P10b): no derivation, explicit budget untouched.
+    THE shared derivation for every task-creation door — the API create path
+    (server._autopilot_fields delegates here) AND scheduler._trigger's B4
+    template jobs — so the rule-4 hard cost backstop moves with the spend axis
+    everywhere a task is born."""
+    import database as db
+    inv = norm_involvement(autopilot) if (autopilot or "").strip() else None
+    sp = norm_spend(spend) if (spend or "").strip() else None
+    budget = explicit_budget
+    if sp and explicit_budget is None:
+        try:
+            base = int(db.get_setting("dispatch.default_task_budget", "5000000") or 5000000)
+            budget = derive(inv, sp, high_stakes=bool(high_stakes), base_budget=base)["budget"]
+        except Exception:
+            budget = explicit_budget
+    return inv, sp, budget
+
+
 def _feature_present(name: str) -> bool:
     """P2: the profile→knob derivations for forward features are gated behind a
     feature-present check — at Phase 3 they derive nothing and report 'staged'."""

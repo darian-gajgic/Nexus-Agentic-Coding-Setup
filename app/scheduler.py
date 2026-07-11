@@ -14,6 +14,7 @@ import threading
 import datetime as dt
 
 import auth
+import autopilot
 import database as db
 
 
@@ -113,17 +114,26 @@ def _trigger(job: dict):
         except Exception:
             tmpl = {}
         dtype = tmpl.get("deliverable_type")
+        # D5/[7,33]: derive the preset axes + rule-4 budget through the SAME
+        # helper as the API create path. The raw INSERT used to store the
+        # template values unnormalized and leave budget_tokens NULL, so a
+        # scheduled Smart job ran on the unscaled 1x default backstop (and an
+        # Eco job on 2x its promised cap).
+        inv, sp, budget = autopilot.preset_fields(
+            tmpl.get("autopilot"), tmpl.get("spend_profile"),
+            bool(tmpl.get("high_stakes")), None)
         db.execute(
             "INSERT INTO tasks (id, title, description, status, priority, "
             "assignee_id, created_at, updated_at, tags, position, user_id, "
-            "super_result, deliverable_type, high_stakes, domain, autopilot, spend_profile) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "super_result, deliverable_type, high_stakes, domain, autopilot, "
+            "spend_profile, budget_tokens) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (tid, f"[scheduled] {job['name']}", job["action"], "todo", 2,
              job.get("agent_id") or None, now, now, json.dumps(["scheduled"]), 0,
              auth.DEFAULT_USER_ID,
              1 if tmpl.get("super_result") else 0, dtype if dtype else None,
              1 if tmpl.get("high_stakes") else 0, tmpl.get("domain"),
-             tmpl.get("autopilot"), tmpl.get("spend_profile")))
+             inv, sp, budget))
         if tmpl.get("super_result"):
             # give the recurring task its Super Result loop, exactly like the API path
             try:

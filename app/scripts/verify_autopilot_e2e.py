@@ -425,6 +425,30 @@ try:
 except Exception:
     chk("rule7 scheduler create reachable", False)
 
+print("=== D5 [7,33] — scheduler._trigger derives axes + rule-4 budget ===")
+# The B4 raw INSERT used to bypass the preset derivation: axes landed
+# unnormalized and budget_tokens stayed NULL (unscaled default backstop).
+# Drive _trigger directly on a disabled eco-template job and assert the task
+# is born with the rule-4 budget + normalized axes.
+import scheduler as scheduler_mod
+db.execute("INSERT OR REPLACE INTO scheduled_jobs (id, name, cron_expr, action, "
+           "enabled, task_template, next_run, run_count, created_at) "
+           "VALUES (?,?,?,?,0,?,?,0,?)",
+           ("qa-d5-job", "QA d5 eco", "0 4 * * 1", "eco probe brief",
+            json.dumps({"autopilot": " assisted ", "spend_profile": " eco ",
+                        "high_stakes": False}),
+            time.time() + 99999, time.time()))
+_cleanup.append(lambda: db.execute("DELETE FROM scheduled_jobs WHERE id='qa-d5-job'"))
+scheduler_mod._trigger(db.query_one("SELECT * FROM scheduled_jobs WHERE id='qa-d5-job'"))
+_t5 = db.query_one("SELECT * FROM tasks WHERE title='[scheduled] QA d5 eco' "
+                   "ORDER BY created_at DESC LIMIT 1")
+_cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE title='[scheduled] QA d5 eco'"))
+_base5 = int(db.get_setting("dispatch.default_task_budget", "5000000") or 5000000)
+chk("D5 scheduled eco task born with the rule-4 budget (0.5 x default)",
+    bool(_t5) and _t5.get("budget_tokens") == int(_base5 * 0.5))
+chk("D5 scheduled task axes normalized (no raw template strings)",
+    bool(_t5) and _t5.get("spend_profile") == "eco" and _t5.get("autopilot") == "assisted")
+
 print("=== Q7a — workflow PATCH cascade of BOTH preset axes → member tasks (HTTP) ===")
 # Part-5 gate: "workflow cascade of both fields". PATCH a workflow's two axes and
 # assert every member task inherits BOTH autopilot AND spend_profile (mirrors the
@@ -447,6 +471,23 @@ try:
         wrow = db.query_one("SELECT autopilot, spend_profile FROM workflows WHERE id=?", (wcid,))
         chk("Q7a workflow row itself carries both axes after PATCH",
             wrow and wrow["autopilot"] == "full_auto" and wrow["spend_profile"] == "smart")
+        # [11] D5: a member carrying its OWN enabled loop_config re-derives on
+        # the workflow PATCH (round cap follows the new profile) with `used`
+        # counters preserved — previously only the WORKFLOW loop regenerated.
+        _lc11 = {"enabled": True, "mode": "closed", "preference": "quality",
+                 "triggers": [{"id": "judge_revise", "enabled": True,
+                               "max_rounds": 3, "used": 1}]}
+        db.execute("UPDATE tasks SET domain='marketing', loop_config=? WHERE id='wc-m0'",
+                   (json.dumps(_lc11),))
+        patch(f"/api/workflows/{wcid}", json={"spend_profile": "eco"})
+        _m0 = json.loads(db.query_one(
+            "SELECT loop_config FROM tasks WHERE id='wc-m0'")["loop_config"] or "{}")
+        _jr11 = next((t for t in _m0.get("triggers") or []
+                      if t.get("id") == "judge_revise"), {})
+        chk("[11] member's own loop re-derived on workflow PATCH (eco round cap)",
+            _jr11.get("max_rounds") == 1)
+        chk("[11] member loop 'used' counters preserved across the re-derive",
+            _jr11.get("used") == 1)
     else:
         chk("Q7a workflow create for cascade reachable", False)
 except Exception:
