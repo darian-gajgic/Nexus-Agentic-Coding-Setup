@@ -486,6 +486,44 @@ chk "deep plan e2e gate exists"      "[ -f scripts/verify_deep_plan_e2e.py ]"
 chk "deep plan UI gate exists"       "[ -f scripts/verify_deep_plan_ui.py ]"
 
 echo ""
+echo -e "${YELLOW}═══ 21. APPENDIX C — cost ledger + escalation + rotation-readiness ═══${NC}"
+# C3 — full-cost ledger + JSON-envelope unwrap (contract C-8)
+chk "C3: frontier ledger table + task cols" "grep -q 'frontier_ledger' database.py && grep -q '\"frontier_tokens\"' database.py && grep -q '\"frontier_cost_usd\"' database.py"
+chk "C3: price table + ledger helpers" "grep -q 'MODEL_PRICES_SEED' database.py && grep -q 'def model_prices' database.py && grep -q 'def task_cost_ledger' database.py && grep -q 'def record_frontier_run' database.py"
+chk "C3: price table seeded + setting" "grep -q 'cost.model_prices' database.py && grep -q 'cost.model_prices' settings_registry.py"
+chk "C3: envelope unwrap before parse (C-8)" "grep -q 'def _unwrap_frontier_output' evals.py && grep -q '_unwrap_frontier_output(r.stdout' evals.py"
+chk "C3: usage_sink plumbed to cmds"  "grep -q 'usage_sink' evals.py && grep -q 'def record_frontier_spend' evals.py"
+chk "C3: cverify/cjudge emit JSON envelope" "grep -q -- '--output-format json' ../setup/bin/cverify && grep -q -- '--output-format json' ../setup/bin/cjudge && grep -q -- '--output-format json' \$HOME/.local/bin/cverify && grep -q -- '--output-format json' \$HOME/.local/bin/cjudge"
+chk "C3: spend recorded in critic+judge threads" "grep -q 'record_frontier_spend' server.py"
+chk "C3: ledger endpoints"            "grep -q '/api/tasks/{task_id}/ledger' server.py && grep -q '/api/workflows/{workflow_id}/ledger' server.py"
+# C1a — escalation_model registry purpose (spec_model already landed with Deep Plan)
+chk "C1a: escalation_model purpose"   "grep -q 'escalation_model' database.py && grep -q 'escalation_model' settings_registry.py && grep -q 'def escalation_model_for' evals.py"
+chk "C1a: purpose seeded + migrated"  "grep -q \"'escalation_model', 'mdl-opus48'\\|('escalation_model', \\\"mdl-opus48\\\")\\|escalation_model.*mdl-opus48\" database.py && grep -q 'migrated.escalation_model' database.py"
+chk "C1a: purpose is CLI-route in UI" "grep -q 'escalation_model:' static/app.js"
+# C1c — escalated rework (setting-gated super.escalation)
+chk "C1c: cexec vendored + installed" "[ -f ../setup/bin/cexec ] && [ -f \$HOME/.local/bin/cexec ] && grep -q -- '--output-format json' ../setup/bin/cexec"
+chk "C1c: escalation runner + dossier" "grep -q 'def run_escalation_cmd' evals.py && grep -q 'def build_escalation_dossier' evals.py && grep -q 'with _FRONTIER_GATE' evals.py"
+chk "C1c: escalation endpoint + thread" "grep -q '/api/tasks/{task_id}/escalate' server.py && grep -q 'def _escalation_thread' server.py"
+chk "C1c: loop hook (REWRITE + round-cap)" "grep -q 'def _try_escalate_super' loop_engine.py && grep -q '_has_open_criticals' loop_engine.py && grep -q \"verdict == .REWRITE. and _try_escalate_super\" loop_engine.py"
+chk "C1c: setting-gated + bounded"    "grep -q 'super.escalation' settings_registry.py && grep -q 'super.escalation_max' settings_registry.py && grep -q 'super.escalation' database.py"
+chk "C1c: escalation spend to ledger" "grep -q '\"escalation\"' server.py && grep -q 'record_frontier_spend' server.py"
+# C1b — critic patch field (CriticGPT: critic-proposed diff, executor applies verbatim)
+chk "C1b: cverify emits optional patch" "grep -q '\\\\\"patch\\\\\"' ../setup/bin/cverify && grep -q 'unified-diff hunk' ../setup/bin/cverify && grep -q -- '--output-format json' \$HOME/.local/bin/cverify"
+chk "C1b: parse captures patch"       "grep -q '\"patch\": _clip(f.get(\"patch\")' evals.py"
+chk "C1b: patch column + retry re-attaches" "grep -q 'ADD COLUMN patch TEXT' database.py && grep -q 'Apply this patch verbatim' server.py"
+# C2 — registry-only model references (rotation readiness)
+chk "C2: centralized fallback map + helpers" "grep -q 'FALLBACK_MODELS = {' database.py && grep -q 'def fallback_model' database.py && grep -q 'def worker_fallback_models' database.py"
+chk "C2: no hardcoded model literal in routing fallbacks" "! grep -qE 'or \"glm-5\.[12]\"|or \"glm-4\.5-air\"' server.py && grep -q 'db.fallback_model(' server.py && grep -q 'db.worker_fallback_models()' server.py"
+chk "C2: dispatch DEFAULT_MODEL via registry" "grep -q 'DEFAULT_MODEL = db.fallback_model' hermes_dispatch.py"
+chk "C2: L4 fingerprint spans new judgment tiers" "grep -q 'spec_model' routing.py && grep -q 'escalation_model' routing.py"
+# rule 3 — Eco model-tier floor (was P2-staged, completed with C2)
+chk "rule3: Eco model floor derived + applied" "grep -q '\"eco\": \"easy\"' autopilot.py && grep -q 'Eco model floor' server.py && grep -q 'model_floor: str' server.py"
+# C5 — escalation-threshold settings
+chk "C5: escalation trigger threshold setting" "grep -q 'super.escalation_trigger' settings_registry.py && grep -q 'def _escalation_mode' loop_engine.py && grep -q 'rewrite_or_cap' loop_engine.py"
+# rule 12 — JARVIS framing documents the new OS surface (ledger + escalated rework)
+chk "rule12: JARVIS knows the cost ledger + escalated rework" "grep -q 'COST LEDGER (Appendix C3)' server.py && grep -q 'ESCALATED REWORK (Appendix C1c)' server.py && grep -q '/api/tasks/ID/escalate' server.py"
+
+echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then
   echo -e "  ${GREEN}ALL CHECKS PASSED: $PASS/$PASS${NC}"

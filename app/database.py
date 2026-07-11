@@ -2,6 +2,7 @@
 import sqlite3
 import json
 import time
+import uuid
 import threading
 from pathlib import Path
 from contextlib import contextmanager
@@ -276,6 +277,14 @@ def init_db():
         # no derivation, existing explicit preference honored as-is).
         ("autopilot", "TEXT"),                   # full_auto|assisted|manual|NULL
         ("spend_profile", "TEXT"),               # eco|optimal|smart|NULL
+        # Appendix C3 (full-cost ledger): frontier subprocess spend for this task —
+        # critic/judge/spec/escalation runs bill the Claude subscription, invisible
+        # to the GLM token counter (tokens_used). These accumulate their captured
+        # tokens + API-EQUIVALENT dollars (from the claude-JSON envelope, else a
+        # transcript-size estimate priced from cost.model_prices) so the ledger
+        # can show a task's total $ across BOTH currencies. Not a bill — a compare.
+        ("frontier_tokens", "INTEGER DEFAULT 0"),
+        ("frontier_cost_usd", "REAL DEFAULT 0"),
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -323,6 +332,12 @@ def init_db():
     rc_cols = {r[1] for r in conn.execute("PRAGMA table_info(review_comments)").fetchall()}
     if "source" not in rc_cols:
         conn.execute("ALTER TABLE review_comments ADD COLUMN source TEXT NOT NULL DEFAULT 'user'")
+    # Appendix C1b: an optional critic-proposed unified-diff patch for a
+    # mechanical critical/high fix — stored in full (out of the 500-char body
+    # cap) and re-attached by _retry_task as a fenced diff the executor applies
+    # verbatim (CriticGPT: critic-proposed diff + executor application).
+    if "patch" not in rc_cols:
+        conn.execute("ALTER TABLE review_comments ADD COLUMN patch TEXT")
 
     # Q2 (operator-edit distillation): per-domain evidence that feeds the lessons
     # distillation job — rejection feedback, user review comments, and the diff
@@ -576,10 +591,39 @@ def init_db():
                              # Deep Plan (Phase 5): spec_model runs the premortem plan
                              # critique — an EXTERNAL judgment-tier verifier, seeded to
                              # the same frontier judge as frontier_judge (rotate later).
-                             ("spec_model", "mdl-opus48")):
+                             ("spec_model", "mdl-opus48"),
+                             # Appendix C1c: escalation_model writes the escalated
+                             # rework — same judgment-tier default (Opus 4.8), rotated
+                             # up one tier each generation with the others.
+                             ("escalation_model", "mdl-opus48")):
             conn.execute(
                 "INSERT OR IGNORE INTO model_assignments (user_id, purpose, model_row_id, "
                 "updated_at) VALUES ('global',?,?,?)", (purpose, mid, now))
+
+    # Appendix C3 (full-cost ledger): one row per frontier subprocess run
+    # (critic / judge / spec-premortem / escalated rework). tokens + cost_usd
+    # come from the `claude -p --output-format json` envelope when present
+    # (source='envelope') else a transcript-size estimate priced from the
+    # settings table (source='estimate'). The task accumulators frontier_tokens/
+    # frontier_cost_usd are bumped in the same write. Keeps SR's real spend from
+    # being invisible (B7) so "beats Opus, cheaper than Fable" is checkable.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS frontier_ledger (
+        id TEXT PRIMARY KEY,
+        task_id TEXT,
+        workflow_id TEXT,
+        user_id TEXT,
+        kind TEXT,
+        model TEXT,
+        tokens INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0,
+        source TEXT,
+        created_at REAL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_frontier_ledger_task "
+                 "ON frontier_ledger(task_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_frontier_ledger_wf "
+                 "ON frontier_ledger(workflow_id)")
 
     # Deep Plan mode (Phase 5): conversational planning sessions. Resumable —
     # no boot-reset; stale 'active' rows are swept >7 days by the plan engine
@@ -628,6 +672,21 @@ def init_db():
             "updated_at) VALUES ('global','spec_model',?,?)", (seed_mid, now))
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated.spec_model','1')")
 
+    # One-time addition (2026-07-10, Appendix C1c Phase 7): the escalation_model
+    # purpose — the judgment-tier model that writes the ESCALATED REWORK. Existing
+    # installs get the global row here, defaulting to whatever frontier_judge
+    # currently resolves to (fallback mdl-opus48). Marker-guarded (same contract).
+    if not conn.execute("SELECT 1 FROM settings WHERE key='migrated.escalation_model'").fetchone():
+        now = time.time()
+        fj = conn.execute(
+            "SELECT model_row_id FROM model_assignments WHERE user_id='global' "
+            "AND purpose='frontier_judge'").fetchone()
+        seed_mid = (fj[0] if fj else None) or "mdl-opus48"
+        conn.execute(
+            "INSERT OR IGNORE INTO model_assignments (user_id, purpose, model_row_id, "
+            "updated_at) VALUES ('global','escalation_model',?,?)", (seed_mid, now))
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated.escalation_model','1')")
+
     # Seed real-dispatch settings (visible/editable). Real dispatch is the
     # default since v2 shipped — a fresh install behaves like the main machine.
     dispatch_defaults = [
@@ -638,9 +697,20 @@ def init_db():
         ("dispatch.max_concurrent_total", "8"),
         ("judge.cmd", "cjudge {file} {domain}"),
         ("super.critic_cmd", "cverify {file} {domain} {sandbox}"),
+        ("super.escalation_cmd", "cexec {workspace} {deliverable} {dossier}"),  # C1c
     ]
     for k, v in dispatch_defaults:
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+
+    # Appendix C3 (full-cost ledger): the per-model price table (USD per 1M
+    # tokens), seeded from MODEL-PRICING-2026-07-10.md (re-verified 2026-07-10).
+    # INSERT OR IGNORE so an operator edit sticks. Frontier runs report the
+    # envelope's OWN dollars; this table prices the GLM executor (blended token
+    # counter) and displays what a model WOULD cost. Fable 5 is priced for the
+    # reference/comparison arm only — it is never assigned to a purpose.
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('cost.model_prices', ?)",
+                 (json.dumps(MODEL_PRICES_SEED),))
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('cost.output_fraction', '0.5')")
 
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'dark')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('poll_interval', '2')")
@@ -704,9 +774,193 @@ def set_setting(key, value):
     execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
 
 
+# --- Full-cost ledger (Appendix C3) ------------------------------------------
+# Per-model prices in USD per 1M tokens, from MODEL-PRICING-2026-07-10.md
+# (re-verified 2026-07-10). GLM 5.1/4.5-air/turbo have no separately published
+# sheet — priced at the GLM-5.2 public rate as a documented default (edit the
+# cost.model_prices setting to refine). Cache write/read follow the doc's
+# multipliers. Fable 5 is the reference/comparison arm only (never assigned).
+MODEL_PRICES_SEED = {
+    "glm-5.2":       {"input": 1.40, "output": 4.40, "cache_write": 0.0,   "cache_read": 0.26},
+    "glm-5.1":       {"input": 1.40, "output": 4.40, "cache_write": 0.0,   "cache_read": 0.26},
+    "glm-4.5-air":   {"input": 1.40, "output": 4.40, "cache_write": 0.0,   "cache_read": 0.26},
+    "glm-5-turbo":   {"input": 1.40, "output": 4.40, "cache_write": 0.0,   "cache_read": 0.26},
+    "claude-opus-4-8": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-fable-5":  {"input": 10.0, "output": 50.0, "cache_write": 12.50, "cache_read": 1.0},
+}
+
+
+def model_prices() -> dict:
+    """The per-model price table (settings cost.model_prices), merged over the
+    seed so a partial operator edit still covers the built-ins. USD per 1M
+    tokens. Never raises — a corrupt setting falls back to the seed."""
+    table = dict(MODEL_PRICES_SEED)
+    try:
+        raw = get_setting("cost.model_prices", None)
+        if raw:
+            user = json.loads(raw)
+            if isinstance(user, dict):
+                for k, v in user.items():
+                    if isinstance(v, dict):
+                        table[k] = {**table.get(k, {}), **v}
+    except Exception:
+        pass
+    return table
+
+
+def price_for(model_id: str | None) -> dict | None:
+    """The price row for a model id (exact, else a prefix match on the family,
+    e.g. 'glm-5.2-0710' → 'glm-5.2'). None when unknown."""
+    if not model_id:
+        return None
+    table = model_prices()
+    if model_id in table:
+        return table[model_id]
+    for k, v in table.items():
+        if model_id.startswith(k):
+            return v
+    return None
+
+
+def blended_rate(model_id: str | None) -> float:
+    """A single USD-per-1M-tokens rate for a BLENDED token counter (input+output
+    mixed, e.g. tasks.tokens_used). Weighted by cost.output_fraction (default
+    0.5) since the counter doesn't split the two. Returns 0 for unknown models
+    (unknown = uncounted, never a fabricated cost)."""
+    p = price_for(model_id)
+    if not p:
+        return 0.0
+    try:
+        frac = float(get_setting("cost.output_fraction", "0.5") or 0.5)
+    except (TypeError, ValueError):
+        frac = 0.5
+    frac = max(0.0, min(1.0, frac))
+    return float(p.get("input", 0.0)) * (1 - frac) + float(p.get("output", 0.0)) * frac
+
+
+def glm_cost_estimate(tokens: int, model_id: str | None) -> float:
+    """API-equivalent USD for a GLM run's blended token count. An ESTIMATE (the
+    counter is input+output mixed) — the ledger labels it as such."""
+    try:
+        t = int(tokens or 0)
+    except (TypeError, ValueError):
+        t = 0
+    return round((t / 1_000_000.0) * blended_rate(model_id), 6)
+
+
+def record_frontier_run(task_id: str | None, kind: str, tokens: int,
+                        cost_usd: float | None, source: str,
+                        model: str | None = None, workflow_id: str | None = None,
+                        user_id: str | None = None) -> None:
+    """C3: log one frontier subprocess run and bump the task's accumulators.
+    cost_usd None (an estimate with no price row) counts as 0 dollars but still
+    records the tokens. Never raises — a ledger write must never fail a critic/
+    judge run."""
+    try:
+        tok = int(tokens or 0)
+    except (TypeError, ValueError):
+        tok = 0
+    try:
+        cost = float(cost_usd) if cost_usd is not None else 0.0
+    except (TypeError, ValueError):
+        cost = 0.0
+    try:
+        execute(
+            "INSERT INTO frontier_ledger (id, task_id, workflow_id, user_id, kind, "
+            "model, tokens, cost_usd, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (f"fl-{uuid.uuid4().hex[:12]}", task_id, workflow_id, user_id, kind,
+             model, tok, cost, source, time.time()))
+        if task_id:
+            execute("UPDATE tasks SET frontier_tokens=COALESCE(frontier_tokens,0)+?, "
+                    "frontier_cost_usd=COALESCE(frontier_cost_usd,0)+? WHERE id=?",
+                    (tok, cost, task_id))
+    except Exception:
+        pass
+
+
+def task_cost_ledger(task_id: str) -> dict:
+    """API-equivalent cost for one task across BOTH currencies: the GLM executor
+    (tokens_used priced from the table — an estimate) + the frontier subprocess
+    spend (critic/judge/spec/escalation, from the envelope's own dollars). This
+    is a COMPARISON figure, not a bill."""
+    t = query_one("SELECT model, tokens_used, frontier_tokens, frontier_cost_usd "
+                  "FROM tasks WHERE id=?", (task_id,)) or {}
+    glm_tokens = int(t.get("tokens_used") or 0)
+    glm_usd = glm_cost_estimate(glm_tokens, t.get("model"))
+    frontier_tokens = int(t.get("frontier_tokens") or 0)
+    frontier_usd = round(float(t.get("frontier_cost_usd") or 0.0), 6)
+    runs = query_all(
+        "SELECT kind, model, tokens, cost_usd, source FROM frontier_ledger "
+        "WHERE task_id=? ORDER BY created_at", (task_id,))
+    return {
+        "glm_tokens": glm_tokens, "glm_usd": round(glm_usd, 4),
+        "frontier_tokens": frontier_tokens, "frontier_usd": round(frontier_usd, 4),
+        "total_usd": round(glm_usd + frontier_usd, 4),
+        "runs": runs,
+        "currency": "API-equivalent USD",
+        "note": "comparison figure, not a bill — frontier runs bill the Claude "
+                "subscription and GLM runs the Z.AI plan; GLM $ is a blended-rate estimate.",
+    }
+
+
+def workflow_cost_ledger(workflow_id: str) -> dict:
+    """Same as task_cost_ledger, summed across a workflow's member tasks."""
+    rows = query_all(
+        "SELECT model, tokens_used, frontier_tokens, frontier_cost_usd "
+        "FROM tasks WHERE workflow_id=?", (workflow_id,))
+    glm_tokens = frontier_tokens = 0
+    glm_usd = frontier_usd = 0.0
+    for r in rows:
+        gt = int(r.get("tokens_used") or 0)
+        glm_tokens += gt
+        glm_usd += glm_cost_estimate(gt, r.get("model"))
+        frontier_tokens += int(r.get("frontier_tokens") or 0)
+        frontier_usd += float(r.get("frontier_cost_usd") or 0.0)
+    return {
+        "tasks": len(rows),
+        "glm_tokens": glm_tokens, "glm_usd": round(glm_usd, 4),
+        "frontier_tokens": frontier_tokens, "frontier_usd": round(frontier_usd, 4),
+        "total_usd": round(glm_usd + frontier_usd, 4),
+        "currency": "API-equivalent USD",
+        "note": "comparison figure, not a bill.",
+    }
+
+
 # --- Model registry helpers (Settings v2 — shared by server, dispatch, evals) ---
 
-MODEL_PURPOSES = ("complicated", "easy", "mechanical", "frontier_judge", "spec_model")
+MODEL_PURPOSES = ("complicated", "easy", "mechanical", "frontier_judge",
+                  "spec_model", "escalation_model")
+
+# Appendix C2 (rotation readiness): the ONE place that maps a registry purpose to
+# its pre-registry fallback model id. These literals are used ONLY when the
+# registry has no assignment for a purpose (a wiped/misconfigured registry still
+# boots). A GENERATION ROTATION edits the REGISTRY (model_assignments) — zero code
+# changes; this map is the safety net, not the routing table. Every hardcoded
+# model-name fallback in the codebase now resolves through here (audited out of
+# server.py / hermes_dispatch.py / tools_hub.py) so a rotation never means hunting
+# string literals. Fable 5 is never here — it is the reference tier, never assigned.
+FALLBACK_MODELS = {
+    "complicated": "glm-5.2",
+    "easy": "glm-5.1",
+    "mechanical": "glm-4.5-air",
+    "fallback": "glm-5-turbo",          # dispatch overload fallback (setting-backed)
+    "frontier_judge": "claude-opus-4-8",
+    "spec_model": "claude-opus-4-8",
+    "escalation_model": "claude-opus-4-8",
+}
+
+
+def fallback_model(purpose: str) -> str | None:
+    """The pre-registry fallback model id for a purpose (C2). None for unknown
+    purposes. Callers use it as `resolve_assignment(...) or fallback_model(p)`."""
+    return FALLBACK_MODELS.get(purpose)
+
+
+def worker_fallback_models() -> list[str]:
+    """The three GLM executor tiers, in order — the pre-registry fallback list for
+    task_models_for / the wizard model dropdown (C2: derived, not re-typed)."""
+    return [FALLBACK_MODELS["complicated"], FALLBACK_MODELS["easy"],
+            FALLBACK_MODELS["mechanical"]]
 
 
 def visible_models(user_id: str | None, enabled_only: bool = False) -> list:
@@ -724,7 +978,7 @@ def task_models_for(user_id: str | None) -> list[str]:
     for m in visible_models(user_id, enabled_only=True):
         if m["route"] == "hermes" and m["model_id"] not in ids:
             ids.append(m["model_id"])
-    return ids or ["glm-5.2", "glm-5.1", "glm-4.5-air"]
+    return ids or worker_fallback_models()  # C2: centralized pre-registry fallback
 
 
 def resolve_assignment(user_id: str | None, purpose: str) -> dict | None:

@@ -66,9 +66,11 @@ chk("rule4 budget multiplier ×0.5/×1/×2",
     eco["budget"] == 500_000 and opt["budget"] == 1_000_000 and smart["budget"] == 2_000_000)
 chk("involvement flips mode (full_auto/assisted closed, manual open)",
     smart["mode"] == "closed" and opt["sr_mode"] == "open" and eco["mode"] == "open")
-chk("rule3 Eco model floor STAGED until Phase 7", "model_floor" in eco.get("staged", {}))
-chk("P2 forward-deps staged (plan_recommend/escalation)",
-    "plan_recommend" in eco.get("staged", {}) and "escalation" in eco.get("staged", {}))
+chk("rule3 Eco model floor DERIVED (C2/Phase 7): Eco→easy tier, Opt/Smart none",
+    eco.get("model_floor") == "easy" and opt.get("model_floor") is None
+    and smart.get("model_floor") is None and "model_floor" not in eco.get("staged", {}))
+chk("P2 forward-deps staged (plan_recommend); escalation derives when on",
+    "plan_recommend" in eco.get("staged", {}))
 
 print("=== Q7a — design_loop derivation (rule 2 hard floor) ===")
 c_smart = le.design_loop("workflow", {"title": "Aud", "domain": "marketing", "super_result": True,

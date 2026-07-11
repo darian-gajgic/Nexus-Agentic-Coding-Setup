@@ -391,6 +391,22 @@ def _bump_rounds(trig: dict, task_id: str | None):
         trig["used"] = int(trig.get("used") or 0) + 1
 
 
+def _escalations_used(trig: dict, task_id: str | None) -> int:
+    """Appendix C1c: escalated reworks already spent (separate budget from the
+    GLM rework rounds; per-task when the loop is inherited from a workflow)."""
+    if task_id is not None:
+        return int((trig.get("esc_tasks") or {}).get(task_id) or 0)
+    return int(trig.get("esc_used") or 0)
+
+
+def _bump_escalations(trig: dict, task_id: str | None):
+    if task_id is not None:
+        et = trig.setdefault("esc_tasks", {})
+        et[task_id] = int(et.get(task_id) or 0) + 1
+    else:
+        trig["esc_used"] = int(trig.get("esc_used") or 0) + 1
+
+
 def _sweep_task_loops(actions_left: int) -> int:
     """judge_revise + auto_judge on loop-enabled tasks. A task with its own
     loop_config uses it; otherwise it INHERITS its project's loop (the
@@ -483,6 +499,72 @@ def _set_super_state(trig: dict, task_id: str | None, state):
         trig["state"] = state
 
 
+def _has_open_criticals(t: dict) -> bool:
+    """True when the latest critique still holds a critical/high finding — the
+    signal that a round-cap should escalate to the frontier rather than the
+    human (C1c)."""
+    try:
+        parsed = json.loads(t.get("critic_json") or "{}") or {}
+    except Exception:
+        return False
+    return any((f.get("severity") in ("critical", "high"))
+               for f in (parsed.get("findings") or []))
+
+
+def _escalation_mode(t: dict) -> str:
+    """C5 escalation threshold: WHICH conditions trigger the escalated rework —
+    off | rewrite | rewrite_or_cap. A task carrying a spend profile uses the
+    autopilot-derived value (Eco off / Optimal rewrite / Smart rewrite_or_cap);
+    otherwise the global setting super.escalation_trigger. The master switch
+    super.escalation still gates everything (checked by the caller)."""
+    sp = t.get("spend_profile")
+    if sp:
+        try:
+            import autopilot as _ap
+            m = (_ap.derive(None, sp) or {}).get("escalation")
+            return m if m in ("off", "rewrite", "rewrite_or_cap") else "off"
+        except Exception:
+            pass
+    m = (db.get_setting("super.escalation_trigger", "rewrite_or_cap") or "rewrite_or_cap")
+    return m if m in ("off", "rewrite", "rewrite_or_cap") else "rewrite_or_cap"
+
+
+def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
+                        trigger_kind: str = "rewrite") -> bool:
+    """Appendix C1c: dispatch the escalated rework (the frontier escalation_model
+    writes the final version) when super.escalation is on, this task's escalation
+    THRESHOLD (C5) allows this trigger, and it still has escalation budget.
+    trigger_kind is 'rewrite' (a REWRITE verdict) or 'cap' (round cap with open
+    criticals) — 'cap' needs the rewrite_or_cap threshold. Returns True when it
+    dispatched (caller bumps state + persists, skipping the GLM retry / human
+    checkpoint); False = not eligible. The endpoint CAS-guards a double-spawn."""
+    if db.get_setting("super.escalation", "0") != "1":
+        return False
+    mode = _escalation_mode(t)  # C5 threshold
+    if mode == "off":
+        return False
+    if trigger_kind == "cap" and mode != "rewrite_or_cap":
+        return False
+    # don't hammer the one Claude subscription while a backoff window is armed
+    if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+        return False
+    used = _escalations_used(trig, per_task)
+    cap = int(db.get_setting("super.escalation_max", "1") or 1)
+    if used >= cap:
+        return False
+    tid = t["id"]
+    if _api("POST", f"/api/tasks/{tid}/escalate", {}, user_id=t.get("user_id")):
+        _bump_escalations(trig, per_task)
+        _set_super_state(trig, per_task,
+                         {"kind": "escalated_rework", "handled_ts": t.get("critic_ts")})
+        db.log_activity("info", "loop",
+                        "Super Result: escalated rework dispatched — frontier writes the "
+                        f"final on '{(t.get('title') or '')[:50]}' ({used + 1}/{cap})",
+                        user_id=t.get("user_id"))
+        return True
+    return False
+
+
 def _escalate_super(t: dict, trig: dict, per_task: str | None,
                     reason: str | None) -> bool:
     """Open a human checkpoint (approvals row, action_type='super_result') for
@@ -570,7 +652,7 @@ def _sweep_super_result(actions_left: int) -> int:
         if not trig:
             continue
         verdict = t.get("critic_verdict")
-        if verdict == "running":
+        if verdict in ("running", "escalating"):  # C1c: skip an in-flight rework
             continue
         tid = t["id"]
         critiqued_this_version = bool(t.get("critic_ts")) and \
@@ -636,6 +718,13 @@ def _sweep_super_result(actions_left: int) -> int:
                 _save_cfg(owner_kind, owner_id, cfg)
             continue
         if used >= max_rounds:
+            # C1c: the GLM rework rounds are exhausted but criticals remain —
+            # let the frontier escalation_model write the final version (if on +
+            # budget) before handing it to the human.
+            if _has_open_criticals(t) and _try_escalate_super(t, trig, per_task, "cap"):
+                _save_cfg(owner_kind, owner_id, cfg)
+                actions_left -= 1
+                continue
             if _escalate_super(t, trig, per_task,
                                f"round cap reached ({used}/{max_rounds})"):
                 _save_cfg(owner_kind, owner_id, cfg)
@@ -643,6 +732,14 @@ def _sweep_super_result(actions_left: int) -> int:
         if cfg.get("mode") == "open":
             if _escalate_super(t, trig, per_task, None):
                 _save_cfg(owner_kind, owner_id, cfg)
+            continue
+        # C1c: a REWRITE means another GLM pass won't salvage the draft — when
+        # escalation is on (+ budget), the frontier model writes the final itself
+        # instead of re-dispatching to GLM. Falls through to the GLM retry when
+        # off / out of escalation budget (the pre-C1c behavior).
+        if verdict == "REWRITE" and _try_escalate_super(t, trig, per_task, "rewrite"):
+            _save_cfg(owner_kind, owner_id, cfg)
+            actions_left -= 1
             continue
         # closed mode → automatic rework with the critic's revision brief;
         # _retry_task drains the critic comments into the prompt automatically

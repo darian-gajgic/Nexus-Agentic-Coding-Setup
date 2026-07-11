@@ -79,4 +79,8 @@ exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
   -u CLAUDE_CODE_ALWAYS_ENABLE_EFFORT -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC -u API_TIMEOUT_MS \
   -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
   "${KEY_ENV[@]}" \
-  claude "${MODEL_ARGS[@]}" -p "$PROMPT"
+  claude "${MODEL_ARGS[@]}" --output-format json -p "$PROMPT"
+# Nexus C3 (Appendix C, contract C-8): --output-format json wraps the reply in a
+# JSON envelope {result, usage, total_cost_usd, modelUsage}. The judge's sentinel
+# block rides INSIDE .result; evals.run_judge_cmd unwraps .result before
+# parse_judge_metrics and books usage/$ into the full-cost ledger.

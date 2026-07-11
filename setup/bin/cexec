@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# cexec — ESCALATED REWORK: the judgment-tier model writes the FINAL version of a
+# deliverable with FULL tool access in the REAL workspace.
+# Part of Nexus Super Result / Appendix C1c (SUPER-RESULT-PLAN-2026-07-09.md §10).
+#
+# This is cverify MINUS the sandbox: when the grounded critic returns REWRITE (or
+# the round cap leaves criticals open) and the operator turned on super.escalation,
+# the rework itself runs on the frontier model — handed the full dossier and told
+# to produce the best possible final deliverable that resolves every blocker.
+#
+# Usage: cexec <workspace> <deliverable_rel> <dossier>
+#   <workspace>       the task's REAL workspace dir (cwd; write access)
+#   <deliverable_rel> deliverable path to (re)write, relative to <workspace>
+#   <dossier>         path to a dossier .md (brief + verified findings +
+#                     contradictions + critique history + sibling reports)
+#
+# The CALLER (evals.run_escalation_cmd) owns the timeout; this script only drives
+# one headless claude turn against a prepared workspace.
+#
+# HONESTY NOTE (C-7): the floor this buys APPROACHES judgment-tier-direct but is
+# not guaranteed by construction — a dossier carrying a wrong critic finding or a
+# flawed draft can anchor the rework below a clean direct pass. Phase 8 measures it.
+#
+# SAFETY: write access is the whole point, so there is NO sandbox boundary here —
+# cwd is the real workspace. The deny rules still forbid push/remote/gh/sudo, and
+# acceptEdits (NOT bypassPermissions) keeps them enforceable. The caller passes a
+# workspace, never a repo root, so the blast radius is the task's own workspace.
+set -euo pipefail
+
+WS="${1:-}"; DELIV="${2:-}"; DOSSIER="${3:-}"
+
+usage() {
+  echo "usage: cexec <workspace> <deliverable_rel> <dossier>" >&2
+  exit 1
+}
+
+[ -n "$WS" ] && [ -n "$DELIV" ] && [ -n "$DOSSIER" ] || usage
+WS="$(realpath "$WS")"
+[ -d "$WS" ] || { echo "cexec: no such workspace: $WS" >&2; exit 1; }
+DOSSIER="$(realpath "$DOSSIER")"
+[ -f "$DOSSIER" ] || { echo "cexec: no such dossier: $DOSSIER" >&2; exit 1; }
+
+PROMPT="You are the ESCALATION WRITER — the stronger, judgment-tier model called in to write the FINAL version of a deliverable after a weaker model's draft failed a grounded critic. You have FULL tool access in the REAL workspace ($WS). This is not a sandbox — your edits are the shipped result.
+
+FIRST read the dossier at $DOSSIER — it holds the task brief, the grounded critic's VERIFIED findings, contradictions, the critique history across rounds, and the sibling reports. Then read the current deliverable at $DELIV and any evidence it cites.
+
+YOUR JOB: produce the best possible final deliverable at $DELIV that resolves EVERY blocking finding in the dossier. You may read files, run tests, re-run the exact commands the critic ran, install dependencies, and edit/rewrite $DELIV in place. Do the verification yourself — do not trust the failed draft's self-assertions; a claim stays unverified until you confirm it against primary evidence.
+
+RULES:
+- Resolve every critical/high finding. Do not merely paper over the critic's wording — fix the underlying problem.
+- Keep what the draft got right; rewrite only what must change. The result must stand on its own as a complete deliverable, not a diff.
+- Mark any claim you could not fully verify with '[UNSURE: reason]' — an unmarked claim is held to the verified standard.
+- Never push, never use gh, never use git remote, never sudo, never touch paths outside $WS.
+- When you are done, WRITE the finished deliverable to $DELIV (overwrite it), then reply with a short (<=800 char) summary of what you changed and which findings you resolved. The deliverable FILE is the output — the summary is just for the log."
+
+# Nexus Settings v2 hooks (both optional, absent = original behavior), same
+# contract as cverify/cjudge:
+#   JUDGE_MODEL              — explicit escalation model → claude --model
+#   JUDGE_ANTHROPIC_API_KEY  — per-user Anthropic key; when set, key-authed
+MODEL_ARGS=()
+if [ -n "${JUDGE_MODEL:-}" ]; then MODEL_ARGS=(--model "$JUDGE_MODEL"); fi
+
+KEY_ENV=(-u ANTHROPIC_API_KEY)
+if [ -n "${JUDGE_ANTHROPIC_API_KEY:-}" ]; then
+  KEY_ENV=(ANTHROPIC_API_KEY="$JUDGE_ANTHROPIC_API_KEY")
+fi
+
+cd "$WS"
+
+# NOTE: env requires -u options BEFORE NAME=VALUE assignments — KEY_ENV
+# (either `-u ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY=…`) must come last.
+# Deny rules beat allow rules; acceptEdits (NOT bypassPermissions) keeps the
+# deny list enforceable while still letting the model write the deliverable.
+exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL \
+  -u ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES -u ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
+  -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_SUBAGENT_MODEL -u CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY \
+  -u CLAUDE_CODE_EFFORT_LEVEL -u CLAUDE_CODE_AUTO_COMPACT_WINDOW -u CLAUDE_CODE_WORKFLOWS \
+  -u CLAUDE_CODE_ALWAYS_ENABLE_EFFORT -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC -u API_TIMEOUT_MS \
+  -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+  "${KEY_ENV[@]}" \
+  claude "${MODEL_ARGS[@]}" \
+    --permission-mode acceptEdits \
+    --allowedTools "Bash" "Read" "Edit" "Write" "Grep" "Glob" "WebSearch" "WebFetch" \
+    --disallowedTools "Bash(git push:*)" "Bash(git remote:*)" "Bash(gh:*)" "Bash(sudo:*)" \
+    --output-format json \
+    -p "$PROMPT"
+# Nexus C3 (contract C-8): --output-format json wraps the reply in a JSON envelope
+# {result, usage, total_cost_usd, modelUsage}; evals.run_escalation_cmd unwraps
+# .result for the log and books usage/$ into the full-cost ledger (kind=escalation).

@@ -141,6 +141,93 @@ class _FrontierGate:
 _FRONTIER_GATE = _FrontierGate()
 
 
+# ─────────────────────────── Frontier cost capture (Appendix C3, contract C-8) ───────────────────────────
+# `claude -p --output-format json` (added to cverify/cjudge) wraps the reply in
+# a JSON envelope {result, usage, total_cost_usd, modelUsage}. The sentinel
+# parsers (parse_critic_json / parse_judge_metrics) consume the INNER text, so
+# run_critic_cmd/run_judge_cmd must unwrap `.result` BEFORE they parse — else a
+# JSON envelope breaks the sentinel search. A stubbed or legacy plain-text
+# output has no envelope and passes straight through unchanged.
+
+def _unwrap_frontier_output(stdout: str, sink: dict | None = None) -> str:
+    """Return the model's reply text. When `stdout` is a claude-JSON envelope,
+    that is `.result`, and — if `sink` is given — it is filled with the run's
+    captured spend: {'tokens': int, 'cost_usd': float|None, 'source': 'envelope',
+    'model': str|None}. Plain text (stub/legacy) returns unchanged and leaves the
+    sink untouched, so the caller falls back to the transcript-size estimate.
+    Never raises."""
+    s = (stdout or "").strip()
+    # cheap guard: only attempt a parse when it plausibly IS the envelope
+    if not (s.startswith("{") and '"result"' in s):
+        return stdout
+    try:
+        env = json.loads(s)
+    except Exception:
+        return stdout
+    if not isinstance(env, dict) or not isinstance(env.get("result"), str):
+        return stdout
+    if sink is not None:
+        usage = env.get("usage") if isinstance(env.get("usage"), dict) else {}
+        tok = 0
+        for k in ("input_tokens", "output_tokens",
+                  "cache_creation_input_tokens", "cache_read_input_tokens"):
+            try:
+                tok += int(usage.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        cost = env.get("total_cost_usd")
+        try:
+            cost = float(cost) if cost is not None else None
+        except (TypeError, ValueError):
+            cost = None
+        model = None
+        mu = env.get("modelUsage")
+        if isinstance(mu, dict) and mu:
+            model = next(iter(mu.keys()), None)
+        sink.update({"tokens": tok, "cost_usd": cost, "source": "envelope",
+                     "model": model, "usage": usage})
+    return env["result"]
+
+
+def estimate_frontier_tokens(text: str) -> int:
+    """Fallback token estimate when there is no envelope (stub/legacy output):
+    ~4 chars per token, the standard rough heuristic. Deliberately conservative
+    and clearly labelled 'estimate' in the ledger."""
+    return max(0, len(text or "") // 4)
+
+
+def record_frontier_spend(sink: dict, out_text: str, kind: str,
+                          fallback_model: str | None,
+                          task_id: str | None = None,
+                          workflow_id: str | None = None,
+                          user_id: str | None = None) -> None:
+    """Persist one frontier run's spend to the C3 ledger. Uses the envelope's
+    OWN tokens + dollars when captured (source='envelope'); otherwise estimates
+    tokens from the transcript and prices them from the settings table
+    (source='estimate'). `out_text` is the already-unwrapped reply. Best-effort."""
+    if sink:
+        tokens = int(sink.get("tokens") or 0)
+        cost = sink.get("cost_usd")
+        model = sink.get("model") or fallback_model
+        source = "envelope"
+        if cost is None:  # envelope without total_cost_usd → price the tokens
+            cost = _price_tokens_blended(tokens, model)
+    else:
+        tokens = estimate_frontier_tokens(out_text)
+        model = fallback_model
+        cost = _price_tokens_blended(tokens, model)
+        source = "estimate"
+    db.record_frontier_run(task_id, kind, tokens, cost, source, model=model,
+                           workflow_id=workflow_id, user_id=user_id)
+
+
+def _price_tokens_blended(tokens: int, model: str | None) -> float:
+    try:
+        return db.glm_cost_estimate(tokens, model)  # blended-rate pricing helper
+    except Exception:
+        return 0.0
+
+
 def knowledge_root() -> str:
     return os.path.expanduser(db.get_setting("onboarding.root", "") or KNOWLEDGE_DIR)
 
@@ -281,9 +368,21 @@ def spec_model_for(user_id: str | None) -> tuple[str | None, str | None]:
     return row["model_id"], key
 
 
+def escalation_model_for(user_id: str | None) -> tuple[str | None, str | None]:
+    """Appendix C1c escalated-rework model: the owner's 'escalation_model'
+    purpose → (model_id, api_key). No assignment / non-cli route → (None, None)
+    = the CLI's saved default (subscription auth). Mirrors judge_model_for."""
+    import secrets_store
+    row = db.resolve_assignment(user_id, "escalation_model")
+    if not row or row["route"] != "cli":
+        return None, None
+    key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
+    return row["model_id"], key
+
+
 def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
                   api_key: str | None = None, type_rubric: str | None = None,
-                  spec_path: str | None = None) -> str:
+                  spec_path: str | None = None, usage_sink: dict | None = None) -> str:
     """Run the frontier judge command on a file (shared with the task judge).
     Template lives in settings judge.cmd so gates can stub it (R4.3).
 
@@ -346,7 +445,9 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
             r = sp.run(tokens, capture_output=True, text=True, timeout=900,
                        cwd=KNOWLEDGE_DIR, env=env)
-        out = (r.stdout or "")
+        # C-8: unwrap the claude-JSON envelope's `.result` BEFORE the sentinel
+        # parser runs, capturing tokens + $ into usage_sink when present.
+        out = _unwrap_frontier_output(r.stdout or "", usage_sink)
         if r.returncode != 0:
             out += f"\n[judge exited {r.returncode}] {(r.stderr or '')[-1000:]}"
     except sp.TimeoutExpired:
@@ -542,8 +643,8 @@ def build_critic_sandbox(task: dict, round_no: int = 1):
     sandbox = CRITIC_SANDBOXES / f"{task['id']}-r{round_no}-{uuid.uuid4().hex[:6]}"
     shutil.copytree(
         ws, sandbox / "workspace",
-        ignore=shutil.ignore_patterns("_critic*", "node_modules", ".venv*",
-                                      ".next", "dist", "build", "__pycache__"),
+        ignore=shutil.ignore_patterns("_critic*", "_escalation", "node_modules",
+                                      ".venv*", ".next", "dist", "build", "__pycache__"),
         ignore_dangling_symlinks=True)
 
     repo_root = repo_branch = repo_base = repo_note = None
@@ -676,7 +777,8 @@ def build_critic_sandbox(task: dict, round_no: int = 1):
 
 
 def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
-                   api_key: str | None = None, round_no: int = 1) -> str:
+                   api_key: str | None = None, round_no: int = 1,
+                   usage_sink: dict | None = None) -> str:
     """Build the sandbox, run the critic command (settings super.critic_cmd —
     gates stub it, same contract as judge.cmd), tear the sandbox down.
     Mirrors run_judge_cmd; the timeout is owned HERE (§4.2)."""
@@ -709,7 +811,8 @@ def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
             with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
                 r = sp.run(tokens, capture_output=True, text=True, timeout=timeout_s,
                            cwd=str(sandbox), env=env)
-            out = (r.stdout or "")
+            # C-8: unwrap the claude-JSON envelope before parse_critic_json.
+            out = _unwrap_frontier_output(r.stdout or "", usage_sink)
             if r.returncode != 0:
                 out += f"\n[critic exited {r.returncode}] {(r.stderr or '')[-1000:]}"
         except sp.TimeoutExpired:
@@ -720,6 +823,154 @@ def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
     finally:
         if sreg.conf("super.keep_sandbox", "0") != "1":
             shutil.rmtree(sandbox, ignore_errors=True)
+
+
+# ─────────────────────────── Escalated rework (Appendix C1c) ───────────────────────────
+# When the grounded critic returns REWRITE (or the round cap leaves criticals
+# open) and super.escalation is ON, the rework ITSELF runs on the judgment-tier
+# escalation_model: cverify minus the sandbox — the frontier model rewrites the
+# deliverable in the REAL workspace, handed the full dossier. The floor this buys
+# APPROACHES judgment-tier-direct but is an empirical claim, not a guarantee
+# (C-7): a dossier carrying a wrong finding can anchor the rework below a clean
+# direct pass. Phase 8 measures it. Setting-gated, near-zero marginal CLI cost.
+
+def build_escalation_dossier(task: dict) -> str:
+    """The full dossier the escalation writer needs: the brief, the grounded
+    critic's verified findings + contradictions + missing items + revision brief,
+    the open review comments (accumulated across rounds = the critique history),
+    and clipped sibling reports. Markdown, self-contained."""
+    try:
+        parsed = json.loads(task.get("critic_json") or "{}") or {}
+    except Exception:
+        parsed = {}
+    out = [f"# Escalated rework dossier — {(task.get('title') or '')[:200]}", ""]
+    out.append("## Task brief")
+    out.append((task.get("description") or "(no brief)")[:4000])
+    out.append("")
+    rb = (parsed.get("revision_brief") or "").strip()
+    out.append(f"## Grounded critic verdict: {task.get('critic_verdict') or '?'} "
+               f"(round {int(task.get('critic_round') or 0)})")
+    if parsed.get("summary"):
+        out.append(f"Summary: {parsed['summary']}")
+    if rb:
+        out.append("")
+        out.append("### Revision brief (the exact instruction to satisfy)")
+        out.append(rb)
+    findings = parsed.get("findings") or []
+    if findings:
+        out.append("")
+        out.append("### Verified findings (resolve EVERY critical/high)")
+        for i, f in enumerate(findings, 1):
+            loc = f.get("file_path") or "deliverable.md"
+            if f.get("line_no"):
+                loc += f":{f['line_no']}"
+            out.append(f"{i}. [{(f.get('severity') or 'medium').upper()}] {loc}")
+            if f.get("claim"):
+                out.append(f"   - claim: {f['claim']}")
+            if f.get("evidence"):
+                out.append(f"   - evidence found: {f['evidence']}")
+            if f.get("problem"):
+                out.append(f"   - problem: {f['problem']}")
+            if f.get("suggested_fix"):
+                out.append(f"   - suggested fix: {f['suggested_fix']}")
+    contras = parsed.get("contradictions") or []
+    if contras:
+        out.append("")
+        out.append("### Contradictions to resolve")
+        for c in contras:
+            out.append(f"- with {c.get('with') or 'internal'}: {c.get('a')} ⇄ {c.get('b')}"
+                       + (f" — hint: {c['resolution_hint']}" if c.get("resolution_hint") else ""))
+    missing = parsed.get("missing") or []
+    if missing:
+        out.append("")
+        out.append("### Missing (add these)")
+        for m in missing:
+            out.append(f"- {m.get('what')} — {m.get('why_it_matters')}")
+    # Open review comments = the accumulated critique history (line-anchored).
+    try:
+        comments = db.query_all(
+            "SELECT file_path, line_no, body, source FROM review_comments "
+            "WHERE task_id=? AND status='open' ORDER BY created_at", (task["id"],))
+    except Exception:
+        comments = []
+    if comments:
+        out.append("")
+        out.append("### Open line comments (address each)")
+        for c in comments[:50]:
+            loc = f"{c['file_path']}:{c['line_no']}" if c.get("line_no") else c["file_path"]
+            out.append(f"- [{(c.get('source') or 'user').upper()}] {loc} → {(c.get('body') or '')[:300]}")
+    # Sibling reports (predecessor deliverables) clipped inline — the escalation
+    # writer's cwd is THIS task's workspace, so siblings can't be read from disk.
+    try:
+        import hermes_dispatch as _hd
+        sibs = [d for d in _hd.task_dependencies(task) if d.get("status") == "done"]
+    except Exception:
+        sibs = []
+    for d in sibs[:4]:
+        fp = os.path.join(d.get("workspace_path") or "", "deliverable.md")
+        if os.path.isfile(fp):
+            try:
+                body = open(fp, errors="replace").read()[:3000]
+            except Exception:
+                continue
+            out.append("")
+            out.append(f"### Sibling report — {(d.get('title') or d['id'])[:120]}")
+            out.append(body)
+    return "\n".join(out)
+
+
+def run_escalation_cmd(task: dict, dossier_text: str, deliverable_rel: str = "deliverable.md",
+                       model: str | None = None, api_key: str | None = None,
+                       usage_sink: dict | None = None) -> str:
+    """Run the escalated rework: write the dossier into the workspace, run cexec
+    (settings super.escalation_cmd — gates stub it, same contract as critic_cmd)
+    so the escalation_model rewrites the deliverable in place, then remove the
+    dossier. Returns the model's log summary (already unwrapped). Blocks on the
+    same _FRONTIER_GATE as the critic/judge (premortem P1)."""
+    import shlex
+    import shutil
+    import subprocess as sp
+    import settings_registry as sreg
+    ws = task.get("workspace_path") or ""
+    if not os.path.isdir(ws):
+        return f"[escalation skipped: task {task.get('id')} has no workspace]"
+    dossier_dir = Path(ws) / "_escalation"
+    try:
+        dossier_dir.mkdir(exist_ok=True)
+        dossier_fp = dossier_dir / "dossier.md"
+        dossier_fp.write_text(dossier_text or "(empty dossier)")
+        tokens = [t.replace("{workspace}", ws)
+                   .replace("{deliverable}", deliverable_rel)
+                   .replace("{dossier}", str(dossier_fp))
+                   .replace("{model}", model or "")
+                  for t in shlex.split(
+                      sreg.conf("super.escalation_cmd",
+                                "cexec {workspace} {deliverable} {dossier}"))]
+        tokens = [t for t in tokens if t != ""]
+        if tokens and not shutil.which(tokens[0]):
+            cand = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+            if os.path.isfile(cand):
+                tokens[0] = cand
+        env = _scrubbed_env()
+        if model:
+            env["JUDGE_MODEL"] = model
+        if api_key:
+            env["JUDGE_ANTHROPIC_API_KEY"] = api_key
+        timeout_s = int(sreg.conf("super.escalation_timeout_s", "2100") or 2100)
+        try:
+            with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
+                r = sp.run(tokens, capture_output=True, text=True, timeout=timeout_s,
+                           cwd=ws, env=env)
+            out = _unwrap_frontier_output(r.stdout or "", usage_sink)  # C-8
+            if r.returncode != 0:
+                out += f"\n[escalation exited {r.returncode}] {(r.stderr or '')[-1000:]}"
+        except sp.TimeoutExpired:
+            out = f"[escalation timed out after {timeout_s}s]"
+        except Exception as e:
+            out = f"[escalation failed to run: {e}]"
+        return out
+    finally:
+        shutil.rmtree(dossier_dir, ignore_errors=True)  # never leave it for the next critic copytree
 
 
 # ─────────────────────────── Deep Plan premortem critique (Phase 5, Step 7) ───────────────────────────
@@ -929,6 +1180,9 @@ def parse_critic_json(text: str, repo_task: bool = False) -> dict:
             "evidence": _clip(f.get("evidence"), 400),
             "problem": _clip(f.get("problem"), 300),
             "suggested_fix": _clip(f.get("suggested_fix"), 300),
+            # C1b: an optional unified-diff hunk for a mechanical critical/high
+            # fix — the executor applies it verbatim instead of re-deriving prose.
+            "patch": _clip(f.get("patch"), 1600) or None,
         })
     # severity-ordered so a truncation (here or at the comment cap) always
     # drops the LEAST severe findings (§4.8)
@@ -1062,8 +1316,14 @@ def _run_thread(run_id: str, domain: str, uid: str | None):
             # the case opts in via frontmatter — default stays today's behavior.
             trubric = type_rubric_path(case["deliverable_type"]) \
                 if case.get("deliverable_type") else None
+            jsink: dict = {}
             out = run_judge_cmd(gen["path"], domain, model=jmodel, api_key=jkey,
-                                type_rubric=trubric)
+                                type_rubric=trubric, usage_sink=jsink)
+            # C3 ledger: eval-judge spend is tagged by run_id (workflow_id slot)
+            # so the Phase-8 campaign can total frontier $ per arm.
+            record_frontier_spend(jsink, out, "judge_eval",
+                                  jmodel or db.fallback_model("frontier_judge"),
+                                  task_id=None, workflow_id=run_id, user_id=uid)
             m = parse_judge_metrics(out)
             db.execute(
                 "UPDATE eval_results SET status='scored', verdict=?, score=?, score_max=?, "

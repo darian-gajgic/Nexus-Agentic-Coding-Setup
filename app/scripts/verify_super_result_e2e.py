@@ -43,6 +43,10 @@ orig_cmd = db.get_setting("super.critic_cmd")
 orig_frontier_max = db.get_setting("frontier.max_concurrent")
 orig_frontier_backoff = db.get_setting("frontier.quota_backoff_until")
 orig_frontier_consec = db.get_setting("frontier.quota_consecutive")
+# Appendix C1c escalated-rework settings (restored in finally).
+orig_escalation = db.get_setting("super.escalation")
+orig_escalation_cmd = db.get_setting("super.escalation_cmd")
+orig_escalation_max = db.get_setting("super.escalation_max")
 made_dirs: list = []  # scratch dirs to remove in the finally block
 
 
@@ -193,6 +197,148 @@ try:
         '"problem": "p", "fix": "f"}], "revision_brief": "brief"}\nNEXUS_JUDGE_JSON_END')
     chk("N2: judge sentinel JSON parses (findings + brief)",
         len(m.get("findings") or []) == 1 and m.get("revision_brief") == "brief")
+
+    # ── Appendix C3 (contract C-8): the claude-JSON envelope unwrap ──
+    _inner = ('narration\nNEXUS_CRITIC_JSON_BEGIN\n{"verdict":"SHIP","confidence":0.9,'
+              '"findings":[]}\nNEXUS_CRITIC_JSON_END')
+    _env = json.dumps({"type": "result", "result": _inner, "total_cost_usd": 0.1234,
+                       "usage": {"input_tokens": 1000, "output_tokens": 500,
+                                 "cache_read_input_tokens": 200},
+                       "modelUsage": {"claude-opus-4-8": {"costUSD": 0.1234}}})
+    _sink: dict = {}
+    _text = evals._unwrap_frontier_output(_env, _sink)
+    chk("C3: JSON-envelope unwrap → .result reaches the sentinel parser",
+        evals.parse_critic_json(_text)["verdict"] == "SHIP")
+    chk("C3: envelope usage/$ captured (tokens summed, envelope dollars)",
+        _sink.get("tokens") == 1700 and abs(_sink.get("cost_usd") - 0.1234) < 1e-9
+        and _sink.get("source") == "envelope" and _sink.get("model") == "claude-opus-4-8")
+    # a STUBBED plain-text critic (this gate's own stub shape) must pass through
+    # unchanged with an empty sink → the ledger falls back to the size estimate
+    _stub_out = ('[STUB]\nNEXUS_CRITIC_JSON_BEGIN\n{"verdict":"REVISE","findings":[]}\n'
+                 'NEXUS_CRITIC_JSON_END')
+    _sink2: dict = {}
+    _t2 = evals._unwrap_frontier_output(_stub_out, _sink2)
+    chk("C3: plain-text stub passes through untouched, sink empty (estimate fallback)",
+        _t2 == _stub_out and _sink2 == {}
+        and evals.parse_critic_json(_t2)["verdict"] == "REVISE")
+    _jenv = json.dumps({"result": 'VERDICT: REVISE\nGATES: 1 PASS 2 FAIL\n'
+                        'NEXUS_JUDGE_JSON_BEGIN\n{"verdict":"REVISE","findings":[]}\n'
+                        'NEXUS_JUDGE_JSON_END', "total_cost_usd": 0.5,
+                        "usage": {"input_tokens": 10, "output_tokens": 20}})
+    _js: dict = {}
+    chk("C3: judge envelope unwraps + metrics parse + $ captured",
+        evals.parse_judge_metrics(evals._unwrap_frontier_output(_jenv, _js))["verdict"] == "REVISE"
+        and abs(_js.get("cost_usd") - 0.5) < 1e-9)
+    # price table + ledger math
+    chk("C3: price table seeded (GLM 1.40/4.40, Opus 5/25, Fable 10/50)",
+        db.price_for("glm-5.2")["output"] == 4.40
+        and db.price_for("claude-opus-4-8")["output"] == 25.0
+        and db.price_for("claude-fable-5")["output"] == 50.0)
+    chk("C3: blended GLM estimate uses output_fraction",
+        abs(db.glm_cost_estimate(1_000_000, "glm-5.2") - 2.9) < 1e-6)
+    # record_frontier_run → task accumulators + ledger row + combined $
+    _lt = c.post("/api/tasks", json={"title": "sr-gate ledger probe"}).json()["id"]
+    made_tasks.append(_lt)
+    db.execute("UPDATE tasks SET tokens_used=1000000, model='glm-5.2' WHERE id=?", (_lt,))
+    db.record_frontier_run(_lt, "critic", 1700, 0.1234, "envelope",
+                           model="claude-opus-4-8")
+    _led = db.task_cost_ledger(_lt)
+    chk("C3: ledger sums GLM estimate + frontier envelope $ (total across currencies)",
+        _led["frontier_tokens"] == 1700 and abs(_led["frontier_usd"] - 0.1234) < 1e-3
+        and abs(_led["glm_usd"] - 2.9) < 1e-3 and abs(_led["total_usd"] - 3.02) < 1e-2
+        and len(_led["runs"]) == 1 and _led["runs"][0]["source"] == "envelope")
+    _api_led = c.get(f"/api/tasks/{_lt}/ledger").json()
+    chk("C3: GET /api/tasks/{id}/ledger returns the $ total + currency label",
+        abs(_api_led["total_usd"] - 3.02) < 1e-2
+        and _api_led["currency"] == "API-equivalent USD")
+
+    # ── Appendix C1c: escalated rework (frontier writes the final) ──
+    # in-process: the dossier carries the brief + verified findings + brief text
+    _esc_task = {"id": "escT", "title": "esc probe", "description": "the brief here",
+                 "critic_verdict": "REWRITE", "critic_round": 2,
+                 "critic_json": json.dumps({
+                     "verdict": "REWRITE", "summary": "not shippable",
+                     "revision_brief": "rewrite section 2 with real evidence",
+                     "findings": [{"severity": "critical", "file_path": "deliverable.md",
+                                   "line_no": 3, "claim": "X is true", "evidence": "found Y",
+                                   "problem": "unsupported", "suggested_fix": "cite the source"}],
+                     "contradictions": [], "missing": []})}
+    _dossier = evals.build_escalation_dossier(_esc_task)
+    chk("C1c: dossier carries brief + verified findings + revision brief",
+        "the brief here" in _dossier and "[CRITICAL]" in _dossier
+        and "rewrite section 2" in _dossier and "unsupported" in _dossier)
+    # endpoint gating: off by default → 400
+    _edep = c.post("/api/tasks", json={"title": "sr-gate esc parked dep",
+                                       "description": "never done"}).json()["id"]
+    made_tasks.append(_edep)
+    _et = make_plain("sr-gate escalate probe", _edep)
+    db.execute("UPDATE tasks SET critic_verdict='REWRITE', critic_round=2, critic_json=? WHERE id=?",
+               (_esc_task["critic_json"], _et))
+    db.set_setting("super.escalation", "0")
+    chk("C1c: /escalate 400 when super.escalation off",
+        c.post(f"/api/tasks/{_et}/escalate").status_code == 400)
+    # a stub cexec that rewrites the deliverable + emits a claude-JSON envelope
+    _cexec = write_raw_stub("cexec_stub.sh", """set -euo pipefail
+WS="${1:?}"; DELIV="${2:?}"; DOSSIER="${3:?}"
+[ -f "$DOSSIER" ] || exit 1
+printf 'ESCALATED FINAL VERSION\\nrewritten by the frontier stub\\n' > "$WS/$DELIV"
+cat <<'JSON'
+{"type":"result","result":"rewrote the deliverable; resolved all findings","total_cost_usd":0.42,"usage":{"input_tokens":2000,"output_tokens":800},"modelUsage":{"claude-opus-4-8":{"costUSD":0.42}}}
+JSON
+""")
+    db.set_setting("super.escalation", "1")
+    db.set_setting("super.escalation_max", "1")
+    db.set_setting("super.escalation_cmd", f"{_cexec} {{workspace}} {{deliverable}} {{dossier}}")
+    # an open critic comment the rework should consume
+    db.execute("INSERT INTO review_comments (id, task_id, user_id, file_path, side, line_no, "
+               "line_text, body, status, created_at, source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+               (f"rc-esc-{int(time.time())}", _et, db.query_one(
+                   'SELECT user_id FROM tasks WHERE id=?', (_et,))["user_id"],
+                "deliverable.md", "new", 3, "x", "[CRITICAL] fix it", "open", time.time(), "critic"))
+    _esc = c.post(f"/api/tasks/{_et}/escalate")
+    chk("C1c: /escalate accepted (202-style) when on", _esc.status_code == 200
+        and _esc.json().get("status") == "escalating")
+    chk("C1c: double /escalate → 409 (CAS)",
+        c.post(f"/api/tasks/{_et}/escalate").status_code == 409)
+    _ews = APP / "workspaces" / _et / "deliverable.md"
+    chk("C1c: escalation ran — frontier rewrote the deliverable in the workspace",
+        bool(wait_for(lambda: "ESCALATED FINAL VERSION" in _ews.read_text(), timeout=60)))
+    chk("C1c: failing version snapshotted as deliverable.v1.md (evidence)",
+        (APP / "workspaces" / _et / "deliverable.v1.md").is_file())
+    chk("C1c: escalation spend booked to the C3 ledger (envelope $ + kind)",
+        bool(wait_for(lambda: db.query_one(
+            "SELECT 1 FROM frontier_ledger WHERE task_id=? AND kind='escalation' "
+            "AND source='envelope' AND ABS(cost_usd-0.42)<0.001", (_et,)), timeout=30)))
+    chk("C1c: version clock advanced + verdict cleared → re-critique",
+        wait_for(lambda: task_row(_et).get("critic_verdict") is None, timeout=30) is not None)
+    chk("C1c: open comments consumed by the rework",
+        db.query_one("SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? AND status='open'",
+                     (_et,))["n"] == 0)
+    # reset so the leftover settings/stub don't affect later live-sweep tests
+    db.set_setting("super.escalation", "0")
+    db.execute("DELETE FROM frontier_ledger WHERE task_id=?", (_et,))
+
+    # ── Appendix C1b: critic-proposed patch rides the comment → retry ──
+    _patch_stub = write_raw_stub("critic_patch.sh", """set -euo pipefail
+FILE="${1:?}"; DOMAIN="${2:?}"; SANDBOX="${3:?}"
+[ -f "$SANDBOX/_critic_context/context.json" ] || exit 1
+cat <<'EOF'
+NEXUS_CRITIC_JSON_BEGIN
+{"verdict":"REVISE","confidence":0.9,"summary":"s","findings":[{"severity":"critical","file_path":"workspace/deliverable.md","side":"new","line_no":1,"line_text":"","claim":"c","evidence":"e","problem":"p","suggested_fix":"f","patch":"--- a/deliverable.md\\n+++ b/deliverable.md\\n@@ -1 +1 @@\\n-gate probe line one\\n+fixed line one"}],"contradictions":[],"missing":[],"revision_brief":"apply the patch","learning_note":"n"}
+NEXUS_CRITIC_JSON_END
+EOF
+""")
+    _pt = make_plain("sr-gate patch probe", _edep)  # non-SR → drive /critic directly
+    db.set_setting("super.critic_cmd", f"{_patch_stub} {{file}} {{domain}} {{sandbox}}")
+    c.post(f"/api/tasks/{_pt}/critic")
+    chk("C1b: critic finding patch stored on the comment",
+        bool(wait_for(lambda: db.query_one(
+            "SELECT patch FROM review_comments WHERE task_id=? AND source='critic' "
+            "AND patch IS NOT NULL", (_pt,)), timeout=60)))
+    c.post(f"/api/tasks/{_pt}/retry", json={"feedback": ""})
+    chk("C1b: retry re-attaches the patch as a fenced diff",
+        "```diff" in (task_row(_pt).get("retry_feedback") or ""))
+    db.set_setting("super.critic_cmd", orig_cmd)  # restore before the sweep tests
 
     r = c.post("/api/tasks", json={"title": "sr-gate bad dtype", "deliverable_type": "poem"})
     chk("deliverable_type validation → 400", r.status_code == 400)
@@ -564,7 +710,10 @@ finally:
     # backoff window that would otherwise freeze the live critic sweep).
     for key, val in (("frontier.max_concurrent", orig_frontier_max),
                      ("frontier.quota_backoff_until", orig_frontier_backoff),
-                     ("frontier.quota_consecutive", orig_frontier_consec)):
+                     ("frontier.quota_consecutive", orig_frontier_consec),
+                     ("super.escalation", orig_escalation),
+                     ("super.escalation_cmd", orig_escalation_cmd),
+                     ("super.escalation_max", orig_escalation_max)):
         if val in (None, ""):
             db.execute("DELETE FROM settings WHERE key=?", (key,))
         else:
@@ -573,6 +722,7 @@ finally:
         db.execute("DELETE FROM tasks WHERE id=?", (tid,))
         db.execute("DELETE FROM review_comments WHERE task_id=?", (tid,))
         db.execute("DELETE FROM approvals WHERE payload LIKE ?", (f'%"task_id": "{tid}"%',))
+        db.execute("DELETE FROM frontier_ledger WHERE task_id=?", (tid,))  # C3 ledger rows
         shutil.rmtree(APP / "workspaces" / tid, ignore_errors=True)
     for wid in made_wfs:
         db.execute("DELETE FROM workflows WHERE id=?", (wid,))

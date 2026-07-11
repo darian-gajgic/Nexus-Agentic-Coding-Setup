@@ -20,12 +20,14 @@ PURPOSES = {
     "mechanical": "Mechanical tasks — formatting, extraction, conversions",
     "frontier_judge": "Frontier judge — scores high-stakes deliverables and eval runs against the domain rubric",
     "spec_model": "Plan premortem — an external judgment-tier verifier that critiques a Deep Plan before it runs (defaults to the frontier judge)",
+    "escalation_model": "Escalated rework — the judgment-tier model that writes the final version when the critic says REWRITE (or the round-cap leaves criticals open). Setting-gated by super.escalation; defaults to the frontier judge. Appendix C1c.",
 }
 
 WORKER_PURPOSES = ("complicated", "easy", "mechanical")
 # Purposes that run through the headless-CLI path (judge.cmd / cverify / the
-# plan premortem) rather than a Hermes session — they need a route='cli' model.
-CLI_PURPOSES = ("frontier_judge", "spec_model")
+# plan premortem / escalated rework) rather than a Hermes session — they need a
+# route='cli' model.
+CLI_PURPOSES = ("frontier_judge", "spec_model", "escalation_model")
 
 SECTIONS = [
     {
@@ -114,6 +116,30 @@ SECTIONS = [
             {"key": "super.keep_sandbox", "label": "Keep critic sandboxes (debug)", "type": "bool",
              "default": "0",
              "help": "Leave app/workspaces/_critic/<id> in place after a run — debugging only."},
+            # Appendix C1c — escalated rework (the escalation_model writes the final version).
+            {"key": "super.escalation", "label": "Escalated rework (frontier writes the final)", "type": "bool",
+             "default": "0",
+             "help": "C1c: on a REWRITE verdict — or the round cap with criticals still open — the "
+                     "rework ITSELF runs on the 'escalation model' purpose (judgment-tier), handed the "
+                     "full dossier, writing the deliverable directly instead of re-dispatching to GLM. "
+                     "The floor APPROACHES a direct frontier pass but is an empirical claim (a bad "
+                     "dossier can anchor it lower) — Phase 8 measures it. Off by default."},
+            {"key": "super.escalation_max", "label": "Max escalated reworks per task", "type": "int",
+             "default": "1", "min": 1, "max": 3,
+             "help": "After this many escalated reworks that still don't SHIP, fall through to a human "
+                     "checkpoint instead of escalating forever."},
+            {"key": "super.escalation_trigger", "label": "Escalation trigger threshold", "type": "enum",
+             "default": "rewrite_or_cap", "options": ["off", "rewrite", "rewrite_or_cap"],
+             "help": "C5: WHICH conditions escalate to the frontier — 'rewrite' (a REWRITE verdict "
+                     "only), 'rewrite_or_cap' (also the round cap with criticals still open), or 'off'. "
+                     "A task with a spend profile uses the profile's derived value instead (Eco off / "
+                     "Optimal rewrite / Smart rewrite_or_cap). Phase 8 tunes these from measured data."},
+            {"key": "super.escalation_cmd", "label": "Escalation command template", "type": "command",
+             "default": "cexec {workspace} {deliverable} {dossier}",
+             "help": "Tokens: {workspace} {deliverable} {dossier} and optional {model}. Gates stub this."},
+            {"key": "super.escalation_timeout_s", "label": "Escalation timeout (s)", "type": "int",
+             "default": "2100", "min": 120, "max": 3600,
+             "help": "Hard cap on one escalated-rework run (writes the deliverable with tool use)."},
             {"key": "frontier.max_concurrent", "label": "Max concurrent frontier calls", "type": "int",
              "default": "2", "min": 1, "max": 8,
              "help": "Global cap on simultaneous Claude-CLI runs (grounded critic + frontier "
@@ -271,7 +297,18 @@ SECTIONS = [
                      "(provider 'langfuse_public' / 'langfuse_secret') or ~/.hermes/.env."},
             {"key": "cost.per_1m_tokens", "label": "Cost per 1M tokens (USD)", "type": "float",
              "default": "2.0", "env": "NEXUS_COST_PER_1M_TOKENS", "restart": True,
-             "help": "Used for projected-cost displays."},
+             "help": "Used for the per-AGENT projected-cost display (legacy)."},
+            {"key": "cost.model_prices", "label": "Per-model price table (JSON)", "type": "str",
+             "default": "",
+             "help": "Appendix C3 full-cost ledger: {model_id: {input, output, cache_write, "
+                     "cache_read}} in USD per 1M tokens (from MODEL-PRICING). Empty/partial "
+                     "falls back to the built-in seed (GLM-5.2 1.40/4.40, Opus 4.8 5/25, "
+                     "Fable 5 10/50). Prices the GLM executor + display; frontier runs report "
+                     "the claude-envelope's OWN dollars. Comparison currency, not a bill."},
+            {"key": "cost.output_fraction", "label": "GLM blended output fraction", "type": "float",
+             "default": "0.5", "min": 0, "max": 1,
+             "help": "tasks.tokens_used is a blended input+output counter; the ledger prices it "
+                     "at this output share (0.5 = half output). Tune toward your real mix."},
         ],
     },
     {
@@ -539,6 +576,10 @@ def validate(key: str, value: str) -> str | None:
             return f"{key}: below minimum {item['min']}"
         if item.get("max") is not None and n > item["max"]:
             return f"{key}: above maximum {item['max']}"
+    elif t == "enum":
+        opts = item.get("options") or []
+        if value not in opts:
+            return f"{key}: must be one of {opts}"
     elif t in ("command", "str", "path"):
         if len(value) > 2000:
             return f"{key}: too long"
