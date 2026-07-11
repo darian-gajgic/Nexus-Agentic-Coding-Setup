@@ -522,6 +522,54 @@ EOF
     chk("round cap reached → escalation",
         bool(ap2) and "round cap" in (json.loads(ap2["payload"]).get("reason") or ""))
 
+    # ── D2/[30]: a quota-deferred escalated rework must retry after the window ──
+    # 429-stub escalation_cmd → the deferral restores the pre-escalation verdict
+    # (never NULL), spends no escalation budget, arms the backoff, and does NOT
+    # re-critique; with the window cleared + a working stub, the live sweep
+    # re-escalates by itself and the budget lands at exactly 1 with a rewritten
+    # deliverable.
+    STUB_REWRITE = write_stub("critic_rewrite.sh", FIXED_FINDING, verdict="REWRITE")
+    _esc429 = write_raw_stub(
+        "cexec_429.sh",
+        'echo "API Error: 429 Too Many Requests — rate limit exceeded (usage limit)"\n'
+        'exit 1\n')
+    db.set_setting("super.escalation", "1")
+    db.set_setting("super.escalation_max", "1")
+    db.set_setting("super.escalation_cmd", f"{_esc429} {{workspace}} {{deliverable}} {{dossier}}")
+    db.set_setting("frontier.quota_backoff_until", "0")
+    db.set_setting("frontier.quota_consecutive", "0")
+    set_stub(STUB_REWRITE)
+    t2b = make_probe("sr-gate esc-defer probe", dep)
+
+    def _sr_trig(tid):
+        return next((x for x in (json.loads(task_row(tid)["loop_config"] or "{}")
+                                 .get("triggers") or []) if x.get("id") == "super_result"), {})
+
+    chk("D2: deferral restored the pre-escalation verdict (not NULL) + armed backoff",
+        bool(wait_for(lambda: float(db.get_setting("frontier.quota_backoff_until", "0") or 0)
+                      > time.time()
+                      and task_row(t2b).get("critic_verdict") == "REWRITE", timeout=120)))
+    _t2b = task_row(t2b)
+    chk("D2: critic_ts kept ≥ completed_at (no re-critique of the unchanged deliverable)",
+        (_t2b.get("critic_ts") or 0) >= (_t2b.get("completed_at") or _t2b.get("updated_at") or 0))
+    chk("D2: escalation budget unspent on deferral",
+        int(_sr_trig(t2b).get("esc_used") or 0) == 0)
+    time.sleep(25)  # > one sweep cycle inside the backoff window
+    _t2b = task_row(t2b)
+    chk("D2: backoff holds — round stays 1, verdict REWRITE, no GLM retry, no checkpoint",
+        int(_t2b.get("critic_round") or 0) == 1 and _t2b.get("critic_verdict") == "REWRITE"
+        and _t2b.get("status") == "review" and not sr_approval(t2b))
+    # window over + working stub → the sweep re-escalates on its own
+    db.set_setting("super.escalation_cmd", f"{_cexec} {{workspace}} {{deliverable}} {{dossier}}")
+    db.set_setting("frontier.quota_backoff_until", "0")
+    db.set_setting("frontier.quota_consecutive", "0")
+    _t2b_ws = APP / "workspaces" / t2b / "deliverable.md"
+    chk("D2: live sweep re-escalated — frontier rewrote the deliverable",
+        bool(wait_for(lambda: "ESCALATED FINAL VERSION" in _t2b_ws.read_text(), timeout=120)))
+    chk("D2: escalation budget spent exactly once, by the real run",
+        bool(wait_for(lambda: int(_sr_trig(t2b).get("esc_used") or 0) == 1, timeout=30)))
+    db.set_setting("super.escalation", "0")
+
     # ── SHIP: quiet terminal state ──
     set_stub(STUB_SHIP)
     t3 = make_probe("sr-gate ship probe", dep)
