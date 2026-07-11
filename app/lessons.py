@@ -20,6 +20,7 @@ import json
 import time
 import uuid
 import shlex
+import shutil
 import subprocess
 import tempfile
 
@@ -187,16 +188,31 @@ def run_distillation(domain: str, user_id: str | None = None, min_evidence: int 
         tf.write(evidence)
         evid_path = tf.name
     try:
-        cmd = tmpl.format(domain=shlex.quote(domain), evidence=shlex.quote(evid_path),
-                          model=shlex.quote(jmodel or ""))
-        env = dict(os.environ)
+        # [13]: shell=False + per-token replacement — the same machinery as
+        # judge.cmd/critic_cmd/escalation_cmd. The old tmpl.format(...) raised
+        # KeyError on any literal brace in a customized lessons.cmd (awk/jq),
+        # and shell=True made this the only frontier hook interpreted by a
+        # shell instead of run as an argv list.
+        tokens = [t.replace("{domain}", domain).replace("{evidence}", evid_path)
+                   .replace("{model}", jmodel or "")
+                  for t in shlex.split(tmpl)]
+        tokens = [t for t in tokens if t != ""]  # a {model} token with no model vanishes
+        # Under the systemd unit PATH may lack ~/.local/bin (where cdistill lives).
+        if tokens and not shutil.which(tokens[0]):
+            candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+            if os.path.isfile(candidate):
+                tokens[0] = candidate
+        # [5]: the scrubbed env every other frontier subprocess gets — secrets
+        # (GLM_API_KEY, …) stripped + the claude CLI PATH fix (phase7 finding 1);
+        # raw os.environ re-introduced both gaps on this call site.
+        env = _ev._scrubbed_env()
         if jmodel:
             env["JUDGE_MODEL"] = jmodel
         if jkey:
             env["JUDGE_ANTHROPIC_API_KEY"] = jkey
         timeout = int(db.get_setting("super.timeout_s", "1500") or 1500)
         with _ev._FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+            r = subprocess.run(tokens, capture_output=True, text=True,
                                timeout=timeout, env=env)
         out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode else "")
     except subprocess.TimeoutExpired:
@@ -328,9 +344,16 @@ def sweep_distillation():
         import scheduler as _sch
         # due when the previous scheduled fire time has passed since the last run
         last = float(db.get_setting("lessons.last_run", "0") or 0)
-        due_at = _sch.next_run(cron, last)
-        if due_at > time.time():
-            return
+        # [20]: last==0 means NEVER ran — every scheduled fire time has passed,
+        # so it is due now. Feeding 0 into next_run treated it as "now" (falsy
+        # `after`), making due_at always the NEXT future occurrence and this
+        # early return unconditional — the setter at the bottom (the only
+        # writer of lessons.last_run) was unreachable and auto-distillation
+        # never fired. Bounded: min_evidence + the pending-approval skip below.
+        if last:
+            due_at = _sch.next_run(cron, last)
+            if due_at > time.time():
+                return
     except Exception:
         return
     domains = db.query_all(
