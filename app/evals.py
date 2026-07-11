@@ -423,6 +423,7 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         if os.path.isfile(candidate):
             tokens[0] = candidate
     env = dict(os.environ)
+    env["PATH"] = _augment_path_for_claude(env.get("PATH", ""))  # phase7 finding 1
     if model:
         env["JUDGE_MODEL"] = model
     if api_key:
@@ -593,11 +594,32 @@ def type_rubric_path(dtype: str | None) -> str | None:
     return fp if os.path.isfile(fp) else None
 
 
+def _augment_path_for_claude(path: str) -> str:
+    """Ensure the common user CLI bin dirs are on PATH so the frontier scripts
+    (cverify/cjudge/cexec) — which `exec env … claude` bare — resolve the `claude`
+    binary. The nexus.service PATH omits ~/.npm-global/bin (where the CLI installs
+    on this machine), so a service-spawned critic/judge/escalation would otherwise
+    exit 127 (Appendix C, judge phase7 finding 1). Idempotent; dirs are appended
+    (never prepended) so an operator's own PATH ordering is preserved."""
+    parts = [p for p in (path or "").split(os.pathsep) if p]
+    home = os.path.expanduser("~")
+    for d in (os.path.join(home, ".npm-global", "bin"),
+              os.path.join(home, ".local", "bin"),
+              os.path.join(home, "bin"),
+              os.path.join(home, ".claude", "local")):
+        if d not in parts:
+            parts.append(d)
+    return os.pathsep.join(parts)
+
+
 def _scrubbed_env() -> dict:
     """Subprocess env with every secret-looking var dropped (§4.3c). The one
     exception, JUDGE_ANTHROPIC_API_KEY, is re-added by run_critic_cmd when the
-    owner has a per-user judge credential."""
-    return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
+    owner has a per-user judge credential. PATH is augmented so a bare `claude`
+    resolves even off the stripped service PATH (phase7 finding 1)."""
+    env = {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
+    env["PATH"] = _augment_path_for_claude(env.get("PATH", ""))
+    return env
 
 
 def sweep_critic_sandboxes(max_age_h: float = 24.0) -> int:
@@ -1036,6 +1058,7 @@ def run_plan_critique(spec_text: str, plan_text: str, model: str | None = None,
                if k not in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
                             "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR",
                             "CLAUDE_CODE_SUBAGENT_MODEL")}
+        env["PATH"] = _augment_path_for_claude(env.get("PATH", ""))  # phase7 finding 1
         if api_key:
             env["ANTHROPIC_API_KEY"] = api_key
         try:
