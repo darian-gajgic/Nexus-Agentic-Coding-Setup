@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Start Nexus
+Comment=Start Nexus Agent OS and all of its services after a reboot
+Exec=/home/sinep/.local/bin/nexus-up
+Icon=network-server
+Terminal=false
+Categories=Utility;

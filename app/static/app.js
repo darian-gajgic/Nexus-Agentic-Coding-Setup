@@ -246,6 +246,7 @@ async function init() {
     updateQuotaBanner();
     updateModelStrip();
   } catch { }
+  refreshRestartPrep();  // ⏻ appears + reflects an armed prep right after reload
   // Q7a: preselect the operator's configured autopilot default on every preset
   // card (task-create + wizard). Without this the seeded settings
   // autopilot.default_involvement/default_spend were dead — the UI hardcoded
@@ -536,6 +537,7 @@ async function tick() {
       updateQuotaBanner();
       updateModelStrip();
       loadDecisions(false);  // Q7b: keep the Decisions badge fresh everywhere
+      refreshRestartPrep();  // topbar ⏻ state (admin-only; no-op otherwise)
     }
   } catch (e) { /* ignore transient */ }
 }
@@ -2718,6 +2720,140 @@ function updateModelStrip() {
   const extra = Object.keys(inflight).filter(k => !stripModels.includes(k));
   for (const k of extra) parts.push(`<span style="color:var(--accent-2)">${esc(k)} ${inflight[k]}</span>`);
   el.innerHTML = `<span class="muted">sessions</span> ` + parts.join(' <span class="muted">·</span> ');
+}
+
+// ── Restart preparation (topbar ⏻) — pause dispatch, drain, reboot safely ──
+const restartPrepState = { status: null, poll: null, unreachable: false };
+
+async function refreshRestartPrep() {
+  if (!isAdminUser()) { restartPrepIcon(); return; }
+  try { restartPrepState.status = await api('GET', '/api/system/restart-prep'); } catch { return; }
+  restartPrepIcon();
+}
+
+function restartPrepIcon() {
+  const b = $('#powerBtn');
+  if (!b) return;
+  if (!isAdminUser()) { b.style.display = 'none'; return; }
+  b.style.display = '';
+  const st = restartPrepState.status || {};
+  b.classList.toggle('prep-active', !!st.active && !st.safe);
+  b.classList.toggle('prep-safe', !!st.active && !!st.safe);
+  b.title = st.active
+    ? (st.safe ? 'Safe to restart your PC now'
+      : `Restart prep active — ${(st.busy || {}).total || 0} run(s) draining`)
+    : 'Prepare for PC restart — pause agents and drain running work';
+}
+
+function restartPrepModal() {
+  if (!isAdminUser()) return;
+  const st = restartPrepState.status || {};
+  if (st.active) { restartPrepOpenLive(); return; }
+  showModal(`
+    <h2>⏻ Prepare for PC restart</h2>
+    <div class="view-intro" style="margin-bottom:10px">Pauses all agent work (nothing new starts) and waits for running tasks to finish, then tells you it's safe to restart. Queued tasks simply wait through the reboot — nothing is lost either way.</div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="restartPrepClose()">Cancel</button>
+      <button class="btn-primary" onclick="restartPrepStart(this)">⏻ Prepare for restart</button>
+    </div>`);
+}
+
+function restartPrepOpenLive() {
+  showModal(`
+    <h2>⏻ Restart preparation</h2>
+    <div id="rp-live" style="min-height:96px;display:flex;flex-direction:column;justify-content:center"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="restartPrepCancel(this)">Cancel preparation</button>
+      <button class="btn-ghost" onclick="restartPrepClose()">Close</button>
+    </div>`);
+  restartPrepRenderLive();
+  restartPrepPollStart();
+}
+
+async function restartPrepStart(el) {
+  if (el) { el.disabled = true; el.textContent = 'Preparing…'; }
+  try {
+    restartPrepState.status = await api('POST', '/api/system/prepare-restart');
+  } catch (e) {
+    if (el) { el.disabled = false; el.textContent = '⏻ Prepare for restart'; }
+    return;
+  }
+  toast('Dispatch paused — draining running work', 'ok');
+  restartPrepIcon();
+  restartPrepOpenLive();
+}
+
+function restartPrepPollStart() {
+  if (restartPrepState.poll) clearInterval(restartPrepState.poll);
+  restartPrepState.poll = setInterval(async () => {
+    // self-clearing guard: covers every close path — closeModal() only HIDES
+    // #modal (content stays), so check visibility too (overlay click), and
+    // #rp-live disappears when another modal replaces the content.
+    const m = $('#modal');
+    if (!$('#rp-live') || !m || m.style.display === 'none') {
+      clearInterval(restartPrepState.poll); restartPrepState.poll = null; return;
+    }
+    try {
+      restartPrepState.status = await api('GET', '/api/system/restart-prep');
+      restartPrepState.unreachable = false;
+    } catch { restartPrepState.unreachable = true; }
+    restartPrepRenderLive();
+    restartPrepIcon();
+  }, 2000);
+}
+
+function restartPrepRenderLive() {
+  const el = $('#rp-live');
+  if (!el) return;  // update in place only — never rebuild the modal on tick
+  if (restartPrepState.unreachable) {
+    el.innerHTML = '<div class="muted">Server unreachable — if you already pressed restart or shut Nexus down, this is expected.</div>';
+    return;
+  }
+  const st = restartPrepState.status || {};
+  if (!st.active) { el.innerHTML = '<div class="muted">Preparation is not active.</div>'; return; }
+  const busy = st.busy || {};
+  if (st.safe) {
+    el.innerHTML = `
+      <div style="font-size:16px;color:var(--green,#34d399);font-weight:600">✅ Safe to restart now — shut down or reboot your PC.</div>
+      <div class="muted" style="margin-top:8px;font-size:12px">Afterwards, double-click <b>Start Nexus</b> on your Desktop to bring everything back.</div>`;
+    return;
+  }
+  const kinds = [];
+  if (busy.dispatches) kinds.push(`${busy.dispatches} agent run(s)`);
+  if (busy.finalizing) kinds.push(`${busy.finalizing} finalizing`);
+  if (busy.judges) kinds.push(`${busy.judges} judge`);
+  if (busy.critics) kinds.push(`${busy.critics} critic`);
+  if (busy.evals) kinds.push(`${busy.evals} eval`);
+  const stuckHint = (busy.total || 0) > 0 && st.prepared_at
+    && (Date.now() / 1000 - st.prepared_at) > 120;
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px">
+      <span class="rp-spin"></span>
+      <span style="font-size:14px"><b>${busy.total || 0}</b> run(s) still finishing…</span>
+    </div>
+    ${kinds.length ? `<div class="muted" style="margin-top:6px;font-size:12px">${esc(kinds.join(' · '))}</div>` : ''}
+    ${!busy.total ? `<div class="muted" style="margin-top:6px;font-size:12px">Double-checking… (${st.grace_remaining_s || 0}s)</div>` : ''}
+    <div class="muted" style="margin-top:10px;font-size:12px">Restarting anyway is safe — interrupted runs are recovered and resumed on the next start.</div>
+    ${stuckHint ? '<div style="margin-top:6px;font-size:12px;color:var(--yellow,#fbbf24)">Still draining after 2+ minutes — a straggler is cleared by the reconciler shortly, or just restart anyway.</div>' : ''}`;
+}
+
+async function restartPrepCancel(el) {
+  if (el) el.disabled = true;
+  try {
+    restartPrepState.status = await api('POST', '/api/system/prepare-restart/cancel');
+    toast('Restart preparation cancelled — agents resumed', 'ok');
+  } catch (e) {
+    if (el) el.disabled = false;
+    toast('Cancel failed: ' + e.message, 'err');
+    return;
+  }
+  restartPrepIcon();
+  restartPrepClose();
+}
+
+function restartPrepClose() {
+  if (restartPrepState.poll) { clearInterval(restartPrepState.poll); restartPrepState.poll = null; }
+  closeModal();
 }
 
 // ═══════════════════ FEEDBACK → KNOWN ISSUES ═══════════════════

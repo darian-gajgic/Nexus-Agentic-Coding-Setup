@@ -72,19 +72,36 @@ sed "s|/home/sinep/nexus-agent-os|$TARGET|g" "$HERE/system/nexus.service" \
 # dictation types the raw transcript.
 cp "$HERE/system/nexus-cleanup-llm.service" "$HOME/.config/systemd/user/" 2>/dev/null || true
 systemctl --user daemon-reload
-systemctl --user enable nexus >/dev/null 2>&1 || true
+# Manual-start posture (2026-07-11): units are installed but NOT enabled — the
+# stack starts only when you run nexus-up / the "Start Nexus" desktop icon.
+
+# ── start-everything launcher + desktop shortcut ──
+if [ -f "$HERE/setup/bin/nexus-up" ]; then
+  echo "-- Installing nexus-up + the Start Nexus desktop launcher"
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+  install -m 755 "$HERE/setup/bin/nexus-up" "$HOME/.local/bin/"
+  sed "s|/home/sinep|$HOME|g" "$HERE/setup/desktop/nexus-start.desktop" \
+    > "$HOME/.local/share/applications/nexus-start.desktop"
+  chmod 755 "$HOME/.local/share/applications/nexus-start.desktop"
+  if [ -d "$HOME/Desktop" ]; then
+    cp "$HOME/.local/share/applications/nexus-start.desktop" "$HOME/Desktop/"
+    chmod 755 "$HOME/Desktop/nexus-start.desktop"
+    gio set "$HOME/Desktop/nexus-start.desktop" metadata::trusted true 2>/dev/null || true
+  fi
+fi
 
 echo
-echo "== Done. Start with:  systemctl --user start nexus"
+echo "== Done. Start with:  nexus-up   (or the 'Start Nexus' desktop icon)"
 echo "   Dashboard:         https://127.0.0.1:8777  (accept the self-signed cert)"
 echo "   First run creates nexus.db and seeds default settings automatically."
+echo "   Nothing autostarts at boot; before a PC reboot press the topbar ⏻ in Nexus."
 echo
 echo "Dictation (system-wide voice typing, optional — degrades gracefully):"
 echo "  - system pkgs:  sudo apt install python3-tk python3-dev libportaudio2 \\"
 echo "                       ydotool wl-clipboard ffmpeg pipewire-utils"
 echo "  - hotkey needs the user in the 'input' group:  sudo usermod -aG input \$USER"
-echo "  - typing needs ydotoold:  systemctl --user enable --now ydotool"
-echo "  - transcript cleanup LLM: systemctl --user enable --now nexus-cleanup-llm"
+echo "  - typing needs ydotoold:  pulled in by nexus.service (Wants=) — or: systemctl --user start ydotool"
+echo "  - transcript cleanup LLM: pulled in by nexus.service (Wants=) — or: systemctl --user start nexus-cleanup-llm"
 echo "        then: OLLAMA_HOST=127.0.0.1:11435 ollama pull gemma3:4b"
 echo "  - STT model (large-v3, ~2.9GB) downloads on first use"
 echo

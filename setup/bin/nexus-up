@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# nexus-up — start the whole Nexus/Hermes stack after a reboot.
+#
+# The machine runs a manual-start posture: NOTHING autostarts at boot
+# (user units disabled, docker.service + ollama.service disabled, containers
+# restart=no). This script is the single entry point — the "Start Nexus"
+# desktop shortcut runs it. Idempotent: safe to run while everything is up.
+#
+# Root needs: ONE sudoers line (/etc/sudoers.d/nexus-stack) for
+#   systemctl start ollama.service
+# docker needs none — docker.socket stays enabled, so the first docker
+# command lazy-starts the daemon.
+set -uo pipefail   # not -e: each stage degrades with a warning instead of dying
+
+DASH_URL="https://127.0.0.1:8777"
+LOG_DIR="$HOME/.local/state"
+LOG="$LOG_DIR/nexus-up.log"
+mkdir -p "$LOG_DIR"
+exec >>"$LOG" 2>&1
+echo "=== nexus-up $(date -Is) ==="
+
+notify() {
+    notify-send -a Nexus "Nexus" "$1" 2>/dev/null || true
+    echo "$1"
+}
+
+# One instance at a time (double double-click on the shortcut).
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/nexus-up.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "another nexus-up is already running — exiting"
+    exit 0
+fi
+
+dash_up() {
+    # ANY HTTP response counts as up — with login enabled /api/health answers
+    # 401 to the anonymous probe, which still proves the server is alive.
+    local code
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 "$DASH_URL/api/health" 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+start_infra() {
+    # ollama (system service, disabled at boot) — the one sudo action
+    if ! systemctl is-active --quiet ollama.service; then
+        sudo -n systemctl start ollama.service \
+            || notify "ollama failed to start (sudoers rule missing?) — local models degraded"
+    fi
+    # containers, dependencies first; the docker CLI socket-activates dockerd
+    local c
+    for c in qdrant-qdrant-1 \
+             langfuse-postgres-1 langfuse-redis-1 langfuse-clickhouse-1 \
+             langfuse-minio-1 langfuse-langfuse-worker-1 langfuse-langfuse-web-1; do
+        docker start "$c" >/dev/null 2>&1 || notify "container $c failed to start — check $LOG"
+    done
+    # timers are cheap and idempotent
+    systemctl --user start hermes-guardian.timer hermes-reflect.timer hermes-prune.timer \
+        2>/dev/null || true
+}
+
+# Fast path: dashboard already answering → just make sure the rest is up.
+if dash_up; then
+    echo "nexus already up — ensuring infra, opening dashboard"
+    start_infra
+    xdg-open "$DASH_URL" >/dev/null 2>&1 || true
+    exit 0
+fi
+
+notify "Starting Nexus stack…"
+start_infra
+
+# nexus.service Wants= pulls hermes-gateway, ydotool and nexus-cleanup-llm.
+systemctl --user start nexus.service || notify "nexus.service failed to start — check $LOG"
+
+# Wait for the dashboard (≤90s).
+up=""
+for _ in $(seq 1 45); do
+    if dash_up; then up=1; break; fi
+    sleep 2
+done
+
+if [ -n "$up" ]; then
+    notify "Nexus is up — opening the dashboard"
+    xdg-open "$DASH_URL" >/dev/null 2>&1 || true
+    exit 0
+fi
+notify "Nexus did not come up within 90s — journalctl --user -u nexus"
+exit 1
