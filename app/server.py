@@ -5741,12 +5741,27 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
         except Exception:
             model_floor = None
     tasks = []
+    dropped_deps = 0
     for i, rt in enumerate((raw_tasks or [])[:max_raw]):
         t = _clamp_wizard_task(rt if isinstance(rt, dict) else {}, repairs, names,
                                uid=uid, model_floor=model_floor)
         deps = (rt.get("depends_on") if isinstance(rt, dict) else None) or []
-        t["depends_on_idx"] = sorted({d for d in deps if isinstance(d, int) and 0 <= d < i})
+        idxs = set()
+        for d in deps:
+            # Models sometimes stringify indices ("0") — coerce rather than
+            # silently losing the edge (a lost implement→spec edge once let
+            # both stages dispatch in the same second).
+            v = d if isinstance(d, int) and not isinstance(d, bool) else \
+                int(d.strip()) if isinstance(d, str) and d.strip().isdigit() else None
+            if v is not None and 0 <= v < i:
+                idxs.add(v)
+            else:
+                dropped_deps += 1
+        t["depends_on_idx"] = sorted(idxs)
         tasks.append(t)
+    if dropped_deps:
+        repairs.append(f"ignored {dropped_deps} unusable dependency reference(s) "
+                       "in the model's plan (non-index or forward-pointing)")
     def _drop(indices: set, note: str | None):
         nonlocal tasks
         if not indices:
@@ -5798,6 +5813,28 @@ def _repair_workflow(raw_tasks: list, wf_name: str, max_raw: int = 5,
             rev_is = [i for i, t in enumerate(tasks)
                       if t["specialist"] == "code-reviewer"]
             rev_i = rev_is[0] if rev_is else None
+            # BUILD implementers (those before any reviewer) work against the
+            # spec's deliverable (Q3: the spec stage owns the acceptance/
+            # contract), so each must depend on it — the dep is also what
+            # injects the spec's deliverable.md as INPUT at dispatch. The gate
+            # repairs below wire reviewer/fix/verifier edges but nothing else
+            # restores this one: when the model's wiring is lost at intake,
+            # implement becomes a second DAG root and dispatches in parallel
+            # with the spec (happened live 2026-07-11). The orphan-chainer
+            # can't catch it — review/fix depend on implement, so it isn't an
+            # orphan. Fix-stage implementers (after a reviewer) are excluded:
+            # their canonical deps are impl+review, and those edges alone
+            # already order them behind the spec.
+            if spec_i is not None:
+                rewired = [ii for ii in impl
+                           if ii > spec_i and not any(ri < ii for ri in rev_is)
+                           and spec_i not in tasks[ii]["depends_on_idx"]]
+                for ii in rewired:
+                    tasks[ii]["depends_on_idx"] = sorted(
+                        set(tasks[ii]["depends_on_idx"]) | {spec_i})
+                if rewired:
+                    repairs.append("implementation now waits for the spec stage "
+                                   "(missing dependency restored)")
             if rev_i is None and eco_collapse:
                 # Eco: no review/fix gate — the pipeline is spec→implement→verify.
                 repairs.append("Eco profile: collapsed to implement→verify "
