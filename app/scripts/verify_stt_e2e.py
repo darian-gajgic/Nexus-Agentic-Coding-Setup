@@ -177,6 +177,56 @@ def main():
         r = c.delete("/api/meetings/meeting-does-not-exist.md")
         ok("delete missing -> 404", r.status_code == 404, f"status={r.status_code}")
 
+        # ── 7. D4 keepalive + inactivity kill (bugfix 2026-07-12 [26][27]) ──
+        # In-process against voice.py: a PRIVATE worker spawns inside THIS gate
+        # process, so the stall knobs never touch the server's worker. Proves
+        # (i) a long silent decode that emits keepalives survives a tiny
+        # inactivity window, (ii) a silent worker is killed promptly + raises.
+        import numpy as np
+        import voice as _v
+        _sr = 16000
+        _pcm = (0.2 * np.sin(2 * np.pi * 440.0
+                             * np.arange(int(0.8 * _sr)) / _sr)).astype("float32")
+        _old_kill = _v.STT_INACTIVITY_KILL_S
+        try:
+            # knobs must be in the env BEFORE the worker spawns (inherited)
+            os.environ["NEXUS_STT_TEST_STALL_S"] = "20"
+            _v.warm_stt()
+            _t0 = time.time()
+            while not _v._stt_loaded and time.time() - _t0 < 150:
+                time.sleep(1)
+            ok("D4: private gate worker warmed", _v._stt_loaded)
+            _v.STT_INACTIVITY_KILL_S = 8.0
+            try:
+                _v.transcribe_pcm(_pcm, sample_rate=_sr)
+                ok("D4: 20s stall WITH keepalives survives an 8s inactivity timer", True)
+            except Exception as e:  # noqa: BLE001
+                ok("D4: 20s stall WITH keepalives survives an 8s inactivity timer",
+                   False, repr(e))
+            # silent variant needs a fresh worker that inherits the knob
+            _v.STT_INACTIVITY_KILL_S = _old_kill
+            _v._kill_stt_worker("gate: respawn with silent-stall knob")
+            os.environ["NEXUS_STT_TEST_STALL_SILENT"] = "1"
+            _v.warm_stt()
+            _t0 = time.time()
+            while not _v._stt_loaded and time.time() - _t0 < 150:
+                time.sleep(1)
+            _v.STT_INACTIVITY_KILL_S = 8.0
+            _killed = False
+            _t1 = time.time()
+            try:
+                _v.transcribe_pcm(_pcm, sample_rate=_sr)
+            except RuntimeError:
+                _killed = True
+            ok("D4: silent 20s stall -> inactivity kill + RuntimeError",
+               _killed and time.time() - _t1 < 19,
+               f"killed={_killed} elapsed={time.time() - _t1:.1f}s")
+        finally:
+            _v.STT_INACTIVITY_KILL_S = _old_kill
+            os.environ.pop("NEXUS_STT_TEST_STALL_S", None)
+            os.environ.pop("NEXUS_STT_TEST_STALL_SILENT", None)
+            _v._kill_stt_worker("gate cleanup")
+
     finally:
         c.close()
 
