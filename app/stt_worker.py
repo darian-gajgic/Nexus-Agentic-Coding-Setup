@@ -233,7 +233,22 @@ def _with_gpu_fallback(fn):
         traceback.print_exc(file=sys.stderr)
         _model = None
         gc.collect()
-        return _locked()
+        try:
+            return _locked()
+        except Exception as e2:
+            # review K7: the retry can hit a REAL CUDA failure (VRAM taken
+            # between attempts) — classify it like a first attempt instead of
+            # erroring the request while staying pinned to CUDA.
+            if _device == "cuda" and _is_gpu_failure(e2):
+                log(f"CUDA failure on the retry ({e2!r}) — CPU for the rest "
+                    "of this worker's life")
+                traceback.print_exc(file=sys.stderr)
+                _device = "cpu"
+                _model = None
+                _fallback_used = True
+                gc.collect()
+                return fn()
+            raise
 
 
 def op_warm(req: dict) -> dict:

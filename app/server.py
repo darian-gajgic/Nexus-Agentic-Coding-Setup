@@ -4769,7 +4769,10 @@ async def critic_status(task_id: str):
     return {"verdict": task.get("critic_verdict"), "output": task.get("critic_output"),
             "parsed": parsed, "ts": task.get("critic_ts"),
             "round": int(task.get("critic_round") or 0),
-            "running": task.get("critic_verdict") == "running",
+            # review K8: 'escalating' is busy too — the UI polls on this flag,
+            # and running=false mid-escalation fired a verdict toast + full
+            # task refetch every poll cycle for the whole frontier rework.
+            "running": task.get("critic_verdict") in ("running", "escalating"),
             "open_critic_comments": n_open}
 
 
@@ -4864,7 +4867,11 @@ def _regen_loop_for_profile(kind: str, row: dict):
         o = old.get(t.get("id"))
         if o:
             t["used"] = int(o.get("used") or 0)
-            for k in ("used_tasks", "state_tasks"):
+            # review K3: 'state' (handled-critique marker) and esc_* (one-shot
+            # frontier escalation budget) are load-bearing — dropping them on a
+            # preset regen re-fired already-handled escalations and un-capped
+            # super.escalation_max (double frontier spend).
+            for k in ("used_tasks", "state_tasks", "state", "esc_used", "esc_tasks"):
                 if o.get(k):
                     t[k] = o[k]
     db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?", (json.dumps(newcfg), row["id"]))
