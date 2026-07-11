@@ -146,14 +146,16 @@ dropdown rendering to support the threshold picker.)
 - **Static** `scripts/verify.sh` — **436/436** (was 409; +27 Appendix-C checks
   across C3/C1a/C1b/C1c/C2/rule3/C5/rule12).
 - **Super Result e2e** `scripts/verify_super_result_e2e.py` — full live-sweep run,
-  **79/79 (0 failed)**. Includes 8 C3 checks (envelope unwrap, price table, ledger
+  **83/83 (0 failed)**. Includes 12 C3 checks (envelope unwrap, price table, ledger
   math + API), 9 C1c checks (dossier, endpoint gating + CAS, live escalated rework
   rewriting the deliverable, v-snapshot, ledger booking, re-critique, comment
-  consumption), 2 C1b checks (patch stored + re-attached as a fenced diff), and
+  consumption), 2 C1b checks (patch stored + re-attached as a fenced diff),
   **+14 phase7 judge-REVISE regression checks** (finding 1: PATH augmentation +
   claude resolves under a stripped service PATH; finding 2: exit-127 and
   byte-identical reworks do not false-SHIP — comments kept, clock frozen,
-  verdict→error).
+  verdict→error), and **+4 judge-round-2 regression checks** (NULL-model task and
+  workflow ledgers price > $0 at the resolved `complicated` model, an explicit
+  model still wins, `/api/deliverables` costs the same task > $0).
 - **Quality Autopilot e2e** `scripts/verify_autopilot_e2e.py` — **56/56**
   (rule-3 model-floor now asserts DERIVED, not staged).
 - **Deep Plan e2e** `scripts/verify_deep_plan_e2e.py` — **21/21** (spec_model /
@@ -239,6 +241,70 @@ the failure branch re-arms the super-state and keeps the comments.
 
 ---
 
+## Judge REVISE round 2 (phase7) — blocking finding fixed (2026-07-11)
+
+A second independent judge pass returned REVISE with one blocking finding. It was
+re-verified against HEAD (reproduced exactly), then fixed with regression checks
+and a live re-drive of the workflow the judge cited.
+
+### Finding 1 — `tasks.model = NULL` (the default) priced at $0, hiding ~99% of GLM spend
+**Verified at HEAD (reproduced).** `task_cost_ledger` / `workflow_cost_ledger`
+passed `tasks.model` straight into `blended_rate()`, which returns `0.0` for an
+unknown model — and `NULL` is the *deliberate* default, not an unknown. Live
+counts on the working DB confirmed the judge's numbers:
+
+| `tasks.model` | tasks with tokens | tokens |
+|---|---|---|
+| `NULL` (default) | 40 | 50,285,578 |
+| `glm-4.5-air` | 2 | 132,109 |
+| `glm-5.2` | 1 | 250,000 |
+
+So **50.3M of 50.7M tokens (99.2%) priced at $0**, and the judge's observed case
+`GET /api/workflows/wf-ae849fa6/ledger` returned 10,386,674 GLM tokens at
+`glm_usd: 0.0` / `total_usd: 0.0`. C3's contract goal — "every task/workflow gets
+a total $ figure across both currencies, else *beats Opus, cheaper than Fable* is
+unverifiable" — was unmet for the dominant case, and Phase 8's cost arm would have
+been biased toward "GLM is free".
+
+**Root cause:** pricing read `tasks.model` at face value while *dispatch* resolves
+it (`hermes_dispatch.resolve_task_model` = `task.model or default_task_model(uid)`).
+The two sides disagreed about what NULL means.
+
+**Fix (`app/database.py`):** new `effective_task_model(model_id, user_id)` — the
+pricing-side mirror of `resolve_task_model`: explicit task model → the owner's
+`complicated` assignment → `fallback_model("complicated")` (so a wiped registry
+still prices instead of pricing free). Both ledgers now resolve through it (their
+queries also select `user_id`), and `task_cost_ledger` additionally returns
+`glm_model` — the resolved model the estimate actually priced at, so the figure is
+auditable rather than opaque. Took the judge's first alternative (resolve at
+pricing time) over stamping the model at dispatch, because it also fixes the **40
+historical tasks already on disk**; stamping only helps future rows and would have
+left Phase 8's baseline biased.
+
+**Extended beyond the judge's line numbers (same defect, same C3 contract):**
+`GET /api/deliverables` (`server.py`) built its `cost_usd` column with the same
+raw `t.get("model")` and so showed $0 for the same 99% — it now goes through
+`db.effective_task_model` too. `evals.py:_price_tokens_blended` was audited and is
+**correct as-is** (it is only ever handed an already-resolved frontier model).
+
+**Regression (`verify_super_result_e2e.py`, +4 checks):** a NULL-model task with
+`tokens_used=1M` in a scratch workflow asserts (a) the task ledger prices it at
+$2.90 with `glm_model == effective_task_model(None, None)` while the row's `model`
+column is still genuinely `NULL`, (b) the *workflow* ledger rolls it up at $2.90
+(no $0 rollup), (c) an explicit task model still wins over the resolved default
+(no regression to the pre-existing explicit-model check at line 243, which was the
+only coverage before), and (d) `/api/deliverables` costs the same task > $0. The
+task is also given a `result_summary` so it genuinely surfaces in the deliverables
+list — otherwise that check would pass vacuously.
+
+**Live re-drive (the judge's exact case):** after the fix,
+`workflow_cost_ledger("wf-ae849fa6")` → 5 tasks, 10,386,674 GLM tokens,
+**`glm_usd: 30.1214`, `total_usd: 30.1214`** (was `0.0`); a sampled NULL-model task
+prices at $1.16 with `glm_model: "glm-5.2"`. The cross-currency total is now real
+for the dominant case.
+
+---
+
 ## Deviations & follow-ups (recorded per the headless protocol)
 1. **C1d (best-of-2 executor drafts) deferred.** It is marked "optional (medium
    coding tasks)" in the SR plan, and the existing content/research fan-out already
@@ -293,3 +359,12 @@ gate, pre-rework revert, super-state re-arm → human checkpoint; new
 `_drop_snapshot` helper — finding 2), `app/scripts/verify_super_result_e2e.py`
 (+14 regression checks). No Hermes-side (`setup/bin`) change was needed: the fix
 is central in `evals`, which every frontier script inherits its env from.
+
+**Phase7 judge-REVISE round 2 (2026-07-11):** `app/database.py` (new
+`effective_task_model` — the pricing-side mirror of
+`hermes_dispatch.resolve_task_model`; `task_cost_ledger` /`workflow_cost_ledger`
+resolve through it and select `user_id`; task ledger gained `glm_model`),
+`app/server.py` (`/api/deliverables` `cost_usd` uses the same resolver),
+`app/scripts/verify_super_result_e2e.py` (+4 regression checks). Purely a pricing
+change — no dispatch/routing behavior moved, and `evals._price_tokens_blended` was
+audited as already-correct (only ever handed a resolved frontier model).
