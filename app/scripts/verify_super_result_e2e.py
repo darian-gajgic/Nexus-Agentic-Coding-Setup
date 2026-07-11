@@ -252,6 +252,40 @@ try:
         abs(_api_led["total_usd"] - 3.02) < 1e-2
         and _api_led["currency"] == "API-equivalent USD")
 
+    # C3 / phase7 judge finding 1: `tasks.model` NULL is the DELIBERATE default
+    # (dispatch runs the owner's 'complicated' purpose) and covers ~99% of real
+    # GLM spend. Pricing must RESOLVE it, not read it as "unknown model" → $0 —
+    # else the cross-currency total is meaningless and the Phase-8 cost arm is
+    # biased. The check above only covers an explicitly-set model.
+    _nw = c.post("/api/workflows", json={"name": "sr-gate null-model ledger wf"}).json()
+    made_wfs.append(_nw["id"])
+    _nt = c.post("/api/tasks", json={"title": "sr-gate null-model ledger probe",
+                                     "workflow_id": _nw["id"]}).json()["id"]
+    made_tasks.append(_nt)
+    # workspace_path + result_summary so the task also surfaces in /api/deliverables
+    # (the dir need not exist — result_summary alone qualifies it as "produced output").
+    db.execute("UPDATE tasks SET tokens_used=1000000, model=NULL, "
+               "workspace_path='/nonexistent/sr-gate-null-model', "
+               "result_summary='ledger probe' WHERE id=?", (_nt,))
+    _nled = db.task_cost_ledger(_nt)
+    chk("C3: NULL-model task (the default) prices > $0 at the owner's 'complicated' model",
+        db.query_one("SELECT model FROM tasks WHERE id=?", (_nt,))["model"] is None
+        and _nled["glm_usd"] > 0 and abs(_nled["glm_usd"] - 2.9) < 1e-3
+        and _nled["glm_model"] == db.effective_task_model(None, None)
+        and abs(_nled["total_usd"] - 2.9) < 1e-3)
+    _nwled = db.workflow_cost_ledger(_nw["id"])
+    chk("C3: workflow ledger prices its NULL-model members too (no $0 rollup)",
+        _nwled["glm_tokens"] == 1_000_000 and abs(_nwled["glm_usd"] - 2.9) < 1e-3
+        and _nwled["total_usd"] > 0)
+    chk("C3: an EXPLICIT task model still wins over the resolved default",
+        db.effective_task_model("glm-4.5-air", None) == "glm-4.5-air"
+        and db.effective_task_model(None, None) == db.fallback_model("complicated"))
+    _ndel = [d for d in c.get("/api/deliverables").json()["deliverables"]
+             if d["task_id"] == _nt]
+    chk("C3: /api/deliverables costs a NULL-model task > $0 (same resolver)",
+        len(_ndel) == 1 and _ndel[0]["cost_usd"] > 0
+        and abs(_ndel[0]["cost_usd"] - 2.9) < 1e-3)
+
     # ── Appendix C1c: escalated rework (frontier writes the final) ──
     # in-process: the dossier carries the brief + verified findings + brief text
     _esc_task = {"id": "escT", "title": "esc probe", "description": "the brief here",
