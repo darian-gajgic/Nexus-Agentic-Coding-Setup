@@ -59,6 +59,14 @@ if not js.get("connected"):
     sys.exit(1)
 prev_flag = get("/api/settings", params={"prefix": "dispatch.enabled"}).json()["settings"] \
     .get("dispatch.enabled", "0")
+# Captured up front so the janitor can restore it on ANY exit — a crashed run
+# once left the stub wired in for 3 days and every "frontier judge" verdict was
+# the same canned REVISE (2026-07-08 → 11). A captured value that already
+# points at the stub is litter from an earlier crash: restore to "" (registry
+# back-to-default = the real cjudge), never re-pin the stub.
+_pj = get("/api/settings", params={"prefix": "judge.cmd"}).json()["settings"] \
+    .get("judge.cmd", "")
+prev_judge_cmd = "" if "judge_stub" in _pj else _pj
 clear_quota_keys()
 
 import atexit  # noqa: E402
@@ -79,7 +87,8 @@ def _janitor():
                 post(f"/api/agents/{a['id']}/retire")
                 dele(f"/api/agents/{a['id']}")
         clear_quota_keys()
-        patch("/api/settings", json={"dispatch.enabled": prev_flag})
+        patch("/api/settings", json={"dispatch.enabled": prev_flag,
+                                     "judge.cmd": prev_judge_cmd})
     except Exception:
         pass
 
@@ -235,8 +244,8 @@ con.execute("INSERT INTO approvals (id, agent_id, action_type, description, payl
             (json.dumps({"task_id": tE}),))
 con.commit(); con.close()
 
-prev_judge_cmd = get("/api/settings", params={"prefix": "judge.cmd"}).json()["settings"] \
-    .get("judge.cmd", "cjudge {file} {domain}")
+# prev_judge_cmd was captured (and stub-sanitized) at preflight; the janitor
+# restores it on any exit, the inline restore below handles the happy path.
 patch("/api/settings", json={"judge.cmd": f"bash {ROOT}/scripts/judge_stub.sh {{file}} {{domain}}"})
 r = post(f"/api/tasks/{tE}/judge")
 ok("judge starts", r.status_code == 200, r.text[:150])
