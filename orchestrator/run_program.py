@@ -522,7 +522,10 @@ def parse_verdict(text):
 
 def run_judge_phase(state, step):
     phase, impl = step["name"], step["impl"]
-    prompt = read_prompt(f"{phase}-judge.md") + JUDGE_SUFFIX
+    # step names: "phase2"/"phase4"/"phase6" → phaseN-judge.md, but "phase7-judge"
+    # already carries the suffix → phase7-judge.md (not ...-judge-judge.md)
+    fname = f"{phase}.md" if phase.endswith("-judge") else f"{phase}-judge.md"
+    prompt = read_prompt(fname) + JUDGE_SUFFIX
     report, _ = REPORTS.get(impl, (None, None))
     rounds = state["judge_rounds"].get(phase, 0)
 
