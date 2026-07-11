@@ -11,8 +11,11 @@ Work priority each tick:
   3. my blocked tasks whose budget/quota block has cleared
   4. claimable 'todo' work (assigned to me, or unassigned if auto_claim is on)
 
-The lane idles when settings key dispatch.enabled != 1. It exits cleanly when
-its agent row is retired, stopped, or deleted — zombie prevention (R3.1).
+The lane idles when settings key dispatch.enabled != 1 — except the resume
+mode's no-new-token halves (wait-on-active-orphan heartbeats + finished-orphan
+harvest), which keep running so the restart drain stays honest (D3a). It exits
+cleanly when its agent row is retired, stopped, or deleted — zombie
+prevention (R3.1).
 """
 import sys
 import os
@@ -177,7 +180,7 @@ def _wait_on_active_orphan(task: dict, agent_id: str) -> bool:
     return True
 
 
-def _execute(task: dict, mode: str, agent_id: str):
+def _execute(task: dict, mode: str, agent_id: str, dispatch_on: bool = True):
     tid = task["id"]
     if mode == "queued":
         d = db.query_one(
@@ -191,6 +194,15 @@ def _execute(task: dict, mode: str, agent_id: str):
     elif mode == "resume":
         if _wait_on_active_orphan(task, agent_id):
             return  # run still executing upstream — heartbeat refreshed, no churn
+        if not dispatch_on and hd.orphan_run_state(task) != "finished":
+            # Drain posture (D3a/[0]): dispatch paused → the resume lane only
+            # HARVESTS finished orphans (pure recovery, no new tokens); active
+            # ones got their heartbeat refreshed above so the drain keeps
+            # counting them, and dead ones stay untouched — a continue-turn
+            # would spend the tokens the drain promised not to. Known-accepted
+            # edge: a finished-but-failure-text reply declines harvest
+            # downstream and sends ONE bounded resume_with_context turn.
+            return
         db.execute(
             "UPDATE dispatches SET state='failed', ended_at=?, "
             "error=COALESCE(NULLIF(error,''), "
@@ -229,8 +241,13 @@ def main():
         auto_claim = bool(cfg.get("auto_claim", True))
         try:
             task, mode = _find_work(agent_id, auto_claim, dispatch_on)
-            if task and dispatch_on:
-                _execute(task, mode, agent_id)
+            # Resume runs even with dispatch off (D3a/[0]): its no-new-token
+            # halves (heartbeat-refresh wait + finished-orphan harvest) are what
+            # keep the restart drain honest — without them an orphaned run drops
+            # out of the busy count after 120s while still executing upstream.
+            # Queued/retry/claimed stay gated: those SPEND tokens.
+            if task and (dispatch_on or mode == "resume"):
+                _execute(task, mode, agent_id, dispatch_on)
         except Exception as e:
             db.log_activity("error", agent_id,
                             f"worker loop error [cause={hd.classify_failure(e)}] "
