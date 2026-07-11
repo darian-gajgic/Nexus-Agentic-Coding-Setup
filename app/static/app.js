@@ -3821,10 +3821,13 @@ async function pollJudge(id) {
 function criticSectionHTML(t) {
   if (!t.result_summary && !t.critic_verdict && !t.super_result) return '';
   const v = t.critic_verdict;
-  if (v === 'running') {
+  if (v === 'running' || v === 'escalating') {
     setTimeout(() => pollCritic(t.id), 4000);
+    const busy = v === 'escalating'
+      ? '⏳ escalated rework in progress… (the frontier model is rewriting the deliverable)'
+      : '⏳ critiquing in a sandbox… (takes minutes — it re-runs the evidence)';
     return `<div class="form-group"><label class="form-label">🤖 Grounded critic (Super Result)</label>
-      <div class="chip c-blue">⏳ critiquing in a sandbox… (takes minutes — it re-runs the evidence)</div></div>`;
+      <div class="chip c-blue">${busy}</div></div>`;
   }
   if (v && v !== 'error') {
     const cls = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[v] || '';
@@ -8911,7 +8914,7 @@ function viewDeliverables() {
     .filter(d => !q || (d.title + ' ' + (d.domain || '') + ' ' + (d.workflow || '')).toLowerCase().includes(q))
     .map(d => {
       const judgeChip = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[d.judge_verdict];
-      const criticChip = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red', running: 'c-blue', error: 'c-red' }[d.critic_verdict];
+      const criticChip = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red', running: 'c-blue', escalating: 'c-blue', error: 'c-red' }[d.critic_verdict];
       return `
       <div class="agentic-row">
         <div><strong>${esc(d.title)}</strong>

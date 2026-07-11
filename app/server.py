@@ -123,6 +123,16 @@ def startup():
     if stuck_critic:
         db.log_activity("warn", "critic",
                         f"Cleared {stuck_critic} critic run(s) orphaned by restart")
+    # D3b/[31]: same for the escalated rework — a restart mid-escalation left
+    # 'escalating' forever (the sweep skips it, /critic + /escalate 409 on it).
+    # 'error' routes to the human checkpoint via the sweep's error branch.
+    stuck_esc = db.execute(
+        "UPDATE tasks SET critic_verdict='error', "
+        "critic_output=COALESCE(critic_output,'')||' [escalation orphaned by restart]' "
+        "WHERE critic_verdict='escalating'").rowcount
+    if stuck_esc:
+        db.log_activity("warn", "critic",
+                        f"Cleared {stuck_esc} escalated rework(s) orphaned by restart")
     # Same for replan drafts (R2.2) — a restart mid-draft would 409 forever.
     for w in db.query_all("SELECT id, replan FROM workflows WHERE replan IS NOT NULL"):
         try:
@@ -4565,13 +4575,52 @@ def _escalation_thread(task_id: str):
         if not sink and _ev.is_frontier_quota_error(out):
             wait = _ev.note_frontier_quota_hit()
             _drop_snapshot(snap)  # nothing was reworked → don't inflate snapshots
-            db.execute("UPDATE tasks SET critic_verdict=NULL, critic_ts=NULL WHERE id=?", (task_id,))
+            # D2/[30]: restore the pre-escalation verdict from the stored critique
+            # so the sweep re-ESCALATES after the backoff window instead of
+            # re-critiquing the unchanged deliverable (critic_ts stays — it is
+            # ≥ completed_at, so critiqued_this_version holds). NULL both only
+            # when there was never a critique to restore.
+            prev_verdict = None
+            try:
+                prev_verdict = (json.loads(task.get("critic_json") or "null") or {}).get("verdict")
+            except Exception:
+                prev_verdict = None
+            if prev_verdict:
+                db.execute("UPDATE tasks SET critic_verdict=? WHERE id=?",
+                           (prev_verdict, task_id))
+            else:
+                db.execute("UPDATE tasks SET critic_verdict=NULL, critic_ts=NULL WHERE id=?",
+                           (task_id,))
+            # clear the trigger state so the sweep re-evaluates this critique
+            # once the window ends (mirrors the failure branch below)
+            try:
+                import loop_engine as _le
+                loc = _le._locate_super_cfg(task_id)
+                if loc:
+                    _dk_kind, _dk_id, _dk_cfg, _dk_trig, _dk_pt = loc
+                    _le._set_super_state(_dk_trig, _dk_pt, None)
+                    _le._save_cfg(_dk_kind, _dk_id, _dk_cfg)
+            except Exception:
+                pass
             db.log_activity("warn", "critic",
                             f"Escalated rework on {task_id} deferred — frontier quota/rate-limit, "
                             f"backing off {wait}s (will retry)", user_id=owner)
             _broadcast_task_row(task_id, owner)
             return
         _ev.note_frontier_quota_ok()
+        # D2/[30]: the one-shot escalation budget is spent HERE — a frontier run
+        # actually executed (deferred attempts above cost nothing; a non-quota
+        # FAILURE below still bumps, a real attempt was consumed). loc None is
+        # fine: manual /escalate without a loop config has no budget to book.
+        try:
+            import loop_engine as _le
+            loc = _le._locate_super_cfg(task_id)
+            if loc:
+                _bp_kind, _bp_id, _bp_cfg, _bp_trig, _bp_pt = loc
+                _le._bump_escalations(_bp_trig, _bp_pt)
+                _le._save_cfg(_bp_kind, _bp_id, _bp_cfg)
+        except Exception:
+            pass
         # judge phase7 finding 2: a NON-quota failure — exit 127 (claude
         # unresolvable), a timeout, a crash, or a byte-identical deliverable — must
         # NEVER be booked as success. Consuming the open comments + advancing the
@@ -4689,10 +4738,12 @@ async def run_critic(task_id: str):
     # a lost race is a 409, mirroring claim_task / db.claim_task_cas.
     cur = db.execute(
         "UPDATE tasks SET critic_verdict='running', critic_output=NULL, critic_ts=? "
-        "WHERE id=? AND (critic_verdict IS NULL OR critic_verdict!='running')",
+        "WHERE id=? AND (critic_verdict IS NULL OR "
+        "critic_verdict NOT IN ('running','escalating'))",
         (time.time(), task_id))
     if cur.rowcount == 0:
-        return JSONResponse(status_code=409, content={"error": "critic already running"})
+        return JSONResponse(status_code=409,
+                            content={"error": "critic/escalation already running"})
     threading.Thread(target=_critic_thread, args=(task_id,), daemon=True).start()
     db.log_activity("info", "critic", f"Super Result critic started on {task_id} "
                     f"(round {round_no})", user_id=task.get("user_id"))

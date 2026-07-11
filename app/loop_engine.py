@@ -530,39 +530,43 @@ def _escalation_mode(t: dict) -> str:
 
 
 def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
-                        trigger_kind: str = "rewrite") -> bool:
+                        trigger_kind: str = "rewrite") -> str:
     """Appendix C1c: dispatch the escalated rework (the frontier escalation_model
     writes the final version) when super.escalation is on, this task's escalation
     THRESHOLD (C5) allows this trigger, and it still has escalation budget.
     trigger_kind is 'rewrite' (a REWRITE verdict) or 'cap' (round cap with open
-    criticals) — 'cap' needs the rewrite_or_cap threshold. Returns True when it
-    dispatched (caller bumps state + persists, skipping the GLM retry / human
-    checkpoint); False = not eligible. The endpoint CAS-guards a double-spawn."""
+    criticals) — 'cap' needs the rewrite_or_cap threshold. Tri-state (D2/[30]):
+    'sent' = dispatched (caller persists state, skipping the GLM retry / human
+    checkpoint); 'wait' = eligible but the frontier quota backoff is armed —
+    the caller leaves the critique PENDING for a later sweep, never demoting it
+    to the GLM retry; 'no' = not eligible. The escalation budget is spent by
+    server._escalation_thread only when a frontier run actually executed, so a
+    quota-deferred attempt costs nothing. The endpoint CAS-guards a double-spawn."""
     if db.get_setting("super.escalation", "0") != "1":
-        return False
+        return "no"
     mode = _escalation_mode(t)  # C5 threshold
     if mode == "off":
-        return False
+        return "no"
     if trigger_kind == "cap" and mode != "rewrite_or_cap":
-        return False
-    # don't hammer the one Claude subscription while a backoff window is armed
-    if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
-        return False
+        return "no"
     used = _escalations_used(trig, per_task)
     cap = int(db.get_setting("super.escalation_max", "1") or 1)
     if used >= cap:
-        return False
+        return "no"
+    # eligibility established — only NOW consult the backoff, so an armed window
+    # parks the escalation as pending instead of silently disqualifying it
+    if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+        return "wait"
     tid = t["id"]
     if _api("POST", f"/api/tasks/{tid}/escalate", {}, user_id=t.get("user_id")):
-        _bump_escalations(trig, per_task)
         _set_super_state(trig, per_task,
                          {"kind": "escalated_rework", "handled_ts": t.get("critic_ts")})
         db.log_activity("info", "loop",
                         "Super Result: escalated rework dispatched — frontier writes the "
                         f"final on '{(t.get('title') or '')[:50]}' ({used + 1}/{cap})",
                         user_id=t.get("user_id"))
-        return True
-    return False
+        return "sent"
+    return "no"
 
 
 def _escalate_super(t: dict, trig: dict, per_task: str | None,
@@ -721,10 +725,14 @@ def _sweep_super_result(actions_left: int) -> int:
             # C1c: the GLM rework rounds are exhausted but criticals remain —
             # let the frontier escalation_model write the final version (if on +
             # budget) before handing it to the human.
-            if _has_open_criticals(t) and _try_escalate_super(t, trig, per_task, "cap"):
-                _save_cfg(owner_kind, owner_id, cfg)
-                actions_left -= 1
-                continue
+            if _has_open_criticals(t):
+                esc = _try_escalate_super(t, trig, per_task, "cap")
+                if esc == "sent":
+                    _save_cfg(owner_kind, owner_id, cfg)
+                    actions_left -= 1
+                    continue
+                if esc == "wait":  # backoff armed — stays pending, retry a later sweep
+                    continue
             if _escalate_super(t, trig, per_task,
                                f"round cap reached ({used}/{max_rounds})"):
                 _save_cfg(owner_kind, owner_id, cfg)
@@ -736,11 +744,17 @@ def _sweep_super_result(actions_left: int) -> int:
         # C1c: a REWRITE means another GLM pass won't salvage the draft — when
         # escalation is on (+ budget), the frontier model writes the final itself
         # instead of re-dispatching to GLM. Falls through to the GLM retry when
-        # off / out of escalation budget (the pre-C1c behavior).
-        if verdict == "REWRITE" and _try_escalate_super(t, trig, per_task, "rewrite"):
-            _save_cfg(owner_kind, owner_id, cfg)
-            actions_left -= 1
-            continue
+        # off / out of escalation budget (the pre-C1c behavior). A quota-armed
+        # 'wait' stays pending — never demote a REWRITE to the GLM retry it
+        # already declared futile (D2/[30]).
+        if verdict == "REWRITE":
+            esc = _try_escalate_super(t, trig, per_task, "rewrite")
+            if esc == "sent":
+                _save_cfg(owner_kind, owner_id, cfg)
+                actions_left -= 1
+                continue
+            if esc == "wait":
+                continue
         # closed mode → automatic rework with the critic's revision brief;
         # _retry_task drains the critic comments into the prompt automatically
         brief = ""
