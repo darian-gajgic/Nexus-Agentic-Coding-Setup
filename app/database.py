@@ -883,10 +883,11 @@ def task_cost_ledger(task_id: str) -> dict:
     (tokens_used priced from the table — an estimate) + the frontier subprocess
     spend (critic/judge/spec/escalation, from the envelope's own dollars). This
     is a COMPARISON figure, not a bill."""
-    t = query_one("SELECT model, tokens_used, frontier_tokens, frontier_cost_usd "
+    t = query_one("SELECT model, user_id, tokens_used, frontier_tokens, frontier_cost_usd "
                   "FROM tasks WHERE id=?", (task_id,)) or {}
     glm_tokens = int(t.get("tokens_used") or 0)
-    glm_usd = glm_cost_estimate(glm_tokens, t.get("model"))
+    glm_model = effective_task_model(t.get("model"), t.get("user_id"))
+    glm_usd = glm_cost_estimate(glm_tokens, glm_model)
     frontier_tokens = int(t.get("frontier_tokens") or 0)
     frontier_usd = round(float(t.get("frontier_cost_usd") or 0.0), 6)
     runs = query_all(
@@ -894,6 +895,7 @@ def task_cost_ledger(task_id: str) -> dict:
         "WHERE task_id=? ORDER BY created_at", (task_id,))
     return {
         "glm_tokens": glm_tokens, "glm_usd": round(glm_usd, 4),
+        "glm_model": glm_model,   # the RESOLVED model the estimate priced at
         "frontier_tokens": frontier_tokens, "frontier_usd": round(frontier_usd, 4),
         "total_usd": round(glm_usd + frontier_usd, 4),
         "runs": runs,
@@ -906,14 +908,14 @@ def task_cost_ledger(task_id: str) -> dict:
 def workflow_cost_ledger(workflow_id: str) -> dict:
     """Same as task_cost_ledger, summed across a workflow's member tasks."""
     rows = query_all(
-        "SELECT model, tokens_used, frontier_tokens, frontier_cost_usd "
+        "SELECT model, user_id, tokens_used, frontier_tokens, frontier_cost_usd "
         "FROM tasks WHERE workflow_id=?", (workflow_id,))
     glm_tokens = frontier_tokens = 0
     glm_usd = frontier_usd = 0.0
     for r in rows:
         gt = int(r.get("tokens_used") or 0)
         glm_tokens += gt
-        glm_usd += glm_cost_estimate(gt, r.get("model"))
+        glm_usd += glm_cost_estimate(gt, effective_task_model(r.get("model"), r.get("user_id")))
         frontier_tokens += int(r.get("frontier_tokens") or 0)
         frontier_usd += float(r.get("frontier_cost_usd") or 0.0)
     return {
@@ -1000,6 +1002,16 @@ def default_task_model(user_id: str | None) -> str | None:
     apply — identical to pre-registry behavior)."""
     row = resolve_assignment(user_id, "complicated")
     return row["model_id"] if row and row["route"] == "hermes" else None
+
+
+def effective_task_model(model_id: str | None, user_id: str | None) -> str | None:
+    """The model a task's tokens ACTUALLY ran on — the pricing-side mirror of
+    hermes_dispatch.resolve_task_model. `tasks.model` NULL is the DELIBERATE
+    default (dispatch resolves it to the owner's 'complicated' purpose), so
+    pricing MUST resolve it the same way; taking NULL at face value prices the
+    dominant case at $0 and makes the C3 cross-currency total meaningless. The
+    registry fallback is the last resort so a wiped registry still prices."""
+    return model_id or default_task_model(user_id) or fallback_model("complicated")
 
 
 # --- Atomic task claiming (single CAS code path — used by the HTTP endpoint

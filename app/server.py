@@ -7392,8 +7392,10 @@ def list_deliverables(limit: int = 100):
             # C3 ledger: frontier subprocess spend + API-equivalent $ total.
             "frontier_tokens": t.get("frontier_tokens") or 0,
             "frontier_cost_usd": round(float(t.get("frontier_cost_usd") or 0.0), 4),
-            "cost_usd": round(db.glm_cost_estimate(t.get("tokens_used"), t.get("model"))
-                              + float(t.get("frontier_cost_usd") or 0.0), 4),
+            "cost_usd": round(db.glm_cost_estimate(
+                t.get("tokens_used"),
+                db.effective_task_model(t.get("model"), t.get("user_id")))
+                + float(t.get("frontier_cost_usd") or 0.0), 4),
             "completed_at": t.get("completed_at") or t.get("updated_at"),
             "workflow": (wf or {}).get("name"),
             "files": files,
