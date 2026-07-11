@@ -318,6 +318,86 @@ JSON
     db.set_setting("super.escalation", "0")
     db.execute("DELETE FROM frontier_ledger WHERE task_id=?", (_et,))
 
+    # ── phase7 judge finding 1: the frontier scripts (cverify/cjudge/cexec) exec
+    #    bare `claude`; the nexus.service PATH omits ~/.npm-global/bin (where the
+    #    CLI installs), so a service-spawned critic/judge/escalation exited 127.
+    #    _scrubbed_env + the judge/premortem envs now augment PATH. Regress the
+    #    behavior under a service-like (claude-less) PATH. ──
+    _home = os.path.expanduser("~")
+    _orig_path = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+        _senv = evals._scrubbed_env()
+        _spaths = (_senv.get("PATH", "") or "").split(os.pathsep)
+        chk("phase7 finding 1: _scrubbed_env re-adds the user CLI bin dirs to a stripped PATH",
+            os.path.join(_home, ".npm-global", "bin") in _spaths
+            and os.path.join(_home, ".local", "bin") in _spaths)
+        _claude_dirs = [d for d in (os.path.join(_home, ".npm-global", "bin"),
+                                    os.path.join(_home, ".local", "bin"),
+                                    os.path.join(_home, ".claude", "local"), "/usr/local/bin")
+                        if os.path.exists(os.path.join(d, "claude"))]
+        chk("phase7 finding 1: claude resolves under the augmented service PATH (no exit 127)",
+            (not _claude_dirs) or shutil.which("claude", path=_senv.get("PATH")) is not None)
+    finally:
+        os.environ["PATH"] = _orig_path
+    _ev_src = (APP / "evals.py").read_text()
+    chk("phase7 finding 1: run_judge_cmd + run_plan_critique also augment PATH (not only _scrubbed_env)",
+        _ev_src.count('_augment_path_for_claude(env.get("PATH"') >= 2)
+
+    # ── phase7 judge finding 2: a rework that FAILS (exit 127 / timeout / crash) or
+    #    leaves the deliverable byte-identical must NOT be booked as success — the
+    #    open comments stay open, the version clock does not advance, and the verdict
+    #    lands on 'error' (→ human checkpoint). Drive /escalate with no-op stubs on a
+    #    sweep-invisible plain task and assert nothing was falsely consumed. ──
+    _fdep = c.post("/api/tasks", json={"title": "sr-gate esc-fail parked dep",
+                                       "description": "never done"}).json()["id"]
+    made_tasks.append(_fdep)
+
+    def _drive_failed_escalation(stub_body, label):
+        db.set_setting("super.escalation", "1")
+        db.set_setting("super.escalation_max", "1")
+        _stub = write_raw_stub(f"cexec_fail_{label}.sh", stub_body)
+        db.set_setting("super.escalation_cmd", f"{_stub} {{workspace}} {{deliverable}} {{dossier}}")
+        _ft = make_plain(f"sr-gate escalation-{label} probe", _fdep)
+        _fws = APP / "workspaces" / _ft / "deliverable.md"
+        _before = _fws.read_text()
+        db.execute("UPDATE tasks SET critic_verdict='REWRITE', critic_round=2, "
+                   "completed_at=?, critic_json=? WHERE id=?",
+                   (time.time() - 30, _esc_task["critic_json"], _ft))
+        _kept = task_row(_ft).get("completed_at")
+        _uid = db.query_one("SELECT user_id FROM tasks WHERE id=?", (_ft,))["user_id"]
+        db.execute("INSERT INTO review_comments (id, task_id, user_id, file_path, side, "
+                   "line_no, line_text, body, status, created_at, source) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                   (f"rc-fail-{label}-{int(time.time() * 1000)}", _ft, _uid, "deliverable.md",
+                    "new", 3, "x", "[CRITICAL] fix it", "open", time.time(), "critic"))
+        chk(f"phase7 finding 2 ({label}): /escalate accepted",
+            c.post(f"/api/tasks/{_ft}/escalate").status_code == 200)
+        chk(f"phase7 finding 2 ({label}): failed rework → verdict 'error' (never a false SHIP)",
+            bool(wait_for(lambda: task_row(_ft).get("critic_verdict") == "error", timeout=60)))
+        chk(f"phase7 finding 2 ({label}): open comment KEPT (not consumed on a failed rework)",
+            db.query_one("SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? "
+                         "AND status='open'", (_ft,))["n"] == 1)
+        chk(f"phase7 finding 2 ({label}): deliverable is the pre-rework version (no bogus new draft)",
+            _fws.read_text() == _before)
+        chk(f"phase7 finding 2 ({label}): version clock NOT advanced (completed_at unchanged)",
+            task_row(_ft).get("completed_at") == _kept)
+        db.execute("DELETE FROM frontier_ledger WHERE task_id=?", (_ft,))
+
+    # (a) claude unresolvable / crash → exit 127, deliverable untouched
+    _drive_failed_escalation("set -euo pipefail\nexit 127\n", "exit127")
+    # (b) sneaky: exits 0 with a clean claude-JSON envelope but rewrites NOTHING
+    _drive_failed_escalation(
+        "set -euo pipefail\n"
+        "cat <<'JSON'\n"
+        '{"type":"result","result":"reviewed; made no changes","total_cost_usd":0.01,'
+        '"usage":{"input_tokens":10,"output_tokens":5}}\n'
+        "JSON\n", "noop")
+    chk("phase7 finding 2: failure branch keeps comments + re-arms the super-state (source)",
+        "_le._set_super_state(_trig, _per_task, None)" in server_src
+        and "escalated rework produced no new version" in server_src)
+    db.set_setting("super.escalation", "0")
+
     # ── Appendix C1b: critic-proposed patch rides the comment → retry ──
     _patch_stub = write_raw_stub("critic_patch.sh", """set -euo pipefail
 FILE="${1:?}"; DOMAIN="${2:?}"; SANDBOX="${3:?}"
