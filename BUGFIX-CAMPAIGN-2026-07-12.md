@@ -35,20 +35,35 @@ context) is also at `~/.claude/plans/we-have-to-make-eventual-sketch.md`.
 
 | ✓ | Cluster | Findings | Files | Gate | Commit |
 |---|---------|----------|-------|------|--------|
-| ☐ | C1 dispatch stream/resume | [29][24] | hermes_dispatch.py (+settings_registry help) | verify_real_dispatch_e2e | |
-| ☐ | C2 escalation state machine | [22/32][30][31] | server.py ~4560-4700, loop_engine.py | verify_super_result_e2e | |
-| ☐ | C3 judge quota-deferral | [21] | server.py ~4222 | super_result gate + verify.sh static check | |
-| ☐ | C4 restart-drain gaps | [0][1][2] | server.py (_restart_prep_*), worker.py | NEW scripts/verify_restart_prep_e2e.py | |
-| ☐ | C5 lessons/distillation | [20][5][13] | lessons.py | verify_autopilot_e2e + sweep dry-run | |
-| ☐ | C6 scheduler/autopilot | [7/33][11] | scheduler.py, server.py ~7246, autopilot.py | verify_autopilot_e2e | |
-| ☐ | C7 STT/dictation | [26][27][25] | voice.py, stt_worker.py, server.py ~2503 | verify_stt_e2e | |
-| ☐ | C8 approvals scope | [23] | server.py decide_approval ~3219 | verify_agentic_e2e + curl pair | |
+| ☑ | C1 dispatch stream/resume | [29][24] | hermes_dispatch.py (+settings_registry help) | verify_real_dispatch_e2e 57/57 | 9667367 |
+| ☑ | C2 escalation state machine | [22/32][30][31] | server.py, loop_engine.py, app.js | verify_super_result_e2e 89/89 | 33b5a0d |
+| ☑ | C3 judge quota-deferral | [21] | server.py (deferral + boot heal) | super_result 89/89 + verify.sh 437/437 | 7c24b0e |
+| ☑ | C4 restart-drain gaps | [0][1][2] | server.py (_restart_prep_*), worker.py | NEW verify_restart_prep_e2e 26/26 | 4bbac84 |
+| ☑ | C5 lessons/distillation | [20][5][13] | lessons.py | verify_autopilot_e2e 58/58 (incl. sweep dry-run) | 8cc32a1 |
+| ☑ | C6 scheduler/autopilot | [7/33][11] | scheduler.py, server.py, autopilot.py | verify_autopilot_e2e 62/62 | 85c3b9a |
+| ☑ | C7 STT/dictation | [26][27][25] | voice.py, stt_worker.py, server.py | verify_stt_e2e 24/24 | 9de844c |
+| ☑ | C8 approvals scope | [23] | server.py decide_approval | verify_agentic_e2e 32/32 + curl pair (200/404) | e966418 |
 
 **Session-1 exit (human checkpoint):** full sweep (verify.sh + real_dispatch + super_result +
 autopilot + stt gates + loop_probe) → `/code-review` at MEDIUM effort scoped to
 `git diff <pre-session-sha>..HEAD` (record the pre-session sha at step 0) → per-finding
 fixed/skipped table → **user runs the real reboot test** (`~/Desktop/RESTART-TEST.md`),
 which now validates the FIXED drain.
+
+> **Session-1 RESULT (2026-07-12):** pre-session sha `0d113ca`; all 8 clusters committed
+> (`9667367`, `33b5a0d`, `7c24b0e`, `4bbac84`, `8cc32a1`, `85c3b9a`, `9de844c`, `e966418`);
+> all 17 findings FIXED, none skipped. Exit sweep green: verify.sh 441/441, real_dispatch
+> 57/57, super_result 89/89, autopilot 62/62, stt 24/24, loop_probe LOOP-FREE. The medium
+> code review confirmed 7 findings on the session's own diff; 5 small ones were fixed in a
+> follow-up commit (drain-mode _find_work shadowing, regen dropping esc state, critic GET
+> running flag missing 'escalating', drain dead-orphan transcript hammering, retry-path CUDA
+> classification, + the [21] verify.sh pin tightened). **CARRY-OVER → Session 2 / decision:
+> loop_config lost-update race** — _escalation_thread's bump/state-clear (and the pre-existing
+> failure-branch + sweep writers) do unlocked read-modify-writes of the same loop_config JSON;
+> a stale sweep save can erase the esc_used bump → escalations past super.escalation_max
+> (CONFIRMED by review; race class pre-dates this campaign, consequence widened by D2's bump
+> move). Needs a small locking/fresh-read-RMW design, not done here (would redesign §D2).
+> **Reboot test is now ready for the user.**
 
 ## Session 2 — cleanups + installer/doc drift (13 findings, 2-3 grouped commits)
 
