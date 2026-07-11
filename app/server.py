@@ -5159,6 +5159,12 @@ async def quota_status():
 # it after the reboot. The key deliberately lives OUTSIDE settings_registry —
 # /api/settings can never expose or clobber it.
 _RESTART_PREP_KEY = "system.restart_prep"
+# D3c/[2]: single process, so a plain Lock makes prepare/cancel atomic.
+# Without it two concurrent prepares interleaved check-then-act: the loser
+# re-read dispatch.enabled AFTER the winner zeroed it and snapshotted
+# prev_dispatch_enabled='0' — the exact permanent-restore-no-op the
+# idempotency comment guards against. Also serializes prepare-vs-cancel.
+_RESTART_PREP_LOCK = threading.Lock()
 _RESTART_PREP_GRACE_S = 5.0  # > 2× worker POLL_S: a lane that read
 # dispatch_on=1 in the same tick prepare flipped it has a visible dispatch
 # row by the time the grace window closes.
@@ -5186,8 +5192,12 @@ def _restart_prep_busy() -> dict:
             "SELECT COUNT(*) AS n FROM tasks WHERE dispatch_state='finalizing'")["n"],
         "judges": db.query_one(
             "SELECT COUNT(*) AS n FROM tasks WHERE judge_verdict='running'")["n"],
+        # D3b/[1]: 'escalating' is a minutes-long frontier cexec rework in a
+        # daemon thread — cutting it wastes exactly the spend this drain exists
+        # to protect (and pre-D3b it also came back stuck after the reboot).
         "critics": db.query_one(
-            "SELECT COUNT(*) AS n FROM tasks WHERE critic_verdict='running'")["n"],
+            "SELECT COUNT(*) AS n FROM tasks "
+            "WHERE critic_verdict IN ('running','escalating')")["n"],
         "evals": db.query_one(
             "SELECT COUNT(*) AS n FROM eval_runs "
             "WHERE status IN ('running','cancelling')")["n"],
@@ -5246,19 +5256,20 @@ async def prepare_restart():
         return JSONResponse(status_code=403, content={"error": "admin only"})
 
     def _prep() -> bool:
-        if _restart_prep_marker():
-            return True
-        prev = db.get_setting("dispatch.enabled")  # raw row; None = no row
-        # Marker FIRST — a crash between the two writes must still restore.
-        db.set_setting(_RESTART_PREP_KEY,
-                       json.dumps({"prev_dispatch_enabled": prev, "ts": time.time()}))
-        db.set_setting("dispatch.enabled", "0")
-        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        busy = _restart_prep_busy()
-        db.log_activity("info", "system",
-                        "Restart preparation started — dispatch paused, "
-                        f"draining {busy['total']} in-flight run(s)")
-        return False
+        with _RESTART_PREP_LOCK:
+            if _restart_prep_marker():
+                return True
+            prev = db.get_setting("dispatch.enabled")  # raw row; None = no row
+            # Marker FIRST — a crash between the two writes must still restore.
+            db.set_setting(_RESTART_PREP_KEY,
+                           json.dumps({"prev_dispatch_enabled": prev, "ts": time.time()}))
+            db.set_setting("dispatch.enabled", "0")
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            busy = _restart_prep_busy()
+            db.log_activity("info", "system",
+                            "Restart preparation started — dispatch paused, "
+                            f"draining {busy['total']} in-flight run(s)")
+            return False
 
     already = await run_in_threadpool(_prep)
     st = await run_in_threadpool(_restart_prep_status)
@@ -5274,13 +5285,14 @@ async def cancel_restart_prep():
         return JSONResponse(status_code=403, content={"error": "admin only"})
 
     def _cancel() -> bool:
-        m = _restart_prep_marker()
-        if not m:
-            return False
-        _restart_prep_restore(m)
-        db.log_activity("info", "system",
-                        "Restart preparation cancelled — dispatch resumed")
-        return True
+        with _RESTART_PREP_LOCK:
+            m = _restart_prep_marker()
+            if not m:
+                return False
+            _restart_prep_restore(m)
+            db.log_activity("info", "system",
+                            "Restart preparation cancelled — dispatch resumed")
+            return True
 
     cancelled = await run_in_threadpool(_cancel)
     st = await run_in_threadpool(_restart_prep_status)

@@ -509,6 +509,13 @@ chk "C1c: loop hook (REWRITE + round-cap)" "grep -q 'def _try_escalate_super' lo
 # or judged_this_version stays true and the auto-judge never re-runs after the
 # quota window / a restart. Both writers (deferral branch + boot heal) pinned.
 chk "[21]: interrupted judge clears judge_ts (both writers)" "[ \$(grep -c 'judge_ts=NULL' server.py) -ge 2 ]"
+# bugfix campaign 2026-07-12 D3 [0][1][2]: the restart drain must see escalated
+# reworks (busy count + boot heal) and the worker must keep harvesting/waiting
+# on orphans while dispatch is paused; prepare/cancel are lock-serialized.
+chk "D3b: drain busy + boot heal cover 'escalating'" "grep -q \"critic_verdict IN ('running','escalating')\" server.py && grep -q 'escalation orphaned by restart' server.py"
+chk "D3a: drain-harvest resume path in the worker" "grep -q 'dispatch_on or mode == .resume.' worker.py && grep -q 'orphan_run_state(task) != .finished.' worker.py"
+chk "D3c: prepare/cancel serialized" "grep -q '_RESTART_PREP_LOCK = threading.Lock()' server.py && [ \$(grep -c 'with _RESTART_PREP_LOCK' server.py) -ge 2 ]"
+chk "restart-prep gate committed" "[ -f scripts/verify_restart_prep_e2e.py ]"
 chk "C1c: setting-gated + bounded"    "grep -q 'super.escalation' settings_registry.py && grep -q 'super.escalation_max' settings_registry.py && grep -q 'super.escalation' database.py"
 chk "C1c: escalation spend to ledger" "grep -q '\"escalation\"' server.py && grep -q 'record_frontier_spend' server.py"
 # C1b — critic patch field (CriticGPT: critic-proposed diff, executor applies verbatim)
