@@ -109,7 +109,8 @@ def startup():
     # 409s). Any 'running' at boot is by definition a dead judge: clear it.
     stuck = db.execute(
         "UPDATE tasks SET judge_verdict='interrupted', "
-        "judge_output='judge interrupted by server restart — run it again' "
+        "judge_output='judge interrupted by server restart — run it again', "
+        "judge_ts=NULL "  # [21]: fresh judge_ts would block the auto-judge re-run
         "WHERE judge_verdict='running'").rowcount
     if stuck:
         db.log_activity("warn", "judge", f"Cleared {stuck} judge run(s) orphaned by restart")
@@ -4229,7 +4230,12 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     # when NO verdict parsed, so a rubric that mentions rate limits is safe.
     if verdict is None and _ev.is_frontier_quota_error(out):
         wait = _ev.note_frontier_quota_hit()
-        db.execute("UPDATE tasks SET judge_verdict='interrupted', judge_output=? WHERE id=?",
+        # [21]: judge_ts=NULL is what actually makes the row re-judgeable — it
+        # was stamped at the 'running' flip, so leaving it keeps loop_engine's
+        # judged_this_version (judge_ts >= completed_at) true forever and the
+        # auto-judge sweep would never re-run after the window.
+        db.execute("UPDATE tasks SET judge_verdict='interrupted', judge_output=?, "
+                   "judge_ts=NULL WHERE id=?",
                    (out[-30000:], task_id))
         db.log_activity("warn", "judge",
                         f"Frontier judge on {task_id} deferred — quota/rate-limit, "

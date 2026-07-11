@@ -505,6 +505,10 @@ chk "C1c: cexec vendored + installed" "[ -f ../setup/bin/cexec ] && [ -f \$HOME/
 chk "C1c: escalation runner + dossier" "grep -q 'def run_escalation_cmd' evals.py && grep -q 'def build_escalation_dossier' evals.py && grep -q 'with _FRONTIER_GATE' evals.py"
 chk "C1c: escalation endpoint + thread" "grep -q '/api/tasks/{task_id}/escalate' server.py && grep -q 'def _escalation_thread' server.py"
 chk "C1c: loop hook (REWRITE + round-cap)" "grep -q 'def _try_escalate_super' loop_engine.py && grep -q '_has_open_criticals' loop_engine.py && grep -q '_try_escalate_super(t, trig, per_task, .rewrite.)' loop_engine.py && grep -q 'esc == .wait.' loop_engine.py"
+# bugfix campaign 2026-07-12 [21]: an 'interrupted' judge must clear judge_ts,
+# or judged_this_version stays true and the auto-judge never re-runs after the
+# quota window / a restart. Both writers (deferral branch + boot heal) pinned.
+chk "[21]: interrupted judge clears judge_ts (both writers)" "[ \$(grep -c 'judge_ts=NULL' server.py) -ge 2 ]"
 chk "C1c: setting-gated + bounded"    "grep -q 'super.escalation' settings_registry.py && grep -q 'super.escalation_max' settings_registry.py && grep -q 'super.escalation' database.py"
 chk "C1c: escalation spend to ledger" "grep -q '\"escalation\"' server.py && grep -q 'record_frontier_spend' server.py"
 # C1b — critic patch field (CriticGPT: critic-proposed diff, executor applies verbatim)
