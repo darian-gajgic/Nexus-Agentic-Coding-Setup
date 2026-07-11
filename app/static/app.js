@@ -2268,6 +2268,10 @@ function settingItemHTML(it) {
     input = `<input class="form-input sr-item" id="${id}" data-key="${esc(it.key)}" type="number"
       ${it.min !== undefined ? `min="${it.min}"` : ''} ${it.max !== undefined ? `max="${it.max}"` : ''}
       ${it.type === 'float' ? 'step="any"' : ''} value="${esc(it.value || '')}" placeholder="${esc(eff)}">`;
+  } else if (it.type === 'enum') {
+    const opts = [['', `(default: ${esc(eff)})`]].concat((it.options || []).map(o => [o, o]))
+      .map(([v, t]) => `<option value="${esc(v)}" ${it.value === v ? 'selected' : ''}>${esc(t)}</option>`).join('');
+    input = `<select class="form-select sr-item" id="${id}" data-key="${esc(it.key)}">${opts}</select>`;
   } else {
     input = `<input class="form-input sr-item" id="${id}" data-key="${esc(it.key)}"
       value="${esc(it.value || '')}" placeholder="${esc(eff)}" spellcheck="false">`;
@@ -2291,7 +2295,7 @@ function settingsRegistryHTML() {
     </div></div>`).join('');
 }
 
-const PURPOSE_ROUTES = { complicated: 'hermes', easy: 'hermes', mechanical: 'hermes', frontier_judge: 'cli', spec_model: 'cli' };
+const PURPOSE_ROUTES = { complicated: 'hermes', easy: 'hermes', mechanical: 'hermes', frontier_judge: 'cli', spec_model: 'cli', escalation_model: 'cli' };
 
 function modelsCardHTML() {
   const effOpts = (cur) => ['', 'minimal', 'low', 'medium', 'high', 'max'].map(v =>

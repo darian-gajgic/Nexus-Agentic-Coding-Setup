@@ -242,7 +242,11 @@ def stream_turn(session_id: str, input_text: str, system_message: str | None = N
 # COUNTING live dispatches before sending — a task without a free slot WAITS in
 # the queue instead of hitting an upstream error.
 
-DEFAULT_MODEL = "glm-5.2"
+# C2 (rotation readiness): the ultimate dispatch fallback resolves through the
+# ONE fallback map in database.py, so a generation rotation edits the registry —
+# not this literal. Kept as a module constant (read once at import) for the hot
+# path; a plain string tail-guards a missing/renamed purpose.
+DEFAULT_MODEL = db.fallback_model("complicated") or "glm-5.2"
 SLOT_HEARTBEAT_FRESH_S = 120  # a dispatch silent this long holds no upstream slot
 
 

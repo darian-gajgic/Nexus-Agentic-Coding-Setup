@@ -75,7 +75,8 @@ The JSON schema (respect every length limit):
      \"claim\": \"what the deliverable asserts (<=300)\",
      \"evidence\": \"what you actually found and WHERE — file:line or command + real output (<=400)\",
      \"problem\": \"why the claim fails (<=300)\",
-     \"suggested_fix\": \"concrete edit (<=300)\"
+     \"suggested_fix\": \"concrete edit (<=300)\",
+     \"patch\": \"OPTIONAL, critical/high findings only — a unified-diff hunk (--- / +++ / @@ headers, real context lines) the executor can apply VERBATIM to fix this exact finding, when the fix is mechanical enough to express as a diff. Omit for prose/judgment fixes. <=1600 chars\"
   }],
   \"contradictions\": [{\"with\": \"previous_version|sibling:<task-id>|internal\", \"a\": \"...\", \"b\": \"...\", \"resolution_hint\": \"...\"}],
   \"missing\": [{\"what\": \"...\", \"why_it_matters\": \"...\"}],
@@ -89,6 +90,7 @@ RULES:
 - line_no/line_text must reference a real existing line of file_path, or be null.
 - UNCERTAINTY SEVERITY: an UNMARKED claim that proves false is a 'critical' finding (it was presented as verified); a claim the author explicitly marked '[UNSURE: …]' that proves false is at most 'medium' (they flagged the risk) — but a marked claim that is load-bearing and wrong still blocks SHIP.
 - SHIP only when there are zero critical/high findings AND all rubric must-pass gates pass.
+- For a critical/high finding whose fix is MECHANICAL (a wrong number, a broken reference, a missing guard), also emit a 'patch' — a unified-diff hunk the executor applies verbatim (CriticGPT pattern: a critic-proposed diff the executor applies beats re-deriving prose). Real context lines, correct file path. Omit 'patch' when the fix needs judgment.
 - revision_brief must be actionable on its own: what to fix, in what order, with the evidence locations."
 
 # Nexus Settings v2 hooks (both optional, absent = original behavior):
@@ -121,4 +123,9 @@ exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
     --permission-mode acceptEdits \
     --allowedTools "Bash" "Read" "Edit" "Write" "Grep" "Glob" "WebSearch" "WebFetch" \
     --disallowedTools "Bash(git push:*)" "Bash(git remote:*)" "Bash(gh:*)" "Bash(sudo:*)" \
+    --output-format json \
     -p "$PROMPT"
+# Nexus C3 (Appendix C, contract C-8): --output-format json wraps the reply in a
+# JSON envelope {result, usage, total_cost_usd, modelUsage}. The critic's sentinel
+# block rides INSIDE .result; evals.run_critic_cmd unwraps .result before
+# parse_critic_json and books usage/$ into the full-cost ledger.

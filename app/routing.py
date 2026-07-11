@@ -30,7 +30,12 @@ def config_fingerprint(user_id: str | None = None) -> str:
     the model ids assigned to the judgment + bulk purposes. Rotating a tier
     changes this, which auto-invalidates every learned threshold (L4)."""
     parts = []
-    for purpose in ("frontier_judge", "complicated", "easy", "mechanical"):
+    # C2/L4 (Phase 7): the fingerprint spans EVERY purpose whose model can shape a
+    # tuned threshold — including the spec_model + escalation_model judgment tiers
+    # added in Appendix C. Rotating any of them invalidates the learned params
+    # (e.g. escalation thresholds Phase 8 tunes) back to the heuristic defaults.
+    for purpose in ("frontier_judge", "complicated", "easy", "mechanical",
+                    "spec_model", "escalation_model"):
         try:
             row = db.resolve_assignment(user_id, purpose)
             parts.append(f"{purpose}={row['model_id'] if row else '-'}")

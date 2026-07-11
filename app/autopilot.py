@@ -56,8 +56,10 @@ def _feature_present(name: str) -> bool:
         if name == "escalation":
             return db.get_setting("super.escalation", "") == "1"
         if name == "model_floor":
-            # C2 (registry-only roles / executor_light) — not seeded until Phase 7
-            return "executor_light" in (db.MODEL_PURPOSES or ())
+            # C2 (Phase 7, rotation readiness): the centralized fallback-role map
+            # is the model-floor mechanism — once it exists, Eco can floor
+            # non-critical stages to the light executor tier ('easy' purpose).
+            return hasattr(db, "worker_fallback_models")
     except Exception:
         return False
     return False
@@ -154,9 +156,13 @@ def derive(involvement, spend, *, high_stakes: bool = False,
     else:
         out["staged"]["escalation"] = "Escalation ladder (Phase 7) not present — not derived"
 
-    # rule 3 / P2 staged: eco's cheapest-capable model floor (C2, Phase 7).
+    # rule 3 (C2, Phase 7): Eco's cheapest-capable model floor. 'easy' IS the
+    # light executor tier (the light-GLM purpose); Eco floors non-dev, non-high-
+    # stakes WORK stages to it (dev stages + risk keep the hard-thinking tier —
+    # their floors win). Optimal/Smart don't floor. An empirical claim ('same
+    # answer, cheaper') that Phase 8 validates or reverts.
     if _feature_present("model_floor"):
-        out["model_floor"] = {"eco": "executor_light", "optimal": None, "smart": None}[sp]
+        out["model_floor"] = {"eco": "easy", "optimal": None, "smart": None}[sp]
     else:
         out["staged"]["model_floor"] = ("Eco model-tier floor (C2, Phase 7) not present — "
                                         "Eco runs via rounds/SR/fan-out/judge knobs only")
