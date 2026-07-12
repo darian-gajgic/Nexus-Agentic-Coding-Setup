@@ -126,21 +126,33 @@ def snapshot_commit(wt_path: str, message: str) -> bool:
     return code == 0
 
 
-def changed_files(wt_path: str, base: str) -> list[tuple[str, str]]:
-    """(status, path) of every file ADDED/MODIFIED on the branch vs the
-    baseline (three-dot, junk excluded). Deletions are excluded on purpose —
-    this feeds the deliverable-artifact surfacing (item 1), where only files
-    that EXIST on the branch matter."""
-    code, out = _run_git(wt_path, "diff", "--name-status", "--diff-filter=AM",
-                         f"{base}...HEAD", "--", ".", *_JUNK_PATHSPECS)
+def changed_files_range(repo_dir: str, base: str,
+                        head: str = "HEAD") -> list[tuple[str, str]] | None:
+    """(status, path) of every file that EXISTS on `head` and was added/
+    modified vs the baseline (three-dot, junk excluded). --no-renames makes a
+    rename show as A(new path) — with git's default rename detection the R
+    record was dropped by --diff-filter=AM and a `git mv`'d deliverable
+    vanished from artifacts/branch-files (the item-1 gap, reopened).
+    Deletions stay excluded on purpose (the old path's D is filtered).
+    Returns None on git failure (branch gone / not a repo) so callers can
+    distinguish error from empty. Works from a worktree OR the main repo."""
+    code, out = _run_git(repo_dir, "diff", "--name-status", "--no-renames",
+                         "--diff-filter=AM", f"{base}...{head}",
+                         "--", ".", *_JUNK_PATHSPECS)
     if code != 0:
-        return []
+        return None
     rows = []
     for line in out.splitlines():
         parts = line.split("\t", 1)
         if len(parts) == 2 and parts[1].strip():
             rows.append((parts[0].strip(), parts[1].strip()))
     return rows
+
+
+def changed_files(wt_path: str, base: str) -> list[tuple[str, str]]:
+    """changed_files_range from inside the worktree, with the historical
+    []-on-error contract."""
+    return changed_files_range(wt_path, base, "HEAD") or []
 
 
 def capture_diff(wt_path: str, base: str) -> str:

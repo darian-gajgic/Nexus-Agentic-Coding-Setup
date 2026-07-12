@@ -4450,17 +4450,14 @@ def _task_branch_ctx(task: dict) -> tuple[str, str, list[tuple[str, str]]] | Non
     if os.path.isdir(wt_path):
         rows = _wt.changed_files(wt_path, _wt.base_branch(repo))
         return repo, branch, rows
-    # Worktree pruned — the branch may still exist in the repo itself.
-    code, out = _run_git_action(repo, "git", "diff", "--name-status",
-                                "--diff-filter=AM",
-                                f"{_wt.base_branch(repo)}...{branch}")
-    if code != 0:
+    # Worktree pruned — the branch may still exist in the repo itself. Same
+    # shared parse as the worktree path (renames surface, junk excluded — the
+    # old inline re-implementation skipped _JUNK_PATHSPECS, so the same task
+    # reported a DIFFERENT file set once its worktree was pruned, and committed
+    # build junk became downloadable as a "deliverable").
+    rows = _wt.changed_files_range(repo, _wt.base_branch(repo), branch)
+    if rows is None:
         return None
-    rows = []
-    for line in out.splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2 and parts[1].strip():
-            rows.append((parts[0].strip(), parts[1].strip()))
     return repo, branch, rows
 
 
