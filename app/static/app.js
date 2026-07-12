@@ -10265,11 +10265,12 @@ async function meetCreateWorkflow(name, title) {
   const m = (meetState.list || []).find(x => x.name === name);
   let reqs = [];
   try {
-    const r = await api('GET', '/api/meetings').catch(() => null);
-    // requirements live in meeting_meta — refetch via the POST cache path
-    const rr = await api('POST', `/api/meetings/${encodeURIComponent(name)}/requirements`);
+    // Read-only cache: this button must never silently spend a ~1-minute LLM
+    // extraction (the POST re-runs it whenever the transcript mtime changed).
+    const rr = await api('GET', `/api/meetings/${encodeURIComponent(name)}/requirements`);
+    if (rr.stale && !confirm('The transcript changed AFTER these requirements were extracted.\n\nUse the cached list anyway? (Cancel, then 📋 ↻ Re-extract, to refresh — takes ~1 min.)')) return;
     reqs = rr.requirements || [];
-  } catch (e) { toast('Load requirements first (📋)', 'err'); return; }
+  } catch (e) { toast('No requirements yet — run 📋 Requirements first', 'err'); return; }
   if (!reqs.length) { toast('No requirements yet — run 📋 Requirements first', 'err'); return; }
   const when = m ? new Date(m.mtime * 1000).toLocaleDateString() : '';
   const instruction = `Implement the following requirements agreed in the meeting "${title}"${when ? ` (${when})` : ''}:\n`
