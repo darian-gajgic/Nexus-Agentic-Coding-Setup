@@ -133,10 +133,19 @@ files. Reminder of the standing rule (user re-confirmed): if the code contradict
 > pr.cmd → resolve_cmd_tokens, last 'u_owner' literals → auth.DEFAULT_USER_ID.
 > Gates: verify.sh 445/445 (R3 pin now covers server.py + new F2 pin), autopilot 66/66
 > (new F3 + F2 PATCH-graft checks), block3 33/33, stt 24/24, super_result 90/90.
-> **DEFERRED (report-only, user decision):** finding 5 — _CFG_LOCK-taking helpers run
-> on the async event loop; a contended background write can stall requests up to
-> ~busy_timeout. Fix shape: run _sync_super_result_loop/_regen_loop_for_profile via
-> run_in_threadpool + compute design_loop before taking the lock. **CAMPAIGN COMPLETE.**
+> ~~DEFERRED: finding 5~~ — **CLOSED 2026-07-12, commit `87441e6`**: every async call
+> site of the _CFG_LOCK-taking helpers (_sync_super_result_loop, _regen_loop_for_profile,
+> _write_loop_cfg_grafted, _inherit_super_result, replan_apply's F1 reset) now awaits
+> run_in_threadpool; the [11] member cascade batches into one threadpool job. design_loop
+> deliberately stays INSIDE the lock (moving it out would de-linearize concurrent
+> structural regens — a D6 weakening — for no gain, since the UPDATE dominates the hold).
+> Permanent enforcement: the four helpers are in check_async_blocking.py BLOCKING_NAMES
+> (verify.sh rejects any direct on-loop call) + a verify.sh pin + an in-process
+> verify_autopilot_e2e mechanism check (lock held 3s by a thread → helper via
+> run_in_threadpool waits ≥2s, asyncio ticker keeps running, graft lands intact).
+> Gates: verify.sh 446/446, autopilot 69/69, block3 33/33, super_result 90/90,
+> loop_probe LOOP-FREE (canary max 37ms during a ~4.9s heavy storm).
+> **CAMPAIGN COMPLETE — all 8 final-review findings fixed.**
 
 ---
 
