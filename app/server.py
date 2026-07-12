@@ -3865,7 +3865,15 @@ import re as _re
 import subprocess as _sp
 from fastapi.responses import FileResponse
 
+import feedback_log as fb
+
 KNOWLEDGE_DIR = os.path.expanduser("~/knowledge")
+
+
+def _kroot() -> str:
+    """Business-Brain root honoring the onboarding.root redirect — parity with
+    every knowledge reader (hermes_dispatch/jarvis_brain/evals/feedback_log)."""
+    return db.get_setting("onboarding.root", "") or KNOWLEDGE_DIR
 
 
 # Dependency/build dirs would bury the real deliverables under thousands of
@@ -4298,7 +4306,7 @@ def _blind_reject_judge_if_wanted(task_id: str, feedback: str | None) -> bool:
     if not _re.match(r"^[a-z0-9-]+$", domain or ""):
         return False
     deliv = os.path.join(task.get("workspace_path") or "", "deliverable.md")
-    if not os.path.isfile(os.path.join(KNOWLEDGE_DIR, "domains", domain, "RUBRIC.md")) \
+    if not os.path.isfile(os.path.join(_kroot(), "domains", domain, "RUBRIC.md")) \
             or not os.path.isfile(deliv):
         return False
     db.execute("UPDATE tasks SET judge_verdict='running', judge_output=NULL, judge_ts=? WHERE id=?",
@@ -4319,7 +4327,7 @@ async def run_judge(task_id: str):
     domain = (task.get("domain") or "").strip()
     if not _re.match(r"^[a-z0-9-]+$", domain or ""):
         return JSONResponse(status_code=400, content={"error": "task needs a valid domain to be judged"})
-    rubric = os.path.join(KNOWLEDGE_DIR, "domains", domain, "RUBRIC.md")
+    rubric = os.path.join(_kroot(), "domains", domain, "RUBRIC.md")
     if not os.path.isfile(rubric):
         return JSONResponse(status_code=400, content={
             "error": f"no rubric for domain '{domain}' — pick one of ~/knowledge/domains/"})
@@ -4963,55 +4971,174 @@ def _inherit_super_result(task: dict) -> dict:
 
 
 @app.post("/api/tasks/{task_id}/feedback")
-async def log_task_feedback(task_id: str, body: dict):
+def log_task_feedback(task_id: str, body: dict):
     """R6.3: Log as WIN / LESSON — appends a properly-formatted entry to the
-    Business Brain feedback files. Numbers are REQUIRED for wins, never invented."""
+    Business Brain feedback ledgers (feedback_log owns paths/format/locking).
+    Hard rules per win-lesson-logging SKILL.md: a WIN needs the REAL numbers
+    (never invented), a LESSON isn't logged until it names the CORRECTION.
+    Sync handler: FastAPI threadpools it, so file I/O stays off the event loop."""
     task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     kind = body.get("kind")
-    note = (body.get("note") or "").strip()
-    numbers = (body.get("numbers") or "").strip()
     if kind not in ("win", "lesson"):
         return JSONResponse(status_code=400, content={"error": "kind must be win|lesson"})
+    note = fb._one_line(body.get("note") or "")
+    numbers = fb._one_line(body.get("numbers") or "", 400)
     if kind == "win" and not numbers:
         return JSONResponse(status_code=400, content={
             "error": "a WIN needs the real numbers (CTR, sales, opens…) — that's the whole point"})
     if not note:
         return JSONResponse(status_code=400, content={"error": "note required"})
-    import datetime as _dt
-    today = _dt.date.today().isoformat()
-    artifact = os.path.join(task.get("workspace_path") or "?", "deliverable.md")
-    if kind == "win":
-        target = os.path.join(KNOWLEDGE_DIR, "feedback", "WINS.md")
-        entry = (f"### {today} — {task['title']}\n"
-                 f"- Domain: {task.get('domain') or '—'}\n"
-                 f"- Artifact: {artifact} (Nexus task {task_id})\n"
-                 f"- Result: {numbers}\n"
-                 f"- Why we think it worked: {note}\n"
-                 f"- Promote to examples/? no (review first)\n")
-    else:
-        target = os.path.join(KNOWLEDGE_DIR, "feedback", "LESSONS.md")
-        entry = (f"### {today} — {task['title']}\n"
-                 f"- Domain: {task.get('domain') or '—'}\n"
-                 f"- What we expected vs what happened: {note}\n"
-                 f"- Root cause (be honest): {numbers or 'see note'}\n"
-                 f"- Correction: {body.get('correction') or 'to be decided — revisit this entry'}\n"
-                 f"- Applied where: Nexus task {task_id} ({artifact})\n")
+    fields = {
+        "headline": fb._one_line(body.get("headline") or "", 200) or task["title"],
+        "note": note,
+        "numbers": numbers,
+        # back-compat: the pre-modal UI sent the lesson's root cause as `numbers`
+        "root_cause": fb._one_line(body.get("root_cause") or "")
+                      or (numbers if kind == "lesson" else ""),
+        "correction": fb._one_line(body.get("correction") or ""),
+        "applied_where": fb._one_line(body.get("applied_where") or "", 300),
+    }
+    if kind == "lesson" and not fields["correction"]:
+        return JSONResponse(status_code=400, content={
+            "error": "a LESSON isn't logged until it names the CORRECTION — "
+                     "what changes, in which playbook/rubric/process"})
+    promoted_to = None
     try:
-        text = open(target).read()
-        marker = "<!-- newest first -->"
-        idx = text.find(marker)
-        if idx == -1:
-            text += f"\n{entry}\n"
-        else:
-            insert_at = idx + len(marker)
-            text = text[:insert_at] + f"\n\n{entry}" + text[insert_at:]
-        open(target, "w").write(text)
+        if kind == "win" and body.get("promote"):
+            try:
+                promoted_to = fb.promote_deliverable(task, fields["headline"], numbers)
+            except ValueError as e:
+                return JSONResponse(status_code=400, content={"error": f"cannot promote: {e}"})
+        fields["promoted_to"] = promoted_to
+        target = fb.insert_entry(kind, fb.compose_entry(kind, task, fields))
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"could not write: {e}"})
-    db.log_activity("info", "system", f"Task {task_id} logged as {kind.upper()} → {os.path.basename(target)}")
-    return {"ok": True, "file": target}
+    domain = (task.get("domain") or "").strip()
+    if domain and domain != "general" \
+            and db.get_setting("feedback.framing_enabled", "1") == "1":
+        nxt = f"it will ride into future '{domain}' task briefings"
+    else:
+        nxt = "give tasks a domain and their entries ride into future briefings"
+    if promoted_to:
+        nxt = f"deliverable promoted to the '{domain}' quality bar (examples/); " + nxt
+    db.log_activity("info", "system",
+                    f"Task {task_id} logged as {kind.upper()} → {os.path.basename(target)}"
+                    + (" (+promoted to examples/)" if promoted_to else ""))
+    return {"ok": True, "file": target, "promoted_to": promoted_to, "next": nxt}
+
+
+_FEEDBACK_DRAFT_FRAMING = (
+    "You draft Business-Brain feedback ledger entries (WINS/LESSONS) for the operator "
+    "to review. Reply with ONLY a JSON object — no commentary, no code fences. "
+    "For kind=win the keys are: headline (one line, what shipped), why_worked (1-3 "
+    "short bullets joined by '; '), metrics_to_confirm (WHICH metrics the operator "
+    "should look up in their analytics, e.g. 'open rate, CTR, unsubscribes' — never "
+    "guessed values), promote (boolean: is this deliverable strong enough to become a "
+    "reference exemplar for future tasks in its domain?), promote_reason (one line). "
+    "HARD RULE: never state or estimate a real-world result number — real numbers "
+    "exist only in the operator's analytics; naming which metrics to check is your "
+    "job, their values are not. "
+    "For kind=lesson the keys are: headline (one line, what happened), "
+    "expected_vs_actual, root_cause (the honest reason, not the comfortable one), "
+    "correction (the concrete change: which playbook/rubric/process file and what "
+    "edit), applied_where. "
+    "Base every field on the evidence provided; where evidence is thin, say so in "
+    "the field text instead of inventing specifics."
+)
+
+
+@app.post("/api/tasks/{task_id}/feedback/draft")
+async def draft_task_feedback(task_id: str, body: dict):
+    """AI pre-draft for the WIN/LESSON modal (specialist_wizard pattern): the
+    cheap task model condenses the deliverable + judge/critic evidence into
+    the entry fields; the human reviews, edits and saves. Never drafts the
+    result numbers — those exist only in the operator's analytics."""
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    kind = body.get("kind")
+    if kind not in ("win", "lesson"):
+        return JSONResponse(status_code=400, content={"error": "kind must be win|lesson"})
+    ev = [f"KIND: {kind}", f"TITLE: {task['title']}"]
+    for label, key in (("DOMAIN", "domain"), ("CLIENT", "client"),
+                       ("TYPE", "deliverable_type"), ("SPECIALIST", "specialist"),
+                       ("RUBRIC SELF-SCORE", "rubric_score"),
+                       ("JUDGE VERDICT", "judge_verdict"),
+                       ("CRITIC VERDICT", "critic_verdict")):
+        if task.get(key):
+            ev.append(f"{label}: {task[key]}")
+    if task.get("description"):
+        ev.append(f"BRIEF: {str(task['description'])[:1500]}")
+    if task.get("result_summary"):
+        ev.append(f"RESULT SUMMARY: {task['result_summary']}")
+    if task.get("learn_section"):
+        ev.append(f"EXECUTOR'S OWN LEARN NOTES: {task['learn_section']}")
+    if task.get("judge_output"):
+        ev.append(f"JUDGE FINDINGS (tail): {str(task['judge_output'])[-3000:]}")
+    header = "\n".join(ev)
+    deliv = os.path.join(task.get("workspace_path") or "", "deliverable.md")
+    uid = auth.current_user_id()  # contextvar doesn't reach the executor thread
+
+    def _run():
+        text = header
+        try:
+            if os.path.isfile(deliv):
+                with open(deliv) as fh:
+                    text += "\n\nDELIVERABLE (truncated):\n" + fh.read()[:12000]
+        except OSError:
+            pass
+        text += f"\n\nDraft the {kind.upper()} entry JSON now."
+        sid = hd.create_session("nexus:feedback-draft", model=db.default_task_model(uid))
+        hd.publish_session_scope(sid, user=uid)  # never the scopes-file default
+        hd.publish_session_key(sid, uid, db.default_task_model(uid))
+        try:
+            return hd.stream_turn(sid, text, system_message=_FEEDBACK_DRAFT_FRAMING,
+                                  max_seconds=180)
+        finally:
+            hd.delete_session(sid)  # throwaway session — keep the store clean
+
+    try:
+        res = await asyncio.get_running_loop().run_in_executor(None, _run)
+    except hd.QuotaError as e:
+        return JSONResponse(status_code=503, content={
+            "error": f"GLM is load-shedding right now — try again in a minute ({str(e)[:80]})"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    content = (res.get("content") or "").strip()
+    if res.get("error") or not content:
+        return JSONResponse(status_code=502, content={
+            "error": res.get("error") or "the model returned an empty draft"})
+    try:
+        draft = json.loads(content[content.index("{"):content.rindex("}") + 1])
+        if not isinstance(draft, dict):
+            raise ValueError("not an object")
+    except Exception:
+        return JSONResponse(status_code=502, content={"error": "the model returned malformed JSON"})
+    for k in ("numbers", "result", "results", "metrics"):
+        draft.pop(k, None)  # belt-and-braces: real numbers never come from a model
+    draft = {k: (v if isinstance(v, bool) else str(v))
+             for k, v in draft.items() if isinstance(v, (str, int, float, bool))}
+    return {"ok": True, "draft": draft}
+
+
+@app.get("/api/feedback")
+def list_feedback(kind: str = "", domain: str = "", limit: int = 200):
+    """The Wins & Lessons browser: parsed ledger entries, newest first.
+    Shared business knowledge — same trust level as the agents that read it."""
+    limit = max(1, min(int(limit or 200), 1000))
+    dom = (domain or "").strip().lower()
+    out = {"files": {"win": fb.feedback_path("win"), "lesson": fb.feedback_path("lesson")},
+           "wins": [], "lessons": []}
+    for k, bucket in (("win", "wins"), ("lesson", "lessons")):
+        if kind and kind != k:
+            continue
+        rows = fb.load_entries(k)
+        if dom:
+            rows = [e for e in rows if e["domain"] == dom]
+        out[bucket] = rows[:limit]
+    return out
 
 
 def _retry_task(task_id: str, feedback: str | None):

@@ -2028,6 +2028,7 @@ const TOURS = {
     { sel: '[data-memtab="map3d"]', title: 'The 3D map', body: 'The same galaxy as the dashboard, with full tooling: search lights up matching memories, everything else fades to ghost-glow. Hover any star to read the memory, when it was stored, and its strongest associations.' },
     { sel: '#mem3dSearch', title: 'Search the mind', body: 'Type any topic — matching memories flare up and the rest dim. This is a live search through everything your AI remembers.' },
     { sel: '[data-memtab="semantic"]', title: 'The list views', body: 'The other tabs show the same memories as browsable lists: semantic memory (facts), per-agent memory, lessons your specialists learned from feedback, and shared context between agents.' },
+    { sel: '[data-memtab="feedback"]', title: 'Wins & Lessons', body: 'Your real-world feedback ledger: WINS you logged on tasks (with measured results) and LESSONS (flops + their correction). Agents read the recent domain-matching entries in every task briefing — logging here directly shapes future work.' },
   ],
   jarvis: [
     { sel: '#jReactorWrap', title: 'Talk to your AI — literally', body: 'Click the face to start talking; click again to stop (in conversation mode it detects silence by itself). Your speech is transcribed, answered by the AI, and spoken back with lip-synced video — the face IS the answer.' },
@@ -3943,21 +3944,129 @@ async function createPrUI(id) {
   } catch (e) { toast('PR failed: ' + e.message, 'err'); }
 }
 
-async function logFeedbackUI(id, kind) {
-  const note = prompt(kind === 'win'
-    ? 'What worked? (1-3 short bullets)'
-    : 'What did you expect vs what actually happened?');
-  if (note === null || !note.trim()) return;
-  const numbers = prompt(kind === 'win'
-    ? 'The REAL numbers (required): CTR, sales, opens, attendance…'
-    : 'Root cause (be honest — optional):');
-  if (kind === 'win' && (numbers === null || !numbers.trim())) {
-    toast('A WIN needs the real numbers — that’s the whole point', 'err'); return;
-  }
+function logFeedbackUI(id, kind) {
+  const t = (state.tasks || []).find(x => x.id === id);
+  if (!t) { toast('Task not loaded — open it from the board first', 'err'); return; }
+  feedbackLogModal(t, kind);
+}
+
+// WIN/LESSON logging modal: AI pre-drafts every field from the deliverable
+// EXCEPT the real numbers (hard rule — those come only from the operator's
+// analytics); the human reviews, edits and saves. Field ids fl-* (fb-* is
+// taken by the known-issues modal).
+function feedbackLogModal(t, kind) {
+  const isWin = kind === 'win';
+  const artifact = (t.workspace_path || '?') + '/deliverable.md';
+  const domain = (t.domain || '').trim();
+  const hasDomain = !!domain && domain !== 'general';
+  const canPromote = hasDomain && !!t.workspace_path;
+  showModal(`
+    <h2>${isWin ? '🏆 Log a WIN' : '📓 Log a LESSON'}</h2>
+    <div class="view-intro" style="margin-bottom:10px">
+      ${isWin
+      ? 'A WIN is a deliverable that produced <b>measured real-world results</b> — logged so the system learns what actually works.'
+      : 'A LESSON is work that flopped or missed expectations — logged <b>with its correction</b> so the same mistake can\'t repeat.'}
+      Saved to <b>feedback/${isWin ? 'WINS.md' : 'LESSONS.md'}</b> in your Business Brain${hasDomain ? `; recent entries are read by every future <b>${esc(domain)}</b> task briefing` : ''}.
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <strong>${esc(t.title)}</strong>
+      ${domain ? `<span class="chip">${esc(domain)}</span>` : '<span class="chip c-orange" title="Without a domain the entry is saved but never injected into future briefings">no domain</span>'}
+      ${t.rubric_score ? `<span class="chip">self-score ${esc(String(t.rubric_score))}</span>` : ''}
+      ${t.judge_verdict && t.judge_verdict !== 'running' ? `<span class="chip ${t.judge_verdict === 'SHIP' ? 'c-green' : 'c-orange'}">judge: ${esc(t.judge_verdict)}</span>` : ''}
+      <span class="muted" style="font-size:11px;font-family:var(--font-mono);word-break:break-all">${esc(artifact)}</span>
+    </div>
+    <div class="form-group"><label class="form-label">Headline — one line: ${isWin ? 'what shipped' : 'what happened'}</label>
+      <input class="form-input" id="fl-headline" value="${esc(t.title)}"></div>
+    ${isWin ? `
+    <div class="form-group"><label class="form-label">The REAL numbers <span title="required">*</span></label>
+      <input class="form-input" id="fl-numbers" placeholder="e.g. 42% open rate, 6.1% CTR, 38 signups">
+      <div class="form-hint" id="fl-metrics-hint">Measured results from your analytics only — never estimated. The AI never fills this field; if the numbers don't exist yet, don't log yet.</div></div>
+    <div class="form-group"><label class="form-label">Why it worked (1–3 short bullets)</label>
+      <textarea class="form-textarea" id="fl-note" style="height:70px" placeholder="What made this one land?"></textarea></div>
+    <div class="form-group"><label style="display:flex;gap:8px;align-items:baseline;font-size:12.5px;cursor:pointer">
+      <input type="checkbox" id="fl-promote" ${canPromote ? '' : 'disabled'}>
+      <span>Promote to examples/ — copies the deliverable into <span style="font-family:var(--font-mono)">domains/${esc(domain || '<domain>')}/examples/</span>, the folder future ${esc(domain || '')} tasks read as their quality bar${canPromote ? '' : ' <b>(needs a real domain + a deliverable)</b>'}</span></label>
+      <div class="form-hint" id="fl-promote-hint"></div></div>`
+      : `
+    <div class="form-group"><label class="form-label">What did you expect vs what actually happened? <span title="required">*</span></label>
+      <textarea class="form-textarea" id="fl-note" style="height:70px" placeholder="Expected: … / Got: …"></textarea></div>
+    <div class="form-group"><label class="form-label">Root cause</label>
+      <textarea class="form-textarea" id="fl-cause" style="height:50px" placeholder="Be honest — the real reason, not the comfortable one"></textarea></div>
+    <div class="form-group"><label class="form-label">Correction <span title="required">*</span></label>
+      <textarea class="form-textarea" id="fl-correction" style="height:60px" placeholder="The concrete change: which playbook / rubric / process, and what edit"></textarea>
+      <div class="form-hint">A lesson isn't logged until it names the correction — the ✨ draft proposes one; you confirm or rewrite it.</div></div>
+    <div class="form-group"><label class="form-label">Applied where</label>
+      <input class="form-input" id="fl-applied" placeholder="File/line updated, or 'process'" value="${esc('Nexus task ' + t.id + ' (' + artifact + ')')}"></div>`}
+    <div class="muted" id="fl-ai" style="font-size:11.5px;margin:4px 0">✨ drafting from the deliverable…</div>
+    <div class="modal-actions">
+      <button class="btn-ghost" id="fl-redraft" title="Re-run the AI draft (only refills fields you haven't edited yourself)">✨ Re-draft</button>
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="fl-save">${isWin ? '🏆 Log WIN' : '📓 Log LESSON'}</button>
+    </div>`);
+  $$('#modalContent .form-input, #modalContent .form-textarea, #modalContent input[type=checkbox]').forEach(el => {
+    const mark = () => { el.dataset.dirty = '1'; };
+    el.addEventListener('input', mark);
+    el.addEventListener('change', mark);
+  });
+  flDraft(t, kind);
+  $('#fl-redraft').onclick = () => flDraft(t, kind);
+  $('#fl-save').onclick = async () => {
+    const val = sel => (($(sel) || {}).value || '').trim();
+    const body = { kind, headline: val('#fl-headline'), note: val('#fl-note') };
+    if (isWin) {
+      body.numbers = val('#fl-numbers');
+      body.promote = !!($('#fl-promote') || {}).checked;
+      if (!body.numbers) { toast('A WIN needs the real numbers — that\'s the whole point', 'err'); return; }
+    } else {
+      body.root_cause = val('#fl-cause');
+      body.correction = val('#fl-correction');
+      body.applied_where = val('#fl-applied');
+      if (!body.correction) { toast('A LESSON isn\'t logged until it names the correction', 'err'); return; }
+    }
+    if (!body.note) { toast(isWin ? 'Say why it worked (1-3 bullets)' : 'Describe expected vs actual first', 'err'); return; }
+    try {
+      const r = await api('POST', `/api/tasks/${t.id}/feedback`, body);
+      closeModal();
+      fbState.fetched = false;
+      toast(`${isWin ? '🏆 WIN' : '📓 LESSON'} logged → ${r.file}${r.promoted_to ? ' · promoted → ' + r.promoted_to : ''} · ${r.next || ''}`, 'ok', 8000);
+    } catch (e) { toast('Logging failed: ' + e.message, 'err'); }
+  };
+}
+
+async function flDraft(t, kind) {
+  const ai = $('#fl-ai');
+  if (ai) ai.textContent = '✨ drafting from the deliverable…';
+  const rd = $('#fl-redraft');
+  if (rd) rd.disabled = true;
   try {
-    const r = await api('POST', `/api/tasks/${id}/feedback`, { kind, note: note.trim(), numbers: (numbers || '').trim() });
-    toast(`Logged as ${kind.toUpperCase()} → ${r.file.split('/').pop()}`, 'ok');
-  } catch (e) { toast('Logging failed: ' + e.message, 'err'); }
+    const r = await api('POST', `/api/tasks/${t.id}/feedback/draft`, { kind });
+    if (!$('#fl-ai')) return; // modal closed meanwhile
+    const d = r.draft || {};
+    const put = (sel, v) => { const el = $(sel); if (el && !el.dataset.dirty && v) el.value = v; };
+    put('#fl-headline', d.headline);
+    if (kind === 'win') {
+      put('#fl-note', d.why_worked);
+      if (d.metrics_to_confirm) {
+        const h = $('#fl-metrics-hint');
+        if (h) h.textContent = `Check your analytics for: ${d.metrics_to_confirm}. Measured values only — the AI never fills this field.`;
+      }
+      const p = $('#fl-promote');
+      if (p && !p.disabled && !p.dataset.dirty) p.checked = d.promote === true;
+      if (d.promote_reason) { const h = $('#fl-promote-hint'); if (h) h.textContent = '✨ ' + d.promote_reason; }
+    } else {
+      put('#fl-note', d.expected_vs_actual);
+      put('#fl-cause', d.root_cause);
+      put('#fl-correction', d.correction);
+      put('#fl-applied', d.applied_where);
+    }
+    if (ai) ai.textContent = '✨ AI draft applied — review and edit before saving; fields you edited yourself are never overwritten.';
+  } catch (e) {
+    const a = $('#fl-ai');
+    if (a) a.textContent = `✨ draft unavailable (${e.message}) — fill in manually or hit ✨ Re-draft.`;
+  } finally {
+    const r2 = $('#fl-redraft');
+    if (r2) r2.disabled = false;
+  }
 }
 
 async function saveTaskDetail(id) {
@@ -5719,6 +5828,53 @@ function memSharedHTML() {
     </div>`;
 }
 
+// ── Wins & Lessons ledger browser (Business-Brain feedback loop — the 🏆/📓
+// entries logged on tasks; NOT the specialist-lessons subsystem) ──
+const fbState = { fetched: false, loading: false, data: null, kind: '' };
+
+async function loadFeedbackLedger() {
+  if (fbState.loading) return;
+  fbState.loading = true;
+  try { fbState.data = await api('GET', '/api/feedback'); }
+  catch (e) { fbState.data = { error: e.message, wins: [], lessons: [], files: {} }; }
+  fbState.loading = false;
+  fbState.fetched = true;
+  if (currentView === 'memory') render();
+}
+
+function fbSetKind(k) { fbState.kind = k; render(); }
+
+function fbRefreshLedger() { fbState.fetched = false; render(); }
+
+function memFeedbackHTML() {
+  if (!fbState.fetched) { loadFeedbackLedger(); return '<div class="loading">Loading the wins & lessons ledger…</div>'; }
+  const d = fbState.data || {};
+  const files = d.files || {};
+  const all = [
+    ...(d.wins || []).map(e => ({ ...e, kind: 'win' })),
+    ...(d.lessons || []).map(e => ({ ...e, kind: 'lesson' })),
+  ].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  const rows = all.filter(e => !fbState.kind || e.kind === fbState.kind).map(e => `
+    <div class="agentic-row">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="chip ${e.kind === 'win' ? 'c-green' : 'c-orange'}">${e.kind === 'win' ? '🏆 WIN' : '📓 LESSON'}</span>
+        <strong style="flex:1">${esc(e.headline || '')}</strong>
+        ${e.domain ? `<span class="chip">${esc(e.domain)}</span>` : ''}
+        <span class="muted" style="font-size:11px;font-family:var(--font-mono)">${esc(e.date || '')}</span>
+        ${e.task_id && (state.tasks || []).some(t => t.id === e.task_id) ? `<button class="btn-sm" onclick="openTaskDetail('${esc(e.task_id)}')">open task →</button>` : ''}
+      </div>
+      <details style="font-size:11.5px;color:var(--text-dim)"><summary style="cursor:pointer">full entry</summary>
+        <div style="white-space:pre-wrap;font-family:var(--font-mono);margin-top:4px">${esc(e.raw || '')}</div></details>
+    </div>`).join('');
+  const kindChip = (k, label) => `<button class="subtab ${fbState.kind === k ? 'active' : ''}" onclick="fbSetKind('${k}')" style="padding:5px 13px;font-size:11px">${label}</button>`;
+  return `
+    <div class="view-intro">Your business's real-world feedback loop: <b>WINS</b> (deliverables with measured results — promotable into the examples/ quality bar) and <b>LESSONS</b> (what flopped + the correction). Agents read the recent domain-matching entries in every task briefing, so logging here directly shapes future work.${d.error ? ` ⚠ load error: ${esc(d.error)}` : ''}<br>
+      <span style="font-family:var(--font-mono);font-size:11px;word-break:break-all">${esc(files.win || '')} · ${esc(files.lesson || '')}</span></div>
+    <div class="scope-row" style="margin:8px 0">${kindChip('', 'all')}${kindChip('win', '🏆 wins')}${kindChip('lesson', '📓 lessons')}
+      <button class="btn-ghost" style="margin-left:auto" onclick="fbRefreshLedger()">↻ Refresh</button></div>
+    <div style="display:flex;flex-direction:column;gap:6px">${rows || '<div class="empty"><span class="e-ico">🏆</span>Nothing logged yet — open a completed task and hit 🏆 Log WIN (measured results) or 📓 Log LESSON (flop + correction). The AI pre-drafts the entry from the deliverable.</div>'}</div>`;
+}
+
 function viewMemory() {
   const d = memoryState.data;
   if (memoryState.tab === 'semantic' && !memoryState.fetched && !memoryState.loading) loadMemory();
@@ -5726,17 +5882,20 @@ function viewMemory() {
   const semCount = ((memoryState.data || {}).count) || 0;
   const lessonCount = ((specialistsState.data || {}).specialists || []).reduce((n, s) => n + (s.memory_count || 0), 0);
   const sharedCount = (specialistsState.shared || []).length;
+  const fbCount = fbState.data ? ((fbState.data.wins || []).length + (fbState.data.lessons || []).length) : 0;
   const tabs = [
     ['map3d', '🧠 3D Map', null],
     ['semantic', `Semantic (mem0)`, semCount],
     ['agent', 'Agent memory', null],
     ['lessons', 'Specialist lessons', lessonCount || null],
+    ['feedback', '🏆 Wins & Lessons', fbCount || null],
     ['shared', 'Shared context', sharedCount || null],
   ];
   let body = '';
   if (memoryState.tab === 'map3d') body = mem3dHTML();
   else if (memoryState.tab === 'semantic') body = memSemanticHTML();
   else if (memoryState.tab === 'agent') body = memAgentHTML();
+  else if (memoryState.tab === 'feedback') body = memFeedbackHTML();
   else if (memoryState.tab === 'lessons') body = memLessonsHTML();
   else if (memoryState.tab === 'shared') body = memSharedHTML();
   return `

@@ -254,6 +254,20 @@ SECTIONS = [
              "help": "L3 lifecycle: past-work exemplars older than this age out (unless "
                      "re-confirmed by a newer SHIP); the candidate pool is capped at "
                      "exemplars.max×3 so stale 'excellence' can't anchor new work."},
+            {"key": "feedback.framing_enabled", "label": "Inject wins/lessons into briefings", "type": "bool",
+             "default": "1",
+             "help": "Close the feedback loop: recent domain-matching WINS/LESSONS ledger "
+                     "entries (logged via 🏆/📓 on a task) ride into every dispatch framing "
+                     "in that domain, so agents imitate what measurably won and apply "
+                     "logged corrections."},
+            {"key": "feedback.framing_max_entries", "label": "Wins/lessons per briefing", "type": "int",
+             "default": "2", "min": 0, "max": 10,
+             "help": "How many ledger entries of EACH kind (wins / lessons) are excerpted "
+                     "into a task briefing. 0 disables like the toggle."},
+            {"key": "feedback.framing_max_chars", "label": "Wins/lessons block size cap", "type": "int",
+             "default": "1200", "min": 200, "max": 8000,
+             "help": "Hard character cap on the injected feedback block (~300 tokens at "
+                     "the default) — oldest excerpt lines drop first."},
             {"key": "lessons.auto_distill", "label": "Auto-distill operator corrections", "type": "bool",
              "default": "1",
              "help": "Q2/N8: on a schedule, turn the operator's corrections (rejections, "
