@@ -567,6 +567,7 @@ const VIEW_META = {
   usage: ['Usage & Cost', 'Token consumption & estimated spend'],
   observability: ['LLM Observability', 'Traces, tokens & cost via Langfuse'],
   issues: ['Known Issues', 'Your filed feedback with the interaction context — the improvement backlog'],
+  notes: ['Notes', 'Your quick notes — general and per-project, sortable and filterable'],
   settings: ['Settings', 'Budgets, concurrency limits and per-model effort defaults'],
   manual: ['User Manual', 'Everything explained — from first click to full architecture'],
   jarvis: ['J.A.R.V.I.S', 'Neural voice interface'],
@@ -609,6 +610,7 @@ function render() {
   else if (currentView === 'usage') { c.innerHTML = wrapView(viewUsage()); bindUsage(); }
   else if (currentView === 'settings') { c.innerHTML = wrapView(viewSettings()); bindSettings(); }
   else if (currentView === 'issues') { c.innerHTML = wrapView(viewKnownIssues()); }
+  else if (currentView === 'notes') { c.innerHTML = wrapView(viewNotes()); bindNotes(); }
   else if (currentView === 'manual') { c.innerHTML = wrapView(viewManual()); }
   else if (currentView === 'observability') { c.innerHTML = wrapView(viewObservability()); bindObservability(); }
   else if (currentView === 'memory') { c.innerHTML = wrapView(viewMemory()); bindMemory(); }
@@ -2532,11 +2534,65 @@ function credentialsCardHTML() {
     </div></div>`;
 }
 
+// Item 9: per-user GitHub identity — projects publish/push/PR as YOUR account
+// when a PAT is set; without one, the machine's gh login keeps applying.
+function githubCardHTML() {
+  const me = authState.user || {};
+  return `
+    <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>🐙 GitHub account</h3></div><div class="card-body">
+      <div class="form-hint" style="margin-bottom:8px">Set a fine-grained Personal Access Token (needs <code>contents: write</code>, <code>pull requests: write</code>, and <code>administration</code> for creating repos) and your projects publish/push/PR to <b>your own</b> GitHub instead of the operator's. The token is stored encrypted and only ever travels to GitHub. Leave empty = the machine's shared gh login.</div>
+      <div class="form-row" style="flex-wrap:wrap;align-items:flex-end">
+        <div class="form-group"><label class="form-label">GitHub username</label>
+          <input class="form-input" id="ghUser" placeholder="your-github-login" value="${esc(me.github_username || '')}" style="width:180px"></div>
+        <div class="form-group"><label class="form-label">Git author email</label>
+          <input class="form-input" id="ghEmail" placeholder="you@example.com" value="${esc(me.git_email || '')}" style="width:220px"></div>
+        <div class="form-group"><label class="form-label">Personal Access Token (write-only)</label>
+          <input class="form-input" id="ghPat" type="password" autocomplete="off" placeholder="github_pat_…"></div>
+        <button class="btn-primary" onclick="saveGithubIdentity()" style="align-self:center">Save</button>
+        <button class="btn-ghost" onclick="testGithubConnection(this)" style="align-self:center">Test connection</button>
+      </div>
+      <div id="ghTestResult" class="muted" style="font-size:11.5px;margin-top:6px"></div>
+    </div></div>`;
+}
+
+async function saveGithubIdentity() {
+  try {
+    await api('PATCH', '/api/users/me/github', {
+      github_username: ($('#ghUser') || {}).value || '',
+      git_email: ($('#ghEmail') || {}).value || '',
+    });
+    const pat = ($('#ghPat') || {}).value || '';
+    if (pat.trim()) {
+      await api('POST', '/api/credentials', { provider: 'github', value: pat.trim(), label: 'GitHub PAT' });
+      if ($('#ghPat')) $('#ghPat').value = '';
+    }
+    if (authState.user) {
+      authState.user.github_username = ($('#ghUser') || {}).value || '';
+      authState.user.git_email = ($('#ghEmail') || {}).value || '';
+    }
+    settingsState.fetched = false;
+    toast('GitHub identity saved — new publishes/pushes/PRs run as your account', 'ok');
+  } catch (e) { toast('Save failed: ' + e.message, 'err'); }
+}
+
+async function testGithubConnection(btn) {
+  const out = $('#ghTestResult');
+  if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+  try {
+    const r = await api('GET', '/api/github/whoami');
+    if (out) out.textContent = r.fallback
+      ? '✔ No personal PAT — the machine\'s shared gh login applies (that works too).'
+      : `✔ Connected as ${r.login}${r.scopes ? ` · scopes: ${r.scopes}` : ''}`;
+  } catch (e) { if (out) out.textContent = '✖ ' + e.message; }
+  if (btn) { btn.disabled = false; btn.textContent = 'Test connection'; }
+}
+
 function viewSettings() {
   if (!settingsState.fetched) { loadSettingsData(); return skeletonView(); }
   return `
     ${modelsCardHTML()}
     ${credentialsCardHTML()}
+    ${githubCardHTML()}
     ${settingsRegistryHTML()}
     <div class="agentic-card" style="margin-top:14px"><div class="card-head"><h3>👥 Users & access</h3></div><div class="card-body" id="usersPanel">
       <div class="muted" style="font-size:12px">Loading users…</div>
@@ -3106,6 +3162,182 @@ function kiEdit(id) {
 async function kiDelete(id) {
   try { await api('DELETE', `/api/known-issues/${id}`); loadKnownIssues(); }
   catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+}
+
+// ═══════════════════ NOTES (item 14) — 📝 panel + Notes tab ═══════════════════
+// The panel is a lightweight fixed div (NOT #modal): the app stays fully
+// interactive behind it and uiLocked() semantics are untouched. Text survives
+// hide/show until saved or cancelled.
+
+function notesPanelEl() {
+  let p = document.getElementById('notesPanel');
+  if (p) return p;
+  p = document.createElement('div');
+  p.id = 'notesPanel';
+  p.style.cssText = 'display:none;position:fixed;left:18px;bottom:18px;z-index:900;width:330px;' +
+    'padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.15);' +
+    'background:rgba(20,20,32,.95);backdrop-filter:blur(8px);box-shadow:0 8px 30px rgba(0,0,0,.5)';
+  p.innerHTML = `
+    <div style="font-size:12px;font-weight:600;margin-bottom:6px">📝 Quick note</div>
+    <textarea class="form-textarea" id="notesPanelText" style="height:90px;font-size:12.5px" placeholder="Type your idea…"></textarea>
+    <div id="notesPanelCtx" class="muted" style="font-size:10.5px;margin:4px 0"></div>
+    <div style="display:flex;gap:6px;justify-content:flex-end">
+      <button class="btn-ghost btn-sm" onclick="notesPanelToggle(true)">Cancel</button>
+      <button class="btn-ghost btn-sm" id="notesSaveProj" title="Also stores the currently selected project + workflow with the note">Save Project</button>
+      <button class="btn-primary btn-sm" onclick="notesSave(false)">Save General</button>
+    </div>`;
+  document.body.appendChild(p);
+  p.querySelector('#notesPanelText').addEventListener('keydown', e => {
+    if (e.key === 'Escape') notesPanelToggle(true);
+  });
+  p.querySelector('#notesSaveProj').onclick = () => notesSave(true);
+  return p;
+}
+
+function notesPanelToggle(cancel) {
+  const p = notesPanelEl();
+  if (cancel) {
+    p.style.display = 'none';
+    const t = p.querySelector('#notesPanelText');
+    if (cancel === true) t.value = '';
+    return;
+  }
+  const show = p.style.display === 'none';
+  p.style.display = show ? '' : 'none';
+  if (show) {
+    const ctx = p.querySelector('#notesPanelCtx');
+    const proj = focusCtx.project, wf = focusCtx.workflow;
+    ctx.textContent = proj
+      ? `Save Project attaches: 📂 ${proj.name}${wf ? ` · ⚑ ${wf.name}` : ''}`
+      : 'Save Project needs a selected project (🎯 in Projects) — it is disabled until then.';
+    const sp = p.querySelector('#notesSaveProj');
+    sp.disabled = !proj;
+    p.querySelector('#notesPanelText').focus();
+  }
+}
+
+async function notesSave(withProject) {
+  const p = notesPanelEl();
+  const text = p.querySelector('#notesPanelText').value.trim();
+  if (!text) { toast('Type the note first', 'err'); return; }
+  const body = { text };
+  if (withProject && focusCtx.project) {
+    body.project_path = focusCtx.project.path;
+    body.project_name = focusCtx.project.name;
+    if (focusCtx.workflow) {
+      body.workflow_id = focusCtx.workflow.id;
+      body.workflow_name = focusCtx.workflow.name;
+    }
+  }
+  try {
+    await api('POST', '/api/notes', body);
+    p.querySelector('#notesPanelText').value = '';
+    p.style.display = 'none';
+    notesState.fetched = false;
+    toast('Note saved — find it in the Notes tab', 'ok');
+    if (currentView === 'notes') render();
+  } catch (e) { toast('Save failed: ' + e.message, 'err'); }
+}
+
+const notesState = { fetched: false, list: [], sortBy: 'date', filterProject: '', filterWorkflow: '', q: '' };
+
+async function loadNotes() {
+  try {
+    notesState.list = (await api('GET', '/api/notes')).notes || [];
+    notesState.fetched = true;
+  } catch { notesState.list = []; notesState.fetched = true; }
+  if (currentView === 'notes') render();
+}
+
+function viewNotes() {
+  if (!notesState.fetched) { loadNotes(); return skeletonView(); }
+  const s = notesState;
+  const projects = [...new Set(s.list.map(n => n.project_name).filter(Boolean))].sort();
+  const workflows = [...new Set(s.list.map(n => n.workflow_name).filter(Boolean))].sort();
+  let rows = s.list.filter(n =>
+    (!s.filterProject || n.project_name === s.filterProject)
+    && (!s.filterWorkflow || n.workflow_name === s.filterWorkflow)
+    && (!s.q || (n.text + ' ' + (n.project_name || '') + ' ' + (n.workflow_name || '')).toLowerCase().includes(s.q.toLowerCase())));
+  const cmp = {
+    date: (a, b) => (b.created_at || 0) - (a.created_at || 0),
+    project: (a, b) => String(a.project_name || '').localeCompare(String(b.project_name || '')) || (b.created_at || 0) - (a.created_at || 0),
+    workflow: (a, b) => String(a.workflow_name || '').localeCompare(String(b.workflow_name || '')) || (b.created_at || 0) - (a.created_at || 0),
+  }[s.sortBy] || ((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  rows = [...rows].sort(cmp);
+  const html = rows.map(n => `
+    <div class="agentic-row">
+      <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+        <span class="muted" style="font-size:11px;font-family:var(--font-mono)" title="${esc(new Date(n.created_at * 1000).toLocaleString())}">${esc(new Date(n.created_at * 1000).toLocaleString())}</span>
+        ${n.project_name ? `<span class="chip c-cyan">📂 ${esc(n.project_name)}</span>` : '<span class="chip">general</span>'}
+        ${n.workflow_name ? `<span class="chip">⚑ ${esc(n.workflow_name)}</span>` : ''}
+        <span style="flex:1"></span>
+        <button class="btn-sm" title="Edit" onclick="noteEdit('${esc(n.id)}')">✎</button>
+        <button class="btn-sm danger" title="Delete" onclick="noteDelete('${esc(n.id)}')">✕</button>
+      </div>
+      <div style="font-size:12.5px;white-space:pre-wrap">${esc(n.text)}</div>
+    </div>`).join('');
+  return `
+    <div class="view-intro" style="margin-bottom:10px">Every quick note from the 📝 button (bottom right), newest first. General notes carry just their time; project notes remember which project/workflow you had selected.</div>
+    <div class="scope-row" style="margin-bottom:10px;gap:8px;flex-wrap:wrap">
+      <input class="k-search" id="noteSearch" type="search" placeholder="Search notes…" value="${esc(s.q)}" style="max-width:220px">
+      <select class="k-filter" id="noteSort">
+        <option value="date" ${s.sortBy === 'date' ? 'selected' : ''}>Sort: newest first</option>
+        <option value="project" ${s.sortBy === 'project' ? 'selected' : ''}>Sort: by project</option>
+        <option value="workflow" ${s.sortBy === 'workflow' ? 'selected' : ''}>Sort: by workflow</option>
+      </select>
+      <select class="k-filter" id="noteFilterProj"><option value="">All projects</option>
+        ${projects.map(pn => `<option value="${esc(pn)}" ${s.filterProject === pn ? 'selected' : ''}>📂 ${esc(pn)}</option>`).join('')}</select>
+      <select class="k-filter" id="noteFilterWf"><option value="">All workflows</option>
+        ${workflows.map(wn => `<option value="${esc(wn)}" ${s.filterWorkflow === wn ? 'selected' : ''}>⚑ ${esc(wn)}</option>`).join('')}</select>
+      <span class="muted" style="margin-left:auto;font-family:var(--font-mono);font-size:11px">${rows.length}/${s.list.length} notes</span>
+      <button class="btn-primary" onclick="notesPanelToggle()">📝 New note</button>
+    </div>
+    <div id="notesList" style="display:flex;flex-direction:column;gap:6px">${html || '<div class="empty"><span class="e-ico">📝</span>No notes yet — hit the 📝 button (bottom right) whenever an idea strikes.</div>'}</div>`;
+}
+
+function bindNotes() {
+  const q = $('#noteSearch');
+  if (q) q.oninput = e => {
+    notesState.q = e.target.value;
+    render();
+    setTimeout(() => { const x = $('#noteSearch'); if (x) { x.focus(); x.setSelectionRange(x.value.length, x.value.length); } }, 0);
+  };
+  const srt = $('#noteSort');
+  if (srt) srt.onchange = e => { notesState.sortBy = e.target.value; render(); };
+  const fp = $('#noteFilterProj');
+  if (fp) fp.onchange = e => { notesState.filterProject = e.target.value; render(); };
+  const fw = $('#noteFilterWf');
+  if (fw) fw.onchange = e => { notesState.filterWorkflow = e.target.value; render(); };
+}
+
+function noteEdit(id) {
+  const n = notesState.list.find(x => x.id === id);
+  if (!n) return;
+  showModal(`
+    <h2>✎ Edit note</h2>
+    <textarea class="form-textarea" id="note-edit-text" style="height:120px">${esc(n.text)}</textarea>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="note-edit-save">Save</button>
+    </div>`);
+  $('#note-edit-save').onclick = async () => {
+    const text = ($('#note-edit-text') || {}).value || '';
+    if (!text.trim()) { toast('Note text cannot be empty', 'err'); return; }
+    try {
+      await api('PATCH', `/api/notes/${id}`, { text: text.trim() });
+      closeModal();
+      notesState.fetched = false;
+      render();
+    } catch (e) { toast('Update failed: ' + e.message, 'err'); }
+  };
+}
+
+async function noteDelete(id) {
+  try {
+    await api('DELETE', `/api/notes/${id}`);
+    notesState.fetched = false;
+    render();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
 // ═══════ RESULT REVIEW v2 (side-by-side, syntax highlight, line comments — SPEC-BLOCK2 R1) ═══════
@@ -5560,7 +5792,8 @@ function bindSkillCards() {
 }
 
 // ═══════════════════════════════ PROJECTS ═══════════════════════════════
-const projectsState = { data: null, loading: false, fetched: false, sortBy: 'modified' };
+const projectsState = { data: null, loading: false, fetched: false, sortBy: 'modified', q: '' };
+try { projectsState.sortBy = localStorage.getItem('nexusProjSort') || 'modified'; } catch { }
 async function loadProjects() {
   if (projectsState.loading) return;
   projectsState.loading = true; projectsState.data = null; render();
@@ -5569,20 +5802,50 @@ async function loadProjects() {
   pruneStaleFocus((projectsState.data || {}).projects);
   projectsState.loading = false; projectsState.fetched = true; render();
 }
+function projSetSort(v) {
+  projectsState.sortBy = v;
+  try { localStorage.setItem('nexusProjSort', v); } catch { }
+  render();
+}
+function projSetQ(v) {
+  projectsState.q = v;
+  render();
+  setTimeout(() => { const x = $('#projSearch'); if (x) { x.focus(); x.setSelectionRange(x.value.length, x.value.length); } }, 0);
+}
 function viewProjects() {
   if (!projectsState.fetched) { loadProjects(); return skeletonView(); }
   if (projectsState.loading) return skeletonView();
-  const projs = (projectsState.data && projectsState.data.projects) || [];
-  if (!projs.length) return `
+  const rawProjs = (projectsState.data && projectsState.data.projects) || [];
+  if (!rawProjs.length) return `
     <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
       <button class="btn-primary" onclick="newClientProjectUI()">➕ New project</button>
     </div>
     <div class="empty"><span class="e-ico">▣</span>No projects found. Create your first project to get started.</div>`;
+  // Item 10: filter + sort (default: last modified = "last used", newest on top)
+  let projs = rawProjs;
+  const q = (projectsState.q || '').toLowerCase();
+  if (q) projs = projs.filter(p => (p.name + ' ' + (p.client || '')
+    + ' ' + Object.keys(p.languages || {}).join(' ')).toLowerCase().includes(q));
+  const cmpP = {
+    modified: (a, b) => (b.last_modified || 0) - (a.last_modified || 0),
+    name: (a, b) => a.name.localeCompare(b.name),
+    size: (a, b) => (b.size_bytes || 0) - (a.size_bytes || 0),
+    client: (a, b) => String(a.client || '￿').localeCompare(String(b.client || '￿')) || a.name.localeCompare(b.name),
+  }[projectsState.sortBy] || ((a, b) => (b.last_modified || 0) - (a.last_modified || 0));
+  projs = [...projs].sort(cmpP);
   const langColor = l => ({ Python: '#3776ab', JavaScript: '#f7df1e', TypeScript: '#3178c6', Rust: '#dea584', 'C': '#a8b9cc', 'C++': '#00599c', Shell: '#89e051', Markdown: '#888', HTML: '#e34c26', CSS: '#563d7c' }[l] || '#888');
   const fmtSize = b => b > 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b > 1e6 ? (b / 1e6).toFixed(0) + ' MB' : (b / 1e3).toFixed(0) + ' KB';
   const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
   let html = `
-    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <input class="k-search" id="projSearch" type="search" placeholder="Filter by name, client, language…" value="${esc(projectsState.q || '')}" oninput="projSetQ(this.value)" style="max-width:250px">
+      <select class="k-filter" onchange="projSetSort(this.value)">
+        <option value="modified" ${projectsState.sortBy === 'modified' ? 'selected' : ''}>Sort: last used (newest first)</option>
+        <option value="name" ${projectsState.sortBy === 'name' ? 'selected' : ''}>Sort: name A–Z</option>
+        <option value="size" ${projectsState.sortBy === 'size' ? 'selected' : ''}>Sort: size</option>
+        <option value="client" ${projectsState.sortBy === 'client' ? 'selected' : ''}>Sort: by client</option>
+      </select>
+      <span style="flex:1"></span>
       <button class="btn-primary" onclick="newClientProjectUI()">➕ New project</button>
     </div>
     <div class="stats-strip">
@@ -9025,7 +9288,18 @@ async function saveSpecialist(name) {
 }
 
 // ═══════════════════ WORKFLOWS (Projects: task chains) ═══════════════════
-const wfState = { list: null, fetched: false };
+const wfState = { list: null, fetched: false, sortBy: 'used', q: '' };
+try { wfState.sortBy = localStorage.getItem('nexusWfSort') || 'used'; } catch { }
+function wfSetSort(v) {
+  wfState.sortBy = v;
+  try { localStorage.setItem('nexusWfSort', v); } catch { }
+  render();
+}
+function wfSetQ(v) {
+  wfState.q = v;
+  render();
+  setTimeout(() => { const x = $('#wfSearch'); if (x) { x.focus(); x.setSelectionRange(x.value.length, x.value.length); } }, 0);
+}
 let taskCreateContext = null; // {workflow_id, depends_on} consumed by submitTask
 
 async function loadWorkflows() {
@@ -9062,8 +9336,20 @@ function viewWorkflows() {
   if (!wfState.fetched) { loadWorkflows(); return skeletonView(); }
   const wfIds = focusProjectWorkflowIds();
   const fp = focusCtx.project;
-  const scoped = (wfState.list || []).filter(w =>
+  let scoped = (wfState.list || []).filter(w =>
     !fp || w.project_path === fp.path || (wfIds && wfIds.has(w.id)));
+  // Item 10: filter + sort (default: last used = updated_at, newest on top —
+  // every member-task change touches the workflow row)
+  const wq = (wfState.q || '').toLowerCase();
+  if (wq) scoped = scoped.filter(w =>
+    ((w.name || '') + ' ' + (w.goal || '') + ' ' + (w.domain || '')).toLowerCase().includes(wq));
+  const cmpW = {
+    used: (a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0),
+    created: (a, b) => (b.created_at || 0) - (a.created_at || 0),
+    name: (a, b) => String(a.name || '').localeCompare(String(b.name || '')),
+    progress: (a, b) => (b.progress_pct || 0) - (a.progress_pct || 0),
+  }[wfState.sortBy] || ((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  scoped = [...scoped].sort(cmpW);
   const scopeNote = fp ? `<div class="view-intro" style="margin-bottom:8px">Scoped to 📂 <b>${esc(fp.name)}</b> — ${scoped.length} of ${(wfState.list || []).length} workflows. <span class="fx" style="cursor:pointer;color:var(--accent-2)" onclick="setFocusProject(null)">show all</span></div>` : '';
   const rows = scoped.map(w => `
     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
@@ -9086,10 +9372,18 @@ function viewWorkflows() {
     </div>`).join('');
   return `
     <div class="view-intro" style="margin-bottom:12px">A <strong>project</strong> connects several tasks into one campaign. Tasks with dependencies wait until their inputs are DONE, then run automatically — each agent reads its predecessors' deliverable files. Example: research → ad copy → channel plan → publish plan.</div>
-    <div style="display:flex;gap:10px;margin-bottom:14px">
+    <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center">
       <button class="btn-primary" onclick="newWorkflowUI()">➕ Create workflow</button>
       <button class="btn-ghost" title="Describe the whole goal in plain words — the AI plans the task chain" onclick="describeTaskUI()">✨ Describe a goal (AI plans it)</button>
       <button class="btn-ghost" title="Creates a ready-made 4-task marketing campaign chain — edit the [brackets], then watch it run in order" onclick="createExampleCampaign()">Example: marketing campaign</button>
+      <span style="flex:1"></span>
+      <input class="k-search" id="wfSearch" type="search" placeholder="Filter by name, goal, domain…" value="${esc(wfState.q || '')}" oninput="wfSetQ(this.value)" style="max-width:220px">
+      <select class="k-filter" onchange="wfSetSort(this.value)">
+        <option value="used" ${wfState.sortBy === 'used' ? 'selected' : ''}>Sort: last used (newest first)</option>
+        <option value="created" ${wfState.sortBy === 'created' ? 'selected' : ''}>Sort: created</option>
+        <option value="name" ${wfState.sortBy === 'name' ? 'selected' : ''}>Sort: name A–Z</option>
+        <option value="progress" ${wfState.sortBy === 'progress' ? 'selected' : ''}>Sort: progress</option>
+      </select>
     </div>
     ${scopeNote}
     <div class="agentic-grid">${rows || `<div class="empty"><span class="e-ico">⚑</span>${focusCtx.project ? 'No workflows in this project yet — ✨ Describe a goal creates the first round.' : 'No workflows yet — create one, or start from the example campaign.'}</div>`}</div>`;
@@ -9609,6 +9903,10 @@ async function loadMeetings(renderIfChanged = false) {
     meetState.list = r.meetings || [];
     meetState.live = r.live || null;
     meetState.dir = r.dir || '';
+    if (!meetState.projects) {
+      const d = await api('GET', '/api/projects').catch(() => ({ projects: [] }));
+      meetState.projects = (d.projects || []).filter(p => p.is_repo);
+    }
   } catch { meetState.list = []; meetState.live = null; }
   meetState.fetched = true;
   if (currentView !== 'meetings') return;
@@ -9789,19 +10087,30 @@ async function applyEvalImprove(id) {
 function viewMeetings() {
   if (!meetState.fetched) { loadMeetings(); return skeletonView(); }
   const live = meetState.live;
+  const projOpts = m => `<option value="">— no project —</option>` + (meetState.projects || [])
+    .map(p => `<option value="${esc(p.path)}" ${m.project_path === p.path ? 'selected' : ''}>${p.client ? '🏢 ' + esc(p.client) + ' / ' : ''}${esc(p.name)}</option>`).join('');
   const rows = (meetState.list || []).map(m => `
     <div class="agentic-row">
       <div><strong>${esc(m.title || m.name)}</strong>
-        ${m.name === live ? '<span class="chip c-red">● LIVE</span>' : ''}</div>
+        ${m.name === live ? '<span class="chip c-red">● LIVE</span>' : ''}
+        ${m.project_path ? `<span class="chip c-cyan" title="${esc(m.project_path)}">📂 ${esc(m.project_path.split('/').pop())}</span>` : ''}
+        ${m.has_summary ? '<span class="chip c-green" title="a summary is cached">🧠</span>' : ''}
+        ${m.has_requirements ? '<span class="chip c-green" title="requirements were extracted">📋</span>' : ''}</div>
       <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
         ${fmtAgo(m.mtime)} · ${fmtBytes(m.size)} · ${esc(m.name)}</div>
-      <div class="row-actions">
+      <div class="row-actions" style="flex-wrap:wrap">
         <button class="btn-sm" onclick="previewMeeting('${esc(m.name)}')">📄 Read${m.name === live ? ' live' : ''}</button>
+        <select class="form-select" style="width:190px;padding:2px 6px;font-size:11px" title="Assign this transcript to a project — the smart buttons appear once assigned" onchange="meetSetProject('${esc(m.name)}', this.value)">${projOpts(m)}</select>
+        ${m.project_path && m.name !== live ? `
+          <button class="btn-sm" title="One AI call summarizes the transcript (participants, decisions, action items) — cached until the file changes" onclick="meetSummarize('${esc(m.name)}')">🧠 Summarize</button>
+          <button class="btn-sm" title="One AI call lists the requirements discussed — you can edit the list before using it" onclick="meetRequirements('${esc(m.name)}')">📋 Requirements</button>
+          <button class="btn-sm" title="Store the summary in the agents' long-term memory (tagged with this project) so future work recalls this meeting" onclick="meetToMemory('${esc(m.name)}')" ${m.has_summary ? '' : 'disabled'}>💾 Add to memory</button>
+          <button class="btn-sm" title="Open the normal planning wizard prefilled with this meeting's requirements + project" onclick="meetCreateWorkflow('${esc(m.name)}','${esc((m.title || m.name).replace(/'/g, ''))}')" ${m.has_requirements ? '' : 'disabled'}>✨ Create workflow</button>` : ''}
         ${m.name === live ? '' : `<button class="btn-sm" onclick="deleteMeeting('${esc(m.name)}')">🗑 Delete</button>`}
       </div>
     </div>`).join('');
   return `
-    <div class="view-intro" style="margin-bottom:12px">Dual-channel meeting transcripts — 🎤 <strong>Me</strong> (your mic) and 🔊 <strong>Client</strong> (whatever is playing, e.g. the call) — from dictation's MeetingMode. Start one here, from the overlay button, or with the dictation hotkey during a meeting. Files live in <code>${esc(meetState.dir)}</code>.</div>
+    <div class="view-intro" style="margin-bottom:12px">Dual-channel meeting transcripts — 🎤 <strong>Me</strong> (your mic) and 🔊 <strong>Client</strong> (whatever is playing, e.g. the call) — from dictation's MeetingMode. Assign a transcript to a project to unlock the smart buttons: 🧠 summary, 📋 requirements, 💾 memory, ✨ plan work from it. Files live in <code>${esc(meetState.dir)}</code>.</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
       <button class="${live ? 'btn-ghost' : 'btn-primary'}" id="meetToggleBtn">${live ? '⏹ Stop meeting' : '● Start meeting'}</button>
       ${live ? `<span class="chip c-red">recording → ${esc(live)}</span>` : ''}
@@ -9870,8 +10179,101 @@ async function deleteMeeting(name) {
   } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
+// ── Item 8: meeting intelligence actions ──
+
+async function meetSetProject(name, path) {
+  try {
+    await api('PATCH', `/api/meetings/${encodeURIComponent(name)}/meta`,
+      { project_path: path || null });
+    toast(path ? 'Meeting assigned — the smart buttons are now available' : 'Assignment cleared', 'ok');
+    meetState.fetched = false;
+    render();
+  } catch (e) { toast('Assign failed: ' + e.message, 'err'); }
+}
+
+async function meetSummarize(name, force) {
+  toast('Summarizing the transcript (~1 min)…', 'info');
+  try {
+    const r = await api('POST', `/api/meetings/${encodeURIComponent(name)}/summarize${force ? '?force=1' : ''}`);
+    meetState.fetched = false;
+    showModal(`
+      <h2>🧠 Meeting summary</h2>
+      <div style="max-height:60vh;overflow-y:auto;font-size:13px;line-height:1.6">${mdLite(r.summary)}</div>
+      <div class="modal-actions">
+        <button class="btn-ghost" onclick="meetSummarize('${esc(name)}', true)">↻ Re-summarize</button>
+        <button class="btn-ghost" onclick="meetToMemory('${esc(name)}')">💾 Add to memory</button>
+        <button class="btn-primary" onclick="closeModal(); render()">Close</button>
+      </div>`);
+  } catch (e) { toast('Summarize failed: ' + e.message, 'err'); }
+}
+
+async function meetRequirements(name, force) {
+  toast('Extracting requirements (~1 min)…', 'info');
+  try {
+    const r = await api('POST', `/api/meetings/${encodeURIComponent(name)}/requirements${force ? '?force=1' : ''}`);
+    meetState.fetched = false;
+    meetReqsModal(name, r.requirements || []);
+  } catch (e) { toast('Extraction failed: ' + e.message, 'err'); }
+}
+
+function meetReqsModal(name, reqs) {
+  showModal(`
+    <h2>📋 Requirements from this meeting</h2>
+    <div class="view-intro" style="margin-bottom:8px">What the participants agreed should happen. Edit/remove lines, add missing ones, then Save — ✨ Create workflow uses this exact list.</div>
+    <div id="mreq-list">${reqs.map((r, i) => `
+      <div style="display:flex;gap:6px;margin-bottom:4px">
+        <input class="form-input mreq-item" value="${esc(r)}" style="flex:1;font-size:12px">
+        <button class="btn-sm danger" onclick="this.parentElement.remove()">✕</button>
+      </div>`).join('')}</div>
+    <button class="btn-ghost btn-sm" onclick="document.getElementById('mreq-list').insertAdjacentHTML('beforeend', '<div style=&quot;display:flex;gap:6px;margin-bottom:4px&quot;><input class=&quot;form-input mreq-item&quot; style=&quot;flex:1;font-size:12px&quot;><button class=&quot;btn-sm danger&quot; onclick=&quot;this.parentElement.remove()&quot;>✕</button></div>')">＋ Add requirement</button>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="meetRequirements('${esc(name)}', true)">↻ Re-extract</button>
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="mreq-save">Save list</button>
+    </div>`);
+  $('#mreq-save').onclick = async () => {
+    const items = [...document.querySelectorAll('.mreq-item')].map(x => x.value.trim()).filter(Boolean);
+    try {
+      await api('PATCH', `/api/meetings/${encodeURIComponent(name)}/requirements`, { requirements: items });
+      toast('Requirements saved', 'ok');
+      meetState.fetched = false;
+      closeModal();
+      render();
+    } catch (e) { toast('Save failed: ' + e.message, 'err'); }
+  };
+}
+
+async function meetToMemory(name) {
+  if (!confirm('Store this meeting\'s summary in the agents\' long-term memory? Future tasks and chats on this project will recall it.')) return;
+  try {
+    await api('POST', `/api/meetings/${encodeURIComponent(name)}/memory`);
+    toast('Stored — agents on this project now recall this meeting', 'ok');
+  } catch (e) { toast('Memory add failed: ' + e.message, 'err'); }
+}
+
+async function meetCreateWorkflow(name, title) {
+  const m = (meetState.list || []).find(x => x.name === name);
+  let reqs = [];
+  try {
+    const r = await api('GET', '/api/meetings').catch(() => null);
+    // requirements live in meeting_meta — refetch via the POST cache path
+    const rr = await api('POST', `/api/meetings/${encodeURIComponent(name)}/requirements`);
+    reqs = rr.requirements || [];
+  } catch (e) { toast('Load requirements first (📋)', 'err'); return; }
+  if (!reqs.length) { toast('No requirements yet — run 📋 Requirements first', 'err'); return; }
+  const when = m ? new Date(m.mtime * 1000).toLocaleDateString() : '';
+  const instruction = `Implement the following requirements agreed in the meeting "${title}"${when ? ` (${when})` : ''}:\n`
+    + reqs.map(r => `- ${r}`).join('\n')
+    + '\n\nBuild on the existing project state — this is a follow-up round, not a fresh start.';
+  closeModal();
+  describeTaskUI({ instruction, repo_path: (m && m.project_path) || null });
+}
+
 // ═══════════════════ TASK WIZARD (describe → clarify → parameterized task/project) ═══════════════════
-function describeTaskUI() {
+function describeTaskUI(prefill) {
+  // Item 8: meetings (and others) can hand the wizard a prefilled instruction
+  // + project — the user still drives the normal question/plan/review flow.
+  prefill = prefill || null;
   showModal(`
     <h2>✨ Describe what you want done</h2>
     <div class="view-intro" style="margin-bottom:10px">Plain words, German or English. The AI may ask up to 5 clarifying questions first (every one skippable), then plans: specialist, domain, model, priority, high-stakes flag and the full brief — you review before anything is created. Coding goals become the full pipeline (spec → implement → review → fix → verify) automatically.</div>
@@ -9908,6 +10310,7 @@ function describeTaskUI() {
       repo_path: ($('#twRepo') || {}).value || null,   // ground on the existing project
       family: null }, twDeep);
   };
+  if (prefill && prefill.instruction && $('#twAsk')) $('#twAsk').value = prefill.instruction;
   const twSel = $('#twRepo');
   if (twSel) {
     api('GET', '/api/projects').then(d => {
@@ -9917,7 +10320,9 @@ function describeTaskUI() {
       if (twSel.isConnected) {
         twSel.innerHTML += ps.map(x =>
           `<option value="${esc(x.path)}">${x.client ? '🏢 ' + esc(x.client) + ' / ' : (x.personal ? '🏠 ' : '')}${esc(x.name)}</option>`).join('');
-        if (focusCtx.project) twSel.value = focusCtx.project.path; // focus context
+        if (prefill && prefill.repo_path && [...twSel.options].some(o => o.value === prefill.repo_path)) {
+          twSel.value = prefill.repo_path;   // item 8: the meeting's project
+        } else if (focusCtx.project) twSel.value = focusCtx.project.path; // focus context
       }
     }).catch(() => { });
   }

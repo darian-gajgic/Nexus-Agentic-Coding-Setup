@@ -434,6 +434,39 @@ def init_db():
         status TEXT DEFAULT 'new'
     )""")
 
+    # Item 14 (2026-07-12): quick notes — the 📝 bottom-left panel + Notes tab.
+    # project/workflow names are DENORMALIZED on purpose: a note must stay
+    # readable after its project or workflow is deleted.
+    conn.execute("""CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at REAL,
+        updated_at REAL,
+        text TEXT NOT NULL,
+        project_path TEXT,
+        project_name TEXT,
+        workflow_id TEXT,
+        workflow_name TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, created_at)")
+
+    # Item 8 (2026-07-12): meeting intelligence — transcript → project link +
+    # cached LLM summary/requirements. A DB row (not file frontmatter) because
+    # the dictation recorder APPENDS to the transcript live; editing the file
+    # under it would race the writer and break the title scan.
+    conn.execute("""CREATE TABLE IF NOT EXISTS meeting_meta (
+        name TEXT PRIMARY KEY,
+        project_path TEXT,
+        workflow_id TEXT,
+        summary TEXT,
+        summary_ts REAL,
+        requirements TEXT,
+        requirements_ts REAL,
+        user_id TEXT,
+        created_at REAL,
+        updated_at REAL
+    )""")
+
     # B4: a scheduled job may carry a task TEMPLATE (JSON) so recurring high-value
     # jobs get Super Result / deliverable type / autopilot preset automatically.
     _sj_cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduled_jobs)").fetchall()}
@@ -541,6 +574,15 @@ def init_db():
         started_at REAL,
         ended_at REAL
     )""")
+
+    # Item 9 (2026-07-12): per-user GitHub identity — publish/push/PR run as
+    # the project owner's account when they set a PAT (credentials provider
+    # 'github'); these two columns carry the matching git author identity.
+    _u_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "github_username" not in _u_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN github_username TEXT")
+    if "git_email" not in _u_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN git_email TEXT")
 
     # Item 6c (2026-07-12): eval → improvement loop state on the run row.
     # improve_status: none|drafting|proposed|applied|rejected|error.

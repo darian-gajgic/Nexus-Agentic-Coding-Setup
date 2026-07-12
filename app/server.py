@@ -1121,12 +1121,13 @@ def get_coremods():
     return out
 
 
-async def _sp_run_async(cmd: list[str], cwd: str | None = None, timeout: int = 120):
+async def _sp_run_async(cmd: list[str], cwd: str | None = None, timeout: int = 120,
+                        env: dict | None = None):
     """subprocess.run(capture_output=True, text=True) twin that never blocks the
     event loop. Returns (returncode, stdout, stderr); kills the process on
     timeout (like subprocess.run) and raises TimeoutError."""
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=cwd, stdin=asyncio.subprocess.DEVNULL,
+        *cmd, cwd=cwd, env=env, stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -2619,7 +2620,229 @@ async def meetings_list():
         return items
 
     items = await asyncio.to_thread(_scan)
+    # Item 8: attach the project link + cached-analysis flags per meeting.
+    meta = {m["name"]: m for m in db.query_all("SELECT * FROM meeting_meta")}
+    for it in items:
+        mm = meta.get(it["name"]) or {}
+        it["project_path"] = mm.get("project_path")
+        it["workflow_id"] = mm.get("workflow_id")
+        it["has_summary"] = bool(mm.get("summary"))
+        it["has_requirements"] = bool(mm.get("requirements"))
     return {"meetings": items, "live": _live_meeting_name(), "dir": str(d)}
+
+
+def _meeting_transcript_text(name: str, cap: int = 40000) -> str | None:
+    path = _meeting_dir() / name
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if len(text) > cap:
+        head, tail = text[:cap // 2], text[-cap // 2:]
+        text = head + "\n\n…[transcript truncated — middle omitted]…\n\n" + tail
+    return text
+
+
+_MEETING_SUMMARY_FRAMING = (
+    "You summarize ONE dual-channel meeting transcript. Lines starting with 🎤 "
+    "are the operator ('Me'); lines with 🔊 are the other side ('Client' — a "
+    "call, a video, whatever played). Reply with ONLY a markdown summary with "
+    "these sections: ## Participants & context, ## What was discussed, "
+    "## Decisions made, ## Action items (who → what), ## Open questions. Be "
+    "concrete and faithful to the transcript; do not invent names or numbers — "
+    "mark anything unclear as (unclear).")
+
+_MEETING_REQS_FRAMING = (
+    "You extract REQUIREMENTS from ONE dual-channel meeting transcript (🎤 = "
+    "the operator, 🔊 = the client side). A requirement is anything the "
+    "participants agreed should be built, delivered, changed or investigated. "
+    "Reply with ONLY a JSON object, no commentary, no code fences: "
+    '{"requirements": ["one requirement per string, concrete and testable, '
+    "<=200 chars each, at most 20\"]}. If none were discussed, return an "
+    "empty array.")
+
+
+def _meeting_llm_turn(uid: str, transcript: str, framing: str, ask: str) -> dict:
+    """One throwaway Hermes turn (feedback-draft pattern). Blocking."""
+    sid = hd.create_session("nexus:meeting-analysis", model=db.default_task_model(uid))
+    hd.publish_session_scope(sid, user=uid)
+    hd.publish_session_key(sid, uid, db.default_task_model(uid))
+    try:
+        return hd.stream_turn(sid, f"{ask}\n\nTRANSCRIPT:\n{transcript}",
+                              system_message=framing, max_seconds=180)
+    finally:
+        hd.delete_session(sid)
+
+
+@app.patch("/api/meetings/{name}/meta")
+async def meeting_set_meta(name: str, body: dict):
+    """Item 8: assign a transcript to a project (and optionally one workflow).
+    Null project_path clears the assignment. Cached analyses survive."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name) or not (_meeting_dir() / name).is_file():
+        return JSONResponse(status_code=404, content={"error": "meeting not found"})
+    pp = (body.get("project_path") or "").strip() or None
+    if pp and not await _visible_repo_path_async(pp):
+        return JSONResponse(status_code=400, content={
+            "error": "project_path is not one of your git repositories"})
+    wf_id = (body.get("workflow_id") or "").strip() or None
+    if wf_id:
+        w = _owned_workflow(wf_id)
+        if not w:
+            return JSONResponse(status_code=404, content={"error": "workflow not found"})
+        if pp and w.get("project_path") and w["project_path"] != pp:
+            return JSONResponse(status_code=400, content={
+                "error": "that workflow belongs to a different project"})
+    now = time.time()
+    cur = db.query_one("SELECT * FROM meeting_meta WHERE name=?", (name,))
+    if cur:
+        db.execute("UPDATE meeting_meta SET project_path=?, workflow_id=?, updated_at=? "
+                   "WHERE name=?", (pp, wf_id, now, name))
+    else:
+        db.execute("INSERT INTO meeting_meta (name, project_path, workflow_id, user_id, "
+                   "created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                   (name, pp, wf_id, auth.current_user_id(), now, now))
+    return {"ok": True, "project_path": pp, "workflow_id": wf_id}
+
+
+@app.post("/api/meetings/{name}/summarize")
+async def meeting_summarize(name: str, force: int = 0):
+    """Item 8: one-shot LLM summary of the transcript, cached vs file mtime."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name):
+        return JSONResponse(status_code=400, content={"error": "bad name"})
+    if _live_meeting_name() == name:
+        return JSONResponse(status_code=409, content={
+            "error": "meeting is still recording — stop it first"})
+    path = _meeting_dir() / name
+    if not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    meta = db.query_one("SELECT * FROM meeting_meta WHERE name=?", (name,)) or {}
+    if meta.get("summary") and not force \
+            and (meta.get("summary_ts") or 0) >= path.stat().st_mtime:
+        return {"ok": True, "summary": meta["summary"], "cached": True}
+    uid = auth.current_user_id()
+    transcript = await asyncio.to_thread(_meeting_transcript_text, name)
+    try:
+        res = await asyncio.get_running_loop().run_in_executor(
+            None, _meeting_llm_turn, uid, transcript, _MEETING_SUMMARY_FRAMING,
+            "Summarize this meeting now.")
+    except hd.QuotaError as e:
+        return JSONResponse(status_code=503, content={
+            "error": f"GLM is load-shedding right now — try again in a minute ({str(e)[:80]})"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    summary = (res.get("content") or "").strip()
+    if res.get("error") or not summary:
+        return JSONResponse(status_code=502, content={
+            "error": res.get("error") or "the model returned an empty summary"})
+    now = time.time()
+    if meta:
+        db.execute("UPDATE meeting_meta SET summary=?, summary_ts=?, updated_at=? WHERE name=?",
+                   (summary[:20000], now, now, name))
+    else:
+        db.execute("INSERT INTO meeting_meta (name, summary, summary_ts, user_id, created_at, "
+                   "updated_at) VALUES (?,?,?,?,?,?)",
+                   (name, summary[:20000], now, uid, now, now))
+    return {"ok": True, "summary": summary, "cached": False}
+
+
+@app.post("/api/meetings/{name}/requirements")
+async def meeting_requirements(name: str, force: int = 0):
+    """Item 8: extract the requirements discussed in the meeting (editable
+    afterwards via the PATCH below)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name):
+        return JSONResponse(status_code=400, content={"error": "bad name"})
+    if _live_meeting_name() == name:
+        return JSONResponse(status_code=409, content={
+            "error": "meeting is still recording — stop it first"})
+    path = _meeting_dir() / name
+    if not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    meta = db.query_one("SELECT * FROM meeting_meta WHERE name=?", (name,)) or {}
+    if meta.get("requirements") and not force \
+            and (meta.get("requirements_ts") or 0) >= path.stat().st_mtime:
+        return {"ok": True, "requirements": json.loads(meta["requirements"]), "cached": True}
+    uid = auth.current_user_id()
+    transcript = await asyncio.to_thread(_meeting_transcript_text, name)
+    try:
+        res = await asyncio.get_running_loop().run_in_executor(
+            None, _meeting_llm_turn, uid, transcript, _MEETING_REQS_FRAMING,
+            "Extract the requirements now.")
+    except hd.QuotaError as e:
+        return JSONResponse(status_code=503, content={
+            "error": f"GLM is load-shedding right now — try again in a minute ({str(e)[:80]})"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    content = (res.get("content") or "").strip()
+    if res.get("error") or not content:
+        return JSONResponse(status_code=502, content={
+            "error": res.get("error") or "the model returned nothing"})
+    try:
+        data = json.loads(content[content.index("{"):content.rindex("}") + 1])
+        reqs = [str(r).strip()[:200] for r in (data.get("requirements") or []) if str(r).strip()][:20]
+    except Exception:
+        return JSONResponse(status_code=502, content={"error": "unparseable extraction — try again"})
+    now = time.time()
+    if meta:
+        db.execute("UPDATE meeting_meta SET requirements=?, requirements_ts=?, updated_at=? "
+                   "WHERE name=?", (json.dumps(reqs), now, now, name))
+    else:
+        db.execute("INSERT INTO meeting_meta (name, requirements, requirements_ts, user_id, "
+                   "created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                   (name, json.dumps(reqs), now, uid, now, now))
+    return {"ok": True, "requirements": reqs, "cached": False}
+
+
+@app.patch("/api/meetings/{name}/requirements")
+async def meeting_requirements_edit(name: str, body: dict):
+    """Save the operator-edited requirements list (no LLM)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name):
+        return JSONResponse(status_code=400, content={"error": "bad name"})
+    reqs = [str(r).strip()[:200] for r in (body.get("requirements") or []) if str(r).strip()][:20]
+    now = time.time()
+    if db.query_one("SELECT 1 FROM meeting_meta WHERE name=?", (name,)):
+        db.execute("UPDATE meeting_meta SET requirements=?, requirements_ts=?, updated_at=? "
+                   "WHERE name=?", (json.dumps(reqs), now, now, name))
+    else:
+        db.execute("INSERT INTO meeting_meta (name, requirements, requirements_ts, user_id, "
+                   "created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                   (name, json.dumps(reqs), now, auth.current_user_id(), now, now))
+    return {"ok": True, "requirements": reqs}
+
+
+@app.post("/api/meetings/{name}/memory")
+async def meeting_to_memory(name: str):
+    """Item 8: push the meeting summary into mem0 (user-level, project/client-
+    tagged — business context every agent should recall; mirrors
+    /api/memory/merge, deliberately NOT a specialist scope)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    meta = db.query_one("SELECT * FROM meeting_meta WHERE name=?", (name,)) or {}
+    if not meta.get("summary"):
+        return JSONResponse(status_code=409, content={
+            "error": "summarize the meeting first — the summary is what gets memorized"})
+    uid = auth.current_user_id()
+    client = _derive_client(None, meta.get("project_path"))
+    md = {"user": uid, "source": "meeting-summary", "meeting": name}
+    if meta.get("project_path"):
+        md["project"] = meta["project_path"]
+    if client:
+        md["client"] = client
+    out = await run_in_threadpool(
+        _run_curate, "add", "--text", meta["summary"][:4000],
+        "--metadata", json.dumps(md))
+    if not out.get("ok"):
+        return JSONResponse(status_code=502, content={"error": out.get("error") or "mem0 add failed"})
+    db.log_activity("info", "meetings",
+                    f"Meeting {name} summary added to memory"
+                    + (f" (client {client})" if client else ""), user_id=uid)
+    return {"ok": True}
 
 
 @app.get("/api/meetings/{name}")
@@ -2649,6 +2872,7 @@ async def meeting_delete(name: str):
     if not path.is_file():
         return JSONResponse(status_code=404, content={"error": "not found"})
     await asyncio.to_thread(path.unlink)
+    db.execute("DELETE FROM meeting_meta WHERE name=?", (name,))  # item 8
     return {"ok": True}
 
 
@@ -9310,6 +9534,55 @@ async def models_assign(body: dict):
     return {"ok": True}
 
 
+# ── Notes (item 14): quick per-user notes, optionally pinned to a project ──
+
+@app.get("/api/notes")
+async def notes_list():
+    rows = db.query_all(
+        "SELECT * FROM notes WHERE user_id=? ORDER BY created_at DESC LIMIT 500",
+        (auth.current_user_id(),))
+    return {"notes": rows}
+
+
+@app.post("/api/notes")
+async def notes_add(body: dict):
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "note text required"})
+    nid = f"note-{uuid.uuid4().hex[:10]}"
+    now = time.time()
+    db.execute(
+        "INSERT INTO notes (id, user_id, created_at, updated_at, text, project_path, "
+        "project_name, workflow_id, workflow_name) VALUES (?,?,?,?,?,?,?,?,?)",
+        (nid, auth.current_user_id(), now, now, text[:8000],
+         str(body.get("project_path") or "")[:400] or None,
+         str(body.get("project_name") or "")[:120] or None,
+         str(body.get("workflow_id") or "")[:60] or None,
+         str(body.get("workflow_name") or "")[:120] or None))
+    return {"ok": True, "id": nid}
+
+
+@app.patch("/api/notes/{nid}")
+async def notes_update(nid: str, body: dict):
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "note text required"})
+    cur = db.execute("UPDATE notes SET text=?, updated_at=? WHERE id=? AND user_id=?",
+                     (text[:8000], time.time(), nid, auth.current_user_id()))
+    if cur.rowcount == 0:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return {"ok": True}
+
+
+@app.delete("/api/notes/{nid}")
+async def notes_delete(nid: str):
+    cur = db.execute("DELETE FROM notes WHERE id=? AND user_id=?",
+                     (nid, auth.current_user_id()))
+    if cur.rowcount == 0:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return {"ok": True}
+
+
 # ── Known issues: operator feedback with interaction context (v3.4) ──
 
 @app.get("/api/known-issues")
@@ -9800,17 +10073,104 @@ def _tag_project_owner(path: str, user_id: str | None = None):
                 user_id or auth.current_user_id(), time.time()))
 
 
-def _run_git_action(cwd: str, *cmd: str, timeout: int = 120):
+def _run_git_action(cwd: str, *cmd: str, timeout: int = 120, env: dict | None = None):
     import subprocess
-    r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True,
+                       timeout=timeout, env=env)
     return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-800:]
 
 
-async def _run_git_action_async(cwd: str, *cmd: str, timeout: int = 120):
+async def _run_git_action_async(cwd: str, *cmd: str, timeout: int = 120,
+                                env: dict | None = None):
     """_run_git_action for handlers that must stay `async def` (they await
     something else) — same (code, tail) contract, subprocess off the loop."""
-    code, out, err = await _sp_run_async(list(cmd), cwd=cwd, timeout=timeout)
+    code, out, err = await _sp_run_async(list(cmd), cwd=cwd, timeout=timeout, env=env)
     return code, (out + err).strip()[-800:]
+
+
+# ── Item 9: per-user GitHub identity ──
+# The project owner's PAT (credentials provider 'github', USER row only — no
+# global fallback: an absent PAT means today's machine `gh` auth) + git author.
+# The token travels ONLY via environment (GH_TOKEN + git env-config credential
+# helper): never argv (ps-visible), never .git/config, never the output tail.
+
+def _github_ctx(uid: str | None) -> dict:
+    if not uid:
+        return {}
+    u = db.query_one("SELECT github_username, git_email, display_name, username "
+                     "FROM users WHERE id=?", (uid,)) or {}
+    row = db.query_one("SELECT enc_value FROM credentials WHERE provider='github' "
+                       "AND user_id=?", (uid,))
+    token = None
+    if row:
+        try:
+            token = secrets_store.decrypt(row["enc_value"])
+        except Exception:
+            token = None
+    if not token:
+        return {}
+    return {"token": token,
+            "username": u.get("github_username") or u.get("display_name") or u.get("username") or "nexus",
+            "email": u.get("git_email") or "nexus@local"}
+
+
+def _github_env(ctx: dict, cwd: str | None = None, for_git_push: bool = False) -> dict | None:
+    """Subprocess env for gh/git as the ctx user. None = machine default.
+    for_git_push adds an inline credential helper answering with the PAT —
+    applied ONLY when origin is an https GitHub remote (the helper answers any
+    https host, so a foreign remote must never see the token)."""
+    if not ctx:
+        return None
+    env = {**os.environ, "GH_TOKEN": ctx["token"], "GITHUB_TOKEN": ctx["token"]}
+    if for_git_push and cwd:
+        code, url = _run_git_action(cwd, "git", "remote", "get-url", "origin")
+        if code != 0 or not url.strip().startswith("https://github.com/"):
+            return env  # ssh / foreign remote: keep machine credentials for git itself
+        env.update({
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": "credential.helper",
+            "GIT_CONFIG_VALUE_1":
+                "!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f",
+        })
+    return env
+
+
+@app.patch("/api/users/me/github")
+async def user_set_github(body: dict):
+    """Item 9: self-service GitHub identity (username + git author email).
+    The PAT itself goes through POST /api/credentials (provider 'github')."""
+    uid = auth.current_user_id()
+    gu = str(body.get("github_username") or "").strip()[:80]
+    ge = str(body.get("git_email") or "").strip()[:120]
+    if ge and ("@" not in ge or " " in ge):
+        return JSONResponse(status_code=400, content={"error": "git_email doesn't look like an email"})
+    db.execute("UPDATE users SET github_username=?, git_email=? WHERE id=?",
+               (gu or None, ge or None, uid))
+    return {"ok": True, "github_username": gu, "git_email": ge}
+
+
+@app.get("/api/github/whoami")
+async def github_whoami():
+    """Test the caller's GitHub connection server-side — the PAT never reaches
+    the browser. No PAT set → {fallback: true} (machine gh auth applies)."""
+    ctx = await run_in_threadpool(_github_ctx, auth.current_user_id())
+    if not ctx:
+        return {"ok": True, "fallback": True,
+                "note": "no personal PAT set — publish/push/PR use this machine's gh login"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://api.github.com/user",
+                                 headers={"Authorization": f"Bearer {ctx['token']}",
+                                          "Accept": "application/vnd.github+json"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    if r.status_code != 200:
+        return JSONResponse(status_code=502, content={
+            "error": f"GitHub rejected the token (HTTP {r.status_code}) — check the PAT"})
+    j = r.json()
+    return {"ok": True, "fallback": False, "login": j.get("login"),
+            "scopes": r.headers.get("x-oauth-scopes", "")}
 
 
 _SLUG_RE = r"^[a-z0-9][a-z0-9._-]{0,60}$"
@@ -9840,8 +10200,12 @@ def _create_repo(client: str, name: str, publish: bool):
     with open(os.path.join(root, ".gitignore"), "w") as f:
         f.write("node_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n"
                 ".env\n.worktrees/\n.next/\ncoverage/\n")
+    # Item 9: commits + publish run as the CREATOR's identity when they set one.
+    gctx = _github_ctx(auth.current_user_id())
+    author_name = gctx.get("username") or "nexus"
+    author_email = gctx.get("email") or "nexus@local"
     for cmd in (["git", "init", "-b", "main"], ["git", "add", "-A"],
-                ["git", "-c", "user.name=nexus", "-c", "user.email=nexus@local",
+                ["git", "-c", f"user.name={author_name}", "-c", f"user.email={author_email}",
                  "commit", "-m", f"init: {(client + '/') if client else ''}{name} (created via Nexus)"]):
         code, out = _run_git_action(root, *cmd)
         if code != 0:
@@ -9851,7 +10215,8 @@ def _create_repo(client: str, name: str, publish: bool):
     if publish:
         gh_name = f"{client}-{name}" if client else name
         code, out = _run_git_action(root, "gh", "repo", "create", gh_name,
-                                    "--private", "--source", ".", "--push", timeout=180)
+                                    "--private", "--source", ".", "--push", timeout=180,
+                                    env=_github_env(gctx))
         pub_note = " · published privately to GitHub" if code == 0 else f" · GitHub publish FAILED: {out[-160:]}"
     db.log_activity("info", "system",
                     f"{'Client' if client else 'Personal'} project created: {client + '/' if client else ''}{name}{pub_note}")
@@ -10051,11 +10416,15 @@ def project_publish(body: dict):
     code, out = _run_git_action(p, "git", "remote", "get-url", "origin")
     if code == 0:
         return JSONResponse(status_code=409, content={"error": f"repo already has a remote: {out}"})
+    gctx = _github_ctx(auth.current_user_id())  # item 9: publish as the owner
     code, out = _run_git_action(p, "gh", "repo", "create", name,
-                                "--private", "--source", ".", "--push", timeout=180)
+                                "--private", "--source", ".", "--push", timeout=180,
+                                env=_github_env(gctx))
     if code != 0:
         return JSONResponse(status_code=502, content={"error": f"publish failed: {out}"})
-    db.log_activity("info", "system", f"Published {os.path.basename(p)} to GitHub (private) as {name}")
+    db.log_activity("info", "system",
+                    f"Published {os.path.basename(p)} to GitHub (private) as {name}"
+                    + (" (personal account)" if gctx else ""))
     return {"ok": True, "output": out}
 
 
@@ -10069,8 +10438,10 @@ def project_push(body: dict):
     if code != 0:
         return JSONResponse(status_code=400, content={"error": "no remote — publish to GitHub first"})
     code, branch = _run_git_action(p, "git", "symbolic-ref", "--short", "HEAD")
+    genv = _github_env(_github_ctx(auth.current_user_id()), cwd=p, for_git_push=True)
     code2, out = _run_git_action(p, "git", "push", "-u", "origin",
-                                 branch if code == 0 else "HEAD", "--follow-tags", timeout=180)
+                                 branch if code == 0 else "HEAD", "--follow-tags",
+                                 timeout=180, env=genv)
     if code2 != 0:
         return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
     db.log_activity("info", "system", f"Pushed {os.path.basename(p)} ({branch}) to origin")
@@ -10092,7 +10463,8 @@ def project_tag(body: dict):
     code, out = _run_git_action(p, "git", "tag", "-a", tag, "-m", msg)
     if code != 0:
         return JSONResponse(status_code=409, content={"error": f"tag failed: {out}"})
-    code, rout = _run_git_action(p, "git", "push", "origin", tag, timeout=120)
+    genv = _github_env(_github_ctx(auth.current_user_id()), cwd=p, for_git_push=True)
+    code, rout = _run_git_action(p, "git", "push", "origin", tag, timeout=120, env=genv)
     pushed = code == 0
     db.log_activity("info", "system",
                     f"Tagged {os.path.basename(p)} {tag}" + ("" if pushed else " (local only — no remote)"))
@@ -10137,7 +10509,13 @@ async def task_create_pr(task_id: str):
     if code != 0:
         return JSONResponse(status_code=409,
                             content={"error": "no origin remote — ☁ Publish the project first"})
-    code, out = await _run_git_action_async(repo, "git", "push", "-u", "origin", branch, timeout=180)
+    # Item 9: push + PR as the project owner's GitHub identity (PAT via env
+    # only). _github_env runs a git subprocess — built off the event loop.
+    _uid_pr = auth.current_user_id()
+    genv = await run_in_threadpool(
+        lambda: _github_env(_github_ctx(_uid_pr), cwd=repo, for_git_push=True))
+    code, out = await _run_git_action_async(repo, "git", "push", "-u", "origin", branch,
+                                            timeout=180, env=genv)
     if code != 0:
         return JSONResponse(status_code=502, content={"error": f"push failed: {out}"})
     # PR body: brief + review stats + line-comment audit trail pointer
@@ -10174,7 +10552,7 @@ async def task_create_pr(task_id: str):
         "branch": branch, "base": base, "title": title,
         "bodyfile": bodyfile, "repo": repo})
     try:
-        rcode, rout, rerr = await _sp_run_async(tokens, cwd=repo, timeout=180)
+        rcode, rout, rerr = await _sp_run_async(tokens, cwd=repo, timeout=180, env=genv)
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": f"pr command failed: {str(e)[:200]}"})
     combined = (rout + rerr).strip()
