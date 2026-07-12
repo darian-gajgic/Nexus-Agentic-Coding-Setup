@@ -10319,14 +10319,36 @@ def _project_delete_blocking(path: str, wfs: list[dict], tasks: list[dict],
     import shutil
     notes = []
     if delete_tasks:
+        # A collected task can belong to a FOREIGN workflow (repo_path under
+        # the project, but its pipeline's project_path is NULL/different).
+        # Deleting it would rip a stage out of a DAG the operator never asked
+        # to touch — exclude it, clear its dangling repo link, and say so
+        # (the old code silently skipped it while still counting it as
+        # "deleted"). A dangling workflow_id (row gone) counts as project-own.
+        wf_ids_own = {w["id"] for w in wfs}
+
+        def _foreign(t):
+            wid = t.get("workflow_id")
+            if not wid or wid in wf_ids_own:
+                return False
+            return bool(db.query_one("SELECT 1 FROM workflows WHERE id=?", (wid,)))
+
+        foreign_ids = {t["id"] for t in tasks if _foreign(t)}
+        own = [t for t in tasks if t["id"] not in foreign_ids]
         for w in wfs:
             notes += _cascade_delete_workflow(
-                w, [t for t in tasks if t.get("workflow_id") == w["id"]])
-        for t in tasks:
-            if not t.get("workflow_id") and db.query_one(
+                w, [t for t in own if t.get("workflow_id") == w["id"]])
+        for t in own:
+            if t.get("workflow_id") not in wf_ids_own and db.query_one(
                     "SELECT 1 FROM tasks WHERE id=?", (t["id"],)):
                 _delete_task_row(t, rm_workspace=True)
-        notes.append(f"{len(tasks)} task(s) + {len(wfs)} workflow(s) deleted")
+        notes.append(f"{len(own)} task(s) + {len(wfs)} workflow(s) deleted")
+        for tid in foreign_ids:
+            db.execute("UPDATE tasks SET repo_path=NULL, updated_at=? WHERE id=?",
+                       (time.time(), tid))
+        if foreign_ids:
+            notes.append(f"{len(foreign_ids)} task(s) belong to other pipelines — "
+                         "kept on the board, repo link cleared (their workflows untouched)")
     else:
         # Archival unlink: Nexus forgets the link; board items stay.
         for t in tasks:
