@@ -872,10 +872,31 @@ def _task_dispatch_live(task_id: str) -> bool:
         (task_id, time.time() - 120)))
 
 
+def _sql_like_escape(s: str) -> str:
+    """Escape LIKE metacharacters — pair with ESCAPE '\\' in the query. Without
+    this, a `_` in a project dir name matches ANY character and a delete cascade
+    can hit a sibling path (my_app ↔ my-app)."""
+    return str(s).replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+
+def _trash_path(p: str) -> str:
+    """Reversible delete: move `p` into ~/.nexus-trash (0700) as
+    <basename>-<epoch>, short hex suffix on collision. Restore = move it back.
+    Blocking (shutil.move) — threadpool territory."""
+    import shutil
+    trash = os.path.expanduser("~/.nexus-trash")
+    os.makedirs(trash, mode=0o700, exist_ok=True)
+    dest = os.path.join(trash, f"{os.path.basename(str(p).rstrip(os.sep))}-{int(time.time())}")
+    if os.path.exists(dest):
+        dest += f"-{uuid.uuid4().hex[:4]}"
+    shutil.move(p, dest)
+    return dest
+
+
 def _delete_task_row(task: dict, rm_workspace: bool = False):
     """Hard-delete one task: row + depends_on scrub + pending-approval expiry
-    (+ optionally its workspace dir). Blocking (rmtree) — threadpool for bulk."""
-    import shutil
+    (+ optionally its workspace dir → ~/.nexus-trash, reversible). Blocking —
+    threadpool for bulk."""
     task_id = task["id"]
     db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     # Drop the deleted id from other tasks' depends_on — deps_satisfied is
@@ -891,12 +912,18 @@ def _delete_task_row(task: dict, rm_workspace: bool = False):
             pass
     db.execute(
         "UPDATE approvals SET status='expired', decided_at=?, decided_by='task deleted' "
-        "WHERE status='pending' AND action_type='deliverable' AND payload LIKE ?",
+        "WHERE status='pending' AND action_type IN ('deliverable','super_result') "
+        "AND payload LIKE ?",
         (time.time(), f'%"task_id": "{task_id}"%'))
     if rm_workspace:
         ws = task.get("workspace_path") or str(hd.WORKSPACES / task_id)
-        if ws and Path(ws).resolve().is_relative_to(hd.WORKSPACES.resolve()):
-            shutil.rmtree(ws, ignore_errors=True)
+        try:
+            wsp = Path(ws).resolve()
+            if (wsp.is_relative_to(hd.WORKSPACES.resolve())
+                    and wsp != hd.WORKSPACES.resolve() and wsp.is_dir()):
+                _trash_path(str(wsp))
+        except Exception:
+            pass  # trash move is best-effort; the row is already gone
 
 
 @app.delete("/api/tasks/{task_id}")
@@ -5846,10 +5873,14 @@ def _retry_task(task_id: str, feedback: str | None):
     except Exception:
         pass  # escalation is an optimization — never block the retry itself
     now = time.time()
+    # cancel_requested=NULL: a retry is an explicit restart — a stale stop flag
+    # (⏹ during finalizing, or the immediate-stop race guard) would make the
+    # next dispatch insta-cancel at its entry check. Matches the other restart
+    # doors (update_task→todo, /dispatch, bulk-start).
     db.execute(
         "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
-        "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, retry_feedback=?, "
-        "updated_at=? WHERE id=?",
+        "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, cancel_requested=NULL, "
+        "retry_feedback=?, updated_at=? WHERE id=?",
         (fb[:16000] or None, now, task_id))  # 16000 (§4.8): 25 critic findings ≈ 12.5k+ chars
     # The old deliverable's pending approval is now moot — expire it so the
     # Agentic tab never offers a decision on superseded work. Super Result
@@ -10295,21 +10326,22 @@ def _project_delete_blocking(path: str, wfs: list[dict], tasks: list[dict],
             db.execute("UPDATE workflows SET project_path=NULL WHERE id=?", (w["id"],))
         if tasks or wfs:
             notes.append(f"unlinked {len(tasks)} task(s) / {len(wfs)} workflow(s) — kept on the board")
-    # Scheduler jobs whose template targets the project or its workflows would
-    # re-create work against a ghost — drop them (also drains the known
-    # crashed-gate cron leak for deleted objects).
-    for pat in [path] + [w["id"] for w in wfs]:
-        cur = db.execute("DELETE FROM scheduled_jobs WHERE task_template LIKE ?",
-                         (f"%{pat}%",))
-        if cur.rowcount:
-            notes.append(f"{cur.rowcount} scheduler job(s) referencing {os.path.basename(pat)} removed")
-    db.execute("DELETE FROM project_owners WHERE path=? OR path LIKE ?",
-               (path, path + os.sep + "%"))
+    # Scheduler jobs referencing the project or its workflows would re-create
+    # work against a ghost — drop them (also drains the known crashed-gate cron
+    # leak for deleted objects). Boundary-anchored regex over the columns that
+    # can carry a reference — a bare LIKE '%…%' substring match deleted jobs of
+    # SIBLING projects whose path merely contained this one.
+    path_rx = _re.compile(_re.escape(path) + r"(?=$|[/\s\"'),.;:])")
+    wf_rxs = [_re.compile(_re.escape(w["id"]) + r"(?![0-9a-zA-Z])") for w in wfs]
+    for job in db.query_all("SELECT id, name, action, task_template FROM scheduled_jobs"):
+        text = " ".join(str(job.get(k) or "") for k in ("name", "action", "task_template"))
+        if path_rx.search(text) or any(rx.search(text) for rx in wf_rxs):
+            db.execute("DELETE FROM scheduled_jobs WHERE id=?", (job["id"],))
+            notes.append(f"scheduler job '{job.get('name') or job['id']}' referencing the project removed")
+    db.execute("DELETE FROM project_owners WHERE path=? OR path LIKE ? ESCAPE '\\'",
+               (path, _sql_like_escape(path) + os.sep + "%"))
     if delete_repo == "trash":
-        trash = os.path.expanduser("~/.nexus-trash")
-        os.makedirs(trash, mode=0o700, exist_ok=True)
-        dest = os.path.join(trash, f"{os.path.basename(path)}-{int(time.time())}")
-        shutil.move(path, dest)
+        dest = _trash_path(path)
         notes.append(f"repo moved to {dest} (restore = move it back)")
     elif delete_repo == "purge":
         shutil.rmtree(path, ignore_errors=True)
@@ -10338,13 +10370,14 @@ async def project_delete(body: dict):
     delete_repo = body.get("delete_repo")
     if delete_repo not in ("trash", "purge", None):
         return JSONResponse(status_code=400, content={"error": "delete_repo must be 'trash', 'purge' or null"})
+    like_path = _sql_like_escape(path) + os.sep + "%"
     wfs = db.query_all(
-        "SELECT * FROM workflows WHERE project_path=? OR project_path LIKE ?",
-        (path, path + os.sep + "%"))
+        "SELECT * FROM workflows WHERE project_path=? OR project_path LIKE ? ESCAPE '\\'",
+        (path, like_path))
     wf_ids = [w["id"] for w in wfs]
     tasks = db.query_all(
-        "SELECT * FROM tasks WHERE repo_path=? OR repo_path LIKE ?",
-        (path, path + os.sep + "%"))
+        "SELECT * FROM tasks WHERE repo_path=? OR repo_path LIKE ? ESCAPE '\\'",
+        (path, like_path))
     seen = {t["id"] for t in tasks}
     for wid in wf_ids:
         tasks += [t for t in db.query_all("SELECT * FROM tasks WHERE workflow_id=?", (wid,))
@@ -10423,7 +10456,7 @@ def project_history(path: str):
     p = _visible_repo_path(path)
     if not p:
         return JSONResponse(status_code=400, content={"error": "not a git repository under your home"})
-    like_p = p.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    like_p = _sql_like_escape(p)
     tasks = db.query_all(
         "SELECT id, title, status, workflow_id, created_at, completed_at, client "
         "FROM tasks WHERE (repo_path = ? OR repo_path LIKE ? ESCAPE '\\') AND user_id = ? "
