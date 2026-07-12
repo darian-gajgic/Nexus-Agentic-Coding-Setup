@@ -33,14 +33,8 @@ sys.path.insert(0, str(APP))
 sys.path.insert(0, str(APP / "scripts"))
 import os  # noqa: E402
 
-# hermes_dispatch.create_session needs API_SERVER_KEY — same loader as worker.py
-for _env_path in [os.path.expanduser("~/.hermes/.env"), ".env"]:
-    if os.path.exists(_env_path):
-        for _line in open(_env_path):
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+from _gate_common import load_env  # noqa: E402
+load_env()  # hermes_dispatch.create_session needs API_SERVER_KEY
 
 import auth  # noqa: E402
 import database as db  # noqa: E402

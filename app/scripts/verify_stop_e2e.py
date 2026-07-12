@@ -26,19 +26,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-# hermes_dispatch.create_session needs API_SERVER_KEY — same loader as worker.py
-for _env_path in [os.path.expanduser("~/.hermes/.env"), ".env"]:
-    if os.path.exists(_env_path):
-        for _line in open(_env_path):
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+from _gate_common import load_env, preclean_probe_user  # noqa: E402
+load_env()
 
 import database as db          # noqa: E402
 import auth                    # noqa: E402
 import hermes_dispatch as hd   # noqa: E402
-import worktree as wt          # noqa: E402
 
 BASE = "https://127.0.0.1:8777"
 PASS = FAIL = 0
@@ -68,6 +61,7 @@ def mk_task(uid, **kw):
 
 
 ADMIN_PW = "probe-" + _secrets.token_urlsafe(9)
+preclean_probe_user(db, auth, "probe-stop-admin")  # a hard-killed prior run leaves the row
 admin_u, err = auth.create_user("probe-stop-admin", "Probe Stop Admin", ADMIN_PW, role="admin")
 assert admin_u, err
 UID = admin_u["id"]
