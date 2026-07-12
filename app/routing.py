@@ -241,7 +241,14 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
     """(model_id, plain-language reason) or (None, None) = leave NULL (the
     dispatch default). Explicit human/wizard model choices always win upstream;
     dev-pipeline specialists are skipped (their floor is authoritative);
-    high-stakes tasks are never routed below the 'complicated' default."""
+    high-stakes tasks are never routed below the 'complicated' default.
+
+    Mode-coherence fix I-2 (2026-07-12b): the spend profile composes here —
+    'eco' floors non-critical work to the light tier (the rule-3 semantics the
+    wizard applies via _clamp_wizard_task, now also on direct creates) and
+    suppresses description-upgrades; 'smart' never routes below the default.
+    Quality protection for eco is the judge + the retry escalation (cascade),
+    not pre-spend."""
     import re as _re
     global _MECHANICAL_RE
     if db.get_setting("models.auto_route", "1") != "1":
@@ -250,6 +257,7 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
         return None, None
     if (task.get("specialist") or "") in _DEV_SPECIALISTS:
         return None, None
+    spend = (task.get("spend_profile") or "").strip()
     title = str(task.get("title") or "")
     desc = str(task.get("description") or "")
     text = f"{title} {desc}"
@@ -266,6 +274,8 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
             base_purpose = "mechanical"
         elif len(text.strip()) < 160 and (task.get("domain") or "general") == "general":
             base_purpose = "easy"
+        elif spend == "eco":
+            base_purpose = "easy"  # rule-3 floor for direct creates
     base_row = db.resolve_assignment(uid, base_purpose)
     base_model = (base_row or {}).get("model_id")
     base_reason = None
@@ -274,8 +284,17 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
         base_reason = (f"auto-routed to {base_model}: the task looks mechanical "
                        f"(\"{kw}\") — change the model on the task to override")
     elif base_purpose == "easy" and base_model:
-        base_reason = (f"auto-routed to {base_model}: short, simple brief with no "
-                       "domain — change the model on the task to override")
+        base_reason = ((f"auto-routed to {base_model}: Eco profile — non-critical work "
+                        "runs on the light tier and escalates only if the judge sends "
+                        "it back — change the model or the profile to override")
+                       if spend == "eco" else
+                       (f"auto-routed to {base_model}: short, simple brief with no "
+                        "domain — change the model on the task to override"))
+    if spend == "eco" and base_purpose != "complicated":
+        # Eco: the cheap tier IS the choice — no description-upgrades.
+        if base_model and base_model in allowed:
+            return base_model, base_reason
+        return None, None
 
     # Description override: score every enabled hermes model's "Best for"
     # phrases against the task text; any "Avoid for" match vetoes the model.
@@ -294,14 +313,17 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
         if len(hits) > best_score:
             best_model, best_score, best_phrase = m["model_id"], len(hits), hits[0]
     if best_model and best_score >= 1:
-        # High-stakes work may only route to the default 'complicated' model or
-        # a description-matched model that IS that default — never downgraded.
-        if task.get("high_stakes") and best_model != default_hard:
+        # High-stakes work — and the 'smart' profile — may only route to the
+        # default 'complicated' model or a description-matched model that IS
+        # that default: never downgraded below the strong tier.
+        if (task.get("high_stakes") or spend == "smart") and best_model != default_hard:
             return None, None
         if best_model != (base_model or default_hard):
             return best_model, (f"auto-routed to {best_model}: its description lists "
                                 f"\"{best_phrase}\" under Best for, matching this task — "
                                 "change the model on the task to override")
+    if spend == "smart":
+        return None, None  # smart = maximum quality: never below the strong default
     if base_purpose != "complicated" and base_model and base_model in allowed:
         return base_model, base_reason
     return None, None

@@ -778,3 +778,31 @@ mechanics themselves (claiming, watchdog, approvals, cost, worktrees, scheduler)
 - New gates: `verify_stop_e2e.py` (31), `verify_phase_c_e2e.py` (24); Phase-D smoke in
   session scratch. All pre-existing gates stay green (452-check verify.sh, agentic 32,
   v3_ui 24, block2 48, block3 33, feedback 32).
+
+### Mode coherence (2026-07-12b — Eco/Balanced/Smart audit fixes)
+- **Rule-4 budgets are now mode × TYPE**: `autopilot.preset_fields(..., deliverable_type)`
+  scales the per-type baseline (`dispatch.default_budget.<type>`, content 2M) before the
+  ×0.5/1/2 multiplier → eco/Balanced/smart content = **1M/2M/4M** (code/untyped stays
+  2.5M/5M/10M). `_retry_task`'s budget slice honors the same per-type baseline.
+- **The cascade is complete** (`dispatch.escalate_on_revise`, default on): a light-tier
+  attempt (easy/mechanical models) that the judge REVISEs retries on the 'complicated'
+  tier — cheap first, strong model only when verification fails (FrugalGPT/AutoMix
+  pattern). Never high-stakes/dev tasks; bounded by the per-mode round caps; reason
+  recorded in `tasks.model_reason`.
+- **Routing composes with the mode** (`routing.select_model_for_task`): `eco` floors
+  non-critical direct-created tasks to the light tier (rule-3 semantics, previously
+  wizard-only) and suppresses description-upgrades; `smart` never routes below the strong
+  default (same guard as high_stakes).
+- **Per-task spend suggestion** (`plan_engine.recommend_spend`, in the triage payload as
+  `recommend_spend`/`spend_reasons`): deterministic — blast-radius or complexity ≥6 →
+  smart; short/simple/single-artifact → eco; else optimal. The wizard preselects the card
+  with a 🧭 hint; the user overrides by clicking another card. Plain API creates keep
+  `autopilot.default_spend`.
+- **Deliberately mode-blind (documented, not bugs)**: compression (global 0.35 — quality
+  modes differ in VERIFICATION depth, not context fidelity; brief+tail always protected;
+  summarizer stays glm-5.2, the only tier whose 1M window holds big compaction inputs),
+  `model.effort.*` (mode-correlated through model choice: light tiers medium, glm-5.2
+  xhigh), `dispatch.turn_seconds.*` (latency guards — cut runs detach + harvest).
+- **Honest labeling**: 'Balanced — best value' is a HEURISTIC until the deferred Phase-8
+  benchmark (`benchmarks/added-value/`) is run; the Eco card carries the same caveat.
+  Gate: `scripts/verify_mode_coherence_e2e.py`.

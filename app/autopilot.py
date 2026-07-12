@@ -47,14 +47,21 @@ def norm_spend(v) -> str:
 
 
 def preset_fields(autopilot, spend, high_stakes: bool = False,
-                  explicit_budget: int | None = None):
+                  explicit_budget: int | None = None,
+                  deliverable_type: str | None = None):
     """Q7a/D5: normalise the two preset axes and apply the budget multiplier
     (rule 4). Returns (involvement|None, spend|None, effective_budget). NULL
     axes = legacy behaviour (P10b): no derivation, explicit budget untouched.
     THE shared derivation for every task-creation door — the API create path
     (server._autopilot_fields delegates here) AND scheduler._trigger's B4
     template jobs — so the rule-4 hard cost backstop moves with the spend axis
-    everywhere a task is born."""
+    everywhere a task is born.
+
+    Mode-coherence fix I-1 (2026-07-12b): the multiplier scales the PER-TYPE
+    baseline (dispatch.default_budget.<type>, e.g. content 2M) when one exists,
+    falling back to the global default — previously it always scaled the global
+    5M, so an Eco CONTENT task got 2.5M, ABOVE the 2M content cap the profile
+    was supposed to be under. Now: eco/optimal/smart content = 1M/2M/4M."""
     import database as db
     inv = norm_involvement(autopilot) if (autopilot or "").strip() else None
     sp = norm_spend(spend) if (spend or "").strip() else None
@@ -62,6 +69,15 @@ def preset_fields(autopilot, spend, high_stakes: bool = False,
     if sp and explicit_budget is None:
         try:
             base = int(db.get_setting("dispatch.default_task_budget", "5000000") or 5000000)
+            dtype = (deliverable_type or "").strip()
+            if dtype:
+                try:
+                    import settings_registry as sreg
+                    tv = sreg.conf(f"dispatch.default_budget.{dtype}")
+                    if tv:
+                        base = int(float(tv))
+                except (TypeError, ValueError):
+                    pass
             budget = derive(inv, sp, high_stakes=bool(high_stakes), base_budget=base)["budget"]
         except Exception:
             budget = explicit_budget

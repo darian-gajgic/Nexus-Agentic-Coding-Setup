@@ -397,11 +397,15 @@ def _derive_client(client, repo_path):
 
 
 def _autopilot_fields(autopilot, spend_profile, high_stakes: bool,
-                      explicit_budget: Optional[int]):
+                      explicit_budget: Optional[int],
+                      deliverable_type: Optional[str] = None):
     """Q7a rule-4 derivation — delegates to autopilot.preset_fields (D5), the
-    single implementation shared with scheduler._trigger's B4 template jobs."""
+    single implementation shared with scheduler._trigger's B4 template jobs.
+    deliverable_type makes the rule-4 multiplier scale the per-type budget
+    baseline (mode-coherence fix I-1)."""
     import autopilot as _ap
-    return _ap.preset_fields(autopilot, spend_profile, high_stakes, explicit_budget)
+    return _ap.preset_fields(autopilot, spend_profile, high_stakes, explicit_budget,
+                             deliverable_type)
 
 
 class TaskUpdate(BaseModel):
@@ -690,7 +694,8 @@ async def create_task(body: TaskCreate):
         return JSONResponse(status_code=400, content={
             "error": f"deliverable_type must be one of {list(_DELIVERABLE_TYPES)}"})
     ap_inv, ap_spend, budget = _autopilot_fields(body.autopilot, body.spend_profile,
-                                                 body.high_stakes, body.budget_tokens)
+                                                 body.high_stakes, body.budget_tokens,
+                                                 body.deliverable_type)
     # Item 15: description-informed auto-routing at the single create choke
     # point (covers manual create, wizard proposals, follow-ups). An explicit
     # model in the body always wins; the reason is stored for the task detail.
@@ -701,7 +706,8 @@ async def create_task(body: TaskCreate):
             "title": body.title, "description": body.description,
             "domain": body.domain, "specialist": body.specialist,
             "deliverable_type": body.deliverable_type,
-            "high_stakes": body.high_stakes, "model": None}, uid)
+            "high_stakes": body.high_stakes, "model": None,
+            "spend_profile": ap_spend}, uid)  # I-2: the mode composes with routing
         if task_model and task_model not in db.task_models_for(uid):
             task_model, model_reason = None, None
     tid = f"task-{uuid.uuid4().hex[:8]}"
@@ -5796,16 +5802,49 @@ def _retry_task(task_id: str, feedback: str | None):
     # LIFETIME tokens_used, so without extending it, any task at/over budget
     # re-blocks instantly (observed: a rejected 10.4M-token implement task
     # could never rework). Grant the new attempt one budget-slice of headroom.
+    # Mode-coherence (2026-07-12b): the slice honors the per-type baseline
+    # (content 2M) so a content task extends 2M at a time, not the global 5M.
     default_budget = int(db.get_setting("dispatch.default_task_budget", "5000000"))
-    slice_ = int(task.get("budget_tokens") or default_budget)
+    type_default = hd._type_setting("dispatch.default_budget", task, default_budget)
+    slice_ = int(task.get("budget_tokens") or type_default)
     used = int(task.get("tokens_used") or 0)
-    effective = int(task.get("budget_tokens") or default_budget)
+    effective = int(task.get("budget_tokens") or type_default)
     if effective - used < slice_:  # less than one attempt's headroom left
         db.execute("UPDATE tasks SET budget_tokens=? WHERE id=?",
                    (used + slice_, task_id))
         db.log_activity("info", "system",
                         f"Task {task_id}: budget extended to {used + slice_:,} "
                         "for the retry attempt")
+    # Cascade completion (2026-07-12b, mode-coherence gap a): a LIGHT-TIER
+    # attempt the judge sent back gets its retry on the strong tier — "cheap
+    # first, strong model only when verification fails" (the FrugalGPT/AutoMix
+    # pattern that actually buys quality-per-$). Never touches high-stakes or
+    # dev-pipeline tasks (their tiers are pinned elsewhere); kill switch
+    # dispatch.escalate_on_revise.
+    try:
+        if db.get_setting("dispatch.escalate_on_revise", "1") == "1" \
+                and task.get("judge_verdict") in ("REVISE", "REWRITE") \
+                and not task.get("high_stakes") \
+                and (task.get("specialist") or "") not in _DEV_SPECIALISTS \
+                and task.get("model"):
+            uid_esc = task.get("user_id")
+            light = {m for m in (
+                (_purpose_model(uid_esc, "easy") or ""),
+                (_purpose_model(uid_esc, "mechanical") or "")) if m}
+            hard = _purpose_model(uid_esc, "complicated") or db.fallback_model("complicated")
+            if task["model"] in light and hard and task["model"] != hard \
+                    and hard in db.task_models_for(uid_esc):
+                db.execute("UPDATE tasks SET model=?, model_reason=? WHERE id=?",
+                           (hard, f"escalated to {hard} after the judge sent the "
+                                  "light-tier attempt back — cheap first, strong "
+                                  "model when verification fails", task_id))
+                db.log_activity("info", "system",
+                                f"Task {task_id}: retry escalated {task['model']} → {hard} "
+                                "(judge REVISE on a light-tier attempt)",
+                                user_id=uid_esc)
+                task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    except Exception:
+        pass  # escalation is an optimization — never block the retry itself
     now = time.time()
     db.execute(
         "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "

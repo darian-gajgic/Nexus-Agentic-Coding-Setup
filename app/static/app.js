@@ -3853,7 +3853,7 @@ function updateDerivedPref(prefix) {
 // manual change flips the label to "customized (based on <preset>)". The
 // derived quality/speed preference shows read-only under Advanced (rule 1).
 const AUTOPILOT_DEFAULTS = { involvement: 'assisted', spend: 'optimal' };
-function autopilotCardsHTML(prefix, inv, spend) {
+function autopilotCardsHTML(prefix, inv, spend, spendHint) {
   inv = inv || AUTOPILOT_DEFAULTS.involvement;
   spend = spend || AUTOPILOT_DEFAULTS.spend;
   const card = (name, val, icon, title, body, checked) => `
@@ -3873,10 +3873,11 @@ function autopilotCardsHTML(prefix, inv, spend) {
     <div class="ap-axis" data-help="autopilot-spend" style="margin-top:8px" onchange="updateDerivedPref('${prefix}')">
       <div style="font-size:11.5px;font-weight:600;margin-bottom:4px">How much should this cost? <span class="qmark" data-help="autopilot-spend" title="Click for a plain-language explainer">?</span></div>
       <div style="display:flex;gap:7px">
-        ${card('spend', 'eco', '🌱', 'Eco', 'Cheapest that still works — fewest rounds, no fan-out, lean pipeline. ~½ the fuel. (Heuristic — not yet benchmark-validated.)', spend === 'eco')}
-        ${card('spend', 'optimal', '⚖', 'Balanced', 'Best result per fuel — checking scaled to the stakes. The sensible default.', spend === 'optimal')}
-        ${card('spend', 'smart', '🧠', 'Smart', 'Spare no fuel — maximum checking, fan-out, the works. ~2× the fuel.', spend === 'smart')}
+        ${card('spend', 'eco', '🌱', 'Eco', 'Cheapest that still works — fewest rounds, no fan-out, lean pipeline, light model tier (a failed check escalates automatically). ~½ the fuel. (Heuristic — not yet benchmark-validated.)', spend === 'eco')}
+        ${card('spend', 'optimal', '⚖', 'Balanced', 'Best value — checking scaled to the stakes. The sensible default. (Heuristic — Phase-8 benchmark pending.)', spend === 'optimal')}
+        ${card('spend', 'smart', '🧠', 'Smart', 'Spare no fuel — maximum checking, fan-out, the works, never below the strong model tier. ~2× the fuel.', spend === 'smart')}
       </div>
+      ${spendHint ? `<div class="form-hint" id="${prefix}-spend-hint" style="margin-top:4px">🧭 Suggested for this goal: ${spendHint} — click a different card to override.</div>` : ''}
     </div>
     <details style="margin-top:8px">
       <summary style="cursor:pointer;font-size:11.5px;color:var(--text-dim)">Advanced — raw knobs (for professionals)</summary>
@@ -10486,6 +10487,20 @@ function applyWizardTask(t, meta) {
       }
       ssel.value = t.specialist;
     }
+    // I-4: preselect the triage-suggested spend profile (user just clicks another card).
+    const trec = meta && meta.triage && meta.triage.recommend_spend;
+    if (trec) {
+      const radio = document.querySelector(`input[name="m-task-spend"][value="${trec}"]`);
+      if (radio && !document.querySelector('input[name="m-task-spend"]:checked')?.dataset?.userSet) {
+        radio.checked = true;
+        if (typeof updateDerivedPref === 'function') updateDerivedPref('m-task');
+        const axis = radio.closest('.ap-axis');
+        if (axis && !axis.querySelector('.spend-rec-hint')) {
+          axis.insertAdjacentHTML('beforeend',
+            `<div class="form-hint spend-rec-hint" style="margin-top:4px">🧭 Suggested for this goal: <b>${{ eco: '🌱 Eco', optimal: '⚖ Balanced', smart: '🧠 Smart' }[trec] || trec}</b> · ${esc(((meta.triage.spend_reasons || [])[0]) || '')} — click a different card to override.</div>`);
+        }
+      }
+    }
     toast('Review the plan — fill any [brackets], then Create', 'ok');
   }, 250);
 }
@@ -10815,7 +10830,13 @@ function proposeWorkflowModal(wf, meta) {
     </div>
     <div class="form-group" style="margin-top:8px">
       <label class="form-label">🎚 Autopilot — how hands-on, and how much to spend</label>
-      ${autopilotCardsHTML('wf', wf.autopilot, wf.spend_profile)}
+      ${(() => {
+        // I-4: triage suggests the spend profile per goal — preselected, overridable.
+        const tt = (meta && meta.triage) || {};
+        const rec = !wf.spend_profile && !wizardCtx.spend_profile ? tt.recommend_spend : null;
+        const hint = rec ? `<b>${{ eco: '🌱 Eco', optimal: '⚖ Balanced', smart: '🧠 Smart' }[rec] || rec}</b> · ${esc((tt.spend_reasons || [])[0] || '')}` : null;
+        return autopilotCardsHTML('wf', wf.autopilot, wf.spend_profile || wizardCtx.spend_profile || rec, hint);
+      })()}
     </div>
     <div class="form-group" style="margin-top:8px">
       <label class="form-label">🔁 Looping — automatic improve-and-recheck rounds</label>
