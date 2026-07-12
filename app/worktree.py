@@ -126,6 +126,23 @@ def snapshot_commit(wt_path: str, message: str) -> bool:
     return code == 0
 
 
+def changed_files(wt_path: str, base: str) -> list[tuple[str, str]]:
+    """(status, path) of every file ADDED/MODIFIED on the branch vs the
+    baseline (three-dot, junk excluded). Deletions are excluded on purpose —
+    this feeds the deliverable-artifact surfacing (item 1), where only files
+    that EXIST on the branch matter."""
+    code, out = _run_git(wt_path, "diff", "--name-status", "--diff-filter=AM",
+                         f"{base}...HEAD", "--", ".", *_JUNK_PATHSPECS)
+    if code != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1].strip():
+            rows.append((parts[0].strip(), parts[1].strip()))
+    return rows
+
+
 def capture_diff(wt_path: str, base: str) -> str:
     """The pipeline's real deliverable: everything the branch changed vs the
     baseline (three-dot = since the merge-base, immune to base moving on).

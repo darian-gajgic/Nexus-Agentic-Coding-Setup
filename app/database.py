@@ -285,6 +285,10 @@ def init_db():
         # can show a task's total $ across BOTH currencies. Not a bill — a compare.
         ("frontier_tokens", "INTEGER DEFAULT 0"),
         ("frontier_cost_usd", "REAL DEFAULT 0"),
+        # Operator stop (item 5, 2026-07-12): timestamp of a stop request. The
+        # executor polls it between SSE events and aborts; run_task_dispatch
+        # re-checks it before spending. Cleared on explicit re-dispatch.
+        ("cancel_requested", "REAL"),
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -442,6 +446,12 @@ def init_db():
         # per-model slot accounting groups by it; tasks.model is only the
         # pre-fallback intent and under-counts the fallback pool.
         conn.execute("ALTER TABLE dispatches ADD COLUMN model TEXT")
+    if "run_id" not in existing_disp_cols:
+        # Item 5 (stop): the upstream Hermes run id, captured from the first
+        # SSE run.started event — lets the stop endpoint attempt a real
+        # /v1/runs/{id}/stop abort (effective once the session-run-stop
+        # core-mod ships) and audits which run served this dispatch.
+        conn.execute("ALTER TABLE dispatches ADD COLUMN run_id TEXT")
 
     # ===== Multi-user migration (Block 1, additive — docs/SPEC-MULTIUSER.md) =====
     # user_id on the per-user tables; NULL on activity = system-wide row.

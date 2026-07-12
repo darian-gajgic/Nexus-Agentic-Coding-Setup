@@ -24,6 +24,7 @@ anchors in SPEC-REAL-AGENTS.md §1):
 import os
 import re
 import json
+import shutil
 import time
 import uuid
 import datetime as dt
@@ -76,6 +77,11 @@ class QuotaError(Exception):
 class GatewayBusyError(Exception):
     """The Hermes gateway is up but saturated (heavy concurrent turns) —
     transient; callers should surface 'busy, try again shortly', not a 502."""
+
+
+class DispatchCancelled(Exception):
+    """Operator pressed stop (tasks.cancel_requested set) — the executor aborts
+    the streaming turn and finalizes as cancelled instead of failed."""
 
 
 def _headers() -> dict:
@@ -924,7 +930,10 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
                 "branding, decisions already made). Place deliverable files in sensible "
                 "folders inside the project.\n"
                 "- Do not modify previously delivered material unless the goal says so — "
-                "add new versions alongside.\n")
+                "add new versions alongside.\n"
+                f"- ALSO copy every final deliverable FILE (pptx/docx/pdf/png/…) into "
+                f"{workspace}/ next to deliverable.md — the operator's Deliverables view "
+                "reads that folder; the project keeps its own copy on the branch.\n")
         common_tail = (
             "- COMMIT your work on the branch in clear, scoped commits (git add/commit in "
             "the worktree). Never push, never merge, never switch branches.\n"
@@ -1177,31 +1186,63 @@ def _make_on_event(dispatch_id: str, task_id: str, agent_id: str):
     def on_event(name, data):
         # Telemetry only: a transient SQLite error (locked/busy under load)
         # must never abort the live SSE stream it decorates — the next event
-        # retries the same writes anyway.
+        # retries the same writes anyway. Exception: the cancel poll below
+        # RAISES on purpose to abort the stream.
         now = time.time()
+        cancel = False
         try:
             if now - preview["last_write"] > 2.0:
                 db.execute("UPDATE agents SET last_heartbeat=? WHERE id=?", (now, agent_id))
                 db.execute("UPDATE dispatches SET heartbeat_at=? WHERE id=?", (now, dispatch_id))
                 preview["last_write"] = now
-            if name == "_line" or data is None:
-                return
-            if name == "assistant.delta":
-                preview["buf"] = (preview["buf"] + (data.get("delta") or ""))[-200:]
-                tail = " ".join(preview["buf"].split())[-70:]
-                db.execute("UPDATE agents SET current_task=? WHERE id=?",
-                           (f"{task_id}: …{tail}", agent_id))
-            elif name == "tool.completed":
-                db.log_activity("info", agent_id,
-                                f"[{task_id}] tool {data.get('tool_name') or data.get('tool') or '?'} done",
-                                user_id=_task_user(task_id))
-            elif name == "run.started":
-                db.log_activity("info", agent_id, f"[{task_id}] Hermes run started",
-                                user_id=_task_user(task_id))
+                # Item 5 (stop): keepalives arrive ~30s apart even during
+                # silent tool calls, so this bounds stop latency to ~30s.
+                row = db.query_one("SELECT cancel_requested FROM tasks WHERE id=?", (task_id,))
+                cancel = bool(row and row.get("cancel_requested"))
+            if not cancel:
+                if name == "_line" or data is None:
+                    return
+                if name == "assistant.delta":
+                    preview["buf"] = (preview["buf"] + (data.get("delta") or ""))[-200:]
+                    tail = " ".join(preview["buf"].split())[-70:]
+                    db.execute("UPDATE agents SET current_task=? WHERE id=?",
+                               (f"{task_id}: …{tail}", agent_id))
+                elif name == "tool.completed":
+                    db.log_activity("info", agent_id,
+                                    f"[{task_id}] tool {data.get('tool_name') or data.get('tool') or '?'} done",
+                                    user_id=_task_user(task_id))
+                elif name == "run.started":
+                    if isinstance(data, dict) and data.get("run_id"):
+                        db.execute("UPDATE dispatches SET run_id=? WHERE id=?",
+                                   (str(data["run_id"])[:80], dispatch_id))
+                    db.log_activity("info", agent_id, f"[{task_id}] Hermes run started",
+                                    user_id=_task_user(task_id))
         except Exception:
             pass
+        if cancel:
+            raise DispatchCancelled(f"stop requested for {task_id}")
 
     return on_event
+
+
+def _finalize_cancel(dispatch_id: str, task_id: str, agent_id: str):
+    """Operator stop (item 5): close the dispatch as 'cancelled' and park the
+    task back in Backlog, unclaimed. session_id is dropped ON PURPOSE — the
+    orphaned upstream run (if any) must never be waited on or harvested (the
+    operator said stop), and the next dispatch starts fresh."""
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if task and task.get("session_id"):
+        remove_session_key(task["session_id"])
+    _set_dispatch(dispatch_id, state="cancelled", ended_at=time.time(),
+                  error="stopped by operator")
+    _set_task(task_id, status="backlog", dispatch_state="cancelled",
+              claimed_by=None, claimed_at=None, session_id=None,
+              cancel_requested=None, dispatch_error=None)
+    db.log_activity("warn", agent_id,
+                    f"Task {task_id} stopped by operator — returned to Backlog",
+                    user_id=_task_user(task_id))
+    if task:
+        notify_desktop("Nexus: task stopped ⏹", f"{task['title']} — back in Backlog")
 
 
 def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: Path,
@@ -1392,6 +1433,47 @@ def _turn_cut_count(task_id: str) -> int:
     return int((row or {}).get("n") or 0)
 
 
+# Item 1: non-code artifact files (a .pptx, a PDF report, images…) created on
+# a task branch ARE the user-facing deliverable for content-in-repo tasks —
+# but the Deliverables UI reads only the workspace. Mirror them there.
+ARTIFACT_EXTS = {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".odp", ".ods",
+                 ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+                 ".mp3", ".wav", ".mp4", ".zip", ".csv", ".epub"}
+ARTIFACT_MAX_BYTES = 50 * 1024 * 1024
+ARTIFACT_MAX_FILES = 20
+
+
+def _copy_branch_artifacts(repo_ctx: dict, workspace: Path, agent_id: str, task_id: str):
+    """Mirror artifact-type files added/changed on the task branch into
+    workspace/artifacts/ so the existing deliverables plumbing (list, download,
+    preview, primary-output chip) sees them. Best-effort — never fails a
+    finalize."""
+    try:
+        rows = wt.changed_files(repo_ctx["worktree"], repo_ctx["base"])
+        copied = 0
+        for _status, rel in rows:
+            if copied >= ARTIFACT_MAX_FILES:
+                db.log_activity("warn", agent_id,
+                                f"Task {task_id}: artifact copy capped at {ARTIFACT_MAX_FILES} files")
+                break
+            if Path(rel).suffix.lower() not in ARTIFACT_EXTS:
+                continue
+            src = Path(repo_ctx["worktree"]) / rel
+            if not src.is_file() or src.stat().st_size > ARTIFACT_MAX_BYTES:
+                continue
+            dest = workspace / "artifacts" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            copied += 1
+        if copied:
+            db.log_activity("info", agent_id,
+                            f"Task {task_id}: captured {copied} artifact file(s) "
+                            f"from branch {repo_ctx['branch']} into the workspace")
+    except Exception as e:
+        db.log_activity("warn", agent_id,
+                        f"Task {task_id}: artifact copy failed: {str(e)[:100]}")
+
+
 def _capture_repo_result(task: dict, workspace: Path, agent_id: str,
                          repo_ctx: dict | None = None):
     """The branch diff IS the deliverable for repo tasks: snapshot anything the
@@ -1413,6 +1495,7 @@ def _capture_repo_result(task: dict, workspace: Path, agent_id: str,
         db.log_activity("info", agent_id,
                         f"Task {task_id}: captured branch diff "
                         f"({len(diff.splitlines())} lines) from {repo_ctx['branch']}")
+        _copy_branch_artifacts(repo_ctx, workspace, agent_id, task_id)
     except Exception as e:
         db.log_activity("error", agent_id,
                         f"Task {task_id}: diff capture failed: {str(e)[:100]}")
@@ -1464,6 +1547,11 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
     if not task or not agent:
         _set_dispatch(dispatch_id, state="failed", ended_at=time.time(),
                       error="task or agent vanished before dispatch")
+        return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
+    if task.get("cancel_requested"):
+        # Stop arrived between claim and execution (or before a resume) —
+        # honor it before spending anything.
+        _finalize_cancel(dispatch_id, task_id, agent_id)
         return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
     run_model = fallback_model or resolve_task_model(task)
@@ -1601,12 +1689,23 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             # Fresh dispatch, OR a "resume" whose session never heard the brief
             # (worker died before/at the first turn) — send the FULL brief.
             input_text = f"{task['title']}\n\n{task.get('description') or ''}".strip()
-        result = stream_turn(session_id, input_text, system_message=framing, on_event=on_event,
-                             max_seconds=int(db.get_setting("dispatch.max_turn_seconds",
-                                                            str(DEFAULT_MAX_TURN_SECONDS))),
-                             stall_seconds=int(db.get_setting(
-                                 "dispatch.max_turn_stall_seconds",
-                                 str(DEFAULT_TURN_STALL_SECONDS))))
+        if db.get_setting("dispatch.stub_stream") == "1":
+            # Gate-only knob (verify_stop_e2e): a synthetic keepalive loop —
+            # the cancel poll in on_event fires exactly as on a real stream.
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                on_event("_line", None)
+                time.sleep(1)
+            result = {"content": "stubbed deliverable (dispatch.stub_stream)",
+                      "usage": {}, "error": None, "partial": False}
+        else:
+            result = stream_turn(session_id, input_text, system_message=framing,
+                                 on_event=on_event,
+                                 max_seconds=int(db.get_setting("dispatch.max_turn_seconds",
+                                                                str(DEFAULT_MAX_TURN_SECONDS))),
+                                 stall_seconds=int(db.get_setting(
+                                     "dispatch.max_turn_stall_seconds",
+                                     str(DEFAULT_TURN_STALL_SECONDS))))
 
         if is_turn_cut(result.get("error")):
             # The turn outlived its guard but the RUN is still alive upstream
@@ -1661,6 +1760,12 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         _set_dispatch(dispatch_id, state="blocked_quota", ended_at=time.time(), error=str(e)[:300])
         db.log_activity("warn", agent_id, f"Task {task_id} blocked by quota — backoff {backoff}s",
                         user_id=_task_user(task_id))
+    except DispatchCancelled:
+        # Operator stop mid-stream: snapshot whatever the agent already wrote
+        # on the branch (repo tasks) so no work is lost, then park in Backlog.
+        if task.get("repo_path"):
+            _capture_repo_result(task, workspace, agent_id)
+        _finalize_cancel(dispatch_id, task_id, agent_id)
     except Exception as e:
         _set_task(task_id, dispatch_state="failed", dispatch_error=str(e)[:300])
         _set_dispatch(dispatch_id, state="failed", ended_at=time.time(), error=str(e)[:300])
