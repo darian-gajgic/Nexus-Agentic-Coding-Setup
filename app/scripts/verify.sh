@@ -520,6 +520,12 @@ chk "D3b: drain busy + boot heal cover 'escalating'" "grep -q \"critic_verdict I
 chk "D3a: drain-harvest resume path in the worker" "grep -q 'dispatch_on or mode == .resume.' worker.py && grep -q 'orphan_run_state(task) != .finished.' worker.py"
 chk "D3c: prepare/cancel serialized" "grep -q '_RESTART_PREP_LOCK = threading.Lock()' server.py && [ \$(grep -c 'with _RESTART_PREP_LOCK' server.py) -ge 2 ]"
 chk "restart-prep gate committed" "[ -f scripts/verify_restart_prep_e2e.py ]"
+# D6/[R1]: loop_config writes are serialized — the lock + the locked mutate
+# exist and the escalation thread routes through them (no bare locate/save).
+chk "D6: cfg lock + locked mutate"   "grep -q '_CFG_LOCK = threading.RLock()' loop_engine.py && grep -q 'def _mutate_super_cfg' loop_engine.py && grep -q 'def _mutate_cfg_trigger' loop_engine.py && grep -q '_mutate_super_cfg(task_id' server.py && grep -q '_CFG_LOCK' server.py"
+# [R2]: the watchdog counts lane deaths toward the circuit breaker ONLY
+# outside the post-boot grace window (clean restarts retired the fleet).
+chk "R2: watchdog boot grace"        "grep -q '_BOOT_TS = time.time()' watchdog.py && grep -q 'BOOT_GRACE_S' watchdog.py && grep -q 'boot_respawn' watchdog.py"
 chk "C1c: setting-gated + bounded"    "grep -q 'super.escalation' settings_registry.py && grep -q 'super.escalation_max' settings_registry.py && grep -q 'super.escalation' database.py"
 chk "C1c: escalation spend to ledger" "grep -q '\"escalation\"' server.py && grep -q 'record_frontier_spend' server.py"
 # C1b — critic patch field (CriticGPT: critic-proposed diff, executor applies verbatim)

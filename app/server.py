@@ -4603,14 +4603,12 @@ def _escalation_thread(task_id: str):
                 db.execute("UPDATE tasks SET critic_verdict=NULL, critic_ts=NULL WHERE id=?",
                            (task_id,))
             # clear the trigger state so the sweep re-evaluates this critique
-            # once the window ends (mirrors the failure branch below)
+            # once the window ends (mirrors the failure branch below) —
+            # D6/[R1]: through the locked fresh-read mutate
             try:
                 import loop_engine as _le
-                loc = _le._locate_super_cfg(task_id)
-                if loc:
-                    _dk_kind, _dk_id, _dk_cfg, _dk_trig, _dk_pt = loc
-                    _le._set_super_state(_dk_trig, _dk_pt, None)
-                    _le._save_cfg(_dk_kind, _dk_id, _dk_cfg)
+                _le._mutate_super_cfg(task_id,
+                                      lambda trig, pt: _le._set_super_state(trig, pt, None))
             except Exception:
                 pass
             db.log_activity("warn", "critic",
@@ -4621,15 +4619,14 @@ def _escalation_thread(task_id: str):
         _ev.note_frontier_quota_ok()
         # D2/[30]: the one-shot escalation budget is spent HERE — a frontier run
         # actually executed (deferred attempts above cost nothing; a non-quota
-        # FAILURE below still bumps, a real attempt was consumed). loc None is
-        # fine: manual /escalate without a loop config has no budget to book.
+        # FAILURE below still bumps, a real attempt was consumed). False (no
+        # loop config) is fine: a manual /escalate has no budget to book.
+        # D6/[R1]: the locked fresh-read mutate — an unlocked RMW here raced
+        # the sweep's saves and could lose the bump (escalations past the cap).
         try:
             import loop_engine as _le
-            loc = _le._locate_super_cfg(task_id)
-            if loc:
-                _bp_kind, _bp_id, _bp_cfg, _bp_trig, _bp_pt = loc
-                _le._bump_escalations(_bp_trig, _bp_pt)
-                _le._save_cfg(_bp_kind, _bp_id, _bp_cfg)
+            _le._mutate_super_cfg(task_id,
+                                  lambda trig, pt: _le._bump_escalations(trig, pt))
         except Exception:
             pass
         # judge phase7 finding 2: a NON-quota failure — exit 127 (claude
@@ -4664,14 +4661,12 @@ def _escalation_thread(task_id: str):
                         f"{(out or '')[-800:]}", task_id))
             # re-arm the loop-engine super-state so _sweep_super_result re-evaluates
             # this critique (verdict 'error' → human checkpoint) instead of skipping
-            # it as already-handled by the dispatched-rework marker.
+            # it as already-handled by the dispatched-rework marker (D6/[R1]:
+            # through the locked fresh-read mutate).
             try:
                 import loop_engine as _le
-                loc = _le._locate_super_cfg(task_id)
-                if loc:
-                    _ok_kind, _ok_id, _cfg, _trig, _per_task = loc
-                    _le._set_super_state(_trig, _per_task, None)
-                    _le._save_cfg(_ok_kind, _ok_id, _cfg)
+                _le._mutate_super_cfg(task_id,
+                                      lambda trig, pt: _le._set_super_state(trig, pt, None))
             except Exception:
                 pass
             db.log_activity("error", "critic",
@@ -4810,81 +4805,89 @@ def _loop_meta(kind: str, row: dict, super_result: bool) -> dict:
 def _sync_super_result_loop(kind: str, row: dict):
     """Keep the loop_config's super_result trigger in lockstep with the flag:
     flag ON + no trigger → regenerate the design (preserving used counts of
-    surviving triggers); flag OFF → strip the trigger, leave the rest."""
+    surviving triggers); flag OFF → strip the trigger, leave the rest.
+    D6/[R1]: a whole-cfg rewrite — runs under the engine's _CFG_LOCK with a
+    FRESH row so a concurrent engine/escalation write isn't erased."""
     import loop_engine as _loop
-    flag = bool(row.get("super_result"))
-    try:
-        cfg = json.loads(row.get("loop_config") or "null")
-    except Exception:
-        cfg = None
-    cfg = cfg if isinstance(cfg, dict) else None
-    has_trigger = bool(cfg and any((t.get("id") == "super_result")
-                                   for t in cfg.get("triggers") or []))
     table = "tasks" if kind == "task" else "workflows"
-    if flag and not has_trigger:
-        meta = _loop_meta(kind, row, True)
-        newcfg = _loop.design_loop(kind, meta,
-                                   preference=(cfg or {}).get("preference", "quality"),
-                                   mode=(cfg or {}).get("mode", "closed"))
-        if cfg:  # keep round accounting of triggers that survived the redesign
-            old = {t.get("id"): t for t in cfg.get("triggers") or []}
-            for t in newcfg.get("triggers") or []:
-                o = old.get(t.get("id"))
-                if o:
-                    t["used"] = int(o.get("used") or 0)
-                    for k in ("used_tasks", "state_tasks"):
-                        if o.get(k):
-                            t[k] = o[k]
-        db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?",
-                   (json.dumps(newcfg), row["id"]))
-        db.log_activity("info", "loop",
-                        "Super Result loop enabled on "
-                        f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
-                        user_id=row.get("user_id"))
-    elif not flag and has_trigger:
-        cfg["triggers"] = [t for t in cfg.get("triggers") or []
-                           if t.get("id") != "super_result"]
-        db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?",
-                   (json.dumps(cfg), row["id"]))
-        db.log_activity("info", "loop",
-                        "Super Result trigger removed from "
-                        f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
-                        user_id=row.get("user_id"))
+    with _loop._CFG_LOCK:
+        row = db.query_one(f"SELECT * FROM {table} WHERE id=?", (row["id"],)) or row
+        flag = bool(row.get("super_result"))
+        try:
+            cfg = json.loads(row.get("loop_config") or "null")
+        except Exception:
+            cfg = None
+        cfg = cfg if isinstance(cfg, dict) else None
+        has_trigger = bool(cfg and any((t.get("id") == "super_result")
+                                       for t in cfg.get("triggers") or []))
+        if flag and not has_trigger:
+            meta = _loop_meta(kind, row, True)
+            newcfg = _loop.design_loop(kind, meta,
+                                       preference=(cfg or {}).get("preference", "quality"),
+                                       mode=(cfg or {}).get("mode", "closed"))
+            if cfg:  # keep round accounting of triggers that survived the redesign
+                old = {t.get("id"): t for t in cfg.get("triggers") or []}
+                for t in newcfg.get("triggers") or []:
+                    o = old.get(t.get("id"))
+                    if o:
+                        t["used"] = int(o.get("used") or 0)
+                        for k in ("used_tasks", "state_tasks"):
+                            if o.get(k):
+                                t[k] = o[k]
+            db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?",
+                       (json.dumps(newcfg), row["id"]))
+            db.log_activity("info", "loop",
+                            "Super Result loop enabled on "
+                            f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
+                            user_id=row.get("user_id"))
+        elif not flag and has_trigger:
+            cfg["triggers"] = [t for t in cfg.get("triggers") or []
+                               if t.get("id") != "super_result"]
+            db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?",
+                       (json.dumps(cfg), row["id"]))
+            db.log_activity("info", "loop",
+                            "Super Result trigger removed from "
+                            f"{kind} '{(row.get('title') or row.get('name') or '')[:50]}'",
+                            user_id=row.get("user_id"))
 
 
 def _regen_loop_for_profile(kind: str, row: dict):
     """Q7a: regenerate an existing loop_config so its knobs re-derive from the
-    (changed) preset axes — preserving round accounting of surviving triggers."""
+    (changed) preset axes — preserving round accounting of surviving triggers.
+    D6/[R1]: a whole-cfg rewrite — runs under the engine's _CFG_LOCK with a
+    FRESH row so a concurrent engine/escalation write isn't erased."""
     import loop_engine as _loop
-    try:
-        cfg = json.loads(row.get("loop_config") or "null")
-    except Exception:
-        cfg = None
-    if not isinstance(cfg, dict) or not cfg.get("enabled"):
-        return
     table = "tasks" if kind == "task" else "workflows"
-    has_sr = any((t.get("id") == "super_result") for t in cfg.get("triggers") or [])
-    meta = _loop_meta(kind, row, has_sr)
-    newcfg = _loop.design_loop(kind, meta,
-                               preference=cfg.get("preference", "quality"),
-                               mode=cfg.get("mode", "closed"))
-    old = {t.get("id"): t for t in cfg.get("triggers") or []}
-    for t in newcfg.get("triggers") or []:
-        o = old.get(t.get("id"))
-        if o:
-            t["used"] = int(o.get("used") or 0)
-            # review K3: 'state' (handled-critique marker) and esc_* (one-shot
-            # frontier escalation budget) are load-bearing — dropping them on a
-            # preset regen re-fired already-handled escalations and un-capped
-            # super.escalation_max (double frontier spend).
-            for k in ("used_tasks", "state_tasks", "state", "esc_used", "esc_tasks"):
-                if o.get(k):
-                    t[k] = o[k]
-    db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?", (json.dumps(newcfg), row["id"]))
-    db.log_activity("info", "loop",
-                    f"Loop re-derived from the autopilot preset on {kind} "
-                    f"'{(row.get('title') or row.get('name') or '')[:50]}'",
-                    user_id=row.get("user_id"))
+    with _loop._CFG_LOCK:
+        row = db.query_one(f"SELECT * FROM {table} WHERE id=?", (row["id"],)) or row
+        try:
+            cfg = json.loads(row.get("loop_config") or "null")
+        except Exception:
+            cfg = None
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return
+        has_sr = any((t.get("id") == "super_result") for t in cfg.get("triggers") or [])
+        meta = _loop_meta(kind, row, has_sr)
+        newcfg = _loop.design_loop(kind, meta,
+                                   preference=cfg.get("preference", "quality"),
+                                   mode=cfg.get("mode", "closed"))
+        old = {t.get("id"): t for t in cfg.get("triggers") or []}
+        for t in newcfg.get("triggers") or []:
+            o = old.get(t.get("id"))
+            if o:
+                t["used"] = int(o.get("used") or 0)
+                # review K3: 'state' (handled-critique marker) and esc_* (one-shot
+                # frontier escalation budget) are load-bearing — dropping them on a
+                # preset regen re-fired already-handled escalations and un-capped
+                # super.escalation_max (double frontier spend).
+                for k in ("used_tasks", "state_tasks", "state", "esc_used", "esc_tasks"):
+                    if o.get(k):
+                        t[k] = o[k]
+        db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?", (json.dumps(newcfg), row["id"]))
+        db.log_activity("info", "loop",
+                        f"Loop re-derived from the autopilot preset on {kind} "
+                        f"'{(row.get('title') or row.get('name') or '')[:50]}'",
+                        user_id=row.get("user_id"))
 
 
 def _inherit_super_result(task: dict) -> dict:
