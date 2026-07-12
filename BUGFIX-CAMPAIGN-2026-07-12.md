@@ -69,22 +69,22 @@ which now validates the FIXED drain.
 
 | ✓ | Findings | What |
 |---|----------|------|
-| ☐ | [3] | nexus-up hardcoded container names → compose-file fallback when a named container is absent |
-| ☐ | [4] | root install.sh: explicitly `systemctl --user disable nexus` on upgrade installs (posture claim must be true) |
-| ☐ | [8/28] | stale "5/6 core-mods" counts in setup/CLAUDE.md + setup/install.sh → "the count in guardian/core-mods.json (7 today)" |
-| ☐ | [6] | harvest_decisions appends per retry round, no supersede → dedup by task id (replace that task's block) |
-| ☐ | [9] | judge_model_for/spec_model_for/escalation_model_for triplication → one `_cli_model_for(purpose)` |
-| ☐ | [10] | _regen_loop_for_profile vs _sync_super_result_loop meta-dict drift → shared builder |
-| ☐ | [12] | _judge_thread inline SPEC path → reuse `_workflow_spec_md` |
-| ☐ | [14] | startup's synchronous sweep_stale_plan_sessions (serial 10s HTTP DELETEs) → background/deferred |
-| ☐ | [15] | hardcoded 'u_owner' in routing.py:192 + lessons.py:183 → auth.DEFAULT_USER_ID |
-| ☐ | [16] | loop-invariant judge.auto_scope read inside per-candidate loop → hoist |
-| ☐ | [17] | double _turn_cut_count query in the cut-turn budget block |
-| ☐ | [18] | _lessons_safe getattr-by-string → direct callables |
-| ☐ | [19] | eval judge spend stuffed into frontier_ledger.workflow_id → proper source column (small migration) |
-| ☐ | [R1] | loop_config lost-update race (session-1 exit review, CONFIRMED) → implement §D6; also collapses the 3 duplicated locate/unpack/save blocks in _escalation_thread |
-| ☐ | [R2] | watchdog restart circuit-breaker counts CLEAN service restarts: every `systemctl restart nexus` kills lanes → watchdog respawn +1 each, cumulative forever — the 2026-07-12 campaign's ~8 restarts retired the whole fleet (Worker 1-5 + Manual) at 01:21 (healed by hand: counters reset + POST /agents/{id}/restart). Fix: don't increment when the death is within ~120s of service boot (startup ts marker), OR decay restart_count to 0 after 1h of healthy uptime. Gate: seeded restart_count + fake boot marker → no increment on the post-boot respawn |
-| ☐ | [R3] | frontier-cmd token machinery ×5 (promoted 2026-07-12 from the session-1 report-only leftovers, user decision): the `shlex.split` + per-token `{file}`/`{model}`/… `.replace` + empty-token drop + `~/.local/bin` PATH-fallback block is copy-pasted at evals.py ~415, ~816, ~967, ~1047 and lessons.py ~197 → extract ONE shared resolver in evals.py (e.g. `resolve_cmd_tokens(tmpl, mapping) -> list[str]`, keeping the brace-safe per-token replace — NOT .format) and route all 5 call sites through it (lessons.py imports evals). Behavior-preserving refactor only. Gate: existing eval + lessons gates stay green + verify.sh static grep pins `def resolve_cmd_tokens` and 0 remaining inline copies |
+| ☑ | [3] | nexus-up hardcoded container names → compose-file fallback when a named container is absent |
+| ☑ | [4] | root install.sh: explicitly `systemctl --user disable nexus` on upgrade installs (posture claim must be true) |
+| ☑ | [8/28] | stale "5/6 core-mods" counts in setup/CLAUDE.md + setup/install.sh → "the count in guardian/core-mods.json (7 today)" |
+| ☑ | [6] | harvest_decisions appends per retry round, no supersede → dedup by task id (replace that task's block) |
+| ☑ | [9] | judge_model_for/spec_model_for/escalation_model_for triplication → one `_cli_model_for(purpose)` |
+| ☑ | [10] | _regen_loop_for_profile vs _sync_super_result_loop meta-dict drift → shared builder |
+| ☑ | [12] | _judge_thread inline SPEC path → reuse `_workflow_spec_md` |
+| ☑ | [14] | startup's synchronous sweep_stale_plan_sessions (serial 10s HTTP DELETEs) → background/deferred |
+| ☑ | [15] | hardcoded 'u_owner' in routing.py:192 + lessons.py:183 → auth.DEFAULT_USER_ID |
+| ☑ | [16] | loop-invariant judge.auto_scope read inside per-candidate loop → hoist |
+| ☑ | [17] | double _turn_cut_count query in the cut-turn budget block |
+| ☑ | [18] | _lessons_safe getattr-by-string → direct callables |
+| ☑ | [19] | eval judge spend stuffed into frontier_ledger.workflow_id → proper source column (small migration) |
+| ☑ | [R1] | loop_config lost-update race (session-1 exit review, CONFIRMED) → implement §D6; also collapses the 3 duplicated locate/unpack/save blocks in _escalation_thread |
+| ☑ | [R2] | watchdog restart circuit-breaker counts CLEAN service restarts: every `systemctl restart nexus` kills lanes → watchdog respawn +1 each, cumulative forever — the 2026-07-12 campaign's ~8 restarts retired the whole fleet (Worker 1-5 + Manual) at 01:21 (healed by hand: counters reset + POST /agents/{id}/restart). Fix: don't increment when the death is within ~120s of service boot (startup ts marker), OR decay restart_count to 0 after 1h of healthy uptime. Gate: seeded restart_count + fake boot marker → no increment on the post-boot respawn |
+| ☑ | [R3] | frontier-cmd token machinery ×5 (promoted 2026-07-12 from the session-1 report-only leftovers, user decision): the `shlex.split` + per-token `{file}`/`{model}`/… `.replace` + empty-token drop + `~/.local/bin` PATH-fallback block is copy-pasted at evals.py ~415, ~816, ~967, ~1047 and lessons.py ~197 → extract ONE shared resolver in evals.py (e.g. `resolve_cmd_tokens(tmpl, mapping) -> list[str]`, keeping the brace-safe per-token replace — NOT .format) and route all 5 call sites through it (lessons.py imports evals). Behavior-preserving refactor only. Gate: existing eval + lessons gates stay green + verify.sh static grep pins `def resolve_cmd_tokens` and 0 remaining inline copies |
 
 **Session-2 exit (user decision 2026-07-12 — two changes vs. the original flow):**
 verify.sh + verify_autopilot_e2e + verify_deep_plan_e2e + screenshot sweep →
@@ -93,6 +93,19 @@ to the user and STOP; do NOT start the final review until the user gives an expl
 go-ahead** → final `/code-review` on the combined campaign diff → update program memory
 files. Reminder of the standing rule (user re-confirmed): if the code contradicts a
 §Decisions design, STOP and ask the user BEFORE implementing — never improvise a redesign.
+
+> **Session-2 RESULT (2026-07-12):** all 16 items FIXED in 3 grouped commits, none
+> skipped, no §Decisions contradictions found: `5a06622` (setup: [3][4][8/28]),
+> `27b2bcc` (quality: [6][9][10][12][14][15][16][17][18][19][R3]), `f503499`
+> (robustness: [R1] exactly per §D6 + [R2] boot-grace). Per-commit gates: bash -n +
+> live compose-label probe; verify.sh 442/442 + autopilot 63/63 (new [6] dedup check)
+> + block3 33/33 + live-DB [19] migration/backfill verified; verify.sh 444/444 (D6+R2
+> pins) + super_result 90/90 (new D6 2×50-thread no-lost-update check; one stale
+> phase7 source pin updated to the locked pattern) + restart_prep 28/28 (new [R2]
+> real-restart breaker-counter checks). Exit sweep green: verify.sh 444/444,
+> autopilot 63/63, deep_plan 21/21, screenshot sweep 14 tabs no console errors.
+> **PAUSED at the human checkpoint — awaiting the user's explicit go-ahead before
+> the final /code-review on the combined campaign diff + memory updates.**
 
 ---
 
