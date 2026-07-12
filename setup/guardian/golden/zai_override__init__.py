@@ -72,9 +72,12 @@ _SESSION_KEYS_FILE = os.path.expanduser("~/.hermes/session-keys.json")
 _session_keys_cache: dict = {"mtime": 0.0, "sessions": {}}
 
 
-def _session_api_key(session_id: str | None) -> str | None:
+def _session_entries(session_id: str | None) -> dict:
+    """The session's full bridge entry ({} on miss). NEXUS CORE-MOD
+    (session-effort): entries may now carry 'effort' next to 'api_key' —
+    the dispatch's per-task reasoning effort (mode × task-type aware)."""
     if not session_id:
-        return None
+        return {}
     try:
         mtime = os.stat(_SESSION_KEYS_FILE).st_mtime
         if mtime != _session_keys_cache["mtime"]:
@@ -82,13 +85,27 @@ def _session_api_key(session_id: str | None) -> str | None:
             with open(_SESSION_KEYS_FILE) as f:
                 data = _json.load(f)
             _session_keys_cache["sessions"] = {
-                str(k): str(v.get("api_key"))
+                str(k): v
                 for k, v in (data.get("sessions") or {}).items()
-                if isinstance(v, dict) and v.get("api_key")}
+                if isinstance(v, dict)}
             _session_keys_cache["mtime"] = mtime
     except Exception:
-        return None
-    return _session_keys_cache["sessions"].get(session_id)
+        return {}
+    return _session_keys_cache["sessions"].get(session_id) or {}
+
+
+def _session_api_key(session_id: str | None) -> str | None:
+    v = _session_entries(session_id).get("api_key")
+    return str(v) if v else None
+
+
+def _session_effort(session_id: str | None) -> str | None:
+    """NEXUS CORE-MOD (session-effort): per-session reasoning effort published
+    by the Nexus dispatch — the mode/task-type-aware choice; most specific,
+    wins over the per-model operator default (the dispatch is already
+    tier-aware, so no extra light-model cap applies here)."""
+    v = str(_session_entries(session_id).get("effort") or "").strip().lower()
+    return v if v in _WIRE_EFFORTS else None
 
 
 def _operator_effort(model: str | None) -> str | None:
@@ -113,8 +130,13 @@ def _is_light_model(model: str | None) -> bool:
     return "air" in m or "flash" in m
 
 
-def _effective_effort(effort: str, model: str | None) -> str:
-    # An explicit operator default for this model wins over everything.
+def _effective_effort(effort: str, model: str | None,
+                      session_effort: str | None = None) -> str:
+    # NEXUS CORE-MOD (session-effort): the dispatch's per-task effort is the
+    # most specific signal (mode × task type × tier) — it wins first.
+    if session_effort:
+        return _EFFORT_MAP.get(session_effort, session_effort)
+    # An explicit operator default for this model wins over the config value.
     op = _operator_effort(model)
     if op:
         return op
@@ -154,18 +176,21 @@ class ZaiProfile(ProviderProfile):
         if not _model_supports_thinking(model):
             return extra_body, top_level
 
+        _sef = _session_effort(context.get("session_id"))  # NEXUS CORE-MOD (session-effort)
         if isinstance(reasoning_config, dict):
             enabled = reasoning_config.get("enabled") is not False
             extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
             if enabled:  # reasoning_effort only applies while thinking is on
                 extra_body["reasoning_effort"] = _effective_effort(
-                    _EFFORT_MAP.get(reasoning_config.get("effort"), "max"), model
+                    _EFFORT_MAP.get(reasoning_config.get("effort"), "max"), model,
+                    session_effort=_sef,
                 )
         else:
             # No explicit preference: make the tier-appropriate top effort
             # explicit rather than relying on the server default.
             extra_body["thinking"] = {"type": "enabled"}
-            extra_body["reasoning_effort"] = _effective_effort("max", model)
+            extra_body["reasoning_effort"] = _effective_effort("max", model,
+                                                               session_effort=_sef)
 
         # Log the effective effort ONCE per (model, value) at INFO — a per-call
         # WARNING put ~1.7k noise lines into errors.log in three days and

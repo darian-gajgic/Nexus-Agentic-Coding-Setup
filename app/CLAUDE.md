@@ -798,11 +798,18 @@ mechanics themselves (claiming, watchdog, approvals, cost, worktrees, scheduler)
   smart; short/simple/single-artifact → eco; else optimal. The wizard preselects the card
   with a 🧭 hint; the user overrides by clicking another card. Plain API creates keep
   `autopilot.default_spend`.
+- **Per-task reasoning effort** (`dispatch.session_effort`, default on — the I-3
+  follow-up): each dispatch publishes an effort into its session-keys bridge entry
+  (merge-safe next to api_key); the zai plugin's **session-effort mod** (guardian golden
+  updated) resolves session > operator per-model > light-cap > config. Rules
+  (`hermes_dispatch.session_effort_for_task`): smart/high-stakes → xhigh; eco → medium
+  (light tier) / high (escalated to strong); Balanced content → high; Balanced
+  research/analysis/code → None (= xhigh default). Wire-verified in agent.log
+  ("[zai-override] … reasoning_effort=…", logged once per pair).
 - **Deliberately mode-blind (documented, not bugs)**: compression (global 0.35 — quality
   modes differ in VERIFICATION depth, not context fidelity; brief+tail always protected;
   summarizer stays glm-5.2, the only tier whose 1M window holds big compaction inputs),
-  `model.effort.*` (mode-correlated through model choice: light tiers medium, glm-5.2
-  xhigh), `dispatch.turn_seconds.*` (latency guards — cut runs detach + harvest).
+  `dispatch.turn_seconds.*` (latency guards — cut runs detach + harvest).
 - **Honest labeling**: 'Balanced — best value' is a HEURISTIC until the deferred Phase-8
   benchmark (`benchmarks/added-value/`) is run; the Eco card carries the same caveat.
   Gate: `scripts/verify_mode_coherence_e2e.py`.

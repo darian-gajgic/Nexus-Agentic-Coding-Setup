@@ -65,6 +65,15 @@ SECTIONS = [
              "help": "Item 17: content deliverables rarely justify the global 5M default — "
                      "this bounds the NEXT dispatch/retry once a content task has burned 2M. "
                      "A task's own budget_tokens still overrides."},
+            {"key": "dispatch.session_effort", "label": "Per-task reasoning effort", "type": "bool",
+             "default": "1",
+             "help": "Mode-coherence (2026-07-12b): each dispatch publishes a per-task "
+                     "reasoning effort matched to its mode × task type (Smart/high-stakes "
+                     "→ maximum thinking; Eco → lean, even after an escalation; Balanced "
+                     "content → high instead of maximum — creative work gains little from "
+                     "maximum deliberation while the judge still gates quality; Balanced "
+                     "research/analysis/code keep maximum). Off = the per-model/config "
+                     "defaults apply unchanged."},
             {"key": "dispatch.escalate_on_revise", "label": "Escalate model tier on judge REVISE", "type": "bool",
              "default": "1",
              "help": "Mode-coherence (2026-07-12b): when a LIGHT-TIER attempt (easy/"

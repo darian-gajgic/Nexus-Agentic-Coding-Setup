@@ -111,7 +111,7 @@
     {
       "path": "~/.hermes/plugins/model-providers/zai/__init__.py",
       "golden": "zai_override__init__.py",
-      "sha256": "b4c8ed10b85cbd032b829f314a5b06140705aa61fdce1b1e60117a474408cc49",
+      "sha256": "4149647d6a573399b85389ef4d947f1beaca2904e814eee8d011c0774738bcac",
       "mode": "0o664",
       "restore_mode": "whole"
     },
