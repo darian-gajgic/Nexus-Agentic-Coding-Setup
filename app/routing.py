@@ -202,11 +202,18 @@ def sweep_stats():
 # when a registry model's operator-maintained description ("Best for: …")
 # clearly matches the task text. Explainable: the reason is stored on the task.
 
-# Keep in sync with server._DEV_SPECIALISTS — dev pipeline stages have a fixed
-# model floor (glm-5.2 via _repair_workflow) that routing must never touch.
-_DEV_SPECIALISTS = {"tech-lead-orchestrator", "code-implementer", "code-reviewer",
-                    "debugger", "acceptance-verifier"}
-_MECHANICAL_RE = None  # compiled lazily
+# SINGLE SOURCE — server.py imports this (the same set used to be declared in
+# four places and was one edit away from silently disagreeing). Dev pipeline
+# stages have a fixed model floor (glm-5.2 via _repair_workflow) that routing
+# must never touch. app.js keeps a mirrored DEV_SPECIALISTS const (no build
+# step — keep them in sync).
+DEV_SPECIALISTS = {"tech-lead-orchestrator", "code-implementer", "code-reviewer",
+                   "debugger", "acceptance-verifier"}
+_DEV_SPECIALISTS = DEV_SPECIALISTS  # internal alias
+
+# THE mechanical-work signal — shared with plan_engine.recommend_spend so the
+# spend recommendation and the actual routing can never disagree.
+from plan_engine import MECHANICAL_RE as _MECHANICAL_RE  # noqa: E402
 
 
 def _significant_tokens(s: str) -> set:
@@ -249,8 +256,6 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
     suppresses description-upgrades; 'smart' never routes below the default.
     Quality protection for eco is the judge + the retry escalation (cascade),
     not pre-spend."""
-    import re as _re
-    global _MECHANICAL_RE
     if db.get_setting("models.auto_route", "1") != "1":
         return None, None
     if task.get("model"):
@@ -264,10 +269,6 @@ def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str 
     allowed = set(db.task_models_for(uid))
     default_hard = db.default_task_model(uid)
 
-    if _MECHANICAL_RE is None:
-        _MECHANICAL_RE = _re.compile(
-            r"\b(format|convert|extract|rename|transcrib\w*|csv|cleanup|dedup\w*|"
-            r"reformat|normali[sz]e)\b", _re.I)
     base_purpose = "complicated"
     if not task.get("high_stakes"):
         if _MECHANICAL_RE.search(text):
