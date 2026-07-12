@@ -10,6 +10,7 @@ is the canonical spec of the entry format; keep it byte-compatible).
 All functions are plain sync — async callers run them in a threadpool
 (the write endpoint is a sync `def` route for exactly that reason).
 """
+import hashlib
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ import threading
 import datetime as _dt
 from pathlib import Path
 
+import auth
 import database as db
 from onboarding import knowledge_root
 
@@ -40,14 +42,20 @@ _BULLET_RE = re.compile(r"^-\s+([^:]+):\s?(.*)$")
 _entries_cache: dict[str, tuple[float, list]] = {}
 
 
-def feedback_path(kind: str) -> str:
+def feedback_path(kind: str, user_id: str | None = None) -> str:
+    """Item 7 (per-user learning): the owner's ledgers stay canonical
+    (~/knowledge/feedback/ — they double as the shared 'General' bucket, zero
+    migration); every other user gets an overlay ledger under
+    users/<uid>/feedback/ — same layout as onboarding.target_dir."""
+    if user_id and user_id != auth.DEFAULT_USER_ID:
+        return os.path.join(knowledge_root(), "users", user_id, "feedback", FILES[kind])
     return os.path.join(knowledge_root(), "feedback", FILES[kind])
 
 
-def ensure_file(kind: str) -> str:
+def ensure_file(kind: str, user_id: str | None = None) -> str:
     """The ledger must exist before an insert; seed it from the repo template
     (or a minimal embedded skeleton) instead of 500ing on a fresh root."""
-    target = feedback_path(kind)
+    target = feedback_path(kind, user_id)
     if not os.path.isfile(target):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tpl = _TEMPLATE_DIR / FILES[kind]
@@ -89,11 +97,11 @@ def compose_entry(kind: str, task: dict, f: dict) -> str:
             f"- Applied where: {applied}\n")
 
 
-def insert_entry(kind: str, entry: str) -> str:
+def insert_entry(kind: str, entry: str, user_id: str | None = None) -> str:
     """Newest-first insert after the marker; atomic replace so a crash or a
     concurrent log can't tear the file."""
     with _LOCK:
-        target = ensure_file(kind)
+        target = ensure_file(kind, user_id)
         with open(target) as fh:
             text = fh.read()
         idx = text.find(MARKER)
@@ -118,7 +126,8 @@ def insert_entry(kind: str, entry: str) -> str:
     return target
 
 
-def promote_deliverable(task: dict, headline: str, numbers: str = "") -> str:
+def promote_deliverable(task: dict, headline: str, numbers: str = "",
+                        by: str = "") -> str:
     """Copy the winning deliverable into domains/<domain>/examples/ — the
     directory golden_exemplars + dispatch framing already treat as the
     quality bar, so a promoted win immediately shapes future work."""
@@ -136,6 +145,7 @@ def promote_deliverable(task: dict, headline: str, numbers: str = "") -> str:
     with open(src) as fh:
         content = fh.read()
     prov = (f"<!-- promoted from Nexus task {task['id']} on {today}"
+            + (f" by {_one_line(by, 60)}" if by else "")
             + (f"; result: {_one_line(numbers, 200)}" if numbers else "") + " -->\n\n")
     with open(dest, "w") as fh:
         fh.write(prov + content)
@@ -179,13 +189,19 @@ def parse_entries(text: str) -> list[dict]:
         e["domain"] = dom if dom and dom not in ("—", "-", "?") else None
         m = _TASK_ID_RE.search(e["raw"])
         e["task_id"] = m.group(0) if m else None
+        # Item 7: stable identity for cross-user adopt/dedupe + provenance.
+        e["key"] = hashlib.sha1(e["raw"].encode()).hexdigest()[:12]
+        adopted = next((v for k, v in e["fields"] if k.lower().startswith("adopted from")), "")
+        e["adopted_from"] = adopted.strip() or None
+        origin = next((v for k, v in e["fields"] if k.lower() == "origin"), "")
+        e["origin"] = origin.strip() or None
     return entries
 
 
-def load_entries(kind: str) -> list[dict]:
+def load_entries(kind: str, user_id: str | None = None) -> list[dict]:
     """mtime-cached parse (edits in ~/knowledge apply live, like jarvis_brain).
     Never raises — a missing/broken ledger just means fewer entries."""
-    path = feedback_path(kind)
+    path = feedback_path(kind, user_id)
     try:
         mt = os.path.getmtime(path)
     except OSError:
@@ -202,14 +218,65 @@ def load_entries(kind: str) -> list[dict]:
     return entries
 
 
+def list_all_entries(kind: str) -> list[dict]:
+    """Item 7: every user's entries for the browse-and-adopt UI. Canonical
+    ledger entries are tagged general=True (the owner's house ledger, read by
+    everyone); overlay entries carry their author's uid. Bounded: one dir
+    listing + the same mtime-cached parses as load_entries."""
+    out = []
+    for e in load_entries(kind):
+        out.append({**e, "author_id": auth.DEFAULT_USER_ID, "general": True})
+    users_dir = os.path.join(knowledge_root(), "users")
+    try:
+        uids = sorted(os.listdir(users_dir))
+    except OSError:
+        uids = []
+    for uid in uids:
+        if not os.path.isfile(os.path.join(users_dir, uid, "feedback", FILES[kind])):
+            continue
+        for e in load_entries(kind, uid):
+            out.append({**e, "author_id": uid, "general": False})
+    return out
+
+
+def adopt_entry(kind: str, entry: dict, adopter_uid: str,
+                author_name: str, author_id: str) -> str:
+    """Item 7: copy another user's entry into MY ledger with provenance
+    bullets. The physical copy keeps dispatch_block trivial (own file +
+    canonical, nothing else) and survives the tolerant parser. Dedupe by the
+    Origin key — adopting twice is a no-op error."""
+    for mine in load_entries(kind, adopter_uid):
+        if mine.get("origin") == entry["key"] or mine["key"] == entry["key"]:
+            raise ValueError("already in your ledger")
+    today = _dt.date.today().isoformat()
+    copy = (entry["raw"].rstrip() + "\n"
+            f"- Adopted from: {author_name} ({author_id}) on {today}\n"
+            f"- Origin: {entry['key']}\n")
+    return insert_entry(kind, copy, adopter_uid)
+
+
 def _field(entry: dict, prefix: str) -> str:
     p = prefix.lower()
     return next((v for k, v in entry["fields"] if k.lower().startswith(p)), "")
 
 
-def dispatch_block(domain: str) -> str:
+def _merged_entries(kind: str, dom: str, user_id: str | None) -> list[dict]:
+    """Own entries first (incl. adopted copies — they live in the own file),
+    then the canonical/General ledger, deduped by key/origin. For the owner
+    (or no user) this is exactly the pre-item-7 canonical list."""
+    own = ([e for e in load_entries(kind, user_id) if e["domain"] == dom]
+           if user_id and user_id != auth.DEFAULT_USER_ID else [])
+    seen = {e["key"] for e in own} | {e["origin"] for e in own if e.get("origin")}
+    general = [e for e in load_entries(kind) if e["domain"] == dom
+               and e["key"] not in seen]
+    return own + general
+
+
+def dispatch_block(domain: str, user_id: str | None = None) -> str:
     """The loop-closer: a compact excerpt of recent domain-matching wins and
-    lessons for the dispatch/JARVIS framing. Size-capped; kill switch
+    lessons for the dispatch/JARVIS framing. Item 7: entries are per user —
+    the task owner's own ledger (plus anything they adopted) merges ahead of
+    the shared General ledger. Size-capped; kill switch
     feedback.framing_enabled."""
     dom = (domain or "").strip().lower()
     if not dom or dom == "general":
@@ -224,23 +291,25 @@ def dispatch_block(domain: str) -> str:
     if not max_n:
         return ""
     lines = []
-    for e in [w for w in load_entries("win") if w["domain"] == dom][:max_n]:
+    for e in _merged_entries("win", dom, user_id)[:max_n]:
         result = _field(e, "result")
         why = _field(e, "why")
         lines.append(f"- [WIN {e['date']}] {e['headline']} — Result: {result}"
                      + (f" — Why: {why}" if why else ""))
-    lessons = [l for l in load_entries("lesson") if l["domain"] == dom
-               and not _field(l, "correction").lower().startswith("to be decided")]
+    lessons = [l for l in _merged_entries("lesson", dom, user_id)
+               if not _field(l, "correction").lower().startswith("to be decided")]
     for e in lessons[:max_n]:
         lines.append(f"- [LESSON {e['date']}] {e['headline']} — "
                      f"Correction: {_field(e, 'correction')}")
     if not lines:
         return ""
     lines = [ln[:240] for ln in lines]
+    own_path_note = (f"{feedback_path('win', user_id)} + {feedback_path('lesson', user_id)}"
+                     + (f" (yours) and {feedback_path('win')} + {feedback_path('lesson')} (shared)"
+                        if user_id and user_id != auth.DEFAULT_USER_ID else ""))
     header = (f"FEEDBACK LEDGER — real-world results in the '{dom}' domain (newest "
               "first). Imitate what measurably WON; apply every LESSON's correction. "
-              f"Full ledgers (read with your file tools for more): "
-              f"{feedback_path('win')} + {feedback_path('lesson')}")
+              f"Full ledgers (read with your file tools for more): {own_path_note}")
     block = "\n".join([header] + lines)
     while len(block) > max_chars and lines:
         lines.pop()

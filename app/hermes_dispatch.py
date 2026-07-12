@@ -902,7 +902,8 @@ def _attachment_lines(task: dict, workspace: Path) -> list[str]:
     return out
 
 
-def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> str:
+def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
+                  agent_id: str | None = None) -> str:
     parts = [
         f"You are executing Nexus kanban task {task['id']} (\"{task['title']}\") autonomously "
         "for the Nexus Agent OS control plane. Work the task to completion in this turn.",
@@ -985,7 +986,7 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
         # Feedback loop: recent domain-matching WINS/LESSONS ride with the
         # domain block — deliberately NOT skipped on retry rounds (lessons
         # matter most exactly then). Size-capped in feedback_log.
-        fb_block = feedback_log.dispatch_block(domain)
+        fb_block = feedback_log.dispatch_block(domain, task.get("user_id"))
         if fb_block:
             parts.append(fb_block)
     specialist = (task.get("specialist") or "").strip()
@@ -1061,6 +1062,27 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             "This is a RETRY: a previous attempt was rejected. Address every point of this "
             f"feedback before delivering:\n{task['retry_feedback']}"
         )
+    # Item 3: the executing lane's own memory rides with the brief — standing
+    # rules the operator taught it (longterm) + its consolidated track record
+    # (lts auto-summary). Capped; evals stay agent-less (config-pure).
+    if agent_id and db.get_setting("agentmem.framing_enabled", "1") == "1":
+        try:
+            mem_bits = []
+            taught = db.query_all(
+                "SELECT content FROM memory WHERE agent_id=? AND scope='longterm' "
+                "ORDER BY created_at DESC LIMIT 6", (agent_id,))
+            if taught:
+                mem_bits.append("Standing facts the operator taught this lane — honor them:\n"
+                                + "\n".join(f"- {r['content'][:200]}" for r in taught))
+            summ = db.query_one(
+                "SELECT content FROM memory WHERE agent_id=? AND scope='lts' "
+                "AND kind='auto-summary' ORDER BY created_at DESC LIMIT 1", (agent_id,))
+            if summ:
+                mem_bits.append(f"This lane's track record: {summ['content'][:400]}")
+            if mem_bits:
+                parts.append(("AGENT LANE MEMORY:\n" + "\n".join(mem_bits))[:800])
+        except Exception:
+            pass
     parts.append("Finally, reply in chat with the complete final deliverable text — the reply is "
                  "stored as the task result.")
     return "\n\n".join(parts)
@@ -1225,6 +1247,43 @@ def _make_on_event(dispatch_id: str, task_id: str, agent_id: str):
     return on_event
 
 
+def _write_experience(agent_id: str, task: dict, outcome: str, tokens: int,
+                      err: str | None = None, learn: str | None = None,
+                      rubric=None):
+    """Item 3: one deterministic 'experience' row per finished dispatch — the
+    lane's task log (Agent memory tab). No LLM; the hourly consolidation sweep
+    (agent_memory.py) condenses these into the lane's rolling 'lts' summary.
+    Best-effort: memory failures never fail a dispatch."""
+    try:
+        if db.get_setting("agentmem.enabled", "1") != "1":
+            return
+        ttl_days = float(db.get_setting("agentmem.experience_ttl_days", "90") or 90)
+        bits = [f"[{outcome}] {(task.get('title') or '?')[:80]}"]
+        if task.get("specialist"):
+            bits.append(f"specialist={task['specialist']}")
+        if task.get("domain") and task.get("domain") != "general":
+            bits.append(f"domain={task['domain']}")
+        bits.append(f"{tokens:,} tok")
+        if rubric is not None:
+            bits.append(f"self-score {rubric}")
+        if learn:
+            bits.append(f"learned: {' '.join(str(learn).split())[:300]}")
+        if err:
+            bits.append(f"failed: {' '.join(str(err).split())[:160]}")
+        now = time.time()
+        db.execute(
+            "INSERT INTO memory (id, agent_id, scope, kind, content, source, "
+            "created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+            (f"mem-{uuid.uuid4().hex[:10]}", agent_id, "experience", "dispatch",
+             " · ".join(bits)[:1000], "auto", now, now + ttl_days * 86400))
+        # The in-flight scratchpad row is consumed by the finished task.
+        db.execute("DELETE FROM memory WHERE agent_id=? AND scope='stm' "
+                   "AND kind='inflight' AND content LIKE ?",
+                   (agent_id, f"%{task.get('id')}%"))
+    except Exception:
+        pass
+
+
 def _finalize_cancel(dispatch_id: str, task_id: str, agent_id: str):
     """Operator stop (item 5): close the dispatch as 'cancelled' and park the
     task back in Backlog, unclaimed. session_id is dropped ON PURPOSE — the
@@ -1306,6 +1365,7 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
                         f"Task {task_id} dispatch failed [cause={classify_failure(err_text)}]: "
                         f"{err_text[:120]}", user_id=task.get("user_id"))
         notify_desktop("Nexus: task failed", f"{task['title']} — {err_text[:120]}")
+        _write_experience(agent_id, task, "failed", total, err=err_text)
         return
 
     note_quota_ok()
@@ -1354,6 +1414,7 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     _set_dispatch(dispatch_id, state="completed", ended_at=time.time(),
                   tokens_in=tin, tokens_out=tout)
     db.execute("UPDATE agents SET tasks_completed=tasks_completed+1 WHERE id=?", (agent_id,))
+    _write_experience(agent_id, task, "completed", total, learn=learn, rubric=rubric)
     try:  # L1: capture the routing outcome at this terminal task state
         import routing as _routing
         _routing.record_outcome(task_id)
@@ -1648,6 +1709,22 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                             user_id=task.get("user_id"))
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
 
+        # Item 3: the lane's stm scratchpad — what it is working on right now.
+        try:
+            if db.get_setting("agentmem.enabled", "1") == "1":
+                stm_ttl = float(db.get_setting("agentmem.stm_ttl_hours", "48") or 48)
+                db.execute("DELETE FROM memory WHERE agent_id=? AND scope='stm' "
+                           "AND kind='inflight' AND content LIKE ?",
+                           (agent_id, f"%{task_id}%"))
+                db.execute(
+                    "INSERT INTO memory (id, agent_id, scope, kind, content, source, "
+                    "created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (f"mem-{uuid.uuid4().hex[:10]}", agent_id, "stm", "inflight",
+                     f"working on {(task.get('title') or '?')[:120]} (task {task_id})",
+                     "auto", time.time(), time.time() + stm_ttl * 3600))
+        except Exception:
+            pass
+
         session_id = task.get("session_id")
         if not session_id:
             _set_task(task_id, dispatch_state="dispatching")
@@ -1679,7 +1756,7 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             db.log_activity("error", agent_id,
                             f"Task {task_id}: could not create worktree in {task.get('repo_path')}")
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
-        framing = build_framing(task, workspace, repo_ctx)
+        framing = build_framing(task, workspace, repo_ctx, agent_id=agent_id)
         if resume and resume_with_context:
             input_text = (f"You were interrupted mid-task. Continue task {task_id} now and "
                           "finish it. The original instructions still apply: write the final "

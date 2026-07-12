@@ -191,6 +191,16 @@ def scheduler_loop(stop_event: threading.Event):
                     _srv.sweep_stale_plan_sessions()
                 except Exception as e:
                     print(f"[scheduler] plan-session sweep error: {e}", file=sys.stderr)
+                # Item 3: agent lane memory — expire stale rows + condense each
+                # lane's task log into its rolling summary (one cheap call/lane).
+                try:
+                    import agent_memory as _am
+                    n = _am.consolidate_sweep()
+                    if n:
+                        db.log_activity("info", "scheduler",
+                                        f"Agent memory: consolidated {n} lane(s)")
+                except Exception as e:
+                    print(f"[scheduler] agent-memory sweep error: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[scheduler] error: {e}", file=sys.stderr)
         stop_event.wait(15)
