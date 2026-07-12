@@ -4491,7 +4491,9 @@ async function saveTaskDetail(id) {
 }
 
 async function deleteTaskUI(id) {
-  if (!confirm('Delete this task permanently?')) return;
+  const t = (state.tasks || []).find(x => x.id === id);
+  const name = t && t.title ? `"${String(t.title).slice(0, 60)}"` : 'this task';
+  if (!confirm(`Delete task ${name}?\n\nThe board row is removed permanently. Its workspace folder (deliverables) is moved to ~/.nexus-trash — restore it by moving it back.`)) return;
   closeModal();
   await api('DELETE', `/api/tasks/${id}`);
   state.tasks = await api('GET', '/api/tasks');

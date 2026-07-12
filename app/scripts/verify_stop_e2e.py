@@ -240,11 +240,17 @@ finally:
         db.execute("DELETE FROM settings WHERE key='dispatch.stub_stream'")
     else:
         db.set_setting("dispatch.stub_stream", stub_prev)
+    _trash = os.path.expanduser("~/.nexus-trash")
     for tid in created_tasks:
         t = db.query_one("SELECT * FROM tasks WHERE id=?", (tid,))
         if t:
             db.execute("DELETE FROM tasks WHERE id=?", (tid,))
         shutil.rmtree(hd.WORKSPACES / tid, ignore_errors=True)
+        # task deletion now trashes workspaces instead of rmtree — sweep ours
+        if os.path.isdir(_trash):
+            for d in os.listdir(_trash):
+                if d.startswith(f"{tid}-"):
+                    shutil.rmtree(os.path.join(_trash, d), ignore_errors=True)
         db.execute("DELETE FROM dispatches WHERE task_id=?", (tid,))
     for wid in created_wfs:
         db.execute("DELETE FROM workflows WHERE id=?", (wid,))

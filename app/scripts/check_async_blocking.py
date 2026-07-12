@@ -20,6 +20,8 @@ BLOCKING_NAMES = {
     # the event loop stalls every connected client. Threadpool only.
     "_sync_super_result_loop", "_regen_loop_for_profile",
     "_write_loop_cfg_grafted", "_inherit_super_result",
+    # shutil.move / rmtree territory — threadpool only
+    "_delete_task_row", "_trash_path",
 }
 BLOCKING_ATTRS = {
     ("subprocess", "run"), ("_sp", "run"), ("sp", "run"),
