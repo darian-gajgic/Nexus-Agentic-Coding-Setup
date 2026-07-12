@@ -107,5 +107,9 @@ Every path below is absolute. `KIT` in prose means `/home/sinep/Nexus-Agentic-Co
 
 ## Phase G — wrap-up
 
-35. Fill the Scoreboard table in RESULTS.md (each column says where its number comes from).
-36. Start a Claude session in `/home/sinep/Nexus-Agentic-Coding-Setup` and say: `Analyze the bench-01 results in benchmarks/bench-01-first-impression/RESULTS.md` — that session does the comparison write-up and logs WINS/LESSONS.
+35. Run and copy both printed lines into RESULTS.md → Config table (also fill in today's date):
+    ```
+    claude --version && git -C ~/nexus-agent-os log -1 --oneline
+    ```
+36. Fill the Scoreboard table in RESULTS.md (each column says where its number comes from).
+37. Start a Claude session in `/home/sinep/Nexus-Agentic-Coding-Setup` and say: `Analyze the bench-01 results in benchmarks/bench-01-first-impression/RESULTS.md` — that session does the comparison write-up and logs WINS/LESSONS.
