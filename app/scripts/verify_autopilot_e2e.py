@@ -143,6 +143,14 @@ hd.harvest_decisions({"id": "t1", "title": "Stage One", "workflow_id": wid},
 dpath = wsdir / "DECISIONS.md"
 chk("Q4 harvest wrote DECISIONS.md with the lines",
     dpath.is_file() and "Chose Postgres" in dpath.read_text())
+# [6]: a rework round REPLACES the task's block (dedup by task id) — the log
+# must never carry choices a rejected draft already reversed.
+hd.harvest_decisions({"id": "t1", "title": "Stage One", "workflow_id": wid},
+                     "# Report\n\n## Decisions\n- Chose SQLite after the retry.\n- Named module foo.\n")
+_dtxt = dpath.read_text()
+chk("Q4 [6] rework harvest supersedes the task's old block",
+    "Chose SQLite after the retry" in _dtxt and "Chose Postgres" not in _dtxt
+    and _dtxt.count("<!-- task:t1 -->") == 1)
 tws = hd.WORKSPACES / "t2ws"; tws.mkdir(parents=True, exist_ok=True)
 _cleanup.append(lambda: shutil.rmtree(tws, ignore_errors=True))
 fr = hd.build_framing({"id": "t2", "title": "Stage Two", "workflow_id": wid,

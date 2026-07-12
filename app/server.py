@@ -18,6 +18,7 @@ from typing import Optional
 import database as db
 import agent_manager as am
 import auth
+import lessons
 import secrets_store
 import settings_registry as sreg
 
@@ -189,10 +190,16 @@ def startup():
         print(f"[startup] critic-sandbox sweep failed: {_e}", flush=True)
     # Deep Plan hygiene (Phase 5): abandon plan sessions idle >7 days + delete
     # their Hermes sessions (repeated on the scheduler, not only lazily).
-    try:
-        sweep_stale_plan_sessions()
-    except Exception as _e:
-        print(f"[startup] plan-session sweep failed: {_e}", flush=True)
+    # [14]: in the BACKGROUND — the sweep serially DELETEs against the Hermes
+    # gateway (10s timeout each); under the manual-start posture the gateway
+    # may not be up yet, so a synchronous call blocked boot up to 10s × K.
+    def _boot_plan_sweep():
+        try:
+            sweep_stale_plan_sessions()
+        except Exception as _e:
+            print(f"[startup] plan-session sweep failed: {_e}", flush=True)
+    threading.Thread(target=_boot_plan_sweep, daemon=True,
+                     name="plan-sweep-boot").start()
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
@@ -3157,17 +3164,20 @@ async def create_approval(body: ApprovalCreate):
 
 # ── Q2 (operator-edit distillation) glue: evidence capture + apply, all
 #    best-effort so a distillation hiccup never blocks an approval decision. ──
-def _lessons_safe(fn: str, *args):
+def _lessons_safe(fn, *args):
+    """[18]: fn is the lessons.* callable itself — call sites stay greppable/
+    refactorable (getattr-by-string hid them and turned typos into
+    runtime-only warnings)."""
     try:
-        import lessons as _lsn
-        return getattr(_lsn, fn)(*args)
+        return fn(*args)
     except Exception as e:
-        db.log_activity("warn", "lessons", f"{fn} failed: {str(e)[:80]}")
+        db.log_activity("warn", "lessons",
+                        f"{getattr(fn, '__name__', fn)} failed: {str(e)[:80]}")
         return None
 
 
 def _lessons_apply(domain: str, deltas: list, user_id, username: str):
-    return _lessons_safe("apply_deltas", domain, deltas, user_id, username)
+    return _lessons_safe(lessons.apply_deltas, domain, deltas, user_id, username)
 
 
 def _record_routing_outcome(task_id):
@@ -3207,9 +3217,9 @@ def _capture_accept_diff(task: dict):
         accepted = open(accepted_p, encoding="utf-8").read()
     except Exception:
         return
-    diff = _lessons_safe("compact_diff", rejected, accepted, task.get("id") or "")
+    diff = _lessons_safe(lessons.compact_diff, rejected, accepted, task.get("id") or "")
     if diff:
-        _lessons_safe("record_evidence", task, "accept_diff", diff)
+        _lessons_safe(lessons.record_evidence, task, "accept_diff", diff)
 
 
 @app.patch("/api/approvals/{approval_id}")
@@ -3260,7 +3270,7 @@ async def decide_approval(approval_id: str, body: dict):
                 # the judge first so the retry carries real findings (setting-gated).
                 fb = (body.get("feedback") or "").strip() or None
                 if fb:  # Q2: rejection feedback becomes distillation evidence
-                    _lessons_safe("record_evidence", task, "feedback", fb)
+                    _lessons_safe(lessons.record_evidence, task, "feedback", fb)
                 await run_in_threadpool(_blind_reject_judge_if_wanted, task_id, fb)
                 # _retry_task falls back to the judge's findings automatically
                 # (snapshots the workspace — copytree — so off the loop)
@@ -3287,7 +3297,7 @@ async def decide_approval(approval_id: str, body: dict):
             else:
                 fb = (body.get("feedback") or "").strip() or None
                 if fb:
-                    _lessons_safe("record_evidence", task, "feedback", fb)
+                    _lessons_safe(lessons.record_evidence, task, "feedback", fb)
                 await run_in_threadpool(_retry_task, task_id, fb)
                 _loop.bump_super_round(task_id)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -3315,7 +3325,7 @@ async def decide_approval(approval_id: str, body: dict):
         else:
             fb = (body.get("feedback") or "").strip()
             if fb and domain:
-                _lessons_safe("_record_domain_feedback", domain, ap.get("user_id"), fb)
+                _lessons_safe(lessons._record_domain_feedback, domain, ap.get("user_id"), fb)
     await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
     return ap
 
@@ -4206,10 +4216,9 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     trubric = _ev.type_rubric_path(_ev.detect_deliverable_type(task)) if task else None
     # Deep Plan (Step 8): a task in a Deep-Plan project also faces its ORIGINAL
     # SPEC contract (optional token; absent when the project wasn't deep-planned).
-    spec_path = None
-    if task and task.get("workflow_id"):
-        sp = Path(__file__).parent / "workspaces" / f"workflow-{task['workflow_id']}" / "attachments" / "SPEC.md"
-        spec_path = str(sp) if sp.is_file() else None
+    # [12]: the attachments layout lives in ONE helper, not an inline copy.
+    spec_path = _workflow_spec_path(task["workflow_id"]) \
+        if task and task.get("workflow_id") else None
     sink: dict = {}
     out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey,
                             type_rubric=trubric, spec_path=spec_path, usage_sink=sink)
@@ -4776,6 +4785,28 @@ async def critic_status(task_id: str):
             "open_critic_comments": n_open}
 
 
+def _loop_meta(kind: str, row: dict, super_result: bool) -> dict:
+    """[10] the ONE meta-dict builder feeding design_loop from a task/workflow
+    row — the SR-flag sync and the preset regen each had a drifting copy
+    (regen's workflow branch used key 'name' and skipped the member-derived
+    high-stakes floor)."""
+    if kind == "task":
+        return {"title": row.get("title"), "domain": row.get("domain"),
+                "high_stakes": bool(row.get("high_stakes")),
+                "specialist": row.get("specialist"), "super_result": super_result,
+                "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
+    specs = [r["specialist"] for r in db.query_all(
+        "SELECT specialist FROM tasks WHERE workflow_id=?", (row["id"],))
+        if r.get("specialist")]
+    hs = db.query_one(
+        "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND high_stakes=1",
+        (row["id"],))
+    return {"title": row.get("name"), "domain": row.get("domain"),
+            "specialists": specs, "super_result": super_result,
+            "high_stakes": bool(row.get("high_stakes") or (hs or {}).get("c")),
+            "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
+
+
 def _sync_super_result_loop(kind: str, row: dict):
     """Keep the loop_config's super_result trigger in lockstep with the flag:
     flag ON + no trigger → regenerate the design (preserving used counts of
@@ -4791,22 +4822,7 @@ def _sync_super_result_loop(kind: str, row: dict):
                                    for t in cfg.get("triggers") or []))
     table = "tasks" if kind == "task" else "workflows"
     if flag and not has_trigger:
-        if kind == "task":
-            meta = {"title": row.get("title"), "domain": row.get("domain"),
-                    "high_stakes": bool(row.get("high_stakes")),
-                    "specialist": row.get("specialist"), "super_result": True,
-                    "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
-        else:
-            specs = [r["specialist"] for r in db.query_all(
-                "SELECT specialist FROM tasks WHERE workflow_id=?", (row["id"],))
-                if r.get("specialist")]
-            hs = db.query_one(
-                "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND high_stakes=1",
-                (row["id"],))
-            meta = {"title": row.get("name"), "domain": row.get("domain"),
-                    "specialists": specs, "super_result": True,
-                    "high_stakes": bool(row.get("high_stakes") or (hs or {}).get("c")),
-                    "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
+        meta = _loop_meta(kind, row, True)
         newcfg = _loop.design_loop(kind, meta,
                                    preference=(cfg or {}).get("preference", "quality"),
                                    mode=(cfg or {}).get("mode", "closed"))
@@ -4848,17 +4864,7 @@ def _regen_loop_for_profile(kind: str, row: dict):
         return
     table = "tasks" if kind == "task" else "workflows"
     has_sr = any((t.get("id") == "super_result") for t in cfg.get("triggers") or [])
-    if kind == "task":
-        meta = {"title": row.get("title"), "domain": row.get("domain"),
-                "high_stakes": bool(row.get("high_stakes")), "specialist": row.get("specialist"),
-                "super_result": has_sr, "autopilot": row.get("autopilot"),
-                "spend_profile": row.get("spend_profile")}
-    else:
-        specs = [r["specialist"] for r in db.query_all(
-            "SELECT specialist FROM tasks WHERE workflow_id=?", (row["id"],)) if r.get("specialist")]
-        meta = {"name": row.get("name"), "domain": row.get("domain"), "specialists": specs,
-                "super_result": has_sr, "high_stakes": bool(row.get("high_stakes")),
-                "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
+    meta = _loop_meta(kind, row, has_sr)
     newcfg = _loop.design_loop(kind, meta,
                                preference=cfg.get("preference", "quality"),
                                mode=cfg.get("mode", "closed"))
@@ -7119,11 +7125,19 @@ def _write_session_spec(kind: str, oid: str, row: dict) -> bool:
     return True
 
 
+def _workflow_spec_path(wf_id: str) -> str | None:
+    """Path to the Deep Plan SPEC.md attached to a workflow, or None when the
+    project wasn't deep-planned ([12]: the ONE place that knows the SPEC's
+    attachments layout — the judge thread and replan seeding both use it)."""
+    fp = Path(__file__).parent / "workspaces" / f"workflow-{wf_id}" / "attachments" / "SPEC.md"
+    return str(fp) if fp.is_file() else None
+
+
 def _workflow_spec_md(wf_id: str) -> str | None:
     """The Deep Plan SPEC.md attached to a workflow, if any (for replan seeding)."""
-    fp = Path(__file__).parent / "workspaces" / f"workflow-{wf_id}" / "attachments" / "SPEC.md"
+    fp = _workflow_spec_path(wf_id)
     try:
-        return fp.read_text() if fp.is_file() else None
+        return Path(fp).read_text() if fp else None
     except Exception:
         return None
 

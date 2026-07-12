@@ -612,6 +612,7 @@ def init_db():
         id TEXT PRIMARY KEY,
         task_id TEXT,
         workflow_id TEXT,
+        eval_run_id TEXT,
         user_id TEXT,
         kind TEXT,
         model TEXT,
@@ -624,6 +625,14 @@ def init_db():
                  "ON frontier_ledger(task_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_frontier_ledger_wf "
                  "ON frontier_ledger(workflow_id)")
+    # [19]: eval-run judge spend gets its OWN column — it used to be stuffed
+    # into the workflow_id slot, so any ledger→workflows join silently mixed
+    # in eval rows. One-time backfill moves the old judge_eval rows over.
+    fl_cols = {r[1] for r in conn.execute("PRAGMA table_info(frontier_ledger)").fetchall()}
+    if "eval_run_id" not in fl_cols:
+        conn.execute("ALTER TABLE frontier_ledger ADD COLUMN eval_run_id TEXT")
+        conn.execute("UPDATE frontier_ledger SET eval_run_id=workflow_id, workflow_id=NULL "
+                     "WHERE kind='judge_eval' AND workflow_id IS NOT NULL")
 
     # Deep Plan mode (Phase 5): conversational planning sessions. Resumable —
     # no boot-reset; stale 'active' rows are swept >7 days by the plan engine
@@ -851,7 +860,8 @@ def glm_cost_estimate(tokens: int, model_id: str | None) -> float:
 def record_frontier_run(task_id: str | None, kind: str, tokens: int,
                         cost_usd: float | None, source: str,
                         model: str | None = None, workflow_id: str | None = None,
-                        user_id: str | None = None) -> None:
+                        user_id: str | None = None,
+                        eval_run_id: str | None = None) -> None:
     """C3: log one frontier subprocess run and bump the task's accumulators.
     cost_usd None (an estimate with no price row) counts as 0 dollars but still
     records the tokens. Never raises — a ledger write must never fail a critic/
@@ -866,10 +876,10 @@ def record_frontier_run(task_id: str | None, kind: str, tokens: int,
         cost = 0.0
     try:
         execute(
-            "INSERT INTO frontier_ledger (id, task_id, workflow_id, user_id, kind, "
-            "model, tokens, cost_usd, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (f"fl-{uuid.uuid4().hex[:12]}", task_id, workflow_id, user_id, kind,
-             model, tok, cost, source, time.time()))
+            "INSERT INTO frontier_ledger (id, task_id, workflow_id, eval_run_id, user_id, "
+            "kind, model, tokens, cost_usd, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (f"fl-{uuid.uuid4().hex[:12]}", task_id, workflow_id, eval_run_id, user_id,
+             kind, model, tok, cost, source, time.time()))
         if task_id:
             execute("UPDATE tasks SET frontier_tokens=COALESCE(frontier_tokens,0)+?, "
                     "frontier_cost_usd=COALESCE(frontier_cost_usd,0)+? WHERE id=?",

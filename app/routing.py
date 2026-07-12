@@ -18,6 +18,7 @@ import time
 import uuid
 import hashlib
 
+import auth
 import database as db
 
 STATS_EVERY_TASKS = 100  # or monthly, whichever comes first
@@ -189,6 +190,7 @@ def sweep_stats():
         "risk_level, requested_at, user_id, scope) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (f"appr-{uuid.uuid4().hex[:10]}", "routing-stats", "routing_tuning",
          f"Routing review: {len(proposals)} threshold suggestion(s) from {n} tasks",
-         json.dumps(payload), "pending", "low", time.time(), "u_owner", "admin"))
+         json.dumps(payload), "pending", "low", time.time(),
+         auth.DEFAULT_USER_ID, "admin"))  # [15]
     db.log_activity("info", "routing",
                     f"Filed a routing-tuning Decisions card ({len(proposals)} proposals)")

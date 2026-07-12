@@ -423,6 +423,9 @@ def _sweep_task_loops(actions_left: int) -> int:
     candidates = [(t, _cfg(t), "task", t["id"], None) for t in own] + \
                  [(t, _cfg({"loop_config": t.get("_wf_cfg")}), "workflow",
                    t.get("_wf_id"), t["id"]) for t in inherited]
+    # [16] loop-invariant: ONE settings read per sweep, not one per candidate
+    # (design_loop hoists the identical read the same way).
+    all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
     for t, cfg, owner_kind, owner_id, per_task in candidates:
         if actions_left <= 0:
             break
@@ -441,7 +444,6 @@ def _sweep_task_loops(actions_left: int) -> int:
         # cfg.auto_judge flag already encodes the scope decision from design_loop.
         # Q7a: a task under the optimal/smart spend profile carries all_quality
         # scope of its own, independent of the global setting.
-        all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
         prof = (t.get("spend_profile") or "").strip()
         scope_ok = bool(t.get("high_stakes")) or all_quality or prof in ("optimal", "smart")
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \

@@ -19,11 +19,10 @@ import re
 import json
 import time
 import uuid
-import shlex
-import shutil
 import subprocess
 import tempfile
 
+import auth
 import database as db
 
 KNOWLEDGE_DIR = os.path.expanduser("~/knowledge")
@@ -181,27 +180,20 @@ def run_distillation(domain: str, user_id: str | None = None, min_evidence: int 
     evidence, ev_ids = gather_evidence_text(domain)
     if not evidence.strip():
         return {"ok": False, "reason": "no evidence text assembled"}
-    owner = user_id or "u_owner"
+    owner = user_id or auth.DEFAULT_USER_ID  # [15]
     jmodel, jkey = _ev.judge_model_for(owner)
     tmpl = db.get_setting("lessons.cmd", "cdistill {domain} {evidence}") or "cdistill {domain} {evidence}"
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, dir="/tmp") as tf:
         tf.write(evidence)
         evid_path = tf.name
     try:
-        # [13]: shell=False + per-token replacement — the same machinery as
-        # judge.cmd/critic_cmd/escalation_cmd. The old tmpl.format(...) raised
-        # KeyError on any literal brace in a customized lessons.cmd (awk/jq),
-        # and shell=True made this the only frontier hook interpreted by a
-        # shell instead of run as an argv list.
-        tokens = [t.replace("{domain}", domain).replace("{evidence}", evid_path)
-                   .replace("{model}", jmodel or "")
-                  for t in shlex.split(tmpl)]
-        tokens = [t for t in tokens if t != ""]  # a {model} token with no model vanishes
-        # Under the systemd unit PATH may lack ~/.local/bin (where cdistill lives).
-        if tokens and not shutil.which(tokens[0]):
-            candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-            if os.path.isfile(candidate):
-                tokens[0] = candidate
+        # [13]/[R3]: shell=False + brace-safe per-token replacement — the SAME
+        # resolver as judge.cmd/critic_cmd/escalation_cmd/plan.critique_cmd
+        # (evals.resolve_cmd_tokens). The old tmpl.format(...) raised KeyError
+        # on any literal brace in a customized lessons.cmd (awk/jq), and
+        # shell=True made this the only frontier hook interpreted by a shell.
+        tokens = _ev.resolve_cmd_tokens(tmpl, {"domain": domain, "evidence": evid_path,
+                                               "model": jmodel})
         # [5]: the scrubbed env every other frontier subprocess gets — secrets
         # (GLM_API_KEY, …) stripped + the claude CLI PATH fix (phase7 finding 1);
         # raw os.environ re-introduced both gaps on this call site.

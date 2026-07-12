@@ -200,7 +200,8 @@ def record_frontier_spend(sink: dict, out_text: str, kind: str,
                           fallback_model: str | None,
                           task_id: str | None = None,
                           workflow_id: str | None = None,
-                          user_id: str | None = None) -> None:
+                          user_id: str | None = None,
+                          eval_run_id: str | None = None) -> None:
     """Persist one frontier run's spend to the C3 ledger. Uses the envelope's
     OWN tokens + dollars when captured (source='envelope'); otherwise estimates
     tokens from the transcript and prices them from the settings table
@@ -218,7 +219,8 @@ def record_frontier_spend(sink: dict, out_text: str, kind: str,
         cost = _price_tokens_blended(tokens, model)
         source = "estimate"
     db.record_frontier_run(task_id, kind, tokens, cost, source, model=model,
-                           workflow_id=workflow_id, user_id=user_id)
+                           workflow_id=workflow_id, user_id=user_id,
+                           eval_run_id=eval_run_id)
 
 
 def _price_tokens_blended(tokens: int, model: str | None) -> float:
@@ -343,41 +345,62 @@ def fingerprint(domain: str, specialists: list) -> dict:
 
 # ─────────────────────────── Judge integration ───────────────────────────
 
-def judge_model_for(user_id: str | None) -> tuple[str | None, str | None]:
-    """Settings v2: the owner's 'frontier_judge' purpose → (model_id, api_key).
-    No assignment → (None, None) = the historical behavior (cjudge runs the
-    Claude CLI's saved default, subscription auth). The key is the owner's
-    credential for the judge model's provider — None keeps the CLI default."""
+def _cli_model_for(user_id: str | None, purpose: str) -> tuple[str | None, str | None]:
+    """Settings v2 ([9]: the ONE resolve-assignment/route-check/resolve-key
+    body): a CLI-routed purpose assignment → (model_id, api_key). No assignment
+    / non-cli route → (None, None) = the Claude CLI's saved default
+    (subscription auth). The key is the user's credential for the model's
+    provider — None keeps the CLI default."""
     import secrets_store
-    row = db.resolve_assignment(user_id, "frontier_judge")
+    row = db.resolve_assignment(user_id, purpose)
     if not row or row["route"] != "cli":
         return None, None
     key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
     return row["model_id"], key
+
+
+def judge_model_for(user_id: str | None) -> tuple[str | None, str | None]:
+    """The owner's 'frontier_judge' purpose → (model_id, api_key)."""
+    return _cli_model_for(user_id, "frontier_judge")
 
 
 def spec_model_for(user_id: str | None) -> tuple[str | None, str | None]:
-    """Deep Plan premortem model: the owner's 'spec_model' purpose → (model_id,
-    api_key). No assignment / non-cli route → (None, None) = the CLI's saved
-    default (subscription auth). Mirrors judge_model_for."""
-    import secrets_store
-    row = db.resolve_assignment(user_id, "spec_model")
-    if not row or row["route"] != "cli":
-        return None, None
-    key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
-    return row["model_id"], key
+    """Deep Plan premortem model: the owner's 'spec_model' purpose."""
+    return _cli_model_for(user_id, "spec_model")
 
 
 def escalation_model_for(user_id: str | None) -> tuple[str | None, str | None]:
-    """Appendix C1c escalated-rework model: the owner's 'escalation_model'
-    purpose → (model_id, api_key). No assignment / non-cli route → (None, None)
-    = the CLI's saved default (subscription auth). Mirrors judge_model_for."""
-    import secrets_store
-    row = db.resolve_assignment(user_id, "escalation_model")
-    if not row or row["route"] != "cli":
-        return None, None
-    key = secrets_store.resolve_key(user_id, row["provider"], row.get("credential_id"))
-    return row["model_id"], key
+    """Appendix C1c escalated-rework model: the owner's 'escalation_model' purpose."""
+    return _cli_model_for(user_id, "escalation_model")
+
+
+def _fallback_local_bin(tokens: list[str]) -> list[str]:
+    """Under the systemd unit PATH may lack ~/.local/bin (where the frontier
+    hook CLIs — cjudge/cverify/cexec/cdistill/claude — live): resolve a bare
+    command name explicitly before giving up."""
+    import shutil
+    if tokens and not shutil.which(tokens[0]):
+        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
+        if os.path.isfile(candidate):
+            tokens[0] = candidate
+    return tokens
+
+
+def resolve_cmd_tokens(tmpl: str, mapping: dict) -> list[str]:
+    """[R3] the ONE frontier-hook command resolver (judge.cmd, super.critic_cmd,
+    super.escalation_cmd, plan.critique_cmd, lessons.cmd): shlex-split the
+    template, substitute {token}s PER TOKEN (brace-safe — NOT .format:
+    deliverable titles and model ids may contain literal braces), drop tokens
+    that substituted to empty (an optional {model} with no model vanishes), and
+    resolve the command through ~/.local/bin when the service PATH lacks it."""
+    import shlex
+    tokens = []
+    for t in shlex.split(tmpl or ""):
+        for k, v in (mapping or {}).items():
+            t = t.replace("{" + k + "}", v or "")
+        if t != "":
+            tokens.append(t)
+    return _fallback_local_bin(tokens)
 
 
 def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
@@ -396,7 +419,6 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
     `claude -p` (inside cjudge) can only read files under its working directory
     without permission prompts, and the judge must read BOTH the rubric tree
     and the deliverable."""
-    import shlex
     import shutil
     import subprocess as sp
     tmpdir = Path(KNOWLEDGE_DIR) / ".nexus-judge-tmp"
@@ -409,19 +431,11 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         judged_path = str(tmp_file)
     except Exception:
         pass  # fall back to the original path
-    # shell=False + per-token replacement (NOT .format — deliverable titles and
-    # model ids may contain braces): template values are validated, and this
+    # shell=False + brace-safe per-token replacement — [R3] resolve_cmd_tokens
     # removes the shell layer entirely (defense in depth for judge.cmd).
-    tokens = [t.replace("{file}", judged_path).replace("{domain}", domain)
-               .replace("{model}", model or "")
-               .replace("{type_rubric}", type_rubric or "")
-              for t in shlex.split(db.get_setting("judge.cmd", "cjudge {file} {domain}"))]
-    tokens = [t for t in tokens if t != ""]  # a {model} token with no model vanishes
-    # Under the systemd unit PATH may lack ~/.local/bin (where cjudge lives).
-    if tokens and not shutil.which(tokens[0]):
-        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-        if os.path.isfile(candidate):
-            tokens[0] = candidate
+    tokens = resolve_cmd_tokens(db.get_setting("judge.cmd", "cjudge {file} {domain}"),
+                                {"file": judged_path, "domain": domain,
+                                 "model": model, "type_rubric": type_rubric})
     env = dict(os.environ)
     env["PATH"] = _augment_path_for_claude(env.get("PATH", ""))  # phase7 finding 1
     if model:
@@ -804,24 +818,15 @@ def run_critic_cmd(task: dict, domain: str | None, model: str | None = None,
     """Build the sandbox, run the critic command (settings super.critic_cmd —
     gates stub it, same contract as judge.cmd), tear the sandbox down.
     Mirrors run_judge_cmd; the timeout is owned HERE (§4.2)."""
-    import shlex
     import shutil
     import subprocess as sp
     import settings_registry as sreg
     sandbox, deliv_rel = build_critic_sandbox(task, round_no)
     try:
-        tokens = [t.replace("{file}", str(sandbox / deliv_rel))
-                   .replace("{domain}", domain or "-")
-                   .replace("{sandbox}", str(sandbox))
-                   .replace("{model}", model or "")
-                  for t in shlex.split(
-                      sreg.conf("super.critic_cmd", "cverify {file} {domain} {sandbox}"))]
-        tokens = [t for t in tokens if t != ""]
-        # Under the systemd unit PATH may lack ~/.local/bin (where cverify lives).
-        if tokens and not shutil.which(tokens[0]):
-            candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-            if os.path.isfile(candidate):
-                tokens[0] = candidate
+        tokens = resolve_cmd_tokens(
+            sreg.conf("super.critic_cmd", "cverify {file} {domain} {sandbox}"),
+            {"file": str(sandbox / deliv_rel), "domain": domain or "-",
+             "sandbox": str(sandbox), "model": model})
         env = _scrubbed_env()
         if model:
             env["JUDGE_MODEL"] = model
@@ -949,7 +954,6 @@ def run_escalation_cmd(task: dict, dossier_text: str, deliverable_rel: str = "de
     so the escalation_model rewrites the deliverable in place, then remove the
     dossier. Returns the model's log summary (already unwrapped). Blocks on the
     same _FRONTIER_GATE as the critic/judge (premortem P1)."""
-    import shlex
     import shutil
     import subprocess as sp
     import settings_registry as sreg
@@ -961,18 +965,10 @@ def run_escalation_cmd(task: dict, dossier_text: str, deliverable_rel: str = "de
         dossier_dir.mkdir(exist_ok=True)
         dossier_fp = dossier_dir / "dossier.md"
         dossier_fp.write_text(dossier_text or "(empty dossier)")
-        tokens = [t.replace("{workspace}", ws)
-                   .replace("{deliverable}", deliverable_rel)
-                   .replace("{dossier}", str(dossier_fp))
-                   .replace("{model}", model or "")
-                  for t in shlex.split(
-                      sreg.conf("super.escalation_cmd",
-                                "cexec {workspace} {deliverable} {dossier}"))]
-        tokens = [t for t in tokens if t != ""]
-        if tokens and not shutil.which(tokens[0]):
-            cand = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-            if os.path.isfile(cand):
-                tokens[0] = cand
+        tokens = resolve_cmd_tokens(
+            sreg.conf("super.escalation_cmd", "cexec {workspace} {deliverable} {dossier}"),
+            {"workspace": ws, "deliverable": deliverable_rel,
+             "dossier": str(dossier_fp), "model": model})
         env = _scrubbed_env()
         if model:
             env["JUDGE_MODEL"] = model
@@ -1008,8 +1004,6 @@ def run_plan_critique(spec_text: str, plan_text: str, model: str | None = None,
     JSON. Mirrors run_judge_cmd's machinery (frontier gate, quota classification,
     cwd under knowledge). plan.stub short-circuits with a canned finding so the
     verify gate needs no frontier tokens (mirrors evals.stub)."""
-    import shlex
-    import shutil
     import subprocess as sp
     if db.get_setting("plan.stub", "0") == "1":
         return (f"[PLAN STUB — premortem stubbed for the gate]\n{PLAN_JSON_BEGIN}\n"
@@ -1043,15 +1037,11 @@ def run_plan_critique(spec_text: str, plan_text: str, model: str | None = None,
         # headless claude CLI directly on the spec_model.
         tmpl = (db.get_setting("plan.critique_cmd", "") or "").strip()
         if tmpl:
-            tokens = [t.replace("{spec}", str(spec_fp)).replace("{plan}", str(plan_fp))
-                       .replace("{model}", model or "") for t in shlex.split(tmpl)]
-            tokens = [t for t in tokens if t != ""]
+            tokens = resolve_cmd_tokens(tmpl, {"spec": str(spec_fp),
+                                               "plan": str(plan_fp), "model": model})
         else:
-            tokens = ["claude"] + (["--model", model] if model else []) + ["-p", prompt]
-        if tokens and not shutil.which(tokens[0]):
-            cand = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-            if os.path.isfile(cand):
-                tokens[0] = cand
+            tokens = _fallback_local_bin(
+                ["claude"] + (["--model", model] if model else []) + ["-p", prompt])
         # env scrub identical in spirit to cjudge: drop CLI-config vars, honour
         # a per-user key, else fall through to the subscription auth.
         env = {k: v for k, v in os.environ.items()
@@ -1342,11 +1332,13 @@ def _run_thread(run_id: str, domain: str, uid: str | None):
             jsink: dict = {}
             out = run_judge_cmd(gen["path"], domain, model=jmodel, api_key=jkey,
                                 type_rubric=trubric, usage_sink=jsink)
-            # C3 ledger: eval-judge spend is tagged by run_id (workflow_id slot)
-            # so the Phase-8 campaign can total frontier $ per arm.
+            # C3 ledger: eval-judge spend is tagged by its OWN eval_run_id
+            # column ([19] — no longer stuffed into the workflow_id slot) so
+            # the Phase-8 campaign can total frontier $ per arm without
+            # polluting per-workflow ledger joins.
             record_frontier_spend(jsink, out, "judge_eval",
                                   jmodel or db.fallback_model("frontier_judge"),
-                                  task_id=None, workflow_id=run_id, user_id=uid)
+                                  task_id=None, eval_run_id=run_id, user_id=uid)
             m = parse_judge_metrics(out)
             db.execute(
                 "UPDATE eval_results SET status='scored', verdict=?, score=?, score_max=?, "

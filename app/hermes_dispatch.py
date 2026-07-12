@@ -1065,9 +1065,12 @@ def parse_decisions_section(text: str) -> str | None:
 
 
 def harvest_decisions(task: dict, content: str):
-    """Q4 harvest (deterministic, no LLM): append this task's `## Decisions`
-    lines to its project's running DECISIONS.md so every later stage reads a
-    coherent log of the choices already made."""
+    """Q4 harvest (deterministic, no LLM): record this task's `## Decisions`
+    lines in its project's running DECISIONS.md so every later stage reads a
+    coherent log of the choices already made. [6]: ONE block per task — a
+    rework round REPLACES the task's block (keyed by a task-id marker) instead
+    of appending a duplicate; later stages are told the log is binding, so a
+    stale block from a rejected draft would anchor them to reversed choices."""
     wid = task.get("workflow_id")
     if not wid:
         return
@@ -1075,15 +1078,29 @@ def harvest_decisions(task: dict, content: str):
     if not body:
         return
     try:
+        import fcntl
         wdir = WORKSPACES / f"workflow-{wid}"
         wdir.mkdir(parents=True, exist_ok=True)
         path = wdir / "DECISIONS.md"
         stamp = time.strftime("%Y-%m-%d")
         header = "# Project decisions\n\nThe binding choices each stage made. Later stages MUST respect these.\n"
-        if not path.exists():
-            path.write_text(header)
-        with path.open("a") as f:
-            f.write(f"\n### {(task.get('title') or task['id'])[:120]} ({stamp})\n{body}\n")
+        marker = f"<!-- task:{task['id']} -->"
+        block = f"\n### {(task.get('title') or task['id'])[:120]} ({stamp}) {marker}\n{body}\n"
+        # Read-modify-write under an exclusive lock: parallel lanes finalizing
+        # siblings of the same workflow must not erase each other's blocks.
+        with path.open("a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            text = f.read() or header
+            if marker in text:
+                pat = re.compile(r"\n### [^\n]*" + re.escape(marker)
+                                 + r"[^\n]*\n.*?(?=\n### |\Z)", re.S)
+                text = pat.sub(lambda m: block, text, count=1)
+            else:
+                text += block
+            f.seek(0)
+            f.truncate()
+            f.write(text)
     except Exception as e:
         db.log_activity("warn", "dispatch",
                         f"decision-log harvest failed for {task.get('id')}: {str(e)[:80]}")
@@ -1505,7 +1522,10 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             raise QuotaError("simulated 429 (dispatch.force_429)")
 
         blocked = check_budgets(task)
-        if blocked == "blocked_budget" and resume and 0 < _turn_cut_count(task_id) <= 3:
+        # [17]: query the cut count ONCE (guard + log share it) — and only on
+        # the budget-blocked resume path, exactly as before.
+        cuts = _turn_cut_count(task_id) if blocked == "blocked_budget" and resume else 0
+        if 0 < cuts <= 3:
             # B2: this resume finishes work the budget already paid for — parking
             # it one step from the finish strands the whole spend. Grant the same
             # one-slice headroom a judge retry gets (_retry_task), bounded to 3
@@ -1517,7 +1537,7 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             task["budget_tokens"] = new_budget
             db.log_activity("info", agent_id,
                             f"Task {task_id}: budget extended to {new_budget:,} to finish "
-                            f"a cut-turn run (cut #{_turn_cut_count(task_id)})",
+                            f"a cut-turn run (cut #{cuts})",
                             user_id=task.get("user_id"))
             blocked = check_budgets(task)  # daily cap / quota backoff still bind
         if blocked:
