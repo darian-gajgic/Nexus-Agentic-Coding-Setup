@@ -200,6 +200,15 @@ def startup():
             print(f"[startup] plan-session sweep failed: {_e}", flush=True)
     threading.Thread(target=_boot_plan_sweep, daemon=True,
                      name="plan-sweep-boot").start()
+    # Item 6c: a crash mid-improvement-draft leaves improve_status='drafting'
+    # forever — reset so the button re-arms (replan-drafting pattern).
+    try:
+        import evals as _ev_boot
+        _n = _ev_boot.reconcile_improve_drafting()
+        if _n:
+            print(f"[startup] reset {_n} orphaned eval-improve draft(s)", flush=True)
+    except Exception as _e:
+        print(f"[startup] eval-improve reconcile failed: {_e}", flush=True)
     # Start background metrics collector
     stop_event = threading.Event()
     t = threading.Thread(target=am.metrics_loop, args=(stop_event,), daemon=True)
@@ -682,20 +691,34 @@ async def create_task(body: TaskCreate):
             "error": f"deliverable_type must be one of {list(_DELIVERABLE_TYPES)}"})
     ap_inv, ap_spend, budget = _autopilot_fields(body.autopilot, body.spend_profile,
                                                  body.high_stakes, body.budget_tokens)
+    # Item 15: description-informed auto-routing at the single create choke
+    # point (covers manual create, wizard proposals, follow-ups). An explicit
+    # model in the body always wins; the reason is stored for the task detail.
+    task_model, model_reason = body.model, None
+    if not body.model:
+        import routing as _routing
+        task_model, model_reason = _routing.select_model_for_task({
+            "title": body.title, "description": body.description,
+            "domain": body.domain, "specialist": body.specialist,
+            "deliverable_type": body.deliverable_type,
+            "high_stakes": body.high_stakes, "model": None}, uid)
+        if task_model and task_model not in db.task_models_for(uid):
+            task_model, model_reason = None, None
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
          domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id,
-         super_result, deliverable_type, autopilot, spend_profile)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         super_result, deliverable_type, autopilot, spend_profile, model_reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tid, body.title, body.description, body.status, body.priority,
          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
-         body.domain, body.specialist, 1 if body.high_stakes else 0, budget, body.model,
+         body.domain, body.specialist, 1 if body.high_stakes else 0, budget, task_model,
          body.workflow_id, json.dumps(body.depends_on) if body.depends_on else None,
          json.dumps(body.loop_config) if body.loop_config else None,
          (body.repo_path or None), (_derive_client(body.client, body.repo_path)), uid,
-         1 if body.super_result else 0, body.deliverable_type or None, ap_inv, ap_spend))
+         1 if body.super_result else 0, body.deliverable_type or None, ap_inv, ap_spend,
+         model_reason))
     db.log_activity("info", "system", f"Task created: '{body.title}'", user_id=uid)
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     if body.super_result:
@@ -748,6 +771,8 @@ async def update_task(task_id: str, body: TaskUpdate):
             return JSONResponse(status_code=400, content={
                 "error": f"model '{body.model}' is not in your model registry (Settings → Models)"})
         updates["model"] = body.model or None
+        # Item 15: a human choice supersedes the auto-routing explanation.
+        updates["model_reason"] = "chosen by you" if body.model else None
     if body.workflow_id is not None:
         updates["workflow_id"] = body.workflow_id or None
     if body.depends_on is not None:
@@ -3359,6 +3384,34 @@ async def decide_approval(approval_id: str, body: dict):
             fb = (body.get("feedback") or "").strip()
             if fb and domain:
                 _lessons_safe(lessons._record_domain_feedback, domain, ap.get("user_id"), fb)
+    # Item 6c: an admin-scoped eval_improve card — approve applies the (possibly
+    # edited/pruned) deltas to knowledge/specialists/exemplars + git-commits;
+    # reject feeds the feedback into the domain evidence for the next round.
+    elif ap.get("action_type") == "eval_improve":
+        try:
+            payload = json.loads(ap.get("payload") or "{}") or {}
+        except Exception:
+            payload = {}
+        run_id = payload.get("run_id") or ""
+        if decision == "approved":
+            if isinstance(body.get("deltas"), list):
+                payload["deltas"] = body["deltas"]  # UI-edited/pruned set wins
+            import evals as _ev_mod
+            res = await run_in_threadpool(
+                _ev_mod.apply_improvements, payload, ap.get("user_id"),
+                (decided_by or "operator"))
+            db.log_activity("info", "evals",
+                            f"Eval improvements approved for '{payload.get('domain')}': "
+                            f"{len((res or {}).get('applied') or [])} applied")
+        else:
+            fb = (body.get("feedback") or "").strip()
+            if fb and payload.get("domain"):
+                _lessons_safe(lessons._record_domain_feedback,
+                              payload["domain"], ap.get("user_id"),
+                              "eval-improve review: " + fb)
+            if run_id:
+                db.execute("UPDATE eval_runs SET improve_status='rejected' WHERE id=?",
+                           (run_id,))
     await mgr.broadcast({"type": "approval_updated", "data": ap}, user_id=ap.get("user_id"))
     return ap
 
@@ -3376,6 +3429,8 @@ _DECISION_FALLBACKS = {
                      "recommendation": "Review the inspector's findings", "cost_hint": ""},
     "lesson_deltas": {"headline": "New lessons distilled from your corrections.",
                       "recommendation": "Review & apply", "cost_hint": ""},
+    "eval_improve": {"headline": "An eval run suggests durable improvements.",
+                     "recommendation": "Review & apply", "cost_hint": ""},
     "routing_tuning": {"headline": "The router has learning to review.",
                        "recommendation": "Review routing suggestions", "cost_hint": ""},
 }
@@ -3609,9 +3664,34 @@ async def memory_context(agent_id: str):
     summary = " ".join(m["content"] for m in lts).strip()
     lessons = "\n".join(f"- {m['content']}" for m in exp)
     return {
-        "lts_summary": summary or "(no long-term summary yet)",
-        "recent_experience": lessons or "(no recorded experience yet)",
+        "lts_summary": summary or "(no long-term summary yet — it appears once this "
+                                  "lane has completed enough tasks for the hourly sweep "
+                                  "to condense its task log)",
+        "recent_experience": lessons or "(no recorded experience yet — one line is "
+                                        "logged automatically per finished task)",
     }
+
+
+@app.post("/api/agents/{agent_id}/memory/consolidate")
+async def memory_consolidate(agent_id: str):
+    """Item 3: '↻ Summarize now' — condense this lane's task log into its
+    rolling summary immediately instead of waiting for the hourly sweep."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not db.query_one("SELECT 1 FROM agents WHERE id=?", (agent_id,)):
+        return JSONResponse(status_code=404, content={"error": "agent not found"})
+    import agent_memory as _am
+    try:
+        summary = await run_in_threadpool(_am.consolidate_agent, agent_id, True)
+    except hd.QuotaError as e:
+        return JSONResponse(status_code=503, content={
+            "error": f"GLM is load-shedding right now — try again in a minute ({str(e)[:80]})"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    if summary is None:
+        return {"ok": True, "summary": None,
+                "note": "nothing to summarize — no new task-log lines for this lane"}
+    return {"ok": True, "summary": summary}
 
 
 # ── 7. Cron scheduler ──
@@ -5230,11 +5310,17 @@ def log_task_feedback(task_id: str, body: dict):
     try:
         if kind == "win" and body.get("promote"):
             try:
-                promoted_to = fb.promote_deliverable(task, fields["headline"], numbers)
+                _u = auth.current_user() or {}
+                promoted_to = fb.promote_deliverable(
+                    task, fields["headline"], numbers,
+                    by=_u.get("display_name") or _u.get("username") or "")
             except ValueError as e:
                 return JSONResponse(status_code=400, content={"error": f"cannot promote: {e}"})
         fields["promoted_to"] = promoted_to
-        target = fb.insert_entry(kind, fb.compose_entry(kind, task, fields))
+        # Item 7: the entry lands in the LOGGING user's ledger (owner →
+        # canonical/General, member → their overlay) so learning is per user.
+        target = fb.insert_entry(kind, fb.compose_entry(kind, task, fields),
+                                 auth.current_user_id())
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"could not write: {e}"})
     domain = (task.get("domain") or "").strip()
@@ -5346,21 +5432,79 @@ async def draft_task_feedback(task_id: str, body: dict):
 
 
 @app.get("/api/feedback")
-def list_feedback(kind: str = "", domain: str = "", limit: int = 200):
+def list_feedback(kind: str = "", domain: str = "", limit: int = 200, scope: str = "all"):
     """The Wins & Lessons browser: parsed ledger entries, newest first.
-    Shared business knowledge — same trust level as the agents that read it."""
+    Item 7: entries are per user — scope=mine|general|all filters between your
+    own ledger, the shared General ledger (the owner's canonical files), and
+    everyone's. Cross-user visibility is the point (browse + copy others'
+    improvements); kill switch feedback.cross_user_visible."""
     limit = max(1, min(int(limit or 200), 1000))
     dom = (domain or "").strip().lower()
-    out = {"files": {"win": fb.feedback_path("win"), "lesson": fb.feedback_path("lesson")},
-           "wins": [], "lessons": []}
+    uid = auth.current_user_id()
+    cross_ok = db.get_setting("feedback.cross_user_visible", "1") == "1"
+    if scope not in ("mine", "general", "all"):
+        scope = "all"
+    if scope == "all" and not cross_ok:
+        scope = "mine"
+    out = {"files": {"win": fb.feedback_path("win", uid), "lesson": fb.feedback_path("lesson", uid)},
+           "me": uid, "cross_user_visible": cross_ok, "wins": [], "lessons": []}
     for k, bucket in (("win", "wins"), ("lesson", "lessons")):
         if kind and kind != k:
             continue
-        rows = fb.load_entries(k)
+        rows = fb.list_all_entries(k)
+        if scope == "mine":
+            rows = [e for e in rows if e["author_id"] == uid
+                    or (uid == auth.DEFAULT_USER_ID and e["general"])]
+        elif scope == "general":
+            rows = [e for e in rows if e["general"]]
         if dom:
             rows = [e for e in rows if e["domain"] == dom]
+        for e in rows:
+            e["own"] = e["author_id"] == uid
         out[bucket] = rows[:limit]
     return out
+
+
+@app.post("/api/feedback/adopt")
+def adopt_feedback(body: dict):
+    """Item 7: copy another user's WIN/LESSON into MY ledger (with provenance)
+    so it rides into MY task briefings from now on."""
+    kind = body.get("kind")
+    if kind not in ("win", "lesson"):
+        return JSONResponse(status_code=400, content={"error": "kind must be win|lesson"})
+    if db.get_setting("feedback.cross_user_visible", "1") != "1":
+        return JSONResponse(status_code=403, content={"error": "cross-user browsing is disabled"})
+    uid = auth.current_user_id()
+    author_id = str(body.get("author_id") or "")
+    key = str(body.get("key") or "")
+    if author_id == uid:
+        return JSONResponse(status_code=400, content={"error": "that entry is already yours"})
+    src = (fb.load_entries(kind) if author_id == auth.DEFAULT_USER_ID
+           else fb.load_entries(kind, author_id))
+    entry = next((e for e in src if e["key"] == key), None)
+    if not entry:
+        return JSONResponse(status_code=404, content={"error": "entry no longer exists"})
+    author = db.query_one("SELECT display_name, username FROM users WHERE id=?", (author_id,))
+    author_name = (author or {}).get("display_name") or (author or {}).get("username") or author_id
+    try:
+        path = fb.adopt_entry(kind, entry, uid, author_name, author_id)
+    except ValueError as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    db.log_activity("info", "feedback",
+                    f"Adopted a {kind.upper()} from {author_name} into own ledger",
+                    user_id=uid)
+    return {"ok": True, "file": path}
+
+
+@app.get("/api/users/names")
+async def users_names():
+    """Light user roster (id + display name) for author badges — any
+    authenticated user; mirrors /api/specialists/names (the full /api/users
+    stays admin-only)."""
+    rows = db.query_all("SELECT id, display_name, username FROM users WHERE active=1")
+    return {"users": [{"id": r["id"],
+                       "name": r.get("display_name") or r.get("username") or r["id"]}
+                      for r in rows]}
 
 
 def _retry_task(task_id: str, feedback: str | None):
@@ -5882,9 +6026,18 @@ def _model_guidance(uid: str | None) -> str:
     hard = _purpose_model(uid, "complicated") or db.fallback_model("complicated")
     easy = _purpose_model(uid, "easy") or db.fallback_model("easy")
     mech = _purpose_model(uid, "mechanical") or db.fallback_model("mechanical")
-    return (f"- model: one of {_user_task_models(uid)} — {hard} for real deliverables and "
-            f"hard thinking (default), {easy} for light/simple tasks, {mech} only for "
-            f"mechanical formatting/extraction. All dev-pipeline stages: {hard}.\n")
+    out = (f"- model: one of {_user_task_models(uid)} — {hard} for real deliverables and "
+           f"hard thinking (default), {easy} for light/simple tasks, {mech} only for "
+           f"mechanical formatting/extraction. All dev-pipeline stages: {hard}.\n")
+    # Item 15: the operator's per-model capability notes inform plan-time picks.
+    cap_lines = []
+    for m in db.visible_models(uid, enabled_only=True):
+        first = (m.get("description") or "").strip().splitlines()
+        if m.get("route") == "hermes" and first:
+            cap_lines.append(f"  - {m['model_id']}: {first[0][:160]}")
+    if cap_lines:
+        out += "- model capability notes (operator-maintained):\n" + "\n".join(cap_lines) + "\n"
+    return out
 
 
 def _specialist_roster() -> str:
@@ -8555,6 +8708,47 @@ async def evals_run_detail(run_id: str):
     return {"run": run, "results": results}
 
 
+@app.post("/api/evals/runs/{run_id}/improve")
+async def evals_run_improve(run_id: str):
+    """Item 6c: manually trigger the improvement draft for a completed run
+    (auto-draft covers the common case; this re-arms after reject/error)."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=? AND user_id=?",
+                       (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    if run.get("improve_status") in ("drafting", "proposed"):
+        return JSONResponse(status_code=409, content={
+            "error": f"improvement already {run['improve_status']} — decide the "
+                     "pending card first"})
+    import evals as ev
+    res = await run_in_threadpool(ev.run_improvement, run_id, auth.current_user_id())
+    if not res.get("ok"):
+        return JSONResponse(status_code=502, content={"error": res.get("reason")})
+    return {"ok": True, "approval_id": res.get("approval_id"),
+            "deltas": res.get("deltas"), "note": res.get("reason")}
+
+
+@app.get("/api/evals/runs/{run_id}/improve")
+async def evals_run_improve_status(run_id: str):
+    run = db.query_one("SELECT improve_status, improve_approval_id FROM eval_runs "
+                       "WHERE id=? AND user_id=?", (run_id, auth.current_user_id()))
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "run not found"})
+    deltas = None
+    if run.get("improve_approval_id"):
+        ap = db.query_one("SELECT payload, status FROM approvals WHERE id=?",
+                          (run["improve_approval_id"],))
+        if ap:
+            try:
+                deltas = (json.loads(ap.get("payload") or "{}") or {}).get("deltas")
+            except Exception:
+                deltas = None
+    return {"status": run.get("improve_status"),
+            "approval_id": run.get("improve_approval_id"), "deltas": deltas}
+
+
 @app.get("/api/evals/runs/{run_id}/file")
 async def evals_run_file(run_id: str, case: str):
     """The generated deliverable of one eval case (ownership-gated)."""
@@ -8571,7 +8765,7 @@ async def evals_run_file(run_id: str, case: str):
     resolved = Path(p).resolve()
     if not str(resolved).startswith(str(ev.WORKSPACES.resolve()) + os.sep):
         return JSONResponse(status_code=403, content={"error": "path escapes eval workspace"})
-    return FileResponse(str(resolved), media_type="text/plain")
+    return FileResponse(str(resolved), media_type="text/markdown; charset=utf-8")
 
 
 @app.post("/api/evals/runs/{run_id}/cancel")
@@ -8894,8 +9088,9 @@ async def credentials_delete(cred_id: str):
 # ── Settings v2: per-user model registry + purpose routing ──
 
 def _model_public(m: dict) -> dict:
-    return {k: m[k] for k in ("id", "user_id", "provider", "model_id", "label", "route",
-                              "credential_id", "enabled", "config", "created_at", "updated_at")}
+    return {k: m.get(k) for k in ("id", "user_id", "provider", "model_id", "label", "route",
+                                  "credential_id", "enabled", "config", "description",
+                                  "created_at", "updated_at")}
 
 
 def _visible_model(mid: str, uid: str):
@@ -8949,11 +9144,13 @@ async def models_create(body: dict):
     now = time.time()
     db.execute(
         "INSERT INTO user_models (id, user_id, provider, model_id, label, route, "
-        "credential_id, enabled, config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "credential_id, enabled, config, description, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (mid, None if is_global else uid, str(body["provider"]).strip().lower(),
          str(body["model_id"]).strip(), str(body.get("label") or "")[:120],
          body["route"], cred, 1 if body.get("enabled", True) else 0,
-         json.dumps(body.get("config") or {})[:2000], now, now))
+         json.dumps(body.get("config") or {})[:2000],
+         str(body.get("description") or "")[:2000], now, now))
     db.log_activity("info", "settings", f"Model added: {body['model_id']} ({body['route']})",
                     user_id=None if is_global else uid)
     return {"ok": True, "model": _model_public(db.query_one(
@@ -8975,14 +9172,85 @@ async def models_update(mid: str, body: dict):
     if merged.get("credential_id") and not secrets_store.get_credential(merged["credential_id"]):
         return JSONResponse(status_code=400, content={"error": "unknown credential"})
     cfg = json.dumps(body["config"])[:2000] if isinstance(body.get("config"), dict) else m["config"]
+    desc = str(body["description"])[:2000] if "description" in body else (m.get("description") or "")
     db.execute(
         "UPDATE user_models SET provider=?, model_id=?, label=?, route=?, credential_id=?, "
-        "enabled=?, config=?, updated_at=? WHERE id=?",
+        "enabled=?, config=?, description=?, updated_at=? WHERE id=?",
         (str(merged["provider"]).strip().lower(), str(merged["model_id"]).strip(),
          str(merged["label"] or "")[:120], merged["route"], merged.get("credential_id"),
-         1 if merged.get("enabled") in (1, True, "1") else 0, cfg, time.time(), mid))
+         1 if merged.get("enabled") in (1, True, "1") else 0, cfg, desc, time.time(), mid))
     return {"ok": True, "model": _model_public(db.query_one(
         "SELECT * FROM user_models WHERE id=?", (mid,)))}
+
+
+_MODEL_DESCRIBE_FRAMING = (
+    "You research ONE LLM's practical capabilities for a task-routing registry. "
+    "Use your web search tools to find current, factual information about the "
+    "model named in the user message: benchmark strengths, context window, "
+    "speed/cost tier, known weaknesses, languages, tool-use/coding/writing "
+    "aptitude. Reply with ONLY a JSON object — no commentary, no code fences: "
+    '{"strengths": ["<=6 short phrases"], "weaknesses": ["<=4"], '
+    '"best_for": ["<=6 concrete task types, e.g. \'long-form German marketing '
+    "copy', 'mechanical data extraction'\"], \"avoid_for\": [\"<=4\"], "
+    '"notes": "one line (context size, speed, cost tier)"}. '
+    "Base claims on what you actually found; append '(unverified)' inside any "
+    "phrase you could not confirm.")
+
+
+@app.post("/api/models/{mid}/describe")
+async def models_describe(mid: str):
+    """Item 15: ✨ Auto-set description — research the model's strengths/
+    weaknesses via a throwaway Hermes session WITH web search, and return a
+    structured DRAFT (the human reviews and saves via the normal PATCH;
+    nothing auto-writes)."""
+    uid = auth.current_user_id()
+    m = _visible_model(mid, uid)
+    if not m or (m["user_id"] is None and not auth.is_admin()):
+        return JSONResponse(status_code=404, content={"error": "not found"})
+
+    def _run():
+        sid = hd.create_session("nexus:model-describe", model=db.default_task_model(uid))
+        hd.publish_session_scope(sid, user=uid)
+        hd.publish_session_key(sid, uid, db.default_task_model(uid))
+        try:
+            return hd.stream_turn(
+                sid,
+                f"Research the model: provider '{m['provider']}', model id "
+                f"'{m['model_id']}'" + (f" (label: {m['label']})" if m.get("label") else "")
+                + ". Reply with the JSON object now.",
+                system_message=_MODEL_DESCRIBE_FRAMING, max_seconds=240)
+        finally:
+            hd.delete_session(sid)
+
+    try:
+        res = await asyncio.get_running_loop().run_in_executor(None, _run)
+    except hd.QuotaError as e:
+        return JSONResponse(status_code=503, content={
+            "error": f"GLM is load-shedding right now — try again in a minute ({str(e)[:80]})"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    content = (res.get("content") or "").strip()
+    if res.get("error") or not content:
+        return JSONResponse(status_code=502, content={
+            "error": res.get("error") or "the model returned an empty draft"})
+    try:
+        draft = json.loads(content[content.index("{"):content.rindex("}") + 1])
+        if not isinstance(draft, dict):
+            raise ValueError("not an object")
+    except Exception:
+        return JSONResponse(status_code=502, content={"error": "unparseable research reply — try again"})
+
+    def _join(key, cap):
+        vals = [str(v).strip() for v in (draft.get(key) or []) if str(v).strip()][:cap]
+        return "; ".join(vals)
+    text = "\n".join(filter(None, [
+        f"Strengths: {_join('strengths', 6)}" if _join('strengths', 6) else "",
+        f"Weaknesses: {_join('weaknesses', 4)}" if _join('weaknesses', 4) else "",
+        f"Best for: {_join('best_for', 6)}" if _join('best_for', 6) else "",
+        f"Avoid for: {_join('avoid_for', 4)}" if _join('avoid_for', 4) else "",
+        f"Notes: {str(draft.get('notes') or '').strip()}" if draft.get("notes") else "",
+    ]))[:2000]
+    return {"ok": True, "description": text}
 
 
 @app.delete("/api/models/{mid}")

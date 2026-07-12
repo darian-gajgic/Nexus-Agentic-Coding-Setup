@@ -289,6 +289,9 @@ def init_db():
         # executor polls it between SSE events and aborts; run_task_dispatch
         # re-checks it before spending. Cleared on explicit re-dispatch.
         ("cancel_requested", "REAL"),
+        # Item 15: WHY auto-routing picked this task's model (plain language,
+        # shown in the task detail). Cleared when a human sets the model.
+        ("model_reason", "TEXT"),
     ]
     for col, typedef in task_migrations:
         if col not in existing_task_cols:
@@ -539,6 +542,14 @@ def init_db():
         ended_at REAL
     )""")
 
+    # Item 6c (2026-07-12): eval → improvement loop state on the run row.
+    # improve_status: none|drafting|proposed|applied|rejected|error.
+    _er_cols = {r[1] for r in conn.execute("PRAGMA table_info(eval_runs)").fetchall()}
+    if "improve_status" not in _er_cols:
+        conn.execute("ALTER TABLE eval_runs ADD COLUMN improve_status TEXT")
+    if "improve_approval_id" not in _er_cols:
+        conn.execute("ALTER TABLE eval_runs ADD COLUMN improve_approval_id TEXT")
+
     # ===== Settings v2 (docs/SPEC-SETTINGS-V2.md): encrypted credentials +
     # per-user model registry. user_id NULL = global (admin-managed) row.
     conn.execute("""
@@ -567,6 +578,13 @@ def init_db():
         created_at REAL,
         updated_at REAL
     )""")
+    # Item 15 (2026-07-12): per-model capability description ("Strengths /
+    # Weaknesses / Best for / Avoid for") — powers the deterministic
+    # description-informed routing in routing.select_model_for_task.
+    _um_cols = {r[1] for r in conn.execute("PRAGMA table_info(user_models)").fetchall()}
+    if "description" not in _um_cols:
+        conn.execute("ALTER TABLE user_models ADD COLUMN description TEXT DEFAULT ''")
+
     # Purpose → model routing. user_id 'global' = the default assignment every
     # user inherits until they set their own override.
     conn.execute("""
@@ -749,6 +767,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity(ts)",
         "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts)",
         "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_agent_scope ON memory(agent_id, scope, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_eval_runs_user ON eval_runs(user_id, started_at)",

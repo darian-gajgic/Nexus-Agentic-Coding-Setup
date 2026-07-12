@@ -1467,6 +1467,7 @@ function openTaskDetail(id) {
     <div class="form-group">
       <label class="form-label">AI model</label>
       <select class="form-select" id="td-model">${taskModelOptions(t.model)}</select>
+      ${t.model_reason && t.model_reason !== 'chosen by you' ? `<div class="form-hint">🧭 ${esc(t.model_reason)}</div>` : ''}
     </div>
     ${(() => {
       const curDeps = (() => { try { return JSON.parse(t.depends_on || '[]'); } catch { return []; } })();
@@ -2423,7 +2424,7 @@ function modelsCardHTML() {
     const mid = mo.model_id;
     const cred = settingsState.credentials.find(c => c.id === mo.credential_id);
     return `<tr ${mo.enabled ? '' : 'style="opacity:.45"'}>
-      <td><code>${esc(mid)}</code>${mo.label ? `<div class="muted" style="font-size:11px">${esc(mo.label)}</div>` : ''}</td>
+      <td><code>${esc(mid)}</code>${mo.label ? `<div class="muted" style="font-size:11px">${esc(mo.label)}</div>` : ''}${mo.description ? `<div class="muted" style="font-size:10.5px;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(mo.description)}">📇 ${esc(mo.description.split('\n')[0])}</div>` : ''}</td>
       <td>${esc(mo.provider)}${mo.user_id ? '' : ' <span class="muted" title="Global default model (admin-managed)">🌐</span>'}</td>
       <td>${mo.route === 'cli' ? 'CLI (judge)' : 'Hermes session'}</td>
       <td class="muted" style="font-size:11px">${cred ? `🔑 ••••${esc(cred.hint)}` : 'default key'}</td>
@@ -2736,11 +2737,29 @@ function showModelModal(modelRowId) {
           <select class="form-select" id="mm-enabled"><option value="1" ${!m || m.enabled ? 'selected' : ''}>yes</option><option value="0" ${m && !m.enabled ? 'selected' : ''}>no</option></select></div>
       </div>
       ${!m && modelState.isAdmin ? '<label style="font-size:11.5px;display:block;margin-top:10px"><input type="checkbox" id="mm-global"> global (inherited by every user)</label>' : ''}
+      <div class="form-group" style="margin-top:10px">
+        <label class="form-label">What is this model good/bad at? (used for automatic routing)</label>
+        <textarea class="form-textarea" id="mm-desc" style="height:96px" placeholder="Strengths: …\nWeaknesses: …\nBest for: task type a; task type b\nAvoid for: …\nNotes: context, speed, cost tier">${esc(m ? (m.description || '') : '')}</textarea>
+        <div class="form-hint">Structured beats prose — the router matches the "Best for:" / "Avoid for:" lines against each new task. ${m ? '✨ researches the model on the web and drafts this for you.' : 'Save the model first to use ✨ auto-describe.'}</div>
+        ${m ? `<button class="btn-ghost" style="margin-top:6px" id="mm-autodesc">✨ Auto-set description (web research)</button>` : ''}
+      </div>
       <div style="display:flex;gap:10px;margin-top:14px">
         <button class="btn-primary" onclick="submitModelModal(${m ? `'${esc(m.id)}'` : 'null'})">${m ? 'Save changes' : 'Add model'}</button>
         <button class="btn-ghost" onclick="closeModal()">Cancel</button>
       </div>
     </div>`);
+  const ad = $('#mm-autodesc');
+  if (ad) ad.onclick = async () => {
+    ad.disabled = true;
+    ad.textContent = '✨ Researching… (~1-2 min)';
+    try {
+      const r = await api('POST', `/api/models/${m.id}/describe`);
+      if ($('#mm-desc')) $('#mm-desc').value = r.description || '';
+      toast('Draft ready — review it, then Save changes', 'ok');
+    } catch (e) { toast('Research failed: ' + e.message, 'err'); }
+    ad.disabled = false;
+    ad.textContent = '✨ Auto-set description (web research)';
+  };
 }
 
 async function submitModelModal(modelRowId) {
@@ -2751,6 +2770,7 @@ async function submitModelModal(modelRowId) {
     route: $('#mm-route').value,
     credential_id: $('#mm-cred').value || null,
     enabled: $('#mm-enabled').value === '1',
+    description: ($('#mm-desc') || {}).value || '',
   };
   if ($('#mm-global') && $('#mm-global').checked) body.global = true;
   try {
@@ -3924,7 +3944,7 @@ function judgeSectionHTML(t) {
         <div><span class="chip ${cls}" style="font-size:13px;font-weight:700">${esc(v)}</span></div>
         ${learn ? `<div style="font-size:12.5px;color:var(--text-dim)">📖 ${esc(learn[1])}</div>` : ''}
         <details><summary style="cursor:pointer;font-size:12px;color:var(--text-dim)">full judge report</summary>
-          <pre style="max-height:260px;overflow-y:auto;white-space:pre-wrap;font-size:11.5px;margin-top:6px">${esc(t.judge_output || '')}</pre></details>
+          <div style="max-height:260px;overflow-y:auto;font-size:12px;margin-top:6px">${mdLite(t.judge_output || '')}</div></details>
       </div></div>`;
   }
   return `<div class="form-group"><label class="form-label">Frontier judge</label>
@@ -4109,7 +4129,7 @@ function feedbackLogModal(t, kind) {
       ${isWin
       ? 'A WIN is a deliverable that produced <b>measured real-world results</b> — logged so the system learns what actually works.'
       : 'A LESSON is work that flopped or missed expectations — logged <b>with its correction</b> so the same mistake can\'t repeat.'}
-      Saved to <b>feedback/${isWin ? 'WINS.md' : 'LESSONS.md'}</b> in your Business Brain${hasDomain ? `; recent entries are read by every future <b>${esc(domain)}</b> task briefing` : ''}.
+      Saved to <b>YOUR ${isWin ? 'WINS.md' : 'LESSONS.md'}</b> ledger (each user learns individually — others can browse and copy it)${hasDomain ? `; recent entries are read by every future <b>${esc(domain)}</b> task briefing of yours` : ''}.
     </div>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
       <strong>${esc(t.title)}</strong>
@@ -4607,6 +4627,14 @@ function drawerOverviewHTML(a) {
 }
 
 const MEM_SCOPES = ['stm', 'lts', 'experience', 'longterm'];
+// Item 3: plain-language meaning of each scope — users shouldn't need to
+// decode internal names. Shown as subtitles/legend everywhere scopes appear.
+const MEM_SCOPE_HELP = {
+  stm: 'Scratchpad — what this agent is working on right now (auto, expires after ~2 days)',
+  experience: 'Task log — one line per finished task, written automatically (kept ~90 days)',
+  lts: 'Rolling summary — the system condenses the task log into this every ~10 tasks',
+  longterm: 'Things you taught it — standing rules that never expire and ride into every task it runs',
+};
 function drawerMemoryHTML(a) {
   const mems = drawerState.cache.memory || [];
   const ctxBlob = drawerState.cache.context;
@@ -4616,10 +4644,11 @@ function drawerMemoryHTML(a) {
   const sections = MEM_SCOPES.filter(s => (byScope[s] || []).length).map(scope => `
     <div class="drawer-sec">
       <h4>${scope} <span class="muted">(${byScope[scope].length})</span></h4>
+      <div class="muted" style="font-size:11px;margin:-2px 0 6px">${MEM_SCOPE_HELP[scope] || ''}</div>
       ${byScope[scope].map(m => `
         <div class="mem-item">
           <div style="flex:1">${esc(m.content)}
-            <div class="mi-meta">${fmtAgo(m.created_at)}${m.kind ? ' · ' + esc(m.kind) : ''}${m.source ? ' · ' + esc(m.source) : ''}</div>
+            <div class="mi-meta">${fmtAgo(m.created_at)}${m.kind ? ' · ' + esc(m.kind) : ''}${m.source === 'auto' ? ' · <span class="chip" title="written automatically by the system">⚙ auto</span>' : (m.source ? ' · ' + esc(m.source) : '')}</div>
           </div>
           <button class="btn-icon" title="Forget" onclick="deleteAgentMemoryUI('${esc(a.id)}','${esc(m.id)}')">✕</button>
         </div>`).join('')}
@@ -4627,19 +4656,30 @@ function drawerMemoryHTML(a) {
   return `
     ${ctxBlob ? `<div class="drawer-sec"><h4>Condensed context (what it recalls on tasks)</h4>
       <div class="mem-item" style="flex-direction:column;gap:6px;align-items:stretch">
-        <div><span class="chip c-accent">LTS summary</span><div style="margin-top:6px;font-size:12.5px">${esc(ctxBlob.lts_summary)}</div></div>
+        <div><span class="chip c-accent">LTS summary</span>
+          <button class="btn-sm" style="margin-left:8px" title="Condense the task log into the rolling summary now instead of waiting for the hourly sweep" onclick="consolidateAgentMemoryUI('${esc(a.id)}')">↻ Summarize now</button>
+          <div style="margin-top:6px;font-size:12.5px">${esc(ctxBlob.lts_summary)}</div></div>
         <div style="margin-top:4px"><span class="chip c-cyan">Recent experience</span><pre style="margin-top:6px;font-size:11.5px;white-space:pre-wrap;font-family:var(--font-ui)">${esc(ctxBlob.recent_experience)}</pre></div>
       </div></div>` : ''}
-    ${sections || '<div class="empty"><span class="e-ico">◍</span>No memories yet — this agent has not learned anything.</div>'}
+    ${sections || '<div class="empty"><span class="e-ico">◍</span>No memories yet — they appear automatically as this lane completes tasks (one task-log line per finished task, condensed into a rolling summary). You can also teach it a standing rule below.</div>'}
     <div class="drawer-sec">
       <h4>Teach this agent</h4>
+      <div class="muted" style="font-size:11px;margin-bottom:6px">longterm = a standing rule injected into every task this lane runs; experience = a one-off note in its task log.</div>
       <div style="display:flex;gap:8px">
-        <select class="form-select" id="memScopeSel" style="width:130px">${MEM_SCOPES.map(s => `<option value="${s}">${s}</option>`).join('')}</select>
-        <input class="form-input" id="memAddInput" placeholder="New memory…" style="flex:1">
+        <select class="form-select" id="memScopeSel" style="width:130px">${MEM_SCOPES.map(s => `<option value="${s}" ${s === 'longterm' ? 'selected' : ''} title="${esc(MEM_SCOPE_HELP[s] || '')}">${s}</option>`).join('')}</select>
+        <input class="form-input" id="memAddInput" placeholder="e.g. Always cite sources for market numbers" style="flex:1">
         <button class="btn-primary" onclick="addAgentMemoryUI('${esc(a.id)}')">Add</button>
       </div>
     </div>
   `;
+}
+
+async function consolidateAgentMemoryUI(id) {
+  try {
+    const r = await api('POST', `/api/agents/${id}/memory/consolidate`);
+    toast(r.summary ? 'Summary updated' : (r.note || 'Nothing to summarize yet'), 'ok');
+    renderDrawerTab();
+  } catch (e) { toast('Summarize failed: ' + e.message, 'err'); }
 }
 
 function drawerMessagesHTML(a) {
@@ -5970,7 +6010,13 @@ function memAgentHTML() {
       ${scopeChips}
       <button class="btn-ghost" style="margin-left:auto" onclick="openAgentDrawer('${esc(sel)}','memory')">Open in agent drawer →</button>
     </div>
-    <div class="view-intro">Working memory of the selected runtime agent: <b>stm</b> (short-term scratch), <b>lts</b> (long-term summary), <b>experience</b> (task lessons), <b>longterm</b> (durable facts).</div>
+    <div class="view-intro">Working memory of the selected worker agent — written <b>automatically</b> as it completes tasks, plus anything you teach it. What you see here (longterm rules + the rolling summary) is injected into that agent's future task briefings, so editing it changes how it works.</div>
+    <div class="stats-strip" style="margin-bottom:10px">${MEM_SCOPES.map(s => `
+      <div class="stat-card" title="${esc(MEM_SCOPE_HELP[s])}">
+        <div class="stat-num" style="font-size:15px">${s}</div>
+        <div class="stat-label" style="text-transform:none;letter-spacing:0">${esc(MEM_SCOPE_HELP[s])}</div>
+      </div>`).join('')}
+    </div>
     <div class="mem-grid">${list}</div>`;
 }
 
@@ -6015,12 +6061,19 @@ function memSharedHTML() {
 
 // ── Wins & Lessons ledger browser (Business-Brain feedback loop — the 🏆/📓
 // entries logged on tasks; NOT the specialist-lessons subsystem) ──
-const fbState = { fetched: false, loading: false, data: null, kind: '' };
+const fbState = { fetched: false, loading: false, data: null, kind: '', scope: 'all', names: null };
 
 async function loadFeedbackLedger() {
   if (fbState.loading) return;
   fbState.loading = true;
-  try { fbState.data = await api('GET', '/api/feedback'); }
+  try {
+    fbState.data = await api('GET', `/api/feedback?scope=${fbState.scope}`);
+    if (!fbState.names) {
+      const u = await api('GET', '/api/users/names').catch(() => ({ users: [] }));
+      fbState.names = {};
+      (u.users || []).forEach(x => { fbState.names[x.id] = x.name; });
+    }
+  }
   catch (e) { fbState.data = { error: e.message, wins: [], lessons: [], files: {} }; }
   fbState.loading = false;
   fbState.fetched = true;
@@ -6028,13 +6081,25 @@ async function loadFeedbackLedger() {
 }
 
 function fbSetKind(k) { fbState.kind = k; render(); }
+function fbSetScope(s) { fbState.scope = s; fbState.fetched = false; render(); }
 
 function fbRefreshLedger() { fbState.fetched = false; render(); }
+
+async function fbAdopt(kind, authorId, key) {
+  try {
+    await api('POST', '/api/feedback/adopt', { kind, author_id: authorId, key });
+    toast('Copied — it now rides into YOUR task briefings for this domain', 'ok');
+    fbState.fetched = false;
+    render();
+  } catch (e) { toast('Copy failed: ' + e.message, 'err'); }
+}
 
 function memFeedbackHTML() {
   if (!fbState.fetched) { loadFeedbackLedger(); return '<div class="loading">Loading the wins & lessons ledger…</div>'; }
   const d = fbState.data || {};
   const files = d.files || {};
+  const me = d.me || '';
+  const nameOf = id => (fbState.names || {})[id] || id;
   const all = [
     ...(d.wins || []).map(e => ({ ...e, kind: 'win' })),
     ...(d.lessons || []).map(e => ({ ...e, kind: 'lesson' })),
@@ -6045,17 +6110,24 @@ function memFeedbackHTML() {
         <span class="chip ${e.kind === 'win' ? 'c-green' : 'c-orange'}">${e.kind === 'win' ? '🏆 WIN' : '📓 LESSON'}</span>
         <strong style="flex:1">${esc(e.headline || '')}</strong>
         ${e.domain ? `<span class="chip">${esc(e.domain)}</span>` : ''}
+        ${e.general ? '<span class="chip" title="the shared house ledger — read by everyone\'s tasks">🌐 General</span>'
+          : `<span class="chip ${e.own ? 'c-cyan' : ''}" title="${e.own ? 'your entry' : 'another user\'s entry'}">👤 ${esc(e.own ? 'you' : nameOf(e.author_id))}</span>`}
+        ${e.adopted_from ? `<span class="chip" title="copied from another user's ledger">⤵ adopted</span>` : ''}
         <span class="muted" style="font-size:11px;font-family:var(--font-mono)">${esc(e.date || '')}</span>
+        ${!e.own && !e.general ? `<button class="btn-sm" title="Copy this entry into YOUR ledger — it then shapes your own task briefings" onclick="fbAdopt('${e.kind}','${esc(e.author_id)}','${esc(e.key)}')">⤵ Copy to mine</button>` : ''}
         ${e.task_id && (state.tasks || []).some(t => t.id === e.task_id) ? `<button class="btn-sm" onclick="openTaskDetail('${esc(e.task_id)}')">open task →</button>` : ''}
       </div>
       <details style="font-size:11.5px;color:var(--text-dim)"><summary style="cursor:pointer">full entry</summary>
         <div style="white-space:pre-wrap;font-family:var(--font-mono);margin-top:4px">${esc(e.raw || '')}</div></details>
     </div>`).join('');
   const kindChip = (k, label) => `<button class="subtab ${fbState.kind === k ? 'active' : ''}" onclick="fbSetKind('${k}')" style="padding:5px 13px;font-size:11px">${label}</button>`;
+  const scopeChip = (s, label, tip) => `<button class="subtab ${fbState.scope === s ? 'active' : ''}" onclick="fbSetScope('${s}')" style="padding:5px 13px;font-size:11px" title="${tip}">${label}</button>`;
   return `
-    <div class="view-intro">Your business's real-world feedback loop: <b>WINS</b> (deliverables with measured results — promotable into the examples/ quality bar) and <b>LESSONS</b> (what flopped + the correction). Agents read the recent domain-matching entries in every task briefing, so logging here directly shapes future work.${d.error ? ` ⚠ load error: ${esc(d.error)}` : ''}<br>
+    <div class="view-intro">Your business's real-world feedback loop: <b>WINS</b> (deliverables with measured results — promotable into the examples/ quality bar) and <b>LESSONS</b> (what flopped + the correction). Entries are <b>per user</b>: your own + anything you copy from others shape YOUR task briefings; 🌐 General entries (the shared house ledger) shape everyone's.${d.error ? ` ⚠ load error: ${esc(d.error)}` : ''}<br>
       <span style="font-family:var(--font-mono);font-size:11px;word-break:break-all">${esc(files.win || '')} · ${esc(files.lesson || '')}</span></div>
     <div class="scope-row" style="margin:8px 0">${kindChip('', 'all')}${kindChip('win', '🏆 wins')}${kindChip('lesson', '📓 lessons')}
+      <span style="width:14px"></span>
+      ${scopeChip('all', 'All users', 'everything: yours, other users’, and the shared General ledger')}${scopeChip('mine', 'Mine', 'only entries in your own ledger (incl. adopted copies)')}${scopeChip('general', 'General', 'the shared house ledger, read by every user’s tasks')}
       <button class="btn-ghost" style="margin-left:auto" onclick="fbRefreshLedger()">↻ Refresh</button></div>
     <div style="display:flex;flex-direction:column;gap:6px">${rows || '<div class="empty"><span class="e-ico">🏆</span>Nothing logged yet — open a completed task and hit 🏆 Log WIN (measured results) or 📓 Log LESSON (flop + correction). The AI pre-drafts the entry from the deliverable.</div>'}</div>`;
 }
@@ -6084,6 +6156,16 @@ function viewMemory() {
   else if (memoryState.tab === 'lessons') body = memLessonsHTML();
   else if (memoryState.tab === 'shared') body = memSharedHTML();
   return `
+    <details class="view-intro" style="margin-bottom:8px">
+      <summary style="cursor:pointer">🧭 How the memory systems fit together (click to expand)</summary>
+      <div style="margin-top:8px;font-size:12.5px;line-height:1.6">
+        Nexus learns in four separate places, each doing a different job:<br>
+        <b>Semantic (mem0)</b> — what agents learned from working: facts auto-extracted during every task and chat, searchable, tagged per user. This is the big shared brain.<br>
+        <b>Agent memory</b> — each worker agent's own track record (auto task log + rolling summary) plus standing rules you teach that one agent. Injected into that agent's future briefings.<br>
+        <b>Specialist lessons</b> — craft lessons per specialist role (e.g. the copywriter), proposed by the system after tasks and stored into mem0 only after you approve them.<br>
+        <b>🏆 Wins &amp; Lessons</b> — your business outcomes ledger: real-world wins and flops per domain, injected into matching task briefings so the same mistake isn't made twice.
+      </div>
+    </details>
     <div class="subtabs">
       ${tabs.map(([id, label, n]) => `<button class="subtab ${memoryState.tab === id ? 'active' : ''}" data-memtab="${id}">${label}${n != null ? `<span class="n">${n}</span>` : ''}</button>`).join('')}
     </div>
@@ -8733,10 +8815,10 @@ async function evalRunDetail(id) {
         ${x.gates_failed ? `<span class="chip c-red">${x.gates_failed} gate FAIL</span>` : ''}
         ${x.specialist ? `<span class="chip c-cyan">${esc(x.specialist)}</span>` : ''}
         ${x.tokens_used ? `<span class="muted" style="font-size:11px">${Math.round(x.tokens_used / 1000)}k tok</span>` : ''}
-        ${x.deliverable_path ? `<a class="btn-sm" style="text-decoration:none" href="/api/evals/runs/${esc(r.id)}/file?case=${encodeURIComponent(x.case_id)}" target="_blank">📄 deliverable</a>` : ''}
+        ${x.deliverable_path ? `<button class="btn-sm" onclick="evalPreview('${esc(r.id)}','${esc(x.case_id)}','${esc((x.case_title || x.case_id).replace(/'/g, ''))}')">📄 deliverable</button>` : ''}
       </div>
       ${x.error ? `<div style="font-size:11.5px;color:var(--red,#f87171)">${esc(x.error)}</div>` : ''}
-      ${x.judge_output ? `<details style="margin-top:4px"><summary style="cursor:pointer;font-size:11.5px;color:var(--text-dim)">judge output</summary><pre style="white-space:pre-wrap;font-size:11px;max-height:300px;overflow:auto">${esc(x.judge_output)}</pre></details>` : ''}
+      ${x.judge_output ? `<details style="margin-top:4px"><summary style="cursor:pointer;font-size:11.5px;color:var(--text-dim)">judge output</summary><div style="font-size:12px;max-height:300px;overflow:auto">${mdLite(x.judge_output)}</div></details>` : ''}
     </div>`).join('');
   const fp = r.fingerprint || {};
   showModal(`
@@ -8744,7 +8826,49 @@ async function evalRunDetail(id) {
     <div class="view-intro" style="margin-bottom:6px">${esc(r.notes || 'no notes recorded — next time say what changed, future-you will thank you')}</div>
     <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-faint);margin-bottom:8px">config ⚙ ${esc(fp.combined || '?')} · playbook ${esc(fp.playbook || '—')} · rubric ${esc(fp.rubric || '—')} · ${evWhen(r.started_at)}</div>
     <div style="display:flex;flex-direction:column;gap:6px;max-height:440px;overflow-y:auto">${rows || '<div class="empty">no cases</div>'}</div>
-    <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+    <div class="modal-actions">
+      ${r.status === 'completed' && isAdminUser() ? (
+      r.improve_status === 'proposed' && r.improve_approval_id
+        ? `<button class="btn-ghost" title="A reviewable improvement proposal is waiting" onclick="openEvalImproveCard('${esc(r.improve_approval_id)}')">📏 Improvement proposed — review</button>`
+        : r.improve_status === 'drafting'
+          ? '<span class="chip c-blue" title="One frontier call is drafting config improvements from the judge critiques">📏 drafting improvements…</span>'
+          : r.improve_status === 'applied'
+            ? '<span class="chip c-green" title="Improvements from this run were applied to your config">📏 improvements applied</span>'
+            : `<button class="btn-ghost" title="One frontier call turns this run's judge critiques into reviewable config improvements (playbook/rubric/specialist edits, exemplar promotions)" onclick="evalImproveUI('${esc(r.id)}')">✨ Improve from results</button>`) : ''}
+      <button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+}
+
+async function evalImproveUI(runId) {
+  toast('Drafting improvements from the judge critiques (~1-2 min)…', 'info');
+  try {
+    const r = await api('POST', `/api/evals/runs/${runId}/improve`);
+    evalsState.fetched = false;
+    if (r.approval_id) {
+      toast('Proposal ready — review each change below', 'ok');
+      openEvalImproveCard(r.approval_id);
+    } else {
+      toast(r.note || 'The model found no durable config change in these results', 'info');
+      closeModal();
+    }
+  } catch (e) { toast('Improvement draft failed: ' + e.message, 'err'); }
+}
+
+// Item 6b: eval deliverables render in-app (rendered markdown, back button)
+// instead of opening as bare text in a browser tab.
+async function evalPreview(runId, caseId, title) {
+  try {
+    const r = await fetch(`/api/evals/runs/${runId}/file?case=${encodeURIComponent(caseId)}`);
+    if (!r.ok) { toast('Deliverable unavailable (' + r.status + ')', 'err'); return; }
+    const text = await r.text();
+    showModal(`
+      <h2>📄 ${esc(title)}</h2>
+      <div style="max-height:60vh;overflow-y:auto;font-size:13px;line-height:1.6">${text.trim() ? highlightUnsure(mdLite(text)) : '<div class="empty">The stored deliverable file is empty — the model produced no summary text for this case.</div>'}</div>
+      <div class="modal-actions">
+        <a class="btn-ghost" href="/api/evals/runs/${esc(runId)}/file?case=${encodeURIComponent(caseId)}" download="eval-${esc(caseId)}.md" style="text-decoration:none">⬇ Download</a>
+        <button class="btn-ghost" onclick="evalRunDetail('${esc(runId)}')">← Back to run</button>
+        <button class="btn-primary" onclick="closeModal()">Close</button>
+      </div>`);
+  } catch (e) { toast('Preview failed: ' + e.message, 'err'); }
 }
 
 async function evalsCancel(id) {
@@ -9379,6 +9503,57 @@ function highlightUnsure(escaped) {
     '<span class="unsure-tag" title="The system flagged this claim as unverified against a primary source">$&</span>');
 }
 
+// Item 6b: tiny escape-FIRST markdown renderer (no library, no build step) so
+// .md deliverables and judge reports read as documents instead of raw text.
+// Input is escaped before ANY tag is produced — only our own markup survives.
+function mdLite(text) {
+  const src = esc(text || '');
+  const blocks = src.split(/(```[\s\S]*?```)/);
+  const html = blocks.map(b => {
+    if (b.startsWith('```')) {
+      return `<pre class="md-code">${b.replace(/^```[^\n]*\n?/, '').replace(/```$/, '')}</pre>`;
+    }
+    const lines = b.split('\n');
+    const out = [];
+    let list = null, para = [], table = null;
+    const flushPara = () => { if (para.length) { out.push(`<p>${para.join('<br>')}</p>`); para = []; } };
+    const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.map(x => `<li>${x}</li>`).join('')}</${list.tag}>`); list = null; } };
+    const flushTable = () => {
+      if (!table) return;
+      const [head, ...body] = table;
+      out.push(`<table class="md-table"><thead><tr>${head.map(c => `<th>${c}</th>`).join('')}</tr></thead><tbody>${body.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`);
+      table = null;
+    };
+    const inline = s => s
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    for (const raw of lines) {
+      const line = raw.replace(/\s+$/, '');
+      const h = line.match(/^(#{1,6})\s+(.*)$/);
+      const li = line.match(/^\s*[-*]\s+(.*)$/);
+      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        flushPara(); flushList();
+        const cells = line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => inline(c.trim()));
+        if (cells.every(c => /^:?-{2,}:?$/.test(c.replace(/&[a-z]+;/g, '')))) continue; // separator row
+        (table = table || []).push(cells);
+        continue;
+      }
+      flushTable();
+      if (h) { flushPara(); flushList(); out.push(`<h${Math.min(h[1].length + 2, 6)}>${inline(h[2])}</h${Math.min(h[1].length + 2, 6)}>`); continue; }
+      if (li) { flushPara(); if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; } list.items.push(inline(li[1])); continue; }
+      if (ol) { flushPara(); if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; } list.items.push(inline(ol[1])); continue; }
+      if (!line.trim()) { flushPara(); flushList(); continue; }
+      flushList();
+      para.push(inline(line));
+    }
+    flushPara(); flushList(); flushTable();
+    return out.join('\n');
+  }).join('\n');
+  return `<div class="md-body">${html}</div>`;
+}
+
 async function branchFilesUI(taskId, title) {
   try {
     const r = await api('GET', `/api/tasks/${taskId}/branch-files`);
@@ -9399,13 +9574,28 @@ async function previewDeliverable(taskId, name) {
   try {
     const r = await fetch(`/api/tasks/${taskId}/files/${encPath(name)}`);
     const text = await r.text();
+    const isMd = name.endsWith('.md');
+    const rendered = isMd
+      ? `<div style="max-height:60vh;overflow-y:auto;font-size:13px;line-height:1.6">${highlightUnsure(mdLite(text))}</div>`
+      : `<pre style="max-height:60vh;overflow-y:auto;white-space:pre-wrap;font-size:12.5px;font-family:var(--font-mono);line-height:1.5">${highlightUnsure(esc(text))}</pre>`;
+    const rawView = `<pre style="max-height:60vh;overflow-y:auto;white-space:pre-wrap;font-size:12.5px;font-family:var(--font-mono);line-height:1.5">${highlightUnsure(esc(text))}</pre>`;
     showModal(`
       <h2>📄 ${esc(name)}</h2>
-      <pre style="max-height:60vh;overflow-y:auto;white-space:pre-wrap;font-size:12.5px;font-family:var(--font-ui);line-height:1.55">${highlightUnsure(esc(text))}</pre>
+      <div id="pd-rendered">${rendered}</div>
+      <div id="pd-raw" style="display:none">${rawView}</div>
       <div class="modal-actions">
+        ${isMd ? '<button class="btn-ghost" id="pd-toggle">Raw text</button>' : ''}
         <a class="btn-ghost" href="/api/tasks/${esc(taskId)}/files/${encPath(name)}" download style="text-decoration:none">⬇ Download</a>
         <button class="btn-primary" onclick="closeModal()">Close</button>
       </div>`);
+    const tg = $('#pd-toggle');
+    if (tg) tg.onclick = () => {
+      const raw = $('#pd-raw'), ren = $('#pd-rendered');
+      const showRaw = raw.style.display === 'none';
+      raw.style.display = showRaw ? '' : 'none';
+      ren.style.display = showRaw ? 'none' : '';
+      tg.textContent = showRaw ? 'Rendered' : 'Raw text';
+    };
   } catch (e) { toast('Preview failed: ' + e.message, 'err'); }
 }
 
@@ -9443,12 +9633,14 @@ function decisionCardHTML(c) {
   } else {
     const details = c.kind === 'lesson_deltas'
       ? `<button class="btn-ghost" onclick="openLessonCard('${esc(c.id)}')">Open details</button>`
-      : (c.task_id ? `<button class="btn-ghost" onclick="reviewTaskUI('${esc(c.task_id)}')">Open details</button>` : '');
+      : c.kind === 'eval_improve'
+        ? `<button class="btn-ghost" onclick="openEvalImproveCard('${esc(c.id)}')">Open details</button>`
+        : (c.task_id ? `<button class="btn-ghost" onclick="reviewTaskUI('${esc(c.task_id)}')">Open details</button>` : '');
     actions = `<button class="btn-primary" onclick="decideDecision('${esc(c.id)}','approved')">★ ${esc(c.recommendation)}</button>
       <button class="btn-ghost" onclick="decideDecision('${esc(c.id)}','rejected')">Request changes</button>
       ${details}`;
   }
-  const kindChip = { deliverable: '📄 deliverable', super_result: '🔎 inspector', lesson_deltas: '📚 lessons', replan: '🧭 replan' }[c.kind] || c.kind;
+  const kindChip = { deliverable: '📄 deliverable', super_result: '🔎 inspector', lesson_deltas: '📚 lessons', eval_improve: '📏 eval lessons', replan: '🧭 replan' }[c.kind] || c.kind;
   return `<div class="agentic-row" style="flex-direction:column;align-items:stretch;gap:6px;border-left:3px solid ${c.blocking ? 'var(--warn,#eab308)' : 'var(--accent)'}">
     <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
       <strong style="font-size:13px">${esc(c.headline)}</strong>
@@ -9531,6 +9723,67 @@ async function applyLessonDeltas(id, n) {
   } catch (e) { toast('Apply failed: ' + e.message, 'err'); }
   closeModal();
   await loadDecisions(true);
+}
+
+// Item 6c: the eval-improvement review card — per delta: include-checkbox,
+// mini-diff, editable after-text. Applying is git-committed and reversible.
+async function openEvalImproveCard(id) {
+  let deltas = [], domain = '';
+  try {
+    const aps = await api('GET', '/api/approvals');
+    const ap = (aps.approvals || aps || []).find(a => a.id === id);
+    if (ap) {
+      const p = typeof ap.payload === 'string' ? JSON.parse(ap.payload) : ap.payload;
+      deltas = (p && p.deltas) || [];
+      domain = (p && p.domain) || '';
+    }
+  } catch { }
+  const kindLabel = d => d.kind === 'knowledge' ? `📚 ${esc(d.file)}`
+    : d.kind === 'specialist' ? `🧑‍🔬 specialist: ${esc(d.specialist)}`
+      : `⭐ exemplar: case ${esc(d.case_id)}`;
+  const rows = deltas.map((d, i) => `
+    <div style="border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px;margin-bottom:6px">
+      <label style="display:flex;gap:8px;align-items:center;font-size:11.5px">
+        <input type="checkbox" id="ei-inc-${i}" checked>
+        <span class="chip">${kindLabel(d)}</span>
+        <span class="muted" style="font-size:10.5px">${esc(d.expected_effect || '')}</span>
+      </label>
+      ${d.kind === 'exemplar' ? `<div style="font-size:11.5px;color:var(--text-dim);margin-top:4px">Promotes this case's SHIP-quality deliverable into <code>domains/${esc(domain)}/examples/</code> — future agents imitate it.</div>` : `
+      ${d.before ? `<div style="font-size:11.5px;color:#f87171;white-space:pre-wrap;margin-top:4px">− ${esc(d.before)}</div>` : ''}
+      <textarea class="form-textarea" id="ei-after-${i}" style="height:64px;margin-top:4px;font-size:11.5px">${esc(d.after || '')}</textarea>`}
+      <div style="font-size:11px;color:var(--text-faint);margin-top:3px">${esc(d.rationale || '')}</div>
+    </div>`).join('');
+  showModal(`<h2>📏 Improve from eval results — ${esc(domain)}</h2>
+    <div class="view-intro" style="margin-bottom:8px">The judge found repeatable weaknesses in this domain's eval run. Each card below is ONE proposed edit to the instructions your agents read before every <b>${esc(domain)}</b> task (playbook/rubric/voice), to a specialist's standing rules, or a promotion of a strong result into the examples they imitate. Untick what you disagree with, edit the text directly, then apply — everything is git-committed to your knowledge base, so it is reversible.</div>
+    ${rows || '<div class="empty">No proposed changes.</div>'}
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="decideDecision('${esc(id)}','rejected');closeModal()">Reject all</button>
+      <button class="btn-primary" onclick="applyEvalImprove('${esc(id)}')">★ Apply selected (git-committed)</button>
+    </div>`);
+}
+
+async function applyEvalImprove(id) {
+  let deltas = [];
+  try {
+    const aps = await api('GET', '/api/approvals');
+    const ap = (aps.approvals || aps || []).find(a => a.id === id);
+    if (ap) { const p = typeof ap.payload === 'string' ? JSON.parse(ap.payload) : ap.payload; deltas = (p && p.deltas) || []; }
+  } catch { }
+  const chosen = deltas.filter((d, i) => {
+    const inc = $(`#ei-inc-${i}`);
+    if (inc && !inc.checked) return false;
+    const after = $(`#ei-after-${i}`);
+    if (after) d.after = after.value;
+    return true;
+  });
+  if (!chosen.length) { toast('Nothing selected — untick fewer, or Reject all', 'err'); return; }
+  try {
+    await api('PATCH', `/api/approvals/${id}`, { status: 'approved', decided_by: 'operator', deltas: chosen });
+    toast(`${chosen.length} improvement(s) applied — git-committed to your knowledge base`, 'ok');
+  } catch (e) { toast('Apply failed: ' + e.message, 'err'); }
+  closeModal();
+  await loadDecisions(true);
+  evalsState.fetched = false;
 }
 
 function viewMeetings() {

@@ -194,3 +194,114 @@ def sweep_stats():
          auth.DEFAULT_USER_ID, "admin"))  # [15]
     db.log_activity("info", "routing",
                     f"Filed a routing-tuning Decisions card ({len(proposals)} proposals)")
+
+
+# ─────────────────── Item 15 — description-informed model routing ───────────────────
+# Deterministic (NO LLM at task-create time — house doctrine): a base tier from
+# the same keyword heuristics the wizard's guidance describes, then an override
+# when a registry model's operator-maintained description ("Best for: …")
+# clearly matches the task text. Explainable: the reason is stored on the task.
+
+# Keep in sync with server._DEV_SPECIALISTS — dev pipeline stages have a fixed
+# model floor (glm-5.2 via _repair_workflow) that routing must never touch.
+_DEV_SPECIALISTS = {"tech-lead-orchestrator", "code-implementer", "code-reviewer",
+                    "debugger", "acceptance-verifier"}
+_MECHANICAL_RE = None  # compiled lazily
+
+
+def _significant_tokens(s: str) -> set:
+    import re as _re
+    stop = {"the", "and", "for", "with", "from", "that", "this", "into", "your",
+            "our", "their", "task", "create", "make", "write", "please"}
+    return {w for w in _re.findall(r"[a-z0-9]{3,}", (s or "").lower()) if w not in stop}
+
+
+def _parse_capability_lines(description: str) -> tuple[list[str], list[str]]:
+    """(best_for phrases, avoid_for phrases) from the structured description
+    shape ('Best for: a; b; c'). Freeform prose yields nothing → no override."""
+    best, avoid = [], []
+    for line in (description or "").splitlines():
+        low = line.strip().lower()
+        if low.startswith("best for:"):
+            best = [p.strip() for p in line.split(":", 1)[1].split(";") if p.strip()]
+        elif low.startswith("avoid for:"):
+            avoid = [p.strip() for p in line.split(":", 1)[1].split(";") if p.strip()]
+    return best, avoid
+
+
+def _phrase_matches(phrase: str, task_toks: set) -> bool:
+    ptoks = _significant_tokens(phrase)
+    if not ptoks:
+        return False
+    hit = len([t for t in ptoks if t in task_toks])
+    return hit / len(ptoks) >= 0.6
+
+
+def select_model_for_task(task: dict, uid: str | None) -> tuple[str | None, str | None]:
+    """(model_id, plain-language reason) or (None, None) = leave NULL (the
+    dispatch default). Explicit human/wizard model choices always win upstream;
+    dev-pipeline specialists are skipped (their floor is authoritative);
+    high-stakes tasks are never routed below the 'complicated' default."""
+    import re as _re
+    global _MECHANICAL_RE
+    if db.get_setting("models.auto_route", "1") != "1":
+        return None, None
+    if task.get("model"):
+        return None, None
+    if (task.get("specialist") or "") in _DEV_SPECIALISTS:
+        return None, None
+    title = str(task.get("title") or "")
+    desc = str(task.get("description") or "")
+    text = f"{title} {desc}"
+    allowed = set(db.task_models_for(uid))
+    default_hard = db.default_task_model(uid)
+
+    if _MECHANICAL_RE is None:
+        _MECHANICAL_RE = _re.compile(
+            r"\b(format|convert|extract|rename|transcrib\w*|csv|cleanup|dedup\w*|"
+            r"reformat|normali[sz]e)\b", _re.I)
+    base_purpose = "complicated"
+    if not task.get("high_stakes"):
+        if _MECHANICAL_RE.search(text):
+            base_purpose = "mechanical"
+        elif len(text.strip()) < 160 and (task.get("domain") or "general") == "general":
+            base_purpose = "easy"
+    base_row = db.resolve_assignment(uid, base_purpose)
+    base_model = (base_row or {}).get("model_id")
+    base_reason = None
+    if base_purpose == "mechanical" and base_model:
+        kw = _MECHANICAL_RE.search(text).group(0)
+        base_reason = (f"auto-routed to {base_model}: the task looks mechanical "
+                       f"(\"{kw}\") — change the model on the task to override")
+    elif base_purpose == "easy" and base_model:
+        base_reason = (f"auto-routed to {base_model}: short, simple brief with no "
+                       "domain — change the model on the task to override")
+
+    # Description override: score every enabled hermes model's "Best for"
+    # phrases against the task text; any "Avoid for" match vetoes the model.
+    task_toks = _significant_tokens(text) | _significant_tokens(task.get("domain") or "") \
+        | _significant_tokens(task.get("deliverable_type") or "")
+    best_model, best_score, best_phrase = None, 0, ""
+    for m in db.visible_models(uid, enabled_only=True):
+        if m.get("route") != "hermes" or not (m.get("description") or "").strip():
+            continue
+        if m["model_id"] not in allowed:
+            continue
+        best_for, avoid_for = _parse_capability_lines(m["description"])
+        if any(_phrase_matches(p, task_toks) for p in avoid_for):
+            continue
+        hits = [p for p in best_for if _phrase_matches(p, task_toks)]
+        if len(hits) > best_score:
+            best_model, best_score, best_phrase = m["model_id"], len(hits), hits[0]
+    if best_model and best_score >= 1:
+        # High-stakes work may only route to the default 'complicated' model or
+        # a description-matched model that IS that default — never downgraded.
+        if task.get("high_stakes") and best_model != default_hard:
+            return None, None
+        if best_model != (base_model or default_hard):
+            return best_model, (f"auto-routed to {best_model}: its description lists "
+                                f"\"{best_phrase}\" under Best for, matching this task — "
+                                "change the model on the task to override")
+    if base_purpose != "complicated" and base_model and base_model in allowed:
+        return base_model, base_reason
+    return None, None

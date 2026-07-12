@@ -229,7 +229,7 @@ def _playbook_tasks(playbook_path: str) -> list[str]:
     return out[:12]
 
 
-def domain_pack(dom: str, deep: bool) -> str:
+def domain_pack(dom: str, deep: bool, uid: str | None = None) -> str:
     """Compact craft context for a domain. `deep` (a deliverable-looking turn)
     adds the rubric gate checklist + playbook task menu; otherwise just names the
     resources so JARVIS can offer to go deeper."""
@@ -254,7 +254,7 @@ def domain_pack(dom: str, deep: bool) -> str:
                          "short **Learn:** line (we are juniors learning the craft).")
         # Feedback loop parity with dispatch: recent domain wins/lessons on
         # deliverable-looking turns only (shallow chat stays lean).
-        fb_block = feedback_log.dispatch_block(dom) if feedback_log else ""
+        fb_block = feedback_log.dispatch_block(dom, uid) if feedback_log else ""
         if fb_block:
             lines.append(fb_block)
     return "\n".join(lines)
@@ -280,7 +280,7 @@ def brain_framing(text: str, uid: str | None = None) -> tuple[str, str | None]:
                      "these AI-slop phrases: " + kill + ".")
     dom = detect_domain(text)
     if dom:
-        pack = domain_pack(dom, deep=bool(_DELIVERABLE_RE.search(text)))
+        pack = domain_pack(dom, deep=bool(_DELIVERABLE_RE.search(text)), uid=uid)
         if pack:
             parts.append(pack)
     return ("\n\n".join(parts), dom)

@@ -48,6 +48,14 @@ SECTIONS = [
             {"key": "dispatch.max_concurrent_per_model", "label": "Max concurrent per model", "type": "int",
              "default": "8", "min": 1, "max": 32,
              "help": "Z.AI's concurrency limit is per model (~10). Per-model overrides live in Models & routing."},
+            {"key": "models.auto_route", "label": "Auto-pick the best model per task", "type": "bool",
+             "default": "1",
+             "help": "Item 15: when a task is created WITHOUT an explicit model, pick the "
+                     "best-matching enabled model from the descriptions in Models & routing "
+                     "(mechanical/simple work drops to the light tiers; a model whose 'Best "
+                     "for' matches the task wins). The task detail shows WHY a model was "
+                     "picked; setting a model yourself always overrides. Dev-pipeline "
+                     "stages and high-stakes work never route below the default."},
             {"key": "dispatch.max_turn_seconds", "label": "Max seconds per dispatched turn", "type": "int",
              "default": "14400", "min": 60, "max": 43200,
              "help": "Wall-clock backstop per agent turn. Hitting it detaches the stream — the run "
@@ -97,6 +105,22 @@ SECTIONS = [
              "help": "N7: when an approval is rejected with NO feedback and the current version "
                      "was never judged, run the frontier judge first so the retry carries real "
                      "findings instead of re-running on nothing."},
+            {"key": "evals.auto_improve", "label": "Auto-draft improvements after evals", "type": "bool",
+             "default": "1",
+             "help": "Item 6c: when an eval run finishes with any case below SHIP, one "
+                     "frontier call drafts durable config improvements (playbook/rubric "
+                     "edits, specialist rule edits, exemplar promotions) from the judge's "
+                     "critiques — filed as ONE reviewable card in the Decisions inbox. "
+                     "Applying is always your click; everything applied is git-committed "
+                     "and reversible."},
+            {"key": "evals.improve_cmd", "label": "Improvement command template", "type": "command",
+             "default": "cimprove {domain} {evidence}",
+             "help": "Tokens: {domain} {evidence} and optional {model} (the resolved "
+                     "spec_model). Gates stub this — restore after testing."},
+            {"key": "evals.improve_min_score", "label": "Low-score threshold (%)", "type": "int",
+             "default": "75", "min": 0, "max": 100,
+             "help": "Eval cases below this rubric percentage (or any non-SHIP verdict) "
+                     "count as low-scoring and are fed to the improvement draft in full."},
         ],
     },
     {
@@ -274,6 +298,13 @@ SECTIONS = [
              "default": "1200", "min": 200, "max": 8000,
              "help": "Hard character cap on the injected feedback block (~300 tokens at "
                      "the default) — oldest excerpt lines drop first."},
+            {"key": "feedback.cross_user_visible", "label": "Users see each other's wins/lessons", "type": "bool",
+             "default": "1",
+             "help": "Item 7: every user can browse all users' ledger entries in the Wins & "
+                     "Lessons tab and copy useful ones into their own ledger ('⤵ Copy to "
+                     "mine'). Off = each user sees only their own + the shared General "
+                     "ledger. Task briefings only ever use own + adopted + General entries "
+                     "either way."},
             {"key": "lessons.auto_distill", "label": "Auto-distill operator corrections", "type": "bool",
              "default": "1",
              "help": "Q2/N8: on a schedule, turn the operator's corrections (rejections, "
@@ -311,6 +342,41 @@ SECTIONS = [
                      "auto-approve after this many hours (0 = never, the default). NEVER applies "
                      "to rejections, escalations, Super Result checkpoints, high-stakes work, or "
                      "any irreversible action (guardrail rule 2)."},
+        ],
+    },
+    {
+        "id": "agentmem", "title": "Agent lane memory",
+        "desc": "The Agent-memory tab's automatic writers (item 3, 2026-07-12): every "
+                "finished dispatch logs one experience line per lane, an hourly sweep "
+                "condenses the log into a rolling summary, and the summary plus your "
+                "taught rules ride into that lane's next task briefing.",
+        "items": [
+            {"key": "agentmem.enabled", "label": "Automatic lane memory", "type": "bool",
+             "default": "1",
+             "help": "Master switch for the auto writers (stm scratchpad + experience "
+                     "task log). Off = the tab only shows what you add manually — the "
+                     "pre-2026-07-12 behavior."},
+            {"key": "agentmem.framing_enabled", "label": "Inject lane memory into briefings", "type": "bool",
+             "default": "1",
+             "help": "Rules you teach a lane (longterm) and its rolling summary are "
+                     "appended to every task briefing that lane executes (≤800 chars). "
+                     "This is how teaching an agent actually changes its behavior."},
+            {"key": "agentmem.experience_ttl_days", "label": "Task-log retention (days)", "type": "int",
+             "default": "90", "min": 7, "max": 730,
+             "help": "Experience rows expire after this many days (the hourly sweep "
+                     "enforces it). The rolling summary keeps the distilled lessons."},
+            {"key": "agentmem.stm_ttl_hours", "label": "Scratchpad retention (hours)", "type": "int",
+             "default": "48", "min": 1, "max": 336,
+             "help": "stm rows (what a lane is working on right now) expire after this "
+                     "many hours if a crash orphans them."},
+            {"key": "agentmem.consolidate_after", "label": "Summarize every N tasks", "type": "int",
+             "default": "10", "min": 1, "max": 100,
+             "help": "The hourly sweep re-writes a lane's rolling summary once it has "
+                     "this many new task-log lines (one cheap-model call per lane)."},
+            {"key": "agentmem.stub", "label": "Stub consolidation (gate hook)", "type": "bool",
+             "default": "0",
+             "help": "Verify-gate hook (mirrors plan.stub): the summary call returns a "
+                     "canned line instead of calling the model. Leave OFF."},
         ],
     },
     {

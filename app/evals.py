@@ -1363,6 +1363,12 @@ def _run_thread(run_id: str, domain: str, uid: str | None):
                         f"Eval run finished — {domain}: {run['cases_done']}/{run['cases_total']} "
                         "cases" + (f", rubric score {pct}%" if pct is not None else "")
                         + f", {run['ship_count']} SHIP", user_id=uid)
+        # Item 6c: auto-draft the improvement proposal when anything scored
+        # below SHIP (one frontier call; the APPLY still waits for the admin).
+        if db.get_setting("evals.auto_improve", "1") == "1" \
+                and (run.get("ship_count") or 0) < (run.get("cases_done") or 0):
+            threading.Thread(target=run_improvement, args=(run_id, uid),
+                             daemon=True, name=f"eval-improve-{run_id}").start()
     except Exception as e:
         _finish_run(run_id, "failed", str(e)[:300])
         db.log_activity("error", "evals",
@@ -1418,3 +1424,314 @@ def start_run(domain: str, case_ids: list | None, uid: str,
                     f"Eval run started — {domain}, {len(cases)} case(s), "
                     f"config {fp.get('combined')}", user_id=uid)
     return run_id, None
+
+
+# ═══════════ Item 6c (2026-07-12): eval → improvement loop ═══════════
+# Mirror of the Q2 lessons pattern end-to-end: auto-draft after a completed
+# run with non-SHIP cases → ONE admin approval card with editable deltas →
+# apply writes knowledge/specialists/exemplars + git commit. Evals remain the
+# measurement; THIS is the actuator that turns scores into config changes.
+
+IMPROVE_JSON_BEGIN = "NEXUS_IMPROVE_JSON_BEGIN"
+IMPROVE_JSON_END = "NEXUS_IMPROVE_JSON_END"
+
+
+def _improve_min_pct() -> int:
+    try:
+        return max(0, min(100, int(db.get_setting("evals.improve_min_score", "75") or 75)))
+    except (TypeError, ValueError):
+        return 75
+
+
+def gather_improve_evidence(run_id: str) -> tuple[str, str, set, set]:
+    """(evidence_text, domain, specialists, case_ids) for one completed run.
+    Low-scoring cases (verdict != SHIP or pct < evals.improve_min_score) go in
+    FULL (brief + deliverable + judge critique); SHIP cases are one-line
+    summaries flagged as exemplar candidates. Capped ~60k chars."""
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=?", (run_id,))
+    if not run:
+        return "", "", set(), set()
+    domain = run["domain"]
+    rows = db.query_all("SELECT * FROM eval_results WHERE run_id=? ORDER BY id", (run_id,))
+    min_pct = _improve_min_pct()
+    parts = [f"EVAL RUN {run_id} — domain '{domain}', "
+             f"{run.get('cases_done')}/{run.get('cases_total')} cases, "
+             f"{run.get('ship_count')} SHIP. Run notes: {run.get('notes') or '(none)'}"]
+    prev = db.query_one(
+        "SELECT id, score_total, score_max, ship_count FROM eval_runs "
+        "WHERE domain=? AND status='completed' AND started_at < ? "
+        "ORDER BY started_at DESC LIMIT 1", (domain, run.get("started_at") or 0))
+    if prev and prev.get("score_max"):
+        parts.append(f"Previous completed run {prev['id']}: "
+                     f"{100 * prev['score_total'] // prev['score_max']}% rubric, "
+                     f"{prev['ship_count']} SHIP — use it for trend context.")
+    specialists, case_ids = set(), set()
+    for x in rows:
+        case_ids.add(x["case_id"])
+        if x.get("specialist"):
+            specialists.add(x["specialist"])
+        pct = (100 * (x.get("score") or 0) // x["score_max"]) if x.get("score_max") else None
+        low = (x.get("status") == "scored"
+               and (x.get("verdict") != "SHIP" or (pct is not None and pct < min_pct)))
+        if x.get("status") == "error":
+            parts.append(f"\n## CASE {x['case_id']} — ERROR\n{(x.get('error') or '')[:400]}")
+            continue
+        if not low:
+            if x.get("verdict") == "SHIP":
+                parts.append(f"\n## CASE {x['case_id']} ('{x.get('case_title')}') — SHIP"
+                             + (f", {pct}%" if pct is not None else "")
+                             + " — EXEMPLAR CANDIDATE (strong result; consider kind=exemplar)")
+            continue
+        case = load_case(domain, x["case_id"]) or {}
+        deliv = ""
+        try:
+            if x.get("deliverable_path") and os.path.isfile(x["deliverable_path"]):
+                deliv = open(x["deliverable_path"], encoding="utf-8",
+                             errors="replace").read()[:4000]
+        except OSError:
+            pass
+        parts.append(
+            f"\n## CASE {x['case_id']} ('{x.get('case_title')}') — LOW: "
+            f"{x.get('verdict') or 'no verdict'}"
+            + (f", {pct}%" if pct is not None else "")
+            + (f", {x.get('gates_failed')} gate FAIL" if x.get("gates_failed") else "")
+            + (f", specialist={x['specialist']}" if x.get("specialist") else "")
+            + f"\n### Brief (fixed input)\n{(case.get('brief') or '')[:1500]}"
+            + f"\n### Generated deliverable (excerpt)\n{deliv}"
+            + f"\n### Judge critique\n{(x.get('judge_output') or '')[-3000:]}")
+    text = "\n".join(parts)
+    return text[:60000], domain, specialists, case_ids
+
+
+def parse_improve_deltas(out: str, specialists: set, case_ids: set) -> list[dict] | None:
+    """Whitelist-parse the sentinel JSON from cimprove. None on parse failure;
+    [] = the model found nothing durable (a legitimate answer)."""
+    import lessons as _lessons
+    if not out or IMPROVE_JSON_BEGIN not in out:
+        return None
+    try:
+        seg = out.split(IMPROVE_JSON_BEGIN, 1)[1].split(IMPROVE_JSON_END, 1)[0].strip()
+        data = json.loads(seg)
+    except Exception:
+        return None
+    deltas = data.get("deltas") if isinstance(data, dict) else None
+    if not isinstance(deltas, list):
+        return None
+    clean = []
+    for d in deltas[:5]:
+        if not isinstance(d, dict):
+            continue
+        kind = str(d.get("kind") or "").strip()
+        item = {"kind": kind,
+                "before": str(d.get("before") or "")[:500],
+                "after": str(d.get("after") or "")[:800],
+                "rationale": str(d.get("rationale") or "")[:400],
+                "expected_effect": str(d.get("expected_effect") or "")[:200]}
+        if kind == "knowledge":
+            f = str(d.get("file") or "").strip()
+            if f not in _lessons._LESSON_FILES or not item["after"]:
+                continue
+            item["file"] = f
+        elif kind == "specialist":
+            s = str(d.get("specialist") or "").strip()
+            if s not in specialists or not item["after"]:
+                continue
+            item["specialist"] = s
+        elif kind == "exemplar":
+            c = str(d.get("case_id") or "").strip()
+            if c not in case_ids:
+                continue
+            item["case_id"] = c
+        else:
+            continue
+        clean.append(item)
+    return clean
+
+
+def run_improvement(run_id: str, uid: str | None) -> dict:
+    """Draft improvement deltas from a completed run's results (ONE frontier
+    call via evals.improve_cmd — gates stub it) and file ONE admin approval.
+    Returns {ok, reason?, approval_id?, deltas?}."""
+    import subprocess
+    import tempfile
+    run = db.query_one("SELECT * FROM eval_runs WHERE id=?", (run_id,))
+    if not run or run.get("status") != "completed":
+        return {"ok": False, "reason": "run not found or not completed"}
+    if run.get("improve_status") in ("drafting", "proposed"):
+        return {"ok": False, "reason": f"improvement already {run['improve_status']}"}
+    if frontier_backoff_active():
+        return {"ok": False, "reason": "frontier quota backoff active — deferred"}
+    db.execute("UPDATE eval_runs SET improve_status='drafting' WHERE id=?", (run_id,))
+    try:
+        evidence, domain, specialists, case_ids = gather_improve_evidence(run_id)
+        if not evidence.strip():
+            db.execute("UPDATE eval_runs SET improve_status='none' WHERE id=?", (run_id,))
+            return {"ok": False, "reason": "no evidence assembled"}
+        owner = uid or run.get("user_id")
+        smodel, skey = spec_model_for(owner)
+        tmpl = db.get_setting("evals.improve_cmd", "cimprove {domain} {evidence}") \
+            or "cimprove {domain} {evidence}"
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, dir="/tmp") as tf:
+            tf.write(evidence)
+            evid_path = tf.name
+        try:
+            tokens = resolve_cmd_tokens(tmpl, {"domain": domain, "evidence": evid_path,
+                                               "model": smodel})
+            env = _scrubbed_env()
+            if smodel:
+                env["JUDGE_MODEL"] = smodel
+            if skey:
+                env["JUDGE_ANTHROPIC_API_KEY"] = skey
+            timeout = int(db.get_setting("super.timeout_s", "1500") or 1500)
+            with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
+                r = subprocess.run(tokens, capture_output=True, text=True,
+                                   timeout=timeout, env=env)
+            out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode else "")
+        finally:
+            try:
+                os.unlink(evid_path)
+            except OSError:
+                pass
+        deltas = parse_improve_deltas(out, specialists, case_ids)
+        if deltas is None:
+            if is_frontier_quota_error(out):
+                note_frontier_quota_hit()
+                db.execute("UPDATE eval_runs SET improve_status='none' WHERE id=?", (run_id,))
+                return {"ok": False, "reason": "frontier quota/rate-limit — deferred"}
+            db.execute("UPDATE eval_runs SET improve_status='error' WHERE id=?", (run_id,))
+            return {"ok": False, "reason": "no parseable deltas"}
+        note_frontier_quota_ok()
+        if not deltas:
+            db.execute("UPDATE eval_runs SET improve_status='none' WHERE id=?", (run_id,))
+            db.log_activity("info", "evals",
+                            f"Improvement pass for {run_id} ({domain}): the model found "
+                            "no durable config change", user_id=owner)
+            return {"ok": True, "reason": "no durable deltas", "deltas": []}
+        payload = {"run_id": run_id, "domain": domain, "deltas": deltas,
+                   "headline": f"Eval run for '{domain}' suggests {len(deltas)} durable improvement(s).",
+                   "recommendation": "Review each proposed change; apply folds it into the "
+                                     "config your agents read (git-committed, reversible).",
+                   "reasons": [f"{run.get('cases_total', 0) - run.get('ship_count', 0)} case(s) "
+                               "scored below SHIP in the last eval run",
+                               "each change cites the judge critique that justifies it"],
+                   "cost_hint": "no model cost to apply (deltas already generated)"}
+        aid = f"appr-{uuid.uuid4().hex[:10]}"
+        db.execute(
+            "INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
+            "risk_level, requested_at, user_id, scope) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (aid, "eval-improver", "eval_improve",
+             f"{len(deltas)} eval-driven improvement(s) for '{domain}' — review & apply",
+             json.dumps(payload), "pending", "medium", time.time(), owner, "admin"))
+        db.execute("UPDATE eval_runs SET improve_status='proposed', improve_approval_id=? "
+                   "WHERE id=?", (aid, run_id))
+        db.log_activity("info", "evals",
+                        f"Improvement pass for {run_id} ({domain}): {len(deltas)} delta(s) "
+                        f"proposed → approval {aid}", user_id=owner)
+        return {"ok": True, "approval_id": aid, "deltas": deltas}
+    except Exception as e:
+        db.execute("UPDATE eval_runs SET improve_status='error' WHERE id=?", (run_id,))
+        return {"ok": False, "reason": f"improvement error: {str(e)[:160]}"}
+
+
+def apply_improvements(payload: dict, user_id: str | None, username: str = "operator") -> dict:
+    """Apply approved improvement deltas. knowledge → lessons.apply_deltas
+    (same whitelist/snapshot/git); specialist → edit the standing-rules body of
+    ~/.hermes/agents/<name>.md (+ git commit there); exemplar → copy the case's
+    deliverable into the domain examples/ folder with provenance."""
+    import subprocess
+    import lessons as _lessons
+    domain = str(payload.get("domain") or "")
+    run_id = str(payload.get("run_id") or "")
+    deltas = payload.get("deltas") or []
+    applied, skipped = [], []
+    know = [{"file": d["file"], "target": "canonical", "kind": "add",
+             "before": d.get("before") or "", "after": d.get("after") or "",
+             "rationale": d.get("rationale") or ""}
+            for d in deltas if d.get("kind") == "knowledge" and d.get("file")]
+    if know:
+        res = _lessons.apply_deltas(domain, know, user_id, username)
+        applied += [{"kind": "knowledge", **a} for a in res.get("applied", [])]
+    agents_dir = os.path.expanduser("~/.hermes/agents")
+    spec_written = []
+    for d in deltas:
+        if d.get("kind") != "specialist":
+            continue
+        name = d.get("specialist") or ""
+        path = os.path.join(agents_dir, f"{name}.md")
+        if not re.match(r"^[a-z0-9-]+$", name) or not os.path.isfile(path):
+            skipped.append({"kind": "specialist", "specialist": name,
+                            "reason": "specialist no longer exists"})
+            continue
+        try:
+            cur = open(path, encoding="utf-8").read()
+            before = (d.get("before") or "").strip()
+            after = (d.get("after") or "").strip()
+            if before and before in cur:
+                cur = cur.replace(before, after, 1)
+            else:
+                marker = "## Learned from evals"
+                if marker not in cur:
+                    cur = cur.rstrip() + f"\n\n{marker}\n"
+                cur = cur.rstrip() + f"\n- {after}\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(cur)
+            spec_written.append(name)
+            applied.append({"kind": "specialist", "specialist": name, "path": path})
+        except Exception as e:
+            skipped.append({"kind": "specialist", "specialist": name,
+                            "reason": str(e)[:100]})
+    if spec_written:
+        try:
+            subprocess.run(["git", "-C", agents_dir, "add"]
+                           + [f"{n}.md" for n in spec_written],
+                           capture_output=True, timeout=10)
+            subprocess.run(["git", "-C", agents_dir, "-c", "user.name=nexus", "-c",
+                            "user.email=noreply@localhost", "commit", "-m",
+                            f"eval-improve({domain}): {len(spec_written)} specialist edit(s) "
+                            f"approved by {username}"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+    for d in deltas:
+        if d.get("kind") != "exemplar":
+            continue
+        cid = d.get("case_id") or ""
+        row = db.query_one(
+            "SELECT deliverable_path, case_title FROM eval_results "
+            "WHERE run_id=? AND case_id=?", (run_id, cid))
+        src = (row or {}).get("deliverable_path")
+        if not src or not os.path.isfile(src):
+            skipped.append({"kind": "exemplar", "case_id": cid,
+                            "reason": "deliverable file gone"})
+            continue
+        try:
+            import datetime as _dt
+            dest_dir = os.path.join(_lessons._knowledge_root(), "domains", domain, "examples")
+            os.makedirs(dest_dir, exist_ok=True)
+            today = _dt.date.today().isoformat()
+            dest = os.path.join(dest_dir, f"{today}-eval-{cid}.md")
+            content = open(src, encoding="utf-8", errors="replace").read()
+            prov = (f"<!-- promoted from eval run {run_id} case {cid} on {today} "
+                    f"by {username} (SHIP-quality eval result) -->\n\n")
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(prov + content)
+            _lessons._git(_lessons._knowledge_root(), "add", dest)
+            _lessons._git(_lessons._knowledge_root(), "-c", "user.name=nexus", "-c",
+                          "user.email=nexus@local", "commit", "-m",
+                          f"eval-improve({domain}): exemplar {cid} promoted")
+            applied.append({"kind": "exemplar", "case_id": cid, "path": dest})
+        except Exception as e:
+            skipped.append({"kind": "exemplar", "case_id": cid, "reason": str(e)[:100]})
+    db.execute("UPDATE eval_runs SET improve_status='applied' WHERE id=?", (run_id,))
+    db.log_activity("info", "evals",
+                    f"Eval improvements applied for '{domain}' run {run_id}: "
+                    f"{len(applied)} applied, {len(skipped)} skipped", user_id=user_id)
+    return {"applied": applied, "skipped": skipped}
+
+
+def reconcile_improve_drafting():
+    """Boot heal: a crash mid-draft leaves improve_status='drafting' forever —
+    reset to none so the button re-arms (replan-drafting pattern)."""
+    cur = db.execute("UPDATE eval_runs SET improve_status=NULL "
+                     "WHERE improve_status='drafting'")
+    return cur.rowcount
