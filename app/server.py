@@ -4849,9 +4849,17 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     # [12]: the attachments layout lives in ONE helper, not an inline copy.
     spec_path = _workflow_spec_path(task["workflow_id"]) \
         if task and task.get("workflow_id") else None
+    # Judge-scope fix (2026-07-12): the judge also gets this STAGE's contract
+    # (its own 'Done when:' criteria + the workflow stage map) and a size-capped
+    # copy of the files the task actually produced — without these it enforced
+    # whole-project criteria against single stages and refuted every claim
+    # about files it structurally couldn't read.
+    contract = _judge_task_contract(task) if task else None
+    art_dirs = _judge_artifact_dirs(task) if task else None
     sink: dict = {}
     out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey,
-                            type_rubric=trubric, spec_path=spec_path, usage_sink=sink)
+                            type_rubric=trubric, spec_path=spec_path, usage_sink=sink,
+                            task_contract=contract, artifact_dirs=art_dirs)
     # C3 ledger: record this frontier run's tokens + API-equivalent $ (from the
     # claude-JSON envelope, else a transcript-size estimate). Real spend, so it
     # is captured even if the verdict doesn't parse.
@@ -8397,6 +8405,53 @@ def _workflow_spec_md(wf_id: str) -> str | None:
         return Path(fp).read_text() if fp else None
     except Exception:
         return None
+
+
+def _judge_task_contract(task: dict) -> str:
+    """STAGE contract for the frontier judge (judge-scope fix 2026-07-12).
+    The judge used to see only deliverable.md + the whole-project SPEC, so it
+    enforced every project acceptance criterion against every stage ('0/9 met'
+    on a spec stage whose Implement stage hadn't run yet). This renders what
+    the system already scoped per task — the description with the 'Done when:'
+    lines _distribute_criteria wrote into it — plus the workflow stage map so
+    later stages' obligations are visibly not this deliverable's."""
+    lines = [f"# STAGE CONTRACT — {task.get('title') or task.get('id')}", ""]
+    if task.get("deliverable_type"):
+        lines.append(f"deliverable_type: {task['deliverable_type']}")
+    wf_id = task.get("workflow_id")
+    if wf_id:
+        try:
+            sibs = db.query_all(
+                "SELECT id, title, status FROM tasks WHERE workflow_id=? "
+                "AND status != 'archived' ORDER BY position", (wf_id,))
+        except Exception:
+            sibs = []
+        if sibs:
+            lines += ["", "## Workflow stage map"]
+            for i, s in enumerate(sibs, 1):
+                mark = "  ◄ THIS deliverable's stage" if s["id"] == task.get("id") else ""
+                lines.append(f"{i}. {s['title']} [{s['status']}]{mark}")
+    lines += ["", "## This stage's brief (binding, incl. its own 'Done when:' criteria)",
+              "", (task.get("description") or "").strip()[:8000] or "(no description)"]
+    return "\n".join(lines)
+
+
+def _judge_artifact_dirs(task: dict) -> list:
+    """Where this task's produced files live (judge-scope fix): its workspace,
+    plus the shared repo worktree for repo tasks (branch artifacts). Same slug
+    rule as hermes_dispatch._repo_slug — pipeline tasks share one branch."""
+    dirs = []
+    ws = task.get("workspace_path")
+    if ws and os.path.isdir(ws):
+        dirs.append(ws)
+    repo = task.get("repo_path")
+    if repo:
+        slug = (task.get("workflow_id") or task.get("id") or "task") \
+            .replace("wf-", "").replace("task-", "")
+        wt = Path(repo) / ".worktrees" / f"nexus-{slug}"
+        if wt.is_dir():
+            dirs.append(str(wt))
+    return dirs
 
 
 @app.post("/api/plan/sessions/{sid}/attach")

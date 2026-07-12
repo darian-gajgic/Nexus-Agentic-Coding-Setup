@@ -26,20 +26,44 @@ if [ -n "${JUDGE_TYPE_RUBRIC:-}" ] && [ -f "${JUDGE_TYPE_RUBRIC:-}" ]; then
   TYPE_RUBRIC_BLOCK="Additionally read the deliverable-TYPE rubric at $JUDGE_TYPE_RUBRIC and grade against BOTH rubrics — its must-pass gates (e.g. verified-not-inferred) bind exactly like the domain rubric's."
 fi
 
-# Deep Plan (Step 8): when the deliverable was produced under a conversational
-# SPEC, verify it against that ORIGINAL contract too — an unmet acceptance
-# criterion is a blocking finding. Optional; absent = original behavior.
-SPEC_BLOCK=""
-if [ -n "${JUDGE_SPEC:-}" ] && [ -f "${JUDGE_SPEC:-}" ]; then
-  SPEC_BLOCK="This deliverable was produced under a Deep Plan SPEC at $JUDGE_SPEC — read it and ALSO verify the deliverable satisfies every acceptance criterion in that SPEC; a criterion left unmet or untestable is a blocking finding."
+# Judge-scope fix (2026-07-12): when Nexus passes a STAGE contract, it is the
+# binding criteria set for this deliverable — the deliverable is ONE STAGE of a
+# larger plan, and project-level criteria owned by later stages must not fail
+# it. Optional; absent = original behavior.
+TASK_BLOCK=""
+if [ -n "${JUDGE_TASK:-}" ] && [ -f "${JUDGE_TASK:-}" ]; then
+  TASK_BLOCK="This deliverable is ONE STAGE of a larger plan. Its BINDING contract is the stage contract at $JUDGE_TASK — read it FIRST. Enforce the rubric(s) plus that stage contract's own 'Done when:' criteria. Project-level acceptance criteria that the stage map assigns to LATER stages (e.g. implementation criteria while judging a spec/plan stage) are NOT this deliverable's obligations — treat them as out of scope here, not as findings."
 fi
 
-PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC. $TYPE_RUBRIC_BLOCK $SPEC_BLOCK
+# Deep Plan (Step 8): when the deliverable was produced under a conversational
+# SPEC, verify it against that ORIGINAL contract too. With a stage contract
+# present the SPEC becomes background context (criteria enforcement is scoped
+# by the stage contract above); without one, original behavior: an unmet
+# acceptance criterion is a blocking finding.
+SPEC_BLOCK=""
+if [ -n "${JUDGE_SPEC:-}" ] && [ -f "${JUDGE_SPEC:-}" ]; then
+  if [ -n "$TASK_BLOCK" ]; then
+    SPEC_BLOCK="The whole-project Deep Plan SPEC is at $JUDGE_SPEC — read it as background: judge whether this stage's output is CONSISTENT with it, but enforce acceptance criteria only as scoped by the stage contract."
+  else
+    SPEC_BLOCK="This deliverable was produced under a Deep Plan SPEC at $JUDGE_SPEC — read it and ALSO verify the deliverable satisfies every acceptance criterion in that SPEC; a criterion left unmet or untestable is a blocking finding."
+  fi
+fi
+
+# Judge-scope fix (2026-07-12): when Nexus copies the task's actually-produced
+# files next to the deliverable, 'evidence on the page' extends to them — the
+# judge verifies claims against the real artifacts instead of refuting every
+# claim it cannot see. Optional; absent = original behavior.
+ART_BLOCK=""
+if [ -n "${JUDGE_ARTIFACTS:-}" ] && [ -d "${JUDGE_ARTIFACTS:-}" ]; then
+  ART_BLOCK="The task's actually-produced files are at $JUDGE_ARTIFACTS (read-only copies, size-capped). Before refuting any claim about a created/changed file, OPEN that file there and check — 'evidence on the page' extends to these artifacts. A claim the artifacts substantiate counts as verified even when the deliverable does not quote it inline (note the missing inline evidence as a LOW finding at most); a claim the artifacts contradict is CRITICAL."
+fi
+
+PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC. $TYPE_RUBRIC_BLOCK $TASK_BLOCK $SPEC_BLOCK $ART_BLOCK
 
 Stance: REFUTE BY DEFAULT. The deliverable's own assertions and self-scores are never evidence. You cannot run its commands, so judge the EVIDENCE ON THE PAGE: a load-bearing conclusion must rest on cited primary evidence (exact file:line, command + quoted output, source + date). A conclusion resting on a proxy inference ('tests pass' therefore 'code healthy') or on unlocated hand-waving FAILS the gate that covers it, no matter how plausible it reads. Check claims tagged '[UNSURE: reason]' FIRST — the author flagged them as unconfirmed; a marked claim that proves false is a medium finding, an UNMARKED claim that proves false is critical (it was presented as verified).
 
 Steps:
-1. Read $FILE, $RUBRIC, $KNOW/BUSINESS-CONTEXT.md, and $KNOW/STYLE-VOICE.md (plus the type rubric and the Deep Plan SPEC if named above).
+1. Read $FILE, $RUBRIC, $KNOW/BUSINESS-CONTEXT.md, and $KNOW/STYLE-VOICE.md (plus the stage contract, the type rubric, and the Deep Plan SPEC if named above; browse the artifacts directory as needed to verify claims).
 2. Must-pass gates: render ONE binary table covering every gate of every rubric read — | gate | PASS/FAIL | one-line reason |. No partial credit, no 'mostly'.
 3. Scored dimensions: score each 0-4 with a one-line justification.
 4. Kill-list scan: quote any hits verbatim.
