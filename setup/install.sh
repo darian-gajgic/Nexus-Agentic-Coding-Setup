@@ -131,5 +131,5 @@ Next:
      #   printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start ollama.service\n' "\$USER" > /tmp/nexus-stack.sudoers
      #   visudo -c -f /tmp/nexus-stack.sudoers && sudo install -o root -g root -m 0440 /tmp/nexus-stack.sudoers /etc/sudoers.d/nexus-stack
 
-Verify:  $PY $GUARDIAN_DIR/guardian.py   (expect overall=OK, 5 core-mods)
+Verify:  $PY $GUARDIAN_DIR/guardian.py   (expect overall=OK, all core-mods applied — the count in guardian/core-mods.json, 7 today)
 EOF
