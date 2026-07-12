@@ -341,6 +341,9 @@ async function handleWSMessage(msg) {
   if (msg.type === 'program_created') {
     state.programs = await api('GET', '/api/programs');
   }
+  if (msg.type === 'tasks_bulk_updated' || msg.type === 'workflow_deleted') {
+    state.tasks = await api('GET', '/api/tasks');
+  }
   if (msg.type === 'approval_created' || msg.type === 'approval_updated') {
     const appr = await api('GET', '/api/approvals?status=pending');
     state.approvals = appr.approvals || [];
@@ -1227,6 +1230,10 @@ function viewKanban() {
               <span class="col-dot" style="background:${col.color};color:${col.color}"></span>
               <span class="col-title">${col.name}</span>
               <span class="col-count">${tasks.length}</span>
+              ${col.id === 'backlog' && tasks.length
+                ? `<button class="btn-icon col-bulk" title="Start all ${tasks.length} shown backlog task(s) — they move to To Do and run in dependency order" onclick="kanbanStartAll()">▶▶</button>` : ''}
+              ${col.id === 'in_progress' && tasks.some(t => ['queued', 'dispatching', 'streaming', 'finalizing'].includes(t.dispatch_state))
+                ? `<button class="btn-icon col-bulk" title="Stop all running tasks shown in this column" onclick="kanbanStopAll()">⏹⏹</button>` : ''}
               <button class="btn-icon col-add" title="Add task here" onclick="showTaskModal('${col.id}')">+</button>
             </div>
             <div class="col-body" data-col="${col.id}">
@@ -1243,8 +1250,9 @@ function dispatchChip(t) {
   const ds = t.dispatch_state;
   if (!ds || ds === 'none') return '';
   const m = { queued: 'c-blue', dispatching: 'c-blue', streaming: 'c-cyan', finalizing: 'c-cyan',
-              completed: 'c-green', failed: 'c-red', blocked_quota: 'c-orange', blocked_budget: 'c-orange' };
-  const label = { blocked_quota: 'quota ⏸', blocked_budget: 'budget ⏸' }[ds] || ds;
+              completed: 'c-green', failed: 'c-red', blocked_quota: 'c-orange', blocked_budget: 'c-orange',
+              cancelled: 'c-orange' };
+  const label = { blocked_quota: 'quota ⏸', blocked_budget: 'budget ⏸', cancelled: 'stopped ⏹' }[ds] || ds;
   return `<span class="chip ${m[ds] || ''}" title="dispatch: ${esc(ds)}"><i></i>${esc(label)}</span>`;
 }
 
@@ -1292,9 +1300,50 @@ function taskCard(t) {
         ${judgeChip ? `<span class="chip ${judgeChip}" title="frontier judge verdict">${esc(t.judge_verdict)}</span>` : ''}
         ${vsChip ? `<span class="chip ${vsChip}"><i></i>${esc(vs)}</span>` : ''}
         <span class="task-age">${fmtAgo(t.updated_at || t.created_at)}</span>
+        ${['queued', 'dispatching', 'streaming', 'finalizing'].includes(t.dispatch_state)
+          ? `<button class="btn-icon card-stop" data-id="${esc(t.id)}" title="Stop this run — work so far is kept, the task returns to Backlog">⏹</button>` : ''}
       </div>
     </div>
   `;
+}
+
+async function kanbanStartAll() {
+  const ids = (state.tasks || []).filter(taskMatchesFilters)
+    .filter(t => t.status === 'backlog').map(t => t.id);
+  if (!ids.length) { toast('Nothing to start', 'info'); return; }
+  if (!confirm(`Start ${ids.length} backlog task(s)? Stages still run in dependency order.`)) return;
+  try {
+    const r = await api('POST', '/api/tasks/bulk-status', { ids, status: 'todo' });
+    toast(`${(r.changed || []).length} started${(r.skipped || []).length ? `, ${r.skipped.length} skipped` : ''}`, 'ok');
+    state.tasks = await api('GET', '/api/tasks');
+    render();
+  } catch (e) { toast('Bulk start failed: ' + e.message, 'err'); }
+}
+
+async function kanbanStopAll() {
+  const ids = (state.tasks || []).filter(taskMatchesFilters)
+    .filter(t => t.status === 'in_progress' && ['queued', 'dispatching', 'streaming', 'finalizing'].includes(t.dispatch_state))
+    .map(t => t.id);
+  if (!ids.length) { toast('Nothing to stop', 'info'); return; }
+  if (!confirm(`Stop ${ids.length} running task(s)? Work done so far is kept; they return to Backlog.`)) return;
+  try {
+    const r = await api('POST', '/api/tasks/bulk-stop', { ids });
+    const n = (r.results || []).filter(x => x.stopped !== 'skipped' && x.stopped !== 'noop').length;
+    toast(`${n} stopping (live runs abort within ~30s)`, 'ok');
+    state.tasks = await api('GET', '/api/tasks');
+    render();
+  } catch (e) { toast('Bulk stop failed: ' + e.message, 'err'); }
+}
+
+async function stopTaskUI(id) {
+  if (!confirm('Stop this run? Work done so far is snapshotted; the task returns to Backlog.')) return;
+  try {
+    const r = await api('POST', `/api/tasks/${id}/stop`);
+    toast(r.stopped === 'immediate' ? 'Stopped — back in Backlog'
+      : r.stopped === 'cancelling' ? 'Stopping… the run aborts within ~30s' : 'Nothing to stop', 'ok');
+    state.tasks = await api('GET', '/api/tasks');
+    render();
+  } catch (e) { toast('Stop failed: ' + e.message, 'err'); }
 }
 
 // Card handlers live in shared kanbanDrag state (not a bindKanban closure) so
@@ -1309,6 +1358,10 @@ function bindKanbanCards() {
     card.addEventListener('dragend', () => { kanbanDrag.active = false; card.classList.remove('dragging'); });
     card.addEventListener('click', () => { if (!kanbanDrag.active) openTaskDetail(card.dataset.id); });
   });
+  $$('.card-stop').forEach(el => el.addEventListener('click', e => {
+    e.stopPropagation();
+    stopTaskUI(el.dataset.id);
+  }));
 }
 
 function bindKanban() {
@@ -1445,6 +1498,7 @@ function openTaskDetail(id) {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px">
         <span class="chip c-cyan" style="font-family:var(--font-mono)">${esc(t.repo_path)}</span>
         <span class="muted">branch nexus/${esc((t.workflow_id || t.id).replace('wf-', '').replace('task-', ''))} · diff is the deliverable</span>
+        <button class="btn-sm" title="Files this task created/changed on its branch — view/download without touching your checkout" onclick="branchFilesUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">🧬 Branch files…</button>
       </div></div>` : ''}
     <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
       <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
@@ -1460,8 +1514,10 @@ function openTaskDetail(id) {
     <div class="modal-actions" style="justify-content:space-between">
       <button class="btn-sm danger" onclick="deleteTaskUI('${esc(t.id)}')">Delete task</button>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
-        ${['none', 'failed', 'blocked_quota', 'blocked_budget', undefined, null, ''].includes(t.dispatch_state) && ['backlog', 'todo', 'in_progress'].includes(t.status)
+        ${['none', 'failed', 'blocked_quota', 'blocked_budget', 'cancelled', undefined, null, ''].includes(t.dispatch_state) && ['backlog', 'todo', 'in_progress'].includes(t.status)
           ? `<button class="btn-ghost" title="Execute NOW via a real Hermes session" onclick="dispatchTaskUI('${esc(t.id)}')">▶ Dispatch</button>` : ''}
+        ${['queued', 'dispatching', 'streaming', 'finalizing'].includes(t.dispatch_state)
+          ? `<button class="btn-ghost" title="Stop this run — work so far is kept, the task returns to Backlog" onclick="closeModal(); stopTaskUI('${esc(t.id)}')">⏹ Stop</button>` : ''}
         ${['failed'].includes(t.dispatch_state) || (t.judge_verdict && t.judge_verdict !== 'SHIP' && t.judge_verdict !== 'running')
           ? `<button class="btn-ghost" title="Fresh attempt with feedback attached" onclick="retryTaskUI('${esc(t.id)}')">↻ Retry</button>` : ''}
         ${t.repo_path && t.result_summary ? (t.pr_url
@@ -1640,7 +1696,12 @@ async function attachPostFile(kind, id, f) {
 //    in memory while the form is open and uploaded right after Create. The
 //    HTML helper resets the stage, so a cancelled form never leaks files into
 //    the next one. ──
-const attachStaged = {}; // elId → File[]
+const attachStaged = {}; // elId → File[] (each File may carry _target: 'wf' | planTaskIdx)
+// Item 12: per-file targeting in the creation wizard. A modal that wants the
+// target picker registers a provider (options) + a suggest fn (deterministic
+// filename↔task-title match); plain modals (task create) stay single-target.
+const attachStageTargetOpts = {}; // elId → () => [{value, label}]
+const attachStageSuggest = {};    // elId → (file) => 'wf' | taskIdx
 function attachStageHTML(elId) {
   attachStaged[elId] = [];
   return `
@@ -1665,8 +1726,12 @@ function attachStageWire(elId) {
 }
 function attachStageAdd(elId, files) {
   const cur = attachStaged[elId] || (attachStaged[elId] = []);
+  const suggest = attachStageSuggest[elId];
   for (const f of files) {
-    if (!cur.some(x => x.name === f.name && x.size === f.size)) cur.push(f);
+    if (!cur.some(x => x.name === f.name && x.size === f.size)) {
+      if (suggest && f._target === undefined) f._target = suggest(f);
+      cur.push(f);
+    }
   }
   attachStageRender(elId);
 }
@@ -1674,14 +1739,33 @@ function attachStageRemove(elId, i) {
   (attachStaged[elId] || []).splice(i, 1);
   attachStageRender(elId);
 }
+function attachStageSetTarget(elId, i, v) {
+  const f = (attachStaged[elId] || [])[i];
+  if (f) f._target = v === 'wf' ? 'wf' : parseInt(v, 10);
+}
 function attachStageRender(elId) {
   const el = document.getElementById(`${elId}-pending`);
   if (!el) return;
-  el.innerHTML = (attachStaged[elId] || []).map((f, i) => `
-    <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:2px">
+  const optsFn = attachStageTargetOpts[elId];
+  const opts = optsFn ? optsFn() : null;
+  el.innerHTML = (attachStaged[elId] || []).map((f, i) => {
+    let sel = '';
+    if (opts) {
+      // Clamp a stale target (task removed by a revalidate) back to project-wide.
+      if (f._target !== 'wf' && !opts.some(o => o.value === f._target)) f._target = 'wf';
+      sel = `<select class="form-select attach-target" style="width:auto;max-width:230px;padding:1px 6px;font-size:11px"
+        title="Which task gets this file as its input — auto-suggested from the filename, change if wrong"
+        onchange="attachStageSetTarget('${elId}',${i},this.value)">
+        ${opts.map(o => `<option value="${esc(String(o.value))}" ${String(f._target) === String(o.value) ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}
+      </select>`;
+    }
+    return `
+    <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:2px;flex-wrap:wrap">
       📎 ${esc(f.name)} <span class="muted" style="font-size:10.5px">${(f.size / 1024).toFixed(0)} KB · pending</span>
+      ${sel}
       <button class="btn-sm danger" title="remove" onclick="attachStageRemove('${elId}',${i})">✕</button>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 async function attachStageUploadAll(elId, kind, id) {
   const files = attachStaged[elId] || [];
@@ -1692,6 +1776,36 @@ async function attachStageUploadAll(elId, kind, id) {
     catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
   }
   return done;
+}
+// Item 12: upload staged files to their chosen targets after creation.
+// remap = plan-task index → position in the created ids[] (unticked → null).
+async function attachStageUploadTargets(elId, wfId, ids, remap) {
+  const files = attachStaged[elId] || [];
+  delete attachStaged[elId];
+  let done = 0;
+  for (const f of files) {
+    const pos = f._target === 'wf' || f._target === undefined ? null : remap[f._target];
+    const taskId = pos != null ? ids[pos] : null;
+    try {
+      await attachPostFile(taskId ? 'task' : 'workflow', taskId || wfId, f);
+      done++;
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+  }
+  return done;
+}
+// Deterministic filename↔task matcher: significant filename tokens vs
+// title+description token overlap; ≥2 hits → best task, else project-wide.
+function attachSuggestTarget(file, tasks) {
+  const toks = String(file.name).toLowerCase().replace(/\.[a-z0-9]+$/, '')
+    .split(/[^a-z0-9]+/).filter(w => w.length >= 4);
+  if (!toks.length) return 'wf';
+  let best = 'wf', bestScore = 1;
+  (tasks || []).forEach((t, i) => {
+    const hay = ((t.title || '') + ' ' + (t.description || '')).toLowerCase();
+    const score = toks.filter(w => hay.includes(w)).length;
+    if (score > bestScore) { bestScore = score; best = i; }
+  });
+  return best;
 }
 
 // ═══════════════════ GLOBAL FOCUS CONTEXT (Projects › Workflows › Tasks) ═══════════════════
@@ -5486,10 +5600,52 @@ function bindProjects() {
             <button class="btn-primary" onclick="pushRepoUI('${esc(p.path)}')">⬆ Push to remote</button>
             <button class="btn-ghost" onclick="tagRepoUI('${esc(p.path)}','${esc(p.name)}')">🏷 Tag release</button>`}
           </div>` : ''}
+          ${isAdminUser() ? `<div class="modal-actions" style="justify-content:flex-start;margin-top:14px">
+            <button class="btn-sm danger" onclick="deleteProjectUI('${esc(p.path)}','${esc(p.name)}')">🗑 Delete project…</button>
+          </div>` : ''}
         </div>`);
       if (p.is_repo) loadRepoHistory(p.path);
     };
   });
+}
+
+function deleteProjectUI(path, name) {
+  showModal(`
+    <h2>🗑 Delete project — ${esc(name)}</h2>
+    <div class="view-intro" style="margin-bottom:10px">Choose how far to go. The safe default moves the folder to <code>~/.nexus-trash/</code> so you can restore it by moving it back.</div>
+    <div class="form-group"><label class="form-label">Project folder on disk</label>
+      <label style="display:flex;gap:8px;align-items:baseline;font-size:12.5px;margin-top:4px"><input type="radio" name="pdRepo" value="trash" checked> Move to trash (reversible — recommended)</label>
+      <label style="display:flex;gap:8px;align-items:baseline;font-size:12.5px"><input type="radio" name="pdRepo" value=""> Keep the folder — only remove it from Nexus</label>
+      <label style="display:flex;gap:8px;align-items:baseline;font-size:12.5px;color:var(--red,#f87171)"><input type="radio" name="pdRepo" value="purge"> Permanently delete the folder (cannot be undone)</label>
+    </div>
+    <div class="form-group">
+      <label style="display:flex;gap:8px;align-items:baseline;font-size:12.5px"><input type="checkbox" id="pdTasks" checked> Also delete this project's workflows and tasks (+ their workspaces). Unticked: they stay on the board, unlinked.</label>
+    </div>
+    <div class="form-group"><label class="form-label">Type the project name to confirm</label>
+      <input class="form-input" id="pdConfirm" placeholder="${esc(name)}" autocomplete="off"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-sm danger" id="pdGo" disabled>🗑 Delete project</button>
+    </div>`);
+  const inp = $('#pdConfirm'), btn = $('#pdGo');
+  inp.oninput = () => { btn.disabled = inp.value.trim() !== name; };
+  btn.onclick = async () => {
+    const mode = (document.querySelector('input[name="pdRepo"]:checked') || {}).value || '';
+    if (mode === 'purge' && !confirm('PERMANENTLY delete the project folder from disk? This cannot be undone.')) return;
+    try {
+      const r = await api('POST', '/api/projects/delete', {
+        path, confirm: inp.value.trim(),
+        delete_tasks: $('#pdTasks').checked,
+        delete_repo: mode || null,
+      });
+      closeModal();
+      projectsState.fetched = false;
+      wfState.fetched = false;
+      state.tasks = await api('GET', '/api/tasks');
+      toast('Project deleted — ' + (r.notes || []).join(' · '), 'ok');
+      render();
+    } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
+  };
 }
 
 async function wfRepoChanged(repoSel) {
@@ -8790,6 +8946,7 @@ function viewWorkflows() {
       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
         <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
         <button class="focus-btn" title="Run the complete assembled project — current state or any earlier one" onclick="event.stopPropagation(); projectAppUI('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">▶ test</button>
+        ${(w.tasks_by_status || {}).backlog ? `<button class="focus-btn" title="Move all ${(w.tasks_by_status || {}).backlog} backlog task(s) of this workflow to To Do — they run in dependency order" onclick="event.stopPropagation(); wfStartTasksUI('${esc(w.id)}')">▶ Start tasks</button>` : ''}
         <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span>${replanChipHTML(w)}</div>
       <div class="card-body">
         ${w.goal ? `<div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">${esc(w.goal)}</div>` : ''}
@@ -8814,6 +8971,20 @@ function viewWorkflows() {
     <div class="agentic-grid">${rows || `<div class="empty"><span class="e-ico">⚑</span>${focusCtx.project ? 'No workflows in this project yet — ✨ Describe a goal creates the first round.' : 'No workflows yet — create one, or start from the example campaign.'}</div>`}</div>`;
 }
 function bindWorkflows() { /* inline onclick */ }
+
+async function wfStartTasksUI(id) {
+  try {
+    const w = await api('GET', `/api/workflows/${id}`);
+    const ids = (w.tasks || []).filter(t => t.status === 'backlog').map(t => t.id);
+    if (!ids.length) { toast('No backlog tasks in this workflow', 'info'); return; }
+    if (!confirm(`Start ${ids.length} backlog task(s) of "${w.name}"? Stages still run in dependency order.`)) return;
+    const r = await api('POST', '/api/tasks/bulk-status', { ids, status: 'todo' });
+    toast(`${(r.changed || []).length} task(s) started${(r.skipped || []).length ? `, ${r.skipped.length} skipped` : ''}`, 'ok');
+    wfState.fetched = false;
+    state.tasks = await api('GET', '/api/tasks');
+    render();
+  } catch (e) { toast('Start failed: ' + e.message, 'err'); }
+}
 
 async function newWorkflowUI() {
   const name = prompt('Workflow name (e.g. "Q3 marketing campaign"):');
@@ -8941,8 +9112,10 @@ async function openWorkflowDetail(id) {
       <div class="form-hint">Applies to all tasks: their sessions read/write this client's private memory scope. Other clients and personal chats never see it.</div>
     </div>
     <div class="modal-actions" style="justify-content:space-between">
-      <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">Delete project (tasks stay)</button>
+      <button class="btn-sm danger" onclick="deleteWorkflowUI('${esc(w.id)}')">🗑 Delete…</button>
       <div style="display:flex;gap:10px">
+        ${(w.tasks || []).some(t => t.status === 'backlog')
+          ? `<button class="btn-ghost" title="Move all backlog tasks to To Do — they run in dependency order" onclick="wfStartTasksUI('${esc(w.id)}')">▶ Start tasks</button>` : ''}
         <button class="btn-ghost" onclick="addTaskToWorkflow('${esc(w.id)}')">+ Add task</button>
         <button class="btn-primary" onclick="closeModal()">Close</button>
       </div>
@@ -9076,12 +9249,35 @@ function addTaskToWorkflow(wfId) {
 }
 
 async function deleteWorkflowUI(id) {
-  if (!confirm('Delete this project? Its tasks stay on the kanban board (only the grouping is removed).')) return;
-  await api('DELETE', `/api/workflows/${id}`);
-  wfState.fetched = false;
-  closeModal();
-  toast('Project deleted — tasks kept', 'ok');
-  render();
+  let w;
+  try { w = await api('GET', `/api/workflows/${id}`); }
+  catch (e) { toast('Load failed: ' + e.message, 'err'); return; }
+  const n = (w.tasks || []).length;
+  showModal(`
+    <h2>🗑 Delete workflow — ${esc(w.name)}</h2>
+    <div class="view-intro" style="margin-bottom:10px">Choose how much to remove. Deleting tasks also deletes their workspaces (deliverable files).</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="btn-ghost" style="text-align:left" onclick="wfDeleteGo('${esc(id)}', false)">Delete grouping only — its ${n} task(s) stay on the board</button>
+      <button class="btn-sm danger" style="text-align:left" id="wfDelCascadeBtn" disabled>🗑 Delete workflow AND its ${n} task(s) + workspaces</button>
+      <input class="form-input" id="wfDelConfirm" placeholder="type the workflow name to enable full delete" autocomplete="off">
+    </div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button></div>`);
+  const inp = $('#wfDelConfirm'), btn = $('#wfDelCascadeBtn');
+  if (inp && btn) {
+    inp.oninput = () => { btn.disabled = inp.value.trim() !== w.name; };
+    btn.onclick = () => wfDeleteGo(id, true);
+  }
+}
+
+async function wfDeleteGo(id, cascade) {
+  try {
+    await api('DELETE', `/api/workflows/${id}${cascade ? '?cascade=tasks' : ''}`);
+    wfState.fetched = false;
+    closeModal();
+    state.tasks = await api('GET', '/api/tasks');
+    toast(cascade ? 'Workflow and its tasks deleted' : 'Workflow deleted — tasks kept', 'ok');
+    render();
+  } catch (e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
 async function createExampleCampaign() {
@@ -9136,11 +9332,25 @@ function viewDeliverables() {
           ${d.workflow ? `<span class="task-tag" title="project">⚑ ${esc(d.workflow)}</span>` : ''}
           ${d.domain ? `<span class="task-tag">${esc(d.domain)}</span>` : ''}</div>
         <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
-          ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.model ? ' · ' + esc(d.model) : ''}</div>
+          ${fmtAgo(d.completed_at)} · ${fmtTokens(d.tokens_used || 0)} tok${d.cost_usd ? ` · $${d.cost_usd}` : ''}${d.model ? ' · ' + esc(d.model) : ''}</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-          ${d.files.map(f => (f.name.endsWith('.md') || f.name.endsWith('.diff'))
-            ? `<a href="#" onclick="previewDeliverable('${esc(d.task_id)}','${esc(f.name)}');return false" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">${f.name.endsWith('.diff') ? '🧬' : '📄'} ${esc(f.name)}</a>`
-            : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`).join('')}
+          ${(() => {
+            // ⭐ The requested output first: for content/research/analysis the
+            // primary file is the produced artifact (pptx/pdf/…), for code the
+            // diff, else the deliverable text.
+            const isArtifact = f => !f.name.endsWith('.md') && !f.name.endsWith('.diff') && !f.name.endsWith('.json') && !f.name.startsWith('attachments/');
+            let primary = null;
+            if (d.deliverable_type === 'code_change') primary = d.files.find(f => f.name === 'changes.diff');
+            else primary = d.files.find(isArtifact) || d.files.find(f => f.name === 'deliverable.md');
+            return d.files.map(f => {
+              const star = primary && f.name === primary.name;
+              const link = (f.name.endsWith('.md') || f.name.endsWith('.diff'))
+                ? `<a href="#" onclick="previewDeliverable('${esc(d.task_id)}','${esc(f.name)}');return false" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">${f.name.endsWith('.diff') ? '🧬' : '📄'} ${esc(f.name)}</a>`
+                : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`;
+              return star ? `<span class="chip c-accent" title="the output this task was asked to produce" style="display:inline-flex;gap:4px;align-items:center">⭐ ${link}</span>` : link;
+            }).join('');
+          })()}
+          ${d.repo_path ? `<a href="#" onclick="branchFilesUI('${esc(d.task_id)}','${esc(d.title).slice(0, 50)}');return false" style="font-size:12px;color:var(--accent-2)" title="Files this task created/changed on its project branch">🧬 Branch files…</a>` : ''}
         </div>
         <div class="row-actions">
           ${d.app ? `<button class="btn-sm" style="border-color:var(--accent-2)" title="${esc(d.app.label)} — launches on its own local port and opens in a new tab" onclick="testAppUI('${esc(d.task_id)}','${esc(d.title).slice(0, 50)}')">▶ Test app</button>` : ''}
@@ -9167,6 +9377,22 @@ function bindDeliverables() {
 function highlightUnsure(escaped) {
   return (escaped || '').replace(/\[UNSURE:[^\]]*\]/g,
     '<span class="unsure-tag" title="The system flagged this claim as unverified against a primary source">$&</span>');
+}
+
+async function branchFilesUI(taskId, title) {
+  try {
+    const r = await api('GET', `/api/tasks/${taskId}/branch-files`);
+    const rows = (r.files || []).map(f => `
+      <div style="display:flex;gap:8px;align-items:center;font-size:12px;margin-top:3px">
+        <span class="chip" title="${f.status === 'A' ? 'added' : 'modified'}">${f.status === 'A' ? '＋' : '✎'}</span>
+        <a href="/api/tasks/${esc(taskId)}/branch-files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);color:var(--accent-2)">${esc(f.name)}</a>
+      </div>`).join('');
+    showModal(`
+      <h2>🧬 Branch files — ${esc(title)}</h2>
+      <div class="view-intro" style="margin-bottom:8px">Everything this task created or changed on its project branch <code>${esc(r.branch)}</code>. Click to view/download — served straight from git, your checkout is never touched.</div>
+      <div style="max-height:50vh;overflow-y:auto">${rows || '<div class="muted">No files changed on the branch.</div>'}</div>
+      <div class="modal-actions"><button class="btn-primary" onclick="closeModal()">Close</button></div>`);
+  } catch (e) { toast('Branch files unavailable: ' + e.message, 'err'); }
 }
 
 async function previewDeliverable(taskId, name) {
@@ -9581,7 +9807,13 @@ function applyWizardTask(t, meta) {
     if ($('#m-task-priority')) $('#m-task-priority').value = String(t.priority ?? 2);
     if ($('#m-task-budget') && t.budget_tokens) $('#m-task-budget').value = t.budget_tokens;
     if ($('#m-task-tags')) $('#m-task-tags').value = (t.tags || []).join(', ');
-    if ($('#m-task-repo') && (meta && meta.repo_path)) {
+    // Item 1d: only DEV-SHAPED tasks default into repo mode — a content task
+    // (a PowerPoint, a report) that runs in a repo commits its output to the
+    // branch, where the Deliverables view used to lose it. The picker stays
+    // available for deliberate opt-in.
+    const devShaped = ['code-implementer', 'tech-lead-orchestrator', 'code-reviewer',
+      'acceptance-verifier', 'debugger'].includes(t.specialist) || t.deliverable_type === 'code_change';
+    if ($('#m-task-repo') && (meta && meta.repo_path) && devShaped) {
       const rs = $('#m-task-repo');
       if (![...rs.options].some(o => o.value === meta.repo_path)) {
         rs.insertAdjacentHTML('beforeend', `<option value="${esc(meta.repo_path)}">${esc(meta.repo_path.split('/').slice(-2).join('/'))}</option>`);
@@ -9744,6 +9976,8 @@ function planEdRender() {
   if (sw) sw.innerHTML = (planEd.specWarnings || []).length
     ? (planEd.specWarnings || []).map(w => `<div style="font-size:11px;color:var(--warn,#eab308)"><b>Advisory</b> — ${esc(String(w).replace(/^⚠ /, ''))}</div>`).join('')
     + '<div style="font-size:10.5px;color:var(--text-faint);margin-top:2px">These checks compare tasks inside this plan to each other — they never reference your board and never block creation.</div>' : '';
+  // Item 12: staged-file target dropdowns track task list edits (add/remove/revalidate).
+  attachStageRender('wz-attach');
 }
 
 function planEdBindStages() {
@@ -9833,6 +10067,7 @@ function planEdFinalTasks() {
   const remap = {};
   let n = 0;
   tasks.forEach((_, i) => { if (keep[i]) remap[i] = n++; });
+  planEd.lastRemap = remap;  // plan-index → created-task position (attachment targeting)
   return tasks.map((t, i) => ({ t, i })).filter(x => keep[x.i]).map(x => {
     const { _added, ...clean } = x.t;
     return { ...clean, depends_on_idx: [...eff(x.i, new Set())].map(d => remap[d]).sort((a, b2) => a - b2) };
@@ -9933,7 +10168,7 @@ function proposeWorkflowModal(wf, meta) {
       </div>
     </div>
     <div class="form-group" style="margin-top:8px">
-      <label class="form-label">📎 Attachments — project-wide input files (every task reads them)</label>
+      <label class="form-label">📎 Attachments — project-wide or per task (pick per file; the target is auto-suggested from the filename — change it if wrong)</label>
       ${attachStageHTML('wz-attach')}
     </div>
     <div class="form-hint" style="margin-top:8px">Tasks are created in <strong>Backlog</strong> so you can fill any [brackets] first. Move task 1 to Todo to start the chain.</div>
@@ -9943,6 +10178,14 @@ function proposeWorkflowModal(wf, meta) {
     </div>`);
   planEdRender();
   attachStageWire('wz-attach');
+  // Item 12: per-file task targeting — options read planEd.tasks LIVE (they
+  // survive revalidate re-renders); auto-suggest is deterministic.
+  attachStageTargetOpts['wz-attach'] = () => [
+    { value: 'wf', label: '📎 Whole project' },
+    ...((planEd && planEd.tasks) || []).map((t, i) =>
+      ({ value: i, label: `only ${i + 1}. ${(t.title || '').slice(0, 42)}` })),
+  ];
+  attachStageSuggest['wz-attach'] = f => attachSuggestTarget(f, (planEd && planEd.tasks) || []);
   // Deep Plan: auto-run the premortem critique on first draft (advisory).
   if (planSessionId && meta && meta.critique_enabled) setTimeout(() => deepPlanRunCritique(), 60);
   const addBtn = $('#wfAddTask');
@@ -10064,7 +10307,7 @@ function proposeWorkflowModal(wf, meta) {
         });
         ids.push(created.id);
       }
-      const nAtt = await attachStageUploadAll('wz-attach', 'workflow', w.id);
+      const nAtt = await attachStageUploadTargets('wz-attach', w.id, ids, planEd.lastRemap || {});
       // Deep Plan (Step 8): the SPEC travels — write it into the project and
       // close the planning session.
       if (planEd.planSessionId) {
@@ -10074,7 +10317,7 @@ function proposeWorkflowModal(wf, meta) {
       state.tasks = await api('GET', '/api/tasks');
       planEd = null;
       closeModal();
-      toast(`Project "${wf.name}" created${nAtt ? ` with ${nAtt} project-wide file${nAtt > 1 ? 's' : ''}` : ''} — fill the [brackets], then move task 1 to Todo`, 'ok');
+      toast(`Project "${wf.name}" created${nAtt ? ` with ${nAtt} attached file${nAtt > 1 ? 's' : ''}` : ''} — fill the [brackets], then move task 1 to Todo`, 'ok');
       switchView('workflows');
     } catch (e) {
       toast('Create failed: ' + e.message, 'err');

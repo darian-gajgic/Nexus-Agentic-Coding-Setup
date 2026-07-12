@@ -724,6 +724,9 @@ async def update_task(task_id: str, body: TaskUpdate):
         updates["status"] = body.status
         if body.status == "done":
             updates["completed_at"] = time.time()
+        if body.status in ("todo", "in_progress"):
+            # An explicit (re)start consumes a stale stop request (item 5).
+            updates["cancel_requested"] = None
     if body.priority is not None:
         updates["priority"] = body.priority
     if body.assignee_id is not None:
@@ -829,23 +832,20 @@ def _deps_would_cycle(task_id: str, dep_ids: list) -> bool:
     return False
 
 
-@app.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: str):
-    task = _owned_task(task_id)
-    if not task:
-        return JSONResponse(status_code=404, content={"error": "not found"})
-    # Deleting a task whose dispatch is LIVE creates a zombie: the worker keeps
-    # executing against a row that no longer exists (observed 2026-07-09 —
-    # crashed finalize, wasted tokens). Refuse until it is stopped/parked.
-    live = db.query_one(
+def _task_dispatch_live(task_id: str) -> bool:
+    """A fresh-heartbeat executing dispatch — deleting/stopping around one
+    creates zombies (observed 2026-07-09)."""
+    return bool(db.query_one(
         "SELECT id FROM dispatches WHERE task_id=? AND heartbeat_at > ? "
         "AND state IN ('dispatching','streaming','finalizing')",
-        (task_id, time.time() - 120))
-    if live:
-        return JSONResponse(status_code=409, content={
-            "error": "this task is EXECUTING right now — wait for it to finish "
-                     "or fail before deleting (its agent would keep running "
-                     "against a ghost row)"})
+        (task_id, time.time() - 120)))
+
+
+def _delete_task_row(task: dict, rm_workspace: bool = False):
+    """Hard-delete one task: row + depends_on scrub + pending-approval expiry
+    (+ optionally its workspace dir). Blocking (rmtree) — threadpool for bulk."""
+    import shutil
+    task_id = task["id"]
     db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     # Drop the deleted id from other tasks' depends_on — deps_satisfied is
     # fail-closed (a dangling id parks the dependent forever), so this scrub
@@ -858,6 +858,32 @@ async def delete_task(task_id: str):
                        (json.dumps(deps), t["id"]))
         except Exception:
             pass
+    db.execute(
+        "UPDATE approvals SET status='expired', decided_at=?, decided_by='task deleted' "
+        "WHERE status='pending' AND action_type='deliverable' AND payload LIKE ?",
+        (time.time(), f'%"task_id": "{task_id}"%'))
+    if rm_workspace:
+        ws = task.get("workspace_path") or str(hd.WORKSPACES / task_id)
+        if ws and Path(ws).resolve().is_relative_to(hd.WORKSPACES.resolve()):
+            shutil.rmtree(ws, ignore_errors=True)
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    # Deleting a task whose dispatch is LIVE creates a zombie: the worker keeps
+    # executing against a row that no longer exists (observed 2026-07-09 —
+    # crashed finalize, wasted tokens). Refuse until it is stopped/parked.
+    if _task_dispatch_live(task_id):
+        return JSONResponse(status_code=409, content={
+            "error": "this task is EXECUTING right now — stop it first (⏹) or "
+                     "wait for it to finish (its agent would keep running "
+                     "against a ghost row)"})
+    # Complete deletion (item 2): the workspace dir (deliverables) goes too —
+    # an orphaned workspace is unreachable garbage once the row is gone.
+    await run_in_threadpool(_delete_task_row, task, True)
     await mgr.broadcast({"type": "task_deleted", "data": {"id": task_id}},
                         user_id=task.get("user_id"))
     return {"ok": True}
@@ -3819,10 +3845,124 @@ async def dispatch_task(task_id: str, body: dict):
             "a dependency no longer exists — edit this task's dependencies to unblock it"})
     # Queue-only: the lane's worker process is the SOLE executor (no competing
     # server-thread execution — that race is designed out).
+    db.execute("UPDATE tasks SET cancel_requested=NULL WHERE id=?", (task_id,))
     did = hd.start_dispatch(task_id, agent_id)
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return {"ok": True, "dispatch_id": did, "task": task}
+
+
+async def _request_stop(task: dict) -> dict:
+    """Item 5: stop one task. Sets cancel_requested FIRST (the race guard —
+    run_task_dispatch re-checks it before spending), then either parks a
+    not-yet-streaming task immediately or lets the executor's ~2s cancel poll
+    abort the live stream (≤~30s, keepalive-driven). The flag deliberately
+    survives the immediate path: a lane that already claimed the row consumes
+    it at the top of run_task_dispatch; explicit re-dispatch/todo clears it."""
+    tid = task["id"]
+    live = (task.get("dispatch_state") or "") in _ACTIVE_DISPATCH_STATES
+    if task.get("status") not in ("todo", "in_progress") and not live:
+        return {"id": tid, "stopped": "noop", "reason": "not running"}
+    now = time.time()
+    db.execute("UPDATE tasks SET cancel_requested=? WHERE id=?", (now, tid))
+    cur = db.execute(
+        "UPDATE tasks SET status='backlog', dispatch_state='cancelled', "
+        "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, updated_at=? "
+        "WHERE id=? AND status IN ('todo','in_progress') "
+        "AND (dispatch_state IS NULL OR dispatch_state NOT IN "
+        "('dispatching','streaming','finalizing'))",
+        (now, tid))
+    if cur.rowcount > 0:
+        db.execute("UPDATE dispatches SET state='cancelled', ended_at=?, "
+                   "error='stopped by operator before start' "
+                   "WHERE task_id=? AND state='queued'", (now, tid))
+        db.log_activity("info", "operator", f"Task {tid} stopped (was not streaming yet)",
+                        user_id=task.get("user_id"))
+        return {"id": tid, "stopped": "immediate"}
+    # Streaming: best-effort upstream abort (needs the session-run-stop
+    # core-mod; a 404 just means the run drains until the executor's poll cuts
+    # the stream). Never fails the stop.
+    row = db.query_one(
+        "SELECT run_id FROM dispatches WHERE task_id=? AND run_id IS NOT NULL "
+        "AND state IN ('dispatching','streaming','finalizing') "
+        "ORDER BY started_at DESC LIMIT 1", (tid,))
+    if row and row.get("run_id"):
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(f"{hd.HERMES_API_BASE}/v1/runs/{row['run_id']}/stop",
+                                  headers=hd._headers())
+        except Exception:
+            pass
+    db.log_activity("info", "operator", f"Task {tid}: stop requested — cancelling live run",
+                    user_id=task.get("user_id"))
+    return {"id": tid, "stopped": "cancelling"}
+
+
+@app.post("/api/tasks/{task_id}/stop")
+async def stop_task(task_id: str):
+    """Stop a queued or running task: it finalizes as 'stopped' and returns to
+    Backlog with its work-so-far snapshotted (repo tasks keep their branch)."""
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    out = await _request_stop(task)
+    fresh = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    await mgr.broadcast({"type": "task_updated", "data": fresh}, user_id=task.get("user_id"))
+    return {"ok": True, **out}
+
+
+@app.post("/api/tasks/bulk-status")
+async def tasks_bulk_status(body: dict):
+    """Item 11: bulk start (backlog → todo). CAS per id keeps it race-safe;
+    lanes then claim in dependency order (claiming is dep-gated), so flooding
+    todo with a whole DAG is safe. Only the backlog→todo transition (and its
+    inverse) is allowed — everything else has dedicated endpoints."""
+    ids = [str(i) for i in (body.get("ids") or []) if i][:200]
+    status = body.get("status")
+    if status not in ("todo", "backlog"):
+        return JSONResponse(status_code=400, content={"error": "status must be 'todo' or 'backlog'"})
+    if not ids:
+        return JSONResponse(status_code=400, content={"error": "ids required"})
+    src = "backlog" if status == "todo" else "todo"
+    now = time.time()
+    changed, skipped = [], []
+    for tid in ids:
+        task = _owned_task(tid)
+        if not task:
+            skipped.append({"id": tid, "reason": "not found"})
+            continue
+        cur = db.execute(
+            "UPDATE tasks SET status=?, cancel_requested=NULL, updated_at=? "
+            "WHERE id=? AND status=?", (status, now, tid, src))
+        if cur.rowcount > 0:
+            changed.append(tid)
+        else:
+            skipped.append({"id": tid, "reason": f"not in {src}"})
+    if changed:
+        db.log_activity("info", "operator",
+                        f"Bulk {'start' if status == 'todo' else 'un-start'}: "
+                        f"{len(changed)} task(s) → {status}",
+                        user_id=auth.current_user_id())
+        await mgr.broadcast({"type": "tasks_bulk_updated"},
+                            user_id=auth.current_user_id())
+    return {"ok": True, "changed": changed, "skipped": skipped}
+
+
+@app.post("/api/tasks/bulk-stop")
+async def tasks_bulk_stop(body: dict):
+    """Item 11: stop every listed task (see _request_stop for semantics)."""
+    ids = [str(i) for i in (body.get("ids") or []) if i][:200]
+    if not ids:
+        return JSONResponse(status_code=400, content={"error": "ids required"})
+    results = []
+    for tid in ids:
+        task = _owned_task(tid)
+        if not task:
+            results.append({"id": tid, "stopped": "skipped", "reason": "not found"})
+            continue
+        results.append(await _request_stop(task))
+    await mgr.broadcast({"type": "tasks_bulk_updated"}, user_id=auth.current_user_id())
+    return {"ok": True, "results": results}
 
 
 @app.get("/api/tasks/{task_id}/transcript")
@@ -3948,6 +4088,88 @@ async def task_file_download(task_id: str, name: str):
     headers = {} if inline_ok else {
         "Content-Disposition": f'attachment; filename="{p.name}"'}
     return FileResponse(str(p), headers=headers, media_type=media_type)
+
+
+def _task_branch_ctx(task: dict) -> tuple[str, str, list[tuple[str, str]]] | None:
+    """Item 1b: (repo, branch, diff-set) for a repo task. The diff set (files
+    added/changed on the task branch) doubles as the download whitelist —
+    user input is matched by MEMBERSHIP, never resolved on the filesystem."""
+    import worktree as _wt
+    repo = task.get("repo_path")
+    if not repo or not os.path.isdir(repo):
+        return None
+    slug = hd._repo_slug(task)
+    branch = f"nexus/{slug}"
+    wt_path = os.path.join(repo, ".worktrees", f"nexus-{slug}")
+    if os.path.isdir(wt_path):
+        rows = _wt.changed_files(wt_path, _wt.base_branch(repo))
+        return repo, branch, rows
+    # Worktree pruned — the branch may still exist in the repo itself.
+    code, out = _run_git_action(repo, "git", "diff", "--name-status",
+                                "--diff-filter=AM",
+                                f"{_wt.base_branch(repo)}...{branch}")
+    if code != 0:
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1].strip():
+            rows.append((parts[0].strip(), parts[1].strip()))
+    return repo, branch, rows
+
+
+@app.get("/api/tasks/{task_id}/branch-files")
+def task_branch_files(task_id: str):
+    """List the files a repo task's branch added/changed vs its baseline —
+    the browse/rescue path for deliverables that live on the branch (item 1)."""
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    if not task.get("repo_path"):
+        return JSONResponse(status_code=400, content={"error": "not a repo task"})
+    ctx = _task_branch_ctx(task)
+    if ctx is None:
+        return JSONResponse(status_code=404, content={
+            "error": "the task branch is gone (repo moved or branch deleted)"})
+    repo, branch, rows = ctx
+    return {"repo": repo, "branch": branch,
+            "files": [{"status": s, "name": n} for s, n in rows]}
+
+
+@app.get("/api/tasks/{task_id}/branch-files/{name:path}")
+def task_branch_file_download(task_id: str, name: str):
+    """Download ONE file from the task branch via `git show` (read-only; the
+    operator's checkout is never touched). `name` must be an exact member of
+    the branch's diff set — the injection gate."""
+    import subprocess
+    task = _owned_task(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "task not found"})
+    ctx = _task_branch_ctx(task) if task.get("repo_path") else None
+    if ctx is None:
+        return JSONResponse(status_code=404, content={"error": "branch not available"})
+    repo, branch, rows = ctx
+    if name not in {n for _s, n in rows}:
+        return JSONResponse(status_code=404, content={"error": "file not on this task's branch diff"})
+    try:
+        r = subprocess.run(["git", "show", f"{branch}:{name}"], cwd=repo,
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            return JSONResponse(status_code=404, content={"error": "file unreadable on the branch"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+    import mimetypes
+    base = os.path.basename(name)
+    mime = mimetypes.guess_type(base)[0] or "application/octet-stream"
+    # Same inline policy as task_file_download: script-capable types never
+    # render inline from this origin.
+    inline_ok = mime.startswith(("image/", "text/")) or mime == "application/pdf"
+    if mime in ("text/html", "application/xhtml+xml", "image/svg+xml"):
+        inline_ok = False
+        mime = "text/plain"
+    headers = {} if inline_ok else {
+        "Content-Disposition": f'attachment; filename="{base}"'}
+    return RawResponse(content=r.stdout, media_type=mime, headers=headers)
 
 
 # ── App preview: ▶ Test a task's program output live (v3.3) ──
@@ -7885,14 +8107,55 @@ async def update_workflow(wf_id: str, body: dict):
     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
 
 
+def _cascade_delete_workflow(w: dict, tasks: list[dict]) -> list[str]:
+    """Item 2b: delete a workflow AND its tasks + workspaces + clean worktree.
+    Blocking (rmtree + git) — call from a threadpool. Returns warning notes."""
+    import shutil
+    import worktree as _wt
+    notes = []
+    wf_id = w["id"]
+    for t in tasks:
+        _delete_task_row(t, rm_workspace=True)
+    # Pipeline tasks share one branch/worktree per repo (nexus/<wf-slug>) —
+    # remove it only when clean; a dirty worktree is left for human review.
+    slug = wf_id.replace("wf-", "")
+    for repo in {t.get("repo_path") for t in tasks if t.get("repo_path")}:
+        wt_path = str(Path(repo) / ".worktrees" / f"nexus-{slug}")
+        if Path(wt_path).is_dir() and not _wt.remove_worktree(repo, wt_path):
+            notes.append(f"worktree {wt_path} has uncommitted changes — left for review")
+    shutil.rmtree(hd.WORKSPACES / f"workflow-{wf_id}", ignore_errors=True)
+    db.execute("DELETE FROM workflows WHERE id=?", (wf_id,))
+    return notes
+
+
 @app.delete("/api/workflows/{wf_id}")
-async def delete_workflow(wf_id: str):
-    """Delete the workflow container; its tasks stay on the board (unlinked)."""
-    if not _owned_workflow(wf_id):
+async def delete_workflow(wf_id: str, cascade: str = ""):
+    """Delete the workflow container. Default: its tasks stay on the board
+    (unlinked). ?cascade=tasks: the member tasks, their workspaces and the
+    clean shared worktree go too (item 2 — 'really deleted completely')."""
+    w = _owned_workflow(wf_id)
+    if not w:
         return JSONResponse(status_code=404, content={"error": "workflow not found"})
+    if cascade == "tasks":
+        tasks = db.query_all("SELECT * FROM tasks WHERE workflow_id=?", (wf_id,))
+        for t in tasks:
+            if _task_dispatch_live(t["id"]):
+                return JSONResponse(status_code=409, content={
+                    "error": f"task '{t['title']}' is EXECUTING right now — "
+                             "stop it first (⏹), then delete"})
+        notes = await run_in_threadpool(_cascade_delete_workflow, w, tasks)
+        db.log_activity("warn", "operator",
+                        f"Workflow '{w['name']}' deleted WITH {len(tasks)} task(s)"
+                        + (f" — {'; '.join(notes)}" if notes else ""),
+                        user_id=w.get("user_id"))
+        await mgr.broadcast({"type": "workflow_deleted", "data": {"id": wf_id}},
+                            user_id=w.get("user_id"))
+        return {"ok": True, "deleted_tasks": len(tasks), "notes": notes}
     db.execute("UPDATE tasks SET workflow_id=NULL WHERE workflow_id=?", (wf_id,))
     db.execute("DELETE FROM workflows WHERE id=?", (wf_id,))
-    return {"ok": True}
+    await mgr.broadcast({"type": "workflow_deleted", "data": {"id": wf_id}},
+                        user_id=w.get("user_id"))
+    return {"ok": True, "deleted_tasks": 0}
 
 
 # ── Mid-run replanning (Block 3 R2, docs/SPEC-BLOCK3.md) ──
@@ -8211,6 +8474,8 @@ def list_deliverables(limit: int = 100):
         out.append({
             "task_id": t["id"], "title": t["title"], "status": t["status"],
             "domain": t.get("domain"), "model": t.get("model"),
+            "deliverable_type": t.get("deliverable_type"),
+            "repo_path": t.get("repo_path"),
             "judge_verdict": t.get("judge_verdict"),
             "critic_verdict": t.get("critic_verdict"),
             "critic_round": t.get("critic_round"),
@@ -9333,6 +9598,97 @@ def project_create_client(body: dict):
         return JSONResponse(status_code=400, content={"error": note})
     return {"ok": True, "path": root, "client": (body.get("client") or "").strip().lower(),
             "note": note.strip(" ·")}
+
+
+def _project_delete_blocking(path: str, wfs: list[dict], tasks: list[dict],
+                             delete_tasks: bool, delete_repo: str | None) -> list[str]:
+    """Item 2c: the blocking half of project deletion (rmtree/move/git off the
+    event loop). Returns human-readable notes for the response/activity log."""
+    import shutil
+    notes = []
+    if delete_tasks:
+        for w in wfs:
+            notes += _cascade_delete_workflow(
+                w, [t for t in tasks if t.get("workflow_id") == w["id"]])
+        for t in tasks:
+            if not t.get("workflow_id") and db.query_one(
+                    "SELECT 1 FROM tasks WHERE id=?", (t["id"],)):
+                _delete_task_row(t, rm_workspace=True)
+        notes.append(f"{len(tasks)} task(s) + {len(wfs)} workflow(s) deleted")
+    else:
+        # Archival unlink: Nexus forgets the link; board items stay.
+        for t in tasks:
+            db.execute("UPDATE tasks SET repo_path=NULL WHERE id=?", (t["id"],))
+        for w in wfs:
+            db.execute("UPDATE workflows SET project_path=NULL WHERE id=?", (w["id"],))
+        if tasks or wfs:
+            notes.append(f"unlinked {len(tasks)} task(s) / {len(wfs)} workflow(s) — kept on the board")
+    # Scheduler jobs whose template targets the project or its workflows would
+    # re-create work against a ghost — drop them (also drains the known
+    # crashed-gate cron leak for deleted objects).
+    for pat in [path] + [w["id"] for w in wfs]:
+        cur = db.execute("DELETE FROM scheduled_jobs WHERE task_template LIKE ?",
+                         (f"%{pat}%",))
+        if cur.rowcount:
+            notes.append(f"{cur.rowcount} scheduler job(s) referencing {os.path.basename(pat)} removed")
+    db.execute("DELETE FROM project_owners WHERE path=? OR path LIKE ?",
+               (path, path + os.sep + "%"))
+    if delete_repo == "trash":
+        trash = os.path.expanduser("~/.nexus-trash")
+        os.makedirs(trash, mode=0o700, exist_ok=True)
+        dest = os.path.join(trash, f"{os.path.basename(path)}-{int(time.time())}")
+        shutil.move(path, dest)
+        notes.append(f"repo moved to {dest} (restore = move it back)")
+    elif delete_repo == "purge":
+        shutil.rmtree(path, ignore_errors=True)
+        notes.append("repo directory permanently deleted")
+    else:
+        notes.append("repo directory left on disk")
+    return notes
+
+
+@app.post("/api/projects/delete")
+async def project_delete(body: dict):
+    """Item 2c: delete a project — its Nexus links (workflows/tasks/owners/
+    scheduler jobs) and optionally the repo dir (trash = reversible default,
+    purge = rmtree). Admin-only; requires typing the project dir name."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    path = os.path.realpath(os.path.expanduser(str(body.get("path") or "")))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not path.startswith(home + os.sep) or not os.path.isdir(path):
+        return JSONResponse(status_code=400, content={"error": "not a project directory under $HOME"})
+    if not await run_in_threadpool(_project_visible, path):
+        return JSONResponse(status_code=404, content={"error": "project not found"})
+    if (body.get("confirm") or "") != os.path.basename(path):
+        return JSONResponse(status_code=400, content={
+            "error": f"type the project name ('{os.path.basename(path)}') to confirm"})
+    delete_repo = body.get("delete_repo")
+    if delete_repo not in ("trash", "purge", None):
+        return JSONResponse(status_code=400, content={"error": "delete_repo must be 'trash', 'purge' or null"})
+    wfs = db.query_all(
+        "SELECT * FROM workflows WHERE project_path=? OR project_path LIKE ?",
+        (path, path + os.sep + "%"))
+    wf_ids = [w["id"] for w in wfs]
+    tasks = db.query_all(
+        "SELECT * FROM tasks WHERE repo_path=? OR repo_path LIKE ?",
+        (path, path + os.sep + "%"))
+    seen = {t["id"] for t in tasks}
+    for wid in wf_ids:
+        tasks += [t for t in db.query_all("SELECT * FROM tasks WHERE workflow_id=?", (wid,))
+                  if t["id"] not in seen]
+    for t in tasks:
+        if _task_dispatch_live(t["id"]):
+            return JSONResponse(status_code=409, content={
+                "error": f"task '{t['title']}' is EXECUTING right now — stop it first (⏹)"})
+    notes = await run_in_threadpool(
+        _project_delete_blocking, path, wfs, tasks,
+        bool(body.get("delete_tasks")), delete_repo)
+    db.log_activity("warn", "operator",
+                    f"Project {path} deleted ({'; '.join(notes)})",
+                    user_id=auth.current_user_id())
+    await mgr.broadcast({"type": "tasks_bulk_updated"}, user_id=auth.current_user_id())
+    return {"ok": True, "notes": notes}
 
 
 @app.post("/api/tasks/{task_id}/promote")
