@@ -27,6 +27,11 @@ try:
 except Exception:  # pragma: no cover — standalone import
     db = None
 
+try:
+    import feedback_log
+except Exception:  # pragma: no cover — standalone import
+    feedback_log = None
+
 # domain dir → (display label, keyword set for detection). Order = tie-break
 # priority (earlier wins when scores tie). Keywords are matched as whole words
 # on the lowercased message; multi-word phrases match as substrings.
@@ -247,6 +252,11 @@ def domain_pack(dom: str, deep: bool) -> str:
                          "must-pass gates: " + "; ".join(gates) +
                          ". State any FAIL and fix it. End a deliverable with a "
                          "short **Learn:** line (we are juniors learning the craft).")
+        # Feedback loop parity with dispatch: recent domain wins/lessons on
+        # deliverable-looking turns only (shallow chat stays lean).
+        fb_block = feedback_log.dispatch_block(dom) if feedback_log else ""
+        if fb_block:
+            lines.append(fb_block)
     return "\n".join(lines)
 
 

@@ -229,6 +229,12 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
 - **Runtime gate — Onboarding UI (Playwright):** `.venv/bin/python scripts/verify_onboarding_ui.py` —
   CTA banner, welcome step, section explanations, auto-save on Next, n/a toggle, review
   counts, confirm-gated apply → success, Settings entry. 12 checks.
+- **Runtime gate — WIN/LESSON feedback ledger:** `.venv/bin/python scripts/verify_feedback_e2e.py` —
+  32 checks on a scratch knowledge root (settings onboarding.root, restored): validation hard
+  rules (win needs numbers, lesson needs a correction), template bootstrap + newest-first
+  atomic writer, promote-to-examples flow, GET /api/feedback browser payload, tolerant entry
+  parser, dispatch_block caps/kill-switch + build_framing injection, 6-way concurrent-write
+  integrity, draft endpoint (LLM smoke tolerant of 502/503). Self-cleaning.
 - **Runtime gate — Super Result:** `.venv/bin/python scripts/verify_super_result_e2e.py` —
   stubbed-critic e2e against the LIVE sweep (takes minutes): critic run → source/anchor
   validated auto-comments → retry drain → closed auto-round → convergence + round-cap

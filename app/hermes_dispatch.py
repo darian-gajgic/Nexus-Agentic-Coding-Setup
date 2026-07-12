@@ -33,6 +33,7 @@ import httpx
 
 import auth
 import database as db
+import feedback_log
 import settings_registry as sreg
 
 BASE_DIR = Path(__file__).parent
@@ -972,6 +973,12 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None) -> 
             f"against ~/knowledge/domains/{domain}/RUBRIC.md and state the score in one line; end "
             "with a '**Learn:**' section of up to 3 bullets."
         )
+        # Feedback loop: recent domain-matching WINS/LESSONS ride with the
+        # domain block — deliberately NOT skipped on retry rounds (lessons
+        # matter most exactly then). Size-capped in feedback_log.
+        fb_block = feedback_log.dispatch_block(domain)
+        if fb_block:
+            parts.append(fb_block)
     specialist = (task.get("specialist") or "").strip()
     if specialist:
         parts.append(
