@@ -115,12 +115,15 @@ async def main():
             body = await page.locator("#modalContent").inner_text()
             ok("draft → proposal modal renders with Deep Plan banner",
                "Deep Plan" in body and await page.locator("#dpSpecWarnings").count() == 1)
-            # premortem auto-runs (stub) → a ⚠ annotation lands on a task card
+            # premortem auto-runs (stub) → an advisory annotation lands on a
+            # task card. It renders as a `.plan-adv` row ("Advisory — …"); the
+            # ⚠ prefix is stripped in the card template (batch-A relabel,
+            # 5df5d26), so assert the rendered element, not the raw glyph.
             # (wait_for_function: the auto-revise chain re-renders annotations,
             # so a fixed sleep could sample the between-rounds gap)
             try:
                 await page.wait_for_function(
-                    "() => ($('#wfStages') || {}).innerText && $('#wfStages').innerText.includes('⚠')",
+                    "() => document.querySelectorAll('#wfStages .plan-adv').length > 0",
                     timeout=8000)
                 ok("premortem annotation renders on a task card", True)
             except Exception:
