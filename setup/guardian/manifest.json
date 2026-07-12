@@ -167,7 +167,7 @@
     {
       "path": "~/.hermes/mem0.json",
       "golden": "mem0.json",
-      "sha256": "344fe41be39919af84d58dfd3807f75e20f89cdade0fb4cc2540ea109e27603c",
+      "sha256": "f7736de8427a922615b36a7e162b6a0a12281558590e861169b7ce2429da0bef",
       "mode": "0o600",
       "restore_mode": "whole"
     },

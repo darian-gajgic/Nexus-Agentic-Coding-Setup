@@ -2897,10 +2897,13 @@ function feedbackModal() {
   };
 }
 
-const kiState = { fetched: false, issues: [] };
+const kiState = { fetched: false, issues: [], me: '', isAdmin: false };
 async function loadKnownIssues() {
   try {
-    kiState.issues = (await api('GET', '/api/known-issues')).issues || [];
+    const r = await api('GET', '/api/known-issues');
+    kiState.issues = r.issues || [];
+    kiState.me = r.me || '';
+    kiState.isAdmin = !!r.is_admin;
     kiState.fetched = true;
     const open = kiState.issues.filter(i => i.status !== 'resolved').length;
     const b = $('#kiBadge');
@@ -2914,15 +2917,19 @@ function viewKnownIssues() {
   const rows = kiState.issues.map(i => {
     let ctx = [];
     try { ctx = JSON.parse(i.context || '[]'); } catch { }
+    const filer = kiState.isAdmin && i.user_id !== kiState.me
+      ? `<span class="chip" title="filed by">👤 ${esc(i.filer_name || i.filer_username || i.user_id)}</span>` : '';
     return `
     <div class="agentic-row">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span class="chip ${{ new: 'c-red', in_progress: 'c-orange', resolved: 'c-green' }[i.status] || ''}">${esc(i.status)}</span>
+        ${filer}
         <strong style="flex:1">${esc(i.feedback).slice(0, 160)}</strong>
-        <span class="muted" style="font-size:11px;font-family:var(--font-mono)">${fmtAgo(i.ts)} · ${esc(i.view || '?')}</span>
+        <span class="muted" style="font-size:11px;font-family:var(--font-mono)" title="${esc(new Date(i.ts * 1000).toLocaleString())}">${fmtAgo(i.ts)} · ${esc(i.view || '?')}</span>
         <select class="form-select" style="width:130px;padding:2px 6px" onchange="kiSetStatus('${esc(i.id)}', this.value)">
           ${['new', 'in_progress', 'resolved'].map(s => `<option value="${s}" ${i.status === s ? 'selected' : ''}>${s}</option>`).join('')}
         </select>
+        <button class="btn-sm" title="Edit the report text" onclick="kiEdit('${esc(i.id)}')">✎</button>
         <button class="btn-sm danger" onclick="kiDelete('${esc(i.id)}')">✕</button>
       </div>
       ${i.feedback.length > 160 ? `<div style="font-size:12px;color:var(--text-dim);white-space:pre-wrap">${esc(i.feedback)}</div>` : ''}
@@ -2938,6 +2945,28 @@ function viewKnownIssues() {
 async function kiSetStatus(id, status) {
   try { await api('PATCH', `/api/known-issues/${id}`, { status }); loadKnownIssues(); }
   catch (e) { toast('Update failed: ' + e.message, 'err'); }
+}
+
+function kiEdit(id) {
+  const i = kiState.issues.find(x => x.id === id);
+  if (!i) return;
+  showModal(`
+    <h2>✎ Edit known issue</h2>
+    <textarea class="form-textarea" id="ki-edit-text" style="height:120px">${esc(i.feedback)}</textarea>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="ki-edit-save">Save</button>
+    </div>`);
+  $('#ki-edit-save').onclick = async () => {
+    const text = ($('#ki-edit-text') || {}).value || '';
+    if (!text.trim()) { toast('Report text cannot be empty', 'err'); return; }
+    try {
+      await api('PATCH', `/api/known-issues/${id}`, { feedback: text.trim() });
+      closeModal();
+      loadKnownIssues();
+      toast('Report updated', 'ok');
+    } catch (e) { toast('Update failed: ' + e.message, 'err'); }
+  };
 }
 
 async function kiDelete(id) {
@@ -8125,24 +8154,38 @@ function injectModalFsBtn() {
 })();
 
 // ═══════════════════════════════ SPECIALISTS ═══════════════════════════════
-const specialistsState = { data: null, loading: false, fetched: false, tab: 'team' };
+const specialistsState = { data: null, loading: false, fetched: false, tab: 'team', lastJSON: '' };
 // Evals (Block 3 R3): fixed per-domain briefs scored by the judge vs the rubric
-const evalsState = { corpus: null, runs: null, loading: false, fetched: false, pollTimer: null };
+const evalsState = { corpus: null, runs: null, loading: false, fetched: false, pollTimer: null, lastJSON: '' };
 async function loadSpecialists() {
+  // Anti-flicker (house rule): skeleton only on FIRST load; background refetches
+  // hash-compare the payload and re-render only on a real change (never mid-modal).
   if (specialistsState.loading) return;
-  specialistsState.loading = true; render();
+  const first = !specialistsState.fetched;
+  specialistsState.loading = true;
+  if (first) render();
   try {
     const [s, p, sh] = await Promise.all([
       api('GET', '/api/specialists'),
       api('GET', '/api/lessons/pending').catch(() => ({ pending: [] })),
       api('GET', '/api/shared-context').catch(() => ({ memories: [] })),
     ]);
-    specialistsState.data = s;
-    specialistsState.pending = (p && p.pending) || [];
-    specialistsState.shared = (sh && sh.memories) || [];
+    const j = JSON.stringify([s, p, sh]);
+    specialistsState.loading = false; specialistsState.fetched = true;
+    const changed = j !== specialistsState.lastJSON;
+    if (changed) {
+      specialistsState.lastJSON = j;
+      specialistsState.data = s;
+      specialistsState.pending = (p && p.pending) || [];
+      specialistsState.shared = (sh && sh.memories) || [];
+    }
+    if ((first || changed) && currentView === 'specialists' && !uiLocked()) render();
   }
-  catch (e) { specialistsState.data = { error: String(e) }; }
-  specialistsState.loading = false; specialistsState.fetched = true; render(); bindSpecialists();
+  catch (e) {
+    specialistsState.data = { error: String(e) };
+    specialistsState.loading = false; specialistsState.fetched = true;
+    if (currentView === 'specialists' && !uiLocked()) render();
+  }
 }
 
 function specInitials(name) {
@@ -8186,7 +8229,7 @@ function viewSpecialists() {
   if (specialistsState.tab === 'evals') return specTabsHTML() + evalsTabHTML();
   const d = specialistsState.data;
   if (!specialistsState.fetched && !specialistsState.loading) loadSpecialists();
-  if (specialistsState.loading || !d) return skeletonView();
+  if (!d) return skeletonView();
   if (d.error) return `<div class="panel"><div class="empty">${esc(d.error)}</div></div>`;
   const specs = d.specialists || [];
   const pend = specialistsState.pending || [];
@@ -8372,15 +8415,21 @@ async function deleteSharedContext(id) {
 async function loadEvals() {
   if (evalsState.loading) return;
   evalsState.loading = true;
+  const first = !evalsState.fetched;
+  let changed = false;
   try {
     const [c, r] = await Promise.all([api('GET', '/api/evals'), api('GET', '/api/evals/runs')]);
+    const j = JSON.stringify([c, r]);
+    changed = j !== evalsState.lastJSON;
+    evalsState.lastJSON = j;
     evalsState.corpus = c.domains || [];
     evalsState.runs = r.runs || [];
     evalsState.fetched = true;
     evalsState.error = null;
-  } catch (e) { evalsState.corpus = evalsState.corpus || []; evalsState.runs = evalsState.runs || []; evalsState.error = e.message; }
+  } catch (e) { evalsState.corpus = evalsState.corpus || []; evalsState.runs = evalsState.runs || []; evalsState.error = e.message; changed = true; }
   evalsState.loading = false;
-  if (currentView === 'specialists' && specialistsState.tab === 'evals' && !uiLocked()) render();
+  // Anti-flicker: the 8s poll repaints only when the payload actually changed.
+  if ((first || changed) && currentView === 'specialists' && specialistsState.tab === 'evals' && !uiLocked()) render();
   evalsAutoPoll();
 }
 
@@ -9608,8 +9657,19 @@ function planEdRowHTML(t, i) {
       </div>
       ${(t.depends_on_idx || []).length ? `<div style="font-size:11px;color:var(--text-faint)">⛓ waits for: ${t.depends_on_idx.map(x => x + 1).join(', ')}</div>` : ''}
       <div style="font-size:11.5px;color:var(--text-dim);white-space:pre-wrap">${esc((t.description || '').slice(0, 220))}${(t.description || '').length > 220 ? '…' : ''}</div>
-      ${((planEd.annotations || {})[i] || []).map(a => `<div style="font-size:11px;color:var(--warn,#eab308);margin-top:3px">${esc(a)}</div>`).join('')}
+      ${((planEd.annotations || {})[i] || []).map((a, k) => `<div class="plan-adv" style="font-size:11px;color:var(--warn,#eab308);margin-top:3px;display:flex;align-items:baseline;gap:6px" title="Advisory only — compares tasks inside this plan to each other; it never references your board and never blocks creation.">
+        <span style="flex:1"><b>Advisory</b> — ${esc(a.replace(/^⚠ /, ''))}</span>
+        <button class="btn-icon pe-dismiss-ann" data-i="${i}" data-k="${k}" title="Dismiss this advisory" style="font-size:10px">✕</button>
+      </div>`).join('')}
     </div>`;
+}
+
+function planEdDismissAnn(i, k) {
+  const anns = (planEd.annotations || {})[i];
+  if (!anns) return;
+  anns.splice(k, 1);
+  if (!anns.length) delete planEd.annotations[i];
+  planEdRender();
 }
 
 function planEdEditorHTML(t, i) {
@@ -9682,7 +9742,8 @@ function planEdRender() {
   }
   const sw = $('#dpSpecWarnings');
   if (sw) sw.innerHTML = (planEd.specWarnings || []).length
-    ? (planEd.specWarnings || []).map(w => `<div style="font-size:11px;color:var(--warn,#eab308)">${esc(w)}</div>`).join('') : '';
+    ? (planEd.specWarnings || []).map(w => `<div style="font-size:11px;color:var(--warn,#eab308)"><b>Advisory</b> — ${esc(String(w).replace(/^⚠ /, ''))}</div>`).join('')
+    + '<div style="font-size:10.5px;color:var(--text-faint);margin-top:2px">These checks compare tasks inside this plan to each other — they never reference your board and never block creation.</div>' : '';
 }
 
 function planEdBindStages() {
@@ -9695,6 +9756,7 @@ function planEdBindStages() {
     planEd.editing = +el.dataset.i; planEdRender();
   });
   $$('.pe-del').forEach(el => el.onclick = () => planEdRemove(+el.dataset.i));
+  $$('.pe-dismiss-ann').forEach(el => el.onclick = () => planEdDismissAnn(+el.dataset.i, +el.dataset.k));
   const save = $('#pe-save'), cancel = $('#pe-cancel');
   if (cancel) cancel.onclick = () => {
     const i = planEd.editing;

@@ -7138,15 +7138,25 @@ def _validate_plan(tasks: list, family: str, spec: dict, goal: str = "") -> list
                 break
 
     # 3. Duplicate / near-duplicate titles (on the distinctive tokens only).
+    _fanout_toks = ("lens", "draft", "variant", "perspective", "angle")
     for i in range(len(tasks)):
         for j in range(i + 1, len(tasks)):
+            ti, tj = tasks[i], tasks[j]
+            # Fan-out plans create intentional near-twins (parallel lenses /
+            # drafts) — the known false-positive class; skip those pairs.
+            both_text = (str(ti.get("title") or "") + " " + str(tj.get("title") or "")).lower()
+            if (ti.get("super_result") and tj.get("super_result")) or (
+                    ti.get("specialist") and ti.get("specialist") == tj.get("specialist")
+                    and any(t in both_text for t in _fanout_toks)):
+                continue
             a, b = title_toks[i] - common, title_toks[j] - common
             # ≥2 distinctive tokens each side, so "Spec: X" vs "Implement: X"
             # (only the shared goal name in common) never false-positives.
             if len(a) >= 2 and len(b) >= 2 and len(a & b) / max(1, len(a | b)) >= 0.8:
                 warnings.append({"scope": "task", "task_idx": j, "level": "warn",
-                                 "message": f"near-duplicate title of task {i+1} "
-                                            f"('{_short(tasks[j].get('title'))}')"})
+                                 "message": f"title looks similar to task {i+1} "
+                                            f"('{_short(ti.get('title'))}') in this plan "
+                                            "— advisory only, never blocks creation"})
 
     # 4. Per-task budget sanity vs the default.
     try:
@@ -8771,10 +8781,15 @@ async def models_assign(body: dict):
 
 @app.get("/api/known-issues")
 async def known_issues_list():
+    # Admins (the operator) see every user's reports; members see their own.
+    uid = auth.current_user_id()
+    admin = auth.is_admin()
     rows = db.query_all(
-        "SELECT * FROM known_issues WHERE user_id=? ORDER BY ts DESC LIMIT 200",
-        (auth.current_user_id(),))
-    return {"issues": rows}
+        "SELECT k.*, u.display_name AS filer_name, u.username AS filer_username "
+        "FROM known_issues k LEFT JOIN users u ON u.id = k.user_id "
+        "WHERE (k.user_id=? OR ?) ORDER BY k.ts DESC LIMIT 200",
+        (uid, 1 if admin else 0))
+    return {"issues": rows, "me": uid, "is_admin": admin}
 
 
 @app.post("/api/known-issues")
@@ -8795,16 +8810,38 @@ async def known_issues_add(body: dict):
 
 @app.patch("/api/known-issues/{iid}")
 async def known_issues_update(iid: str, body: dict):
+    uid = auth.current_user_id()
+    admin = 1 if auth.is_admin() else 0
+    sets, params = [], []
     if body.get("status") in ("new", "in_progress", "resolved"):
-        db.execute("UPDATE known_issues SET status=? WHERE id=? AND user_id=?",
-                   (body["status"], iid, auth.current_user_id()))
+        sets.append("status=?")
+        params.append(body["status"])
+    if "feedback" in body:
+        fb = (body.get("feedback") or "").strip()
+        if not fb:
+            return JSONResponse(status_code=400, content={"error": "feedback text required"})
+        sets.append("feedback=?")
+        params.append(fb[:4000])
+    if not sets:
+        return {"ok": True}
+    cur = db.execute(
+        f"UPDATE known_issues SET {', '.join(sets)} WHERE id=? AND (user_id=? OR ?)",
+        (*params, iid, uid, admin))
+    if cur.rowcount == 0:
+        return JSONResponse(status_code=404, content={"error": "not found"})
     return {"ok": True}
 
 
 @app.delete("/api/known-issues/{iid}")
 async def known_issues_delete(iid: str):
-    db.execute("DELETE FROM known_issues WHERE id=? AND user_id=?",
-               (iid, auth.current_user_id()))
+    uid = auth.current_user_id()
+    admin = 1 if auth.is_admin() else 0
+    row = db.query_one("SELECT user_id FROM known_issues WHERE id=? AND (user_id=? OR ?)",
+                       (iid, uid, admin))
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    db.execute("DELETE FROM known_issues WHERE id=?", (iid,))
+    db.log_activity("info", "feedback", f"Known issue {iid} deleted", user_id=row["user_id"])
     return {"ok": True}
 
 

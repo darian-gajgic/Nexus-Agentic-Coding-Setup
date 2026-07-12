@@ -9,7 +9,7 @@
         "model": "llama3.1:8b",
         "ollama_base_url": "http://localhost:11434",
         "temperature": 0.1,
-        "max_tokens": 2000
+        "max_tokens": 8000
       }
     },
     "embedder": {
