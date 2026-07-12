@@ -100,6 +100,8 @@ def public_user(u: dict | None) -> dict | None:
             "role": u.get("role") or "member",
             "has_password": bool(u.get("password_hash")),
             "active": bool(u.get("active", 1)),
+            "github_username": u.get("github_username") or "",
+            "git_email": u.get("git_email") or "",
             "created_at": u.get("created_at")}
 
 
