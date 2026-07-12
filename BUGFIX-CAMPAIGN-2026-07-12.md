@@ -83,6 +83,7 @@ which now validates the FIXED drain.
 | ☐ | [18] | _lessons_safe getattr-by-string → direct callables |
 | ☐ | [19] | eval judge spend stuffed into frontier_ledger.workflow_id → proper source column (small migration) |
 | ☐ | [R1] | loop_config lost-update race (session-1 exit review, CONFIRMED) → implement §D6; also collapses the 3 duplicated locate/unpack/save blocks in _escalation_thread |
+| ☐ | [R2] | watchdog restart circuit-breaker counts CLEAN service restarts: every `systemctl restart nexus` kills lanes → watchdog respawn +1 each, cumulative forever — the 2026-07-12 campaign's ~8 restarts retired the whole fleet (Worker 1-5 + Manual) at 01:21 (healed by hand: counters reset + POST /agents/{id}/restart). Fix: don't increment when the death is within ~120s of service boot (startup ts marker), OR decay restart_count to 0 after 1h of healthy uptime. Gate: seeded restart_count + fake boot marker → no increment on the post-boot respawn |
 
 **Session-2 exit:** verify.sh + verify_autopilot_e2e + verify_deep_plan_e2e + screenshot
 sweep → final `/code-review` on the combined campaign diff → update program memory files.
