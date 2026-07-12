@@ -403,9 +403,52 @@ def resolve_cmd_tokens(tmpl: str, mapping: dict) -> list[str]:
     return _fallback_local_bin(tokens)
 
 
+_ARTIFACT_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__",
+                       ".worktrees", ".next", "dist", "build", "attachments"}
+
+
+def _copy_judge_artifacts(sources: list, dest: Path,
+                          per_file: int = 1_000_000, total_cap: int = 40_000_000) -> int:
+    """Size-capped read-only copy of the task's produced files for the judge
+    (judge-scope fix 2026-07-12: the judge previously saw ONLY deliverable.md,
+    so every claim about a created file was unverifiable-by-construction).
+    Each source tree lands under dest/<basename>; oversized files and vendor
+    dirs are skipped. Returns the number of files copied."""
+    import shutil
+    copied, total = 0, 0
+    for src in sources or []:
+        src = Path(src)
+        if not src.is_dir():
+            continue
+        root = dest / src.name
+        for p in sorted(src.rglob("*")):
+            rel = p.relative_to(src)
+            if any(part in _ARTIFACT_SKIP_DIRS for part in rel.parts):
+                continue
+            if not p.is_file():
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            if sz > per_file or total + sz > total_cap:
+                continue
+            tgt = root / rel
+            try:
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, tgt)
+            except Exception:
+                continue
+            copied += 1
+            total += sz
+    return copied
+
+
 def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
                   api_key: str | None = None, type_rubric: str | None = None,
-                  spec_path: str | None = None, usage_sink: dict | None = None) -> str:
+                  spec_path: str | None = None, usage_sink: dict | None = None,
+                  task_contract: str | None = None,
+                  artifact_dirs: list | None = None) -> str:
     """Run the frontier judge command on a file (shared with the task judge).
     Template lives in settings judge.cmd so gates can stub it (R4.3).
 
@@ -418,12 +461,22 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
     Runs with cwd=~/knowledge AND copies the deliverable there first: headless
     `claude -p` (inside cjudge) can only read files under its working directory
     without permission prompts, and the judge must read BOTH the rubric tree
-    and the deliverable."""
+    and the deliverable.
+
+    Judge-scope fix (2026-07-12): `task_contract` (markdown text) lands next to
+    the deliverable as the STAGE contract (env JUDGE_TASK) — the task's own
+    'Done when:' criteria + the workflow stage map, so whole-project criteria
+    owned by later stages stop failing this stage. `artifact_dirs` are copied
+    (size-capped) under the tmp dir (env JUDGE_ARTIFACTS) so the judge can
+    verify claims against the files the task actually produced. Both optional;
+    absent = prior behavior."""
     import shutil
     import subprocess as sp
     tmpdir = Path(KNOWLEDGE_DIR) / ".nexus-judge-tmp"
     judged_path = file_path
     spec_tmp = None
+    contract_tmp = None
+    art_tmp = None
     try:
         tmpdir.mkdir(exist_ok=True)
         tmp_file = tmpdir / f"judge-{uuid.uuid4().hex[:8]}.md"
@@ -456,6 +509,27 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
             env["JUDGE_SPEC"] = str(spec_tmp)
         except Exception:
             pass
+    if task_contract:
+        # Judge-scope fix: the binding STAGE contract for this deliverable.
+        try:
+            contract_tmp = tmpdir / f"TASK-CONTRACT-{uuid.uuid4().hex[:8]}.md"
+            contract_tmp.write_text(task_contract, encoding="utf-8")
+            env["JUDGE_TASK"] = str(contract_tmp)
+        except Exception:
+            contract_tmp = None
+    if artifact_dirs:
+        # Judge-scope fix: the files the task actually produced, so "evidence
+        # on the page" extends to the real artifacts instead of refuting every
+        # unquoted claim.
+        try:
+            art_tmp = tmpdir / f"artifacts-{uuid.uuid4().hex[:8]}"
+            if _copy_judge_artifacts(artifact_dirs, art_tmp):
+                env["JUDGE_ARTIFACTS"] = str(art_tmp)
+            else:
+                shutil.rmtree(art_tmp, ignore_errors=True)
+                art_tmp = None
+        except Exception:
+            art_tmp = None
     try:
         with _FRONTIER_GATE:  # global frontier concurrency cap (premortem P1)
             r = sp.run(tokens, capture_output=True, text=True, timeout=900,
@@ -478,6 +552,16 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         try:
             if spec_tmp:
                 os.unlink(spec_tmp)
+        except Exception:
+            pass
+        try:
+            if contract_tmp:
+                os.unlink(contract_tmp)
+        except Exception:
+            pass
+        try:
+            if art_tmp:
+                shutil.rmtree(art_tmp, ignore_errors=True)
         except Exception:
             pass
     return out

@@ -325,6 +325,13 @@ chk "wizard fan-out + reconciler"    "grep -q 'SUPER RESULT FAN-OUT' server.py &
 chk "cverify vendored + installed"   "[ -f ../setup/bin/cverify ] && [ -f \$HOME/.local/bin/cverify ]"
 chk "cverify sentinel contract"      "grep -q 'NEXUS_CRITIC_JSON_BEGIN' ../setup/bin/cverify && grep -q 'learning_note' ../setup/bin/cverify"
 chk "cjudge N2 structured tail"      "grep -q 'NEXUS_JUDGE_JSON_BEGIN' ../setup/bin/cjudge && grep -q 'JUDGE_TYPE_RUBRIC' ../setup/bin/cjudge"
+# Judge-scope fix (2026-07-12, found by bench-02): high-stakes judging of a
+# pipeline stage must see THIS stage's contract + the files it produced —
+# before this, the judge enforced whole-project SPEC criteria against every
+# stage and structurally could not read any claimed file (cwd=~/knowledge).
+chk "judge-scope: stage contract"    "grep -q 'task_contract' evals.py && grep -q 'JUDGE_TASK' evals.py && grep -q 'def _judge_task_contract' server.py"
+chk "judge-scope: artifacts"         "grep -q 'def _copy_judge_artifacts' evals.py && grep -q 'JUDGE_ARTIFACTS' evals.py && grep -q 'def _judge_artifact_dirs' server.py && grep -q 'artifact_dirs=art_dirs' server.py"
+chk "judge-scope: cjudge vendored"   "grep -q 'JUDGE_TASK' ../setup/bin/cjudge && grep -q 'JUDGE_ARTIFACTS' ../setup/bin/cjudge && grep -q 'LATER stages' ../setup/bin/cjudge"
 chk "INVESTIGATION rubric vendored"  "[ -f ../setup/knowledge/rubrics/INVESTIGATION.md ] && grep -q 'A1 VERIFIED-NOT-INFERRED' ../setup/knowledge/rubrics/INVESTIGATION.md"
 chk "frontend: chips + critic UI"    "grep -q 'function superChip' static/app.js && grep -q 'function criticSectionHTML' static/app.js && grep -q 'function rvLoadCritic' static/app.js"
 chk "frontend: SR toggles"           "grep -q 'id=\"wf-super\"' static/app.js && grep -q 'id=\"m-task-super\"' static/app.js && grep -q 'id=\"td-super\"' static/app.js && grep -q 'id=\"pe-super\"' static/app.js"
