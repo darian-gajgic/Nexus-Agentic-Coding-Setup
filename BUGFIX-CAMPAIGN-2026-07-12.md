@@ -84,9 +84,15 @@ which now validates the FIXED drain.
 | ☐ | [19] | eval judge spend stuffed into frontier_ledger.workflow_id → proper source column (small migration) |
 | ☐ | [R1] | loop_config lost-update race (session-1 exit review, CONFIRMED) → implement §D6; also collapses the 3 duplicated locate/unpack/save blocks in _escalation_thread |
 | ☐ | [R2] | watchdog restart circuit-breaker counts CLEAN service restarts: every `systemctl restart nexus` kills lanes → watchdog respawn +1 each, cumulative forever — the 2026-07-12 campaign's ~8 restarts retired the whole fleet (Worker 1-5 + Manual) at 01:21 (healed by hand: counters reset + POST /agents/{id}/restart). Fix: don't increment when the death is within ~120s of service boot (startup ts marker), OR decay restart_count to 0 after 1h of healthy uptime. Gate: seeded restart_count + fake boot marker → no increment on the post-boot respawn |
+| ☐ | [R3] | frontier-cmd token machinery ×5 (promoted 2026-07-12 from the session-1 report-only leftovers, user decision): the `shlex.split` + per-token `{file}`/`{model}`/… `.replace` + empty-token drop + `~/.local/bin` PATH-fallback block is copy-pasted at evals.py ~415, ~816, ~967, ~1047 and lessons.py ~197 → extract ONE shared resolver in evals.py (e.g. `resolve_cmd_tokens(tmpl, mapping) -> list[str]`, keeping the brace-safe per-token replace — NOT .format) and route all 5 call sites through it (lessons.py imports evals). Behavior-preserving refactor only. Gate: existing eval + lessons gates stay green + verify.sh static grep pins `def resolve_cmd_tokens` and 0 remaining inline copies |
 
-**Session-2 exit:** verify.sh + verify_autopilot_e2e + verify_deep_plan_e2e + screenshot
-sweep → final `/code-review` on the combined campaign diff → update program memory files.
+**Session-2 exit (user decision 2026-07-12 — two changes vs. the original flow):**
+verify.sh + verify_autopilot_e2e + verify_deep_plan_e2e + screenshot sweep →
+**PAUSE — human checkpoint: report the per-finding outcome table (fixed/skipped + shas)
+to the user and STOP; do NOT start the final review until the user gives an explicit
+go-ahead** → final `/code-review` on the combined campaign diff → update program memory
+files. Reminder of the standing rule (user re-confirmed): if the code contradicts a
+§Decisions design, STOP and ask the user BEFORE implementing — never improvise a redesign.
 
 ---
 
@@ -251,6 +257,9 @@ Finish with the batch checkpoint (full gate sweep + /code-review at medium effor
 
 **Session 2:** Read `BUGFIX-CAMPAIGN-2026-07-12.md`. FIRST: the same resume hygiene as
 Session 1. Confirm Session 1 complete via git log.
-Execute the S2 table in 2-3 grouped commits, same re-verify→fix→gate→commit rhythm, then the
-S2 exit sweep and a final /code-review on the combined campaign diff. Report per-finding
-outcomes and update the program memory files.
+Execute the S2 table INCLUDING [R1], [R2] and [R3] in 2-3 grouped commits, same
+re-verify→fix→gate→commit rhythm ([R1] exactly per §D6). If the code contradicts any
+§Decisions design, STOP and ask the user before implementing that item. After the table:
+run the S2 exit sweep, then PAUSE — report the per-finding outcome table to the user and
+WAIT for their explicit go-ahead. Only then run the final /code-review on the combined
+campaign diff and update the program memory files.
