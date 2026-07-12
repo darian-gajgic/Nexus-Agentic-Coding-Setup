@@ -74,6 +74,9 @@ cp "$HERE/system/nexus-cleanup-llm.service" "$HOME/.config/systemd/user/" 2>/dev
 systemctl --user daemon-reload
 # Manual-start posture (2026-07-11): units are installed but NOT enabled — the
 # stack starts only when you run nexus-up / the "Start Nexus" desktop icon.
+# Upgrade installs: an older install.sh DID enable nexus at boot — disable it
+# explicitly so the no-autostart promise below is true on every box.
+systemctl --user disable nexus.service >/dev/null 2>&1 || true
 
 # ── start-everything launcher + desktop shortcut ──
 if [ -f "$HERE/setup/bin/nexus-up" ]; then

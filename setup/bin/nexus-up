@@ -40,6 +40,25 @@ dash_up() {
     [ -n "$code" ] && [ "$code" != "000" ]
 }
 
+start_container() {
+    # $1 = compose service name, $2 = container name on the reference machine.
+    # The hardcoded name matches this machine's compose project layout; a
+    # runbook install can produce another project prefix (e.g. infra-qdrant-1 —
+    # `docker compose -f infra/qdrant-docker-compose.yml` names the project
+    # after the compose file's DIRECTORY), so when the exact name is absent,
+    # fall back to whatever container carries that compose service label.
+    local svc="$1" name="$2" found
+    docker start "$name" >/dev/null 2>&1 && return 0
+    found=$(docker ps -a --filter "label=com.docker.compose.service=$svc" \
+                --format '{{.Names}}' | head -n1)
+    if [ -n "$found" ] && docker start "$found" >/dev/null 2>&1; then
+        echo "started $found for compose service $svc ($name absent on this box)"
+        return 0
+    fi
+    notify "container $name failed to start — check $LOG"
+    return 1
+}
+
 start_infra() {
     # ollama (system service, disabled at boot) — the one sudo action
     if ! systemctl is-active --quiet ollama.service; then
@@ -47,11 +66,13 @@ start_infra() {
             || notify "ollama failed to start (sudoers rule missing?) — local models degraded"
     fi
     # containers, dependencies first; the docker CLI socket-activates dockerd
-    local c
-    for c in qdrant-qdrant-1 \
-             langfuse-postgres-1 langfuse-redis-1 langfuse-clickhouse-1 \
-             langfuse-minio-1 langfuse-langfuse-worker-1 langfuse-langfuse-web-1; do
-        docker start "$c" >/dev/null 2>&1 || notify "container $c failed to start — check $LOG"
+    local pair
+    for pair in qdrant:qdrant-qdrant-1 \
+             postgres:langfuse-postgres-1 redis:langfuse-redis-1 \
+             clickhouse:langfuse-clickhouse-1 minio:langfuse-minio-1 \
+             langfuse-worker:langfuse-langfuse-worker-1 \
+             langfuse-web:langfuse-langfuse-web-1; do
+        start_container "${pair%%:*}" "${pair#*:}"
     done
     # timers are cheap and idempotent
     systemctl --user start hermes-guardian.timer hermes-reflect.timer hermes-prune.timer \

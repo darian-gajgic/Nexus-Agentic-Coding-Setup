@@ -76,7 +76,7 @@ bash install.sh
 This copies configs, the agents (18 active + archive), custom skills, scripts, and plugins into `~/.hermes/`;
 installs the guardian (`~/hermes-guardian/`) and Nexus (`~/nexus-agent-os/`); rewrites
 hard-coded paths to this user's `$HOME`; installs the systemd units; and runs the guardian
-once to apply the core-mod patches (the set listed in guardian/core-mods.json — 6 today,
+once to apply the core-mod patches (the set listed in guardian/core-mods.json — 7 today,
 incl. `session-model-api-server`: the keystone of model routing — upstream's api_server
 ignores per-session models, so without this mod every session turn silently runs
 config.yaml's default and per-task/JARVIS model choices are cosmetic).
@@ -136,10 +136,10 @@ large-v3, ~2.9GB) downloads from HuggingFace on first use.
 
 ### Step 8 — Verify and report
 ```bash
-"$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/hermes-guardian/guardian.py"   # expect overall=OK, core-mods = the count in guardian/core-mods.json (6 today)
+"$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/hermes-guardian/guardian.py"   # expect overall=OK, core-mods = the count in guardian/core-mods.json (7 today)
 systemctl --user is-active hermes-gateway.service nexus.service
 ```
-Confirm to the user: guardian `overall=OK` with **all core-mods applied** (the set in guardian/core-mods.json — 6 today), gateway + nexus
+Confirm to the user: guardian `overall=OK` with **all core-mods applied** (the set in guardian/core-mods.json — 7 today), gateway + nexus
 **active**. Point them at the Nexus dashboard URL the service logs print, and tell them to
 try Hermes with *"use a specialist to research X"* to confirm routing works.
 
