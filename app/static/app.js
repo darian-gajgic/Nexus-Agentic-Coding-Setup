@@ -28,7 +28,13 @@ const kanbanDrag = { active: false, id: null };
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (t) => String(t == null ? '' : t)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+// For string ARGUMENTS inside inline on*="fn('…')" handlers. esc() alone is NOT
+// enough there: the HTML parser decodes &#39; back to ' before the JS engine
+// runs, so the JS string context must be backslash-escaped FIRST.
+const escArg = (t) => esc(String(t == null ? '' : t)
+  .replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
 const fmtTime = (ts) => {
   if (!ts) return '--';
   const d = new Date(ts * 1000);
@@ -1502,14 +1508,14 @@ function openTaskDetail(id) {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px">
         <span class="chip c-cyan" style="font-family:var(--font-mono)">${esc(t.repo_path)}</span>
         <span class="muted">branch nexus/${esc((t.workflow_id || t.id).replace('wf-', '').replace('task-', ''))} · diff is the deliverable</span>
-        <button class="btn-sm" title="Files this task created/changed on its branch — view/download without touching your checkout" onclick="branchFilesUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">🧬 Branch files…</button>
+        <button class="btn-sm" title="Files this task created/changed on its branch — view/download without touching your checkout" onclick="branchFilesUI('${esc(t.id)}','${escArg(String(t.title || '').slice(0, 50))}')">🧬 Branch files…</button>
       </div></div>` : ''}
     <div class="form-group"><label class="form-label">📎 Attachments (input files the agent reads before working)</label>
       <div id="td-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
     <div class="form-group"><label class="form-label">🔁 Looping (automatic improve-and-recheck rounds)</label>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span id="td-loop-badge">${loopBadgeHTML(parseLoopCfg(t.loop_config))}</span>
-        <button class="btn-sm" onclick="loopViewerModal('task','${esc(t.id)}','${esc(t.title).slice(0, 60)}')">🔁 View / edit loop</button>
+        <button class="btn-sm" onclick="loopViewerModal('task','${esc(t.id)}','${escArg(String(t.title || '').slice(0, 60))}')">🔁 View / edit loop</button>
       </div></div>
     <div id="td-judge">${judgeSectionHTML(t)}</div>
     <div id="td-critic">${criticSectionHTML(t)}</div>
@@ -1550,7 +1556,7 @@ async function loadLoopBadge(t) {
     const el = $('#td-loop-badge');
     if (el && cfg && cfg.enabled) {
       el.innerHTML = `${loopBadgeHTML(cfg)} <span class="chip" title="This task is covered by its project's loop. Give the task its own loop to override.">↑ inherited from project</span>
-        <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(t.workflow_id)}','${esc(w.name || 'project')}')">open project loop</button>`;
+        <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(t.workflow_id)}','${escArg(w.name || 'project')}')">open project loop</button>`;
     }
   } catch { /* optional */ }
 }
@@ -1568,7 +1574,7 @@ function attachRowHTML(kind, id, f, elId) {
   return `<div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-top:2px">
     📎 <a href="${attachDlHref(kind, id, f.name)}" target="_blank" style="color:var(--accent)">${esc(f.name)}</a>
     <span class="muted" style="font-size:10.5px">${(f.size / 1024).toFixed(0)} KB</span>
-    <button class="btn-sm danger" title="remove" onclick="deleteAttachment('${kind}','${esc(id)}','${esc(f.name)}','${elId}')">✕</button>
+    <button class="btn-sm danger" title="remove" onclick="deleteAttachment('${kind}','${esc(id)}','${escArg(f.name)}','${elId}')">✕</button>
   </div>`;
 }
 function attachUploadHTML(elId) {
@@ -2636,7 +2642,7 @@ async function loadUsersPanel() {
       <td>${esc(u.role)}</td>
       <td>${u.active ? (u.has_password ? '🔐 password set' : '⚠ no password') : '⛔ deactivated'}</td>
       <td style="display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn-ghost btn-sm" onclick="resetUserPassword('${esc(u.id)}','${esc(u.display_name)}')">Reset password</button>
+        <button class="btn-ghost btn-sm" onclick="resetUserPassword('${esc(u.id)}','${escArg(u.display_name)}')">Reset password</button>
         ${u.id !== me.id ? `<button class="btn-ghost btn-sm" onclick="toggleUserActive('${esc(u.id)}',${u.active ? 'false' : 'true'})">${u.active ? 'Deactivate' : 'Reactivate'}</button>` : ''}
       </td>
     </tr>`).join('');
@@ -3628,7 +3634,7 @@ async function reviewWorkflowUI(wfId, name) {
   try {
     const r = await api('GET', `/api/workflows/${wfId}/review`);
     const rows = (r.tasks || []).map(t => `
-      <div class="agentic-row" style="cursor:pointer" onclick="reviewTaskUI('${esc(t.task_id)}','${esc((t.title || '').slice(0, 60))}')">
+      <div class="agentic-row" style="cursor:pointer" onclick="reviewTaskUI('${esc(t.task_id)}','${escArg((t.title || '').slice(0, 60))}')">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <strong style="flex:1">${esc(t.title)}</strong>
           <span class="chip ${t.status === 'done' ? 'c-green' : ''}">${esc(t.status)}</span>
@@ -4134,13 +4140,13 @@ async function loadTaskExtras(t) {
           <span class="chip c-cyan">${esc(ap.detected.label)}</span>
           ${run && run.ready ? `<span class="chip c-green">running</span><a class="btn-sm" href="${esc(run.url)}" target="_blank" style="text-decoration:none">↗ Open</a>
             <button class="btn-sm danger" onclick="stopAppUI('${esc(t.id)}')">⏹ Stop</button>`
-      : `<button class="btn-sm" style="border-color:var(--accent-2)" onclick="testAppUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">▶ Test app</button>`}
-          <button class="btn-sm" title="Lift this app out of the task workspace into a real client repository (git + backup + delivery workflow)" onclick="promoteTaskUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">📦 Promote to repository</button>
+      : `<button class="btn-sm" style="border-color:var(--accent-2)" onclick="testAppUI('${esc(t.id)}','${escArg(String(t.title || '').slice(0, 50))}')">▶ Test app</button>`}
+          <button class="btn-sm" title="Lift this app out of the task workspace into a real client repository (git + backup + delivery workflow)" onclick="promoteTaskUI('${esc(t.id)}','${escArg(String(t.title || '').slice(0, 50))}')">📦 Promote to repository</button>
         </div></div>`;
     }
     if ((fr.files || []).length) {
       html += `<div class="form-group"><label class="form-label" style="display:flex;align-items:center;gap:10px">Deliverable files (workspace)
-        <button class="btn-sm" style="border-color:var(--accent)" title="PR-style comparison: what changed since the previous version — per file, for code AND documents" onclick="reviewTaskUI('${esc(t.id)}','${esc(t.title).slice(0, 50)}')">🔍 Review changes</button></label>
+        <button class="btn-sm" style="border-color:var(--accent)" title="PR-style comparison: what changed since the previous version — per file, for code AND documents" onclick="reviewTaskUI('${esc(t.id)}','${escArg(String(t.title || '').slice(0, 50))}')">🔍 Review changes</button></label>
         <div style="display:flex;flex-direction:column;gap:4px">` +
         fr.files.map(f => `<a href="/api/tasks/${esc(t.id)}/files/${encPath(f.name)}" target="_blank"
           style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📄 ${esc(f.name)} <span class="muted">(${(f.size / 1024).toFixed(1)} KB)</span></a>`).join('') +
@@ -5763,7 +5769,7 @@ function viewSkills() {
           <div class="agentic-row slim">
             <strong style="min-width:200px;font-size:12.5px">${esc(s.name)}</strong>
             <span style="flex:1;font-size:11.5px;color:var(--text-dim)">${esc(s.description || '')}</span>
-            <button class="btn-sm" onclick="editHermesSkill('${esc(s.name)}')">✏ Edit</button>
+            <button class="btn-sm" onclick="editHermesSkill('${escArg(s.name)}')">✏ Edit</button>
           </div>`).join('') || '<div class="empty">No skills found in ~/.hermes/skills</div>'}
       </div>
     </div>
@@ -5872,7 +5878,7 @@ function viewProjects() {
       <td>${langs}</td>
       <td><code class="git-branch">${esc(p.git_branch || '—')}</code></td>
       <td>${status}</td>
-      <td>${p.is_repo ? `<button class="focus-btn" title="Work in this project: Workflows & Tasks scope to it; new work is assigned to it" onclick="event.stopPropagation(); setFocusProject('${esc(p.path)}','${esc(p.name)}','${esc(p.client || '')}')">🎯 ${focusCtx.project && focusCtx.project.path === p.path ? 'selected' : 'select'}</button>` : ''}</td>
+      <td>${p.is_repo ? `<button class="focus-btn" title="Work in this project: Workflows & Tasks scope to it; new work is assigned to it" onclick="event.stopPropagation(); setFocusProject('${escArg(p.path)}','${escArg(p.name)}','${escArg(p.client || '')}')">🎯 ${focusCtx.project && focusCtx.project.path === p.path ? 'selected' : 'select'}</button>` : ''}</td>
       <td>${p.is_repo ? (p.git_remote ? '<span title="' + esc(p.git_remote) + '" style="color:var(--accent-2)">☁ backed up</span>' : '<span style="color:var(--yellow)">⚠ local only</span>') : '<span class="muted">—</span>'}</td>
       <td>${fmtSize(p.size_bytes)}</td>
       <td class="muted">${fmtDays(p.last_modified)}</td>
@@ -5903,12 +5909,12 @@ function bindProjects() {
             ? 'Backed up to a remote. Push after merges; tag what you deliver.'
             : '⚠ This repository exists ONLY on this machine — a disk failure loses it. Publish creates a PRIVATE GitHub repo and pushes everything (your offsite backup and the future handover vehicle).'}</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            ${!p.git_remote ? `<button class="btn-primary" onclick="publishRepoUI('${esc(p.path)}','${esc(p.name)}')">☁ Publish to GitHub (private)</button>` : `
-            <button class="btn-primary" onclick="pushRepoUI('${esc(p.path)}')">⬆ Push to remote</button>
-            <button class="btn-ghost" onclick="tagRepoUI('${esc(p.path)}','${esc(p.name)}')">🏷 Tag release</button>`}
+            ${!p.git_remote ? `<button class="btn-primary" onclick="publishRepoUI('${escArg(p.path)}','${escArg(p.name)}')">☁ Publish to GitHub (private)</button>` : `
+            <button class="btn-primary" onclick="pushRepoUI('${escArg(p.path)}')">⬆ Push to remote</button>
+            <button class="btn-ghost" onclick="tagRepoUI('${escArg(p.path)}','${escArg(p.name)}')">🏷 Tag release</button>`}
           </div>` : ''}
           ${isAdminUser() ? `<div class="modal-actions" style="justify-content:flex-start;margin-top:14px">
-            <button class="btn-sm danger" onclick="deleteProjectUI('${esc(p.path)}','${esc(p.name)}')">🗑 Delete project…</button>
+            <button class="btn-sm danger" onclick="deleteProjectUI('${escArg(p.path)}','${escArg(p.name)}')">🗑 Delete project…</button>
           </div>` : ''}
         </div>`);
       if (p.is_repo) loadRepoHistory(p.path);
@@ -7729,7 +7735,7 @@ async function jarvisLoadFiles() {
       <div class="jv2-file">
         <a href="/api/jarvis/files/${encodeURIComponent(f.name)}" target="_blank">📄 ${esc(f.name)}</a>
         <span class="muted" style="font-size:10px">${(f.size / 1024).toFixed(0)}K</span>
-        <button class="jv2-mini-btn" title="delete" onclick="jarvisDeleteFile('${esc(f.name)}')">✕</button>
+        <button class="jv2-mini-btn" title="delete" onclick="jarvisDeleteFile('${escArg(f.name)}')">✕</button>
       </div>`).join('') || '<div class="muted" style="font-size:11.5px">Empty — drop a file below</div>';
   } catch { }
 }
@@ -7838,7 +7844,7 @@ async function jarvisLoadDeck() {
   // deliverables with ▶ Test app when a runnable was detected
   const vBadge = (v) => v ? `<span class="jv2-deck-badge ${/APPROVE|PASS/i.test(v) ? 'ok' : /REVISE|REWRITE|FAIL/i.test(v) ? 'warn' : ''}">${esc(v)}</span>` : '';
   const delRows = delivs.length ? delivs.slice(0, 8).map(d => {
-    const test = d.app ? `<button class="jv2-mini-btn" title="Run the produced app/site live" onclick="testAppUI('${esc(d.task_id)}', ${JSON.stringify(esc(d.title))})">▶ Test</button>` : '';
+    const test = d.app ? `<button class="jv2-mini-btn" title="Run the produced app/site live" onclick="testAppUI('${esc(d.task_id)}','${escArg(d.title)}')">▶ Test</button>` : '';
     const open = (d.files && d.files.length)
       ? `<a class="jv2-mini-btn" href="/api/tasks/${esc(d.task_id)}/files/${encodeURIComponent(d.files[0].name || d.files[0])}" target="_blank" title="open first output file">📄</a>` : '';
     return `<div class="jv2-deck-row">
@@ -9358,8 +9364,8 @@ function viewWorkflows() {
   const rows = scoped.map(w => `
     <div class="agentic-card" style="cursor:pointer" onclick="openWorkflowDetail('${esc(w.id)}')">
       <div class="card-head"><h3>⚑ ${esc(w.name)}</h3>
-        <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
-        <button class="focus-btn" title="Run the complete assembled project — current state or any earlier one" onclick="event.stopPropagation(); projectAppUI('${esc(w.id)}','${esc(w.name).slice(0, 40)}')">▶ test</button>
+        <button class="focus-btn" title="Work in this workflow: Tasks scopes to it; new tasks join it" onclick="event.stopPropagation(); setFocusWorkflow('${esc(w.id)}','${escArg(String(w.name || '').slice(0, 40))}')">🎯 ${focusCtx.workflow && focusCtx.workflow.id === w.id ? 'focused' : 'focus'}</button>
+        <button class="focus-btn" title="Run the complete assembled project — current state or any earlier one" onclick="event.stopPropagation(); projectAppUI('${esc(w.id)}','${escArg(String(w.name || '').slice(0, 40))}')">▶ test</button>
         ${(w.tasks_by_status || {}).backlog ? `<button class="focus-btn" title="Move all ${(w.tasks_by_status || {}).backlog} backlog task(s) of this workflow to To Do — they run in dependency order" onclick="event.stopPropagation(); wfStartTasksUI('${esc(w.id)}')">▶ Start tasks</button>` : ''}
         <span class="chip ${w.all_done ? 'c-green' : w.status === 'active' ? 'c-cyan' : ''}">${w.all_done ? 'complete' : esc(w.status)}</span>${replanChipHTML(w)}</div>
       <div class="card-body">
@@ -9499,15 +9505,15 @@ async function openWorkflowDetail(id) {
     ${rpPanel}
     <div style="display:flex;flex-direction:column;gap:6px;max-height:380px;overflow-y:auto">${taskRows || '<div class="empty">No tasks yet — add the first one.</div>'}</div>
     <div style="margin:8px 0;display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">🔍 Review results — what every stage changed</button>
-      <button class="btn-sm" style="border-color:var(--accent-2)" title="Run the complete assembled project — the current state or any earlier one, side by side" onclick="projectAppUI('${esc(w.id)}','${esc(w.name).slice(0, 50)}')">▶ Test project — run any version</button>
+      <button class="btn-sm" style="border-color:var(--accent)" onclick="reviewWorkflowUI('${esc(w.id)}','${escArg(String(w.name || '').slice(0, 50))}')">🔍 Review results — what every stage changed</button>
+      <button class="btn-sm" style="border-color:var(--accent-2)" title="Run the complete assembled project — the current state or any earlier one, side by side" onclick="projectAppUI('${esc(w.id)}','${escArg(String(w.name || '').slice(0, 50))}')">▶ Test project — run any version</button>
     </div>
     <div class="form-group" style="margin-top:10px"><label class="form-label">📎 Attachments (input files — attach to the whole project or to one task)</label>
       <div id="wf-attach"><span class="muted" style="font-size:11.5px">loading…</span></div></div>
     <div class="form-group"><label class="form-label">🔁 Project looping (automatic improve-and-recheck rounds)</label>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         ${loopBadgeHTML(parseLoopCfg(w.loop_config))}
-        <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${esc(w.name).slice(0, 60)}')">🔁 View / edit loop</button>
+        <button class="btn-sm" onclick="loopViewerModal('workflow','${esc(w.id)}','${escArg(String(w.name || '').slice(0, 60))}')">🔁 View / edit loop</button>
       </div></div>
     <div class="form-group">
       <label style="display:flex;align-items:center;gap:8px">
@@ -9767,15 +9773,15 @@ function viewDeliverables() {
             return d.files.map(f => {
               const star = primary && f.name === primary.name;
               const link = (f.name.endsWith('.md') || f.name.endsWith('.diff'))
-                ? `<a href="#" onclick="previewDeliverable('${esc(d.task_id)}','${esc(f.name)}');return false" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">${f.name.endsWith('.diff') ? '🧬' : '📄'} ${esc(f.name)}</a>`
+                ? `<a href="#" onclick="previewDeliverable('${esc(d.task_id)}','${escArg(f.name)}');return false" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">${f.name.endsWith('.diff') ? '🧬' : '📄'} ${esc(f.name)}</a>`
                 : `<a href="/api/tasks/${esc(d.task_id)}/files/${encPath(f.name)}" target="_blank" style="font-family:var(--font-mono);font-size:12px;color:var(--accent-2)">📎 ${esc(f.name)}</a>`;
               return star ? `<span class="chip c-accent" title="the output this task was asked to produce" style="display:inline-flex;gap:4px;align-items:center">⭐ ${link}</span>` : link;
             }).join('');
           })()}
-          ${d.repo_path ? `<a href="#" onclick="branchFilesUI('${esc(d.task_id)}','${esc(d.title).slice(0, 50)}');return false" style="font-size:12px;color:var(--accent-2)" title="Files this task created/changed on its project branch">🧬 Branch files…</a>` : ''}
+          ${d.repo_path ? `<a href="#" onclick="branchFilesUI('${esc(d.task_id)}','${escArg(String(d.title || '').slice(0, 50))}');return false" style="font-size:12px;color:var(--accent-2)" title="Files this task created/changed on its project branch">🧬 Branch files…</a>` : ''}
         </div>
         <div class="row-actions">
-          ${d.app ? `<button class="btn-sm" style="border-color:var(--accent-2)" title="${esc(d.app.label)} — launches on its own local port and opens in a new tab" onclick="testAppUI('${esc(d.task_id)}','${esc(d.title).slice(0, 50)}')">▶ Test app</button>` : ''}
+          ${d.app ? `<button class="btn-sm" style="border-color:var(--accent-2)" title="${esc(d.app.label)} — launches on its own local port and opens in a new tab" onclick="testAppUI('${esc(d.task_id)}','${escArg(String(d.title || '').slice(0, 50))}')">▶ Test app</button>` : ''}
           <button class="btn-sm" onclick="openApprovalTask('${esc(d.task_id)}')">Open task</button>
           <button class="btn-sm" title="New task that uses this output as input" onclick="followUpTaskUI('${esc(d.task_id)}')">➡ Follow-up</button>
         </div>
@@ -10103,14 +10109,14 @@ function viewMeetings() {
       <div style="font-size:11px;color:var(--text-dim);font-family:var(--font-mono)">
         ${fmtAgo(m.mtime)} · ${fmtBytes(m.size)} · ${esc(m.name)}</div>
       <div class="row-actions" style="flex-wrap:wrap">
-        <button class="btn-sm" onclick="previewMeeting('${esc(m.name)}')">📄 Read${m.name === live ? ' live' : ''}</button>
-        <select class="form-select" style="width:190px;padding:2px 6px;font-size:11px" title="Assign this transcript to a project — the smart buttons appear once assigned" onchange="meetSetProject('${esc(m.name)}', this.value)">${projOpts(m)}</select>
+        <button class="btn-sm" onclick="previewMeeting('${escArg(m.name)}')">📄 Read${m.name === live ? ' live' : ''}</button>
+        <select class="form-select" style="width:190px;padding:2px 6px;font-size:11px" title="Assign this transcript to a project — the smart buttons appear once assigned" onchange="meetSetProject('${escArg(m.name)}', this.value)">${projOpts(m)}</select>
         ${m.project_path && m.name !== live ? `
-          <button class="btn-sm" title="One AI call summarizes the transcript (participants, decisions, action items) — cached until the file changes" onclick="meetSummarize('${esc(m.name)}')">🧠 Summarize</button>
-          <button class="btn-sm" title="One AI call lists the requirements discussed — you can edit the list before using it" onclick="meetRequirements('${esc(m.name)}')">📋 Requirements</button>
-          <button class="btn-sm" title="Store the summary in the agents' long-term memory (tagged with this project) so future work recalls this meeting" onclick="meetToMemory('${esc(m.name)}')" ${m.has_summary ? '' : 'disabled'}>💾 Add to memory</button>
-          <button class="btn-sm" title="Open the normal planning wizard prefilled with this meeting's requirements + project" onclick="meetCreateWorkflow('${esc(m.name)}','${esc((m.title || m.name).replace(/'/g, ''))}')" ${m.has_requirements ? '' : 'disabled'}>✨ Create workflow</button>` : ''}
-        ${m.name === live ? '' : `<button class="btn-sm" onclick="deleteMeeting('${esc(m.name)}')">🗑 Delete</button>`}
+          <button class="btn-sm" title="One AI call summarizes the transcript (participants, decisions, action items) — cached until the file changes" onclick="meetSummarize('${escArg(m.name)}')">🧠 Summarize</button>
+          <button class="btn-sm" title="One AI call lists the requirements discussed — you can edit the list before using it" onclick="meetRequirements('${escArg(m.name)}')">📋 Requirements</button>
+          <button class="btn-sm" title="Store the summary in the agents' long-term memory (tagged with this project) so future work recalls this meeting" onclick="meetToMemory('${escArg(m.name)}')" ${m.has_summary ? '' : 'disabled'}>💾 Add to memory</button>
+          <button class="btn-sm" title="Open the normal planning wizard prefilled with this meeting's requirements + project" onclick="meetCreateWorkflow('${escArg(m.name)}','${escArg(m.title || m.name)}')" ${m.has_requirements ? '' : 'disabled'}>✨ Create workflow</button>` : ''}
+        ${m.name === live ? '' : `<button class="btn-sm" onclick="deleteMeeting('${escArg(m.name)}')">🗑 Delete</button>`}
       </div>
     </div>`).join('');
   return `
@@ -10204,8 +10210,8 @@ async function meetSummarize(name, force) {
       <h2>🧠 Meeting summary</h2>
       <div style="max-height:60vh;overflow-y:auto;font-size:13px;line-height:1.6">${mdLite(r.summary)}</div>
       <div class="modal-actions">
-        <button class="btn-ghost" onclick="meetSummarize('${esc(name)}', true)">↻ Re-summarize</button>
-        <button class="btn-ghost" onclick="meetToMemory('${esc(name)}')">💾 Add to memory</button>
+        <button class="btn-ghost" onclick="meetSummarize('${escArg(name)}', true)">↻ Re-summarize</button>
+        <button class="btn-ghost" onclick="meetToMemory('${escArg(name)}')">💾 Add to memory</button>
         <button class="btn-primary" onclick="closeModal(); render()">Close</button>
       </div>`);
   } catch (e) { toast('Summarize failed: ' + e.message, 'err'); }
@@ -10231,7 +10237,7 @@ function meetReqsModal(name, reqs) {
       </div>`).join('')}</div>
     <button class="btn-ghost btn-sm" onclick="document.getElementById('mreq-list').insertAdjacentHTML('beforeend', '<div style=&quot;display:flex;gap:6px;margin-bottom:4px&quot;><input class=&quot;form-input mreq-item&quot; style=&quot;flex:1;font-size:12px&quot;><button class=&quot;btn-sm danger&quot; onclick=&quot;this.parentElement.remove()&quot;>✕</button></div>')">＋ Add requirement</button>
     <div class="modal-actions">
-      <button class="btn-ghost" onclick="meetRequirements('${esc(name)}', true)">↻ Re-extract</button>
+      <button class="btn-ghost" onclick="meetRequirements('${escArg(name)}', true)">↻ Re-extract</button>
       <button class="btn-ghost" onclick="closeModal()">Cancel</button>
       <button class="btn-primary" id="mreq-save">Save list</button>
     </div>`);
