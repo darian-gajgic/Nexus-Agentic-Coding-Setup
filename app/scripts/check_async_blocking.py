@@ -22,6 +22,8 @@ BLOCKING_NAMES = {
     "_write_loop_cfg_grafted", "_inherit_super_result",
     # shutil.move / rmtree territory — threadpool only
     "_delete_task_row", "_trash_path",
+    # LLM turn (≤180s) / git subprocesses — threadpool/executor or sync handlers
+    "_meeting_llm_turn", "_task_branch_ctx", "_github_ctx",
 }
 BLOCKING_ATTRS = {
     ("subprocess", "run"), ("_sp", "run"), ("sp", "run"),
@@ -53,8 +55,8 @@ def check(path: str) -> list:
         stack = list(ast.iter_child_nodes(top))
         while stack:
             node = stack.pop()
-            if isinstance(node, ast.FunctionDef):
-                continue  # sync closure — executor/threadpool territory
+            if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                continue  # sync closure/lambda — executor/threadpool territory
             if isinstance(node, ast.Call):
                 f = node.func
                 if isinstance(f, ast.Name) and f.id in BLOCKING_NAMES:
