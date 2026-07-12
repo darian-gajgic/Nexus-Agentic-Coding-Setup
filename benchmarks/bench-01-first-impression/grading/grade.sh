@@ -47,7 +47,7 @@ for i in 0 1 2; do
   done
   echo "$L = ${ARMS[$i]}" >>"$OUT/mapping.txt"
 done
-cp "$BENCH/PROMPT.md" "$OUT/blind/SPEC.md"
+cp "$BENCH/PROMPT.md" "$OUT/blind/BRIEF.md"
 cp "$HERE/judge-prompt.txt" "$OUT/blind/JUDGE-PROMPT.txt"
 
 echo "=== SUMMARY ==="

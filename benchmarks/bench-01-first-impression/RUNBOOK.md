@@ -1,6 +1,6 @@
 # Bench-01 Runbook — first-impression benchmark (operator steps)
 
-One identical prompt, three arms: Claude Code + Fable 5, Claude Code + Opus 4.8, Nexus (Super Result ON, Full Auto + Optimal). Then objective grading + cost comparison. This is the small pilot of the Phase-8 methodology (`QUALITY-PROGRAM-MASTER-PLAN-2026-07-10.md` §7) — n=1 per arm, directional only.
+One identical prompt, three arms: Claude Code + Fable 5, Claude Code + Opus 4.8, Nexus (Super Result ON, Full Auto + Optimal). The prompt is a deliberately loose, human-written brief — the open decisions in it are the planning test, so each arm runs on its own defaults with no extra hints. Grading = 35 tolerant core checks (interpretation-independent behavior) + a mandatory blind judge for the judgment-under-ambiguity axis + cost comparison. This is the small pilot of the Phase-8 methodology (`QUALITY-PROGRAM-MASTER-PLAN-2026-07-10.md` §7) — n=1 per arm, directional only.
 
 Budget guard: the task is sized to finish well under 50% of one 5-hour Pro window per Claude arm. Both Claude arms share the same window — step 10 checks usage before Arm 2.
 
@@ -14,7 +14,7 @@ Every path below is absolute. `KIT` in prose means `/home/sinep/Nexus-Agentic-Co
    ```
    mkdir -p ~/benchmarks/bench-01/fable5 ~/benchmarks/bench-01/opus48 ~/benchmarks/bench-01/nexus
    ```
-2. Run and confirm it prints the spec (starts with `# Build \`gridcalc\``):
+2. Run and confirm it prints the brief (starts with `I need a small command-line tool`):
    ```
    head -3 /home/sinep/Nexus-Agentic-Coding-Setup/benchmarks/bench-01-first-impression/PROMPT.md
    ```
@@ -25,7 +25,7 @@ Every path below is absolute. `KIT` in prose means `/home/sinep/Nexus-Agentic-Co
    ```
    cd ~/benchmarks/bench-01/fable5 && claude --model claude-fable-5 --dangerously-skip-permissions "$(cat /home/sinep/Nexus-Agentic-Coding-Setup/benchmarks/bench-01-first-impression/PROMPT.md)"
    ```
-4. WAIT — do not type anything while it works. Expected end state: it prints a summary (built `gridcalc.py`, tests pass) and the input box goes idle. If it asks a question instead, reply exactly `Proceed with your best judgment within the spec.` and note "1 intervention" in RESULTS.md → Arm 1 notes.
+4. WAIT — do not type anything while it works. Expected end state: it prints a summary (built `gridcalc.py`, tests pass) and the input box goes idle. If it asks a question instead, reply exactly `You decide — pick something sensible and note it in the README.` and note "1 intervention" in RESULTS.md → Arm 1 notes.
 5. Type `/cost`, press Enter. Copy the printed output into RESULTS.md → "Arm 1 — raw captures".
 6. Type `/status`, press Enter. Note the session usage percentage (and the window reset time) into RESULTS.md → "Arm 1 — raw captures". Press Esc if a panel opened.
 7. Type `/exit`, press Enter.
@@ -69,7 +69,7 @@ Every path below is absolute. `KIT` in prose means `/home/sinep/Nexus-Agentic-Co
     ```
     Bench-01 gridcalc mini spreadsheet engine
     ```
-21. Description — in a terminal run `cat /home/sinep/Nexus-Agentic-Coding-Setup/benchmarks/bench-01-first-impression/PROMPT.md`, select ALL printed text (from `# Build \`gridcalc\`` to the last line), copy it (Ctrl+Shift+C), and paste it into the Description box.
+21. Description — in a terminal run `cat /home/sinep/Nexus-Agentic-Coding-Setup/benchmarks/bench-01-first-impression/PROMPT.md`, select ALL printed text (from `I need a small command-line tool` to the last line), copy it (Ctrl+Shift+C), and paste it into the Description box.
 22. Tick the checkbox **✨ Super Result**.
 23. Set the involvement preset to **Full Auto** and the spending profile to **Optimal** (defaults show Assisted★/Optimal★ — change involvement to Full Auto, keep Optimal).
 24. Set **Status = To Do** (the dropdown defaults to Backlog — a Backlog task will NOT run).
@@ -93,7 +93,7 @@ Every path below is absolute. `KIT` in prose means `/home/sinep/Nexus-Agentic-Co
     ```
 31. Copy the printed `=== SUMMARY ===` block into RESULTS.md → Scoreboard section. Per-check detail is in `grading/out/acceptance-*.txt`, own-test logs in `grading/out/selftests-*.txt`.
 
-## Phase F — blind qualitative judging (optional, ~5 min, small token cost)
+## Phase F — blind judging (REQUIRED — this scores how each arm handled the brief's open decisions, which the core checks deliberately don't; ~5 min, small token cost)
 
 32. Run (the judge sees only anonymized X/Y/Z + the spec):
     ```
