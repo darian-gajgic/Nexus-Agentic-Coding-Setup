@@ -428,7 +428,9 @@ JSON
         '"usage":{"input_tokens":10,"output_tokens":5}}\n'
         "JSON\n", "noop")
     chk("phase7 finding 2: failure branch keeps comments + re-arms the super-state (source)",
-        "_le._set_super_state(_trig, _per_task, None)" in server_src
+        # D6/[R1]: the re-arm now routes through the locked fresh-read mutate
+        "lambda trig, pt: _le._set_super_state(trig, pt, None)" in server_src
+        and "_le._mutate_super_cfg(task_id," in server_src
         and "escalated rework produced no new version" in server_src)
     db.set_setting("super.escalation", "0")
 
@@ -866,6 +868,42 @@ EOF
         float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time())
     chk("finding 3 (quota): no super_result escalation raised on a quota hit",
         not sr_approval(tq))
+
+    # ── D6/[R1]: loop_config lost-update race — every cross-thread write goes
+    #    through loop_engine._mutate_super_cfg (fresh locate + save under
+    #    _CFG_LOCK). Two threads bump THEIR member's esc counter 50× each on
+    #    the SAME workflow cfg; an unlocked read-modify-write would lose
+    #    updates. In-process check (the race class lives inside one process —
+    #    the members carry super_result=0/backlog so live sweeps ignore them). ──
+    import threading as _threading
+    import loop_engine as _le
+    wid_r = f"wf-r1race-{int(time.time())}"
+    db.execute("INSERT INTO workflows (id, name, loop_config) VALUES (?,?,?)",
+               (wid_r, "R1 race probe", json.dumps(
+                   {"enabled": True, "mode": "closed",
+                    "triggers": [{"id": "super_result", "enabled": True,
+                                  "max_rounds": 3, "used": 0}]})))
+    made_wfs.append(wid_r)
+    r1_members = [f"task-r1race-{i}-{int(time.time())}" for i in (1, 2)]
+    for tid_r in r1_members:
+        db.execute("INSERT INTO tasks (id, title, status, workflow_id, super_result) "
+                   "VALUES (?,?,?,?,0)", (tid_r, "R1 race member", "backlog", wid_r))
+        made_tasks.append(tid_r)
+
+    def _bump50(tid_r):
+        for _ in range(50):
+            _le._mutate_super_cfg(tid_r,
+                                  lambda trig, pt: _le._bump_escalations(trig, pt))
+    threads = [_threading.Thread(target=_bump50, args=(tid_r,)) for tid_r in r1_members]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    wrow = db.query_one("SELECT loop_config FROM workflows WHERE id=?", (wid_r,))
+    r1_esc = ((json.loads((wrow or {}).get("loop_config") or "{}").get("triggers")
+               or [{}])[0].get("esc_tasks") or {})
+    chk("D6/[R1] no lost updates: both member esc counters land at exactly 50",
+        r1_esc.get(r1_members[0]) == 50 and r1_esc.get(r1_members[1]) == 50)
 finally:
     db.set_setting("super.critic_cmd", orig_cmd)
     # Restore frontier backpressure settings (the quota probe arms a real

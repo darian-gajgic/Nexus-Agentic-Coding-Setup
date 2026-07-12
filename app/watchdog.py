@@ -22,6 +22,14 @@ import agent_manager as am
 # a stopping service must never resurrect its own SIGTERM'd workers.
 SHUTTING_DOWN = threading.Event()
 
+# [R2]: lane deaths detected within the grace window after a service (re)start
+# are the restart's own SIGTERM casualties, not crash-loop evidence — respawn
+# them WITHOUT counting toward the circuit breaker. Clean `systemctl restart
+# nexus` cycles used to add +1 per lane forever; the 2026-07-12 campaign's ~8
+# restarts pushed the whole fleet over max_restarts and retired it.
+_BOOT_TS = time.time()
+BOOT_GRACE_S = 120
+
 # Defaults (overridable via settings table at runtime)
 # stale_threshold_s must exceed the dispatch stream's worst tolerated silence
 # (SSE keepalives ~30s, read timeout 120s in hermes_dispatch) — killing a
@@ -149,9 +157,12 @@ def _once(cfg: dict) -> list[dict]:
         if not alive and cfg["restart_on_dead"] and pid:
             try:
                 am.restart_agent(a["id"])
-                db.execute("UPDATE agents SET restart_count = restart_count + 1 WHERE id = ?", (a["id"],))
+                boot_respawn = (now - _BOOT_TS) <= BOOT_GRACE_S  # [R2]
+                if not boot_respawn:
+                    db.execute("UPDATE agents SET restart_count = restart_count + 1 WHERE id = ?", (a["id"],))
                 db.log_activity("warn", "watchdog",
-                    f"Agent '{a['name']}' was dead (pid {pid} gone) — auto-restarted")
+                    f"Agent '{a['name']}' was dead (pid {pid} gone) — auto-restarted"
+                    + (" (boot respawn — not counted)" if boot_respawn else ""))
                 actions.append({"agent": a["id"], "action": "restarted_dead"})
             except Exception as e:
                 db.log_activity("error", "watchdog", f"Restart of '{a['name']}' failed: {e}")

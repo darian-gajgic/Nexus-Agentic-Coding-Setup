@@ -271,6 +271,49 @@ def _save_cfg(kind: str, oid: str, cfg: dict):
     db.execute(f"UPDATE {table} SET loop_config=? WHERE id=?", (json.dumps(cfg), oid))
 
 
+# D6/[R1]: every loop_config writer lives in THIS process (server request
+# threads, escalation daemon threads, the engine sweep thread), so one module
+# lock kills the lost-update race — an unlocked read-modify-write of the same
+# JSON blob let a stale sweep save erase e.g. the escalation-budget bump
+# (escalations past super.escalation_max). Sweeps still DECIDE on query-time
+# snapshots (the lock is never held across HTTP calls); only the mutate+persist
+# re-reads FRESH under the lock. Decision staleness is bounded by the existing
+# idempotence guards (handled_ts == critic_ts, endpoint CAS).
+_CFG_LOCK = threading.RLock()
+
+
+def _mutate_cfg_trigger(owner_kind: str, owner_id: str, trigger_id: str, fn) -> bool:
+    """Locked read-modify-write of ONE trigger in a loop_config: FRESH row read
+    under _CFG_LOCK → fn(trig) → _save_cfg. False when the row/cfg/trigger is
+    gone (a concurrent writer removed it — the stale decision dies quietly)."""
+    with _CFG_LOCK:
+        table = "tasks" if owner_kind == "task" else "workflows"
+        row = db.query_one(f"SELECT loop_config FROM {table} WHERE id=?", (owner_id,))
+        cfg = _cfg(row) if row else None
+        trig = next((x for x in ((cfg or {}).get("triggers") or [])
+                     if x.get("id") == trigger_id and x.get("enabled")), None)
+        if not trig:
+            return False
+        fn(trig)
+        _save_cfg(owner_kind, owner_id, cfg)
+        return True
+
+
+def _mutate_super_cfg(task_id: str, fn) -> bool:
+    """D6/[R1]: the ONE safe path for super_result trigger writes — FRESH
+    _locate_super_cfg under _CFG_LOCK → fn(trig, per_task) → _save_cfg.
+    False when the task has no super_result loop config (manual /escalate
+    without a loop — callers tolerate it)."""
+    with _CFG_LOCK:
+        loc = _locate_super_cfg(task_id)
+        if not loc:
+            return False
+        owner_kind, owner_id, cfg, trig, per_task = loc
+        fn(trig, per_task)
+        _save_cfg(owner_kind, owner_id, cfg)
+        return True
+
+
 def _trigger(cfg: dict, tid: str) -> dict | None:
     for t in cfg.get("triggers") or []:
         if t.get("id") == tid and t.get("enabled") and \
@@ -365,10 +408,11 @@ def _sweep_workflow_loops(actions_left: int) -> int:
         ok2 = _api("POST", f"/api/tasks/{ver['id']}/retry", {},
                    user_id=ver.get("user_id"))  # re-verify after fix
         if ok1 and ok2:
-            trig["used"] = int(trig.get("used") or 0) + 1
-            _save_cfg("workflow", wf["id"], cfg)
+            used_now = int(trig.get("used") or 0) + 1  # snapshot + this bump (log only)
+            _mutate_cfg_trigger("workflow", wf["id"], "verify_fail",
+                                lambda t2: _bump_rounds(t2, None))
             db.log_activity("warn", "loop",
-                            f"CLOSED LOOP round {trig['used']}/{trig['max_rounds']}: "
+                            f"CLOSED LOOP round {used_now}/{trig['max_rounds']}: "
                             f"verification FAILED on '{wf['name']}' — fix task re-queued "
                             "with findings, inspection will re-run")
             actions_left -= 1
@@ -466,9 +510,9 @@ def _sweep_task_loops(actions_left: int) -> int:
                 continue
             if _api("POST", f"/api/tasks/{t['id']}/retry", {},
                     user_id=t.get("user_id")):  # retry auto-attaches judge findings
-                _bump_rounds(trig, per_task)
-                _save_cfg(owner_kind, owner_id, cfg)
-                used = _trigger_rounds(trig, per_task)
+                _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
+                                    lambda t2: _bump_rounds(t2, per_task))
+                used = _trigger_rounds(trig, per_task) + 1  # snapshot + this bump (log only)
                 db.log_activity("warn", "loop",
                                 f"CLOSED LOOP round {used}/{trig['max_rounds']}: "
                                 f"judge said {verdict} on '{t['title'][:50]}' — re-queued "
@@ -538,8 +582,9 @@ def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
     THRESHOLD (C5) allows this trigger, and it still has escalation budget.
     trigger_kind is 'rewrite' (a REWRITE verdict) or 'cap' (round cap with open
     criticals) — 'cap' needs the rewrite_or_cap threshold. Tri-state (D2/[30]):
-    'sent' = dispatched (caller persists state, skipping the GLM retry / human
-    checkpoint); 'wait' = eligible but the frontier quota backoff is armed —
+    'sent' = dispatched (state persisted HERE via the locked mutate — D6/[R1];
+    the caller skips the GLM retry / human checkpoint); 'wait' = eligible but
+    the frontier quota backoff is armed —
     the caller leaves the critique PENDING for a later sweep, never demoting it
     to the GLM retry; 'no' = not eligible. The escalation budget is spent by
     server._escalation_thread only when a frontier run actually executed, so a
@@ -561,8 +606,8 @@ def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
         return "wait"
     tid = t["id"]
     if _api("POST", f"/api/tasks/{tid}/escalate", {}, user_id=t.get("user_id")):
-        _set_super_state(trig, per_task,
-                         {"kind": "escalated_rework", "handled_ts": t.get("critic_ts")})
+        _mutate_super_cfg(tid, lambda trig2, pt: _set_super_state(
+            trig2, pt, {"kind": "escalated_rework", "handled_ts": t.get("critic_ts")}))
         db.log_activity("info", "loop",
                         "Super Result: escalated rework dispatched — frontier writes the "
                         f"final on '{(t.get('title') or '')[:50]}' ({used + 1}/{cap})",
@@ -571,15 +616,15 @@ def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
     return "no"
 
 
-def _escalate_super(t: dict, trig: dict, per_task: str | None,
-                    reason: str | None) -> bool:
+def _escalate_super(t: dict, reason: str | None) -> bool:
     """Open a human checkpoint (approvals row, action_type='super_result') for
     this critique — once per version; a pending checkpoint is never doubled.
-    reason=None is the plain open-mode round checkpoint. Returns True when the
-    trigger state changed (caller persists the cfg)."""
+    reason=None is the plain open-mode round checkpoint. D6/[R1]: the
+    handled-state write persists itself through the locked mutate — callers
+    no longer _save_cfg their snapshot."""
     tid = t["id"]
-    _set_super_state(trig, per_task,
-                     {"kind": "escalated", "handled_ts": t.get("critic_ts")})
+    _mutate_super_cfg(tid, lambda trig2, pt: _set_super_state(
+        trig2, pt, {"kind": "escalated", "handled_ts": t.get("critic_ts")}))
     pending = db.query_one(
         "SELECT id FROM approvals WHERE status='pending' AND action_type='super_result' "
         "AND payload LIKE ?", (f'%"task_id": "{tid}"%',))
@@ -684,9 +729,8 @@ def _sweep_super_result(actions_left: int) -> int:
         used = _trigger_rounds(trig, per_task)
         max_rounds = int(trig.get("max_rounds") or 0)
         if verdict == "SHIP":
-            _set_super_state(trig, per_task,
-                             {"kind": "done", "handled_ts": t.get("critic_ts")})
-            _save_cfg(owner_kind, owner_id, cfg)
+            _mutate_super_cfg(tid, lambda trig2, pt: _set_super_state(
+                trig2, pt, {"kind": "done", "handled_ts": t.get("critic_ts")}))
             db.log_activity("info", "loop",
                             "Super Result converged: SHIP after round "
                             f"{int(t.get('critic_round') or 0)} on "
@@ -694,9 +738,7 @@ def _sweep_super_result(actions_left: int) -> int:
             _broadcast_task(tid, t.get("user_id"))  # SHIP transition → UI toast
             continue
         if verdict == "error":
-            if _escalate_super(t, trig, per_task,
-                               "critic run failed — check the critic output"):
-                _save_cfg(owner_kind, owner_id, cfg)
+            _escalate_super(t, "critic run failed — check the critic output")
             continue
         if verdict not in ("REVISE", "REWRITE"):
             continue
@@ -710,18 +752,14 @@ def _sweep_super_result(actions_left: int) -> int:
         # empty brief. Escalate rather than burn rounds. (The old convergence
         # guard's `keys and …` let empty findings fall through to retry — §7.)
         if not keys:
-            if _escalate_super(t, trig, per_task,
-                               "critic did not SHIP but returned no findings — "
-                               "contradiction; human judgment needed"):
-                _save_cfg(owner_kind, owner_id, cfg)
+            _escalate_super(t, "critic did not SHIP but returned no findings — "
+                               "contradiction; human judgment needed")
             continue
         # keys ⊆ prev also catches "critic repeats itself because the executor
         # failed to fix it" — correct behavior is a human checkpoint (§7).
         if int(t.get("critic_round") or 0) > 1 and set(keys) <= set(prev):
-            if _escalate_super(t, trig, per_task,
-                               "no new findings — the rework did not resolve them; "
-                               "human judgment needed"):
-                _save_cfg(owner_kind, owner_id, cfg)
+            _escalate_super(t, "no new findings — the rework did not resolve them; "
+                               "human judgment needed")
             continue
         if used >= max_rounds:
             # C1c: the GLM rework rounds are exhausted but criticals remain —
@@ -730,18 +768,14 @@ def _sweep_super_result(actions_left: int) -> int:
             if _has_open_criticals(t):
                 esc = _try_escalate_super(t, trig, per_task, "cap")
                 if esc == "sent":
-                    _save_cfg(owner_kind, owner_id, cfg)
                     actions_left -= 1
                     continue
                 if esc == "wait":  # backoff armed — stays pending, retry a later sweep
                     continue
-            if _escalate_super(t, trig, per_task,
-                               f"round cap reached ({used}/{max_rounds})"):
-                _save_cfg(owner_kind, owner_id, cfg)
+            _escalate_super(t, f"round cap reached ({used}/{max_rounds})")
             continue
         if cfg.get("mode") == "open":
-            if _escalate_super(t, trig, per_task, None):
-                _save_cfg(owner_kind, owner_id, cfg)
+            _escalate_super(t, None)
             continue
         # C1c: a REWRITE means another GLM pass won't salvage the draft — when
         # escalation is on (+ budget), the frontier model writes the final itself
@@ -752,7 +786,6 @@ def _sweep_super_result(actions_left: int) -> int:
         if verdict == "REWRITE":
             esc = _try_escalate_super(t, trig, per_task, "rewrite")
             if esc == "sent":
-                _save_cfg(owner_kind, owner_id, cfg)
                 actions_left -= 1
                 continue
             if esc == "wait":
@@ -768,10 +801,10 @@ def _sweep_super_result(actions_left: int) -> int:
               f"verdict {verdict}.\n" + brief[:2500])
         if _api("POST", f"/api/tasks/{tid}/retry", {"feedback": fb},
                 user_id=t.get("user_id")):
-            _bump_rounds(trig, per_task)
-            _set_super_state(trig, per_task,
-                             {"kind": "retried", "handled_ts": t.get("critic_ts")})
-            _save_cfg(owner_kind, owner_id, cfg)
+            _mutate_super_cfg(tid, lambda trig2, pt: (
+                _bump_rounds(trig2, pt),
+                _set_super_state(trig2, pt,
+                                 {"kind": "retried", "handled_ts": t.get("critic_ts")})))
             db.log_activity("warn", "loop",
                             f"SUPER RESULT round {used + 1}/{max_rounds}: critic said "
                             f"{verdict} on '{(t.get('title') or '')[:50]}' — re-queued "
@@ -807,26 +840,17 @@ def _locate_super_cfg(task_id: str):
 
 def bump_super_round(task_id: str):
     """Checkpoint REJECTED → the human-triggered rework consumes a round and
-    re-arms the state so the NEXT version is handled fresh."""
-    loc = _locate_super_cfg(task_id)
-    if not loc:
-        return
-    owner_kind, owner_id, cfg, trig, per_task = loc
-    _bump_rounds(trig, per_task)
-    _set_super_state(trig, per_task, None)
-    _save_cfg(owner_kind, owner_id, cfg)
+    re-arms the state so the NEXT version is handled fresh (D6/[R1]: through
+    the locked mutate)."""
+    _mutate_super_cfg(task_id, lambda trig, pt: (
+        _bump_rounds(trig, pt), _set_super_state(trig, pt, None)))
 
 
 def mark_super_done(task_id: str):
     """Checkpoint APPROVED → accept this version, end the loop for it."""
-    loc = _locate_super_cfg(task_id)
-    if not loc:
-        return
-    owner_kind, owner_id, cfg, trig, per_task = loc
     t = db.query_one("SELECT critic_ts FROM tasks WHERE id=?", (task_id,))
-    _set_super_state(trig, per_task,
-                     {"kind": "done", "handled_ts": (t or {}).get("critic_ts")})
-    _save_cfg(owner_kind, owner_id, cfg)
+    _mutate_super_cfg(task_id, lambda trig, pt: _set_super_state(
+        trig, pt, {"kind": "done", "handled_ts": (t or {}).get("critic_ts")}))
 
 
 def _parse_replan(wf) -> dict | None:

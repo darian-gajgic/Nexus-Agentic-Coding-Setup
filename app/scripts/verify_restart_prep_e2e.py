@@ -217,6 +217,14 @@ try:
     print("=== 7. Restore + heal across a REAL service restart ===", flush=True)
     api("POST", "/api/system/prepare-restart")
     db.execute("UPDATE tasks SET critic_verdict='escalating' WHERE id=?", (esc_tid,))
+    # [R2] fixture: capture the fleet's circuit-breaker counters BEFORE the
+    # clean restart — the post-boot respawn of the SIGTERM'd lanes must NOT
+    # increment them (watchdog boot grace), or every restart marches the
+    # whole fleet toward max_restarts retirement.
+    pre_counts = {a["id"]: int(a.get("restart_count") or 0)
+                  for a in db.query_all("SELECT id, restart_count FROM agents "
+                                        "WHERE status IN ('running','busy')")}
+    t_restart = time.time()
     subprocess.run(["systemctl", "--user", "restart", "nexus"], check=True, timeout=60)
     ok("service back up", bool(wait_for(_health_ok, timeout=60, step=2)))
     ok("startup restored dispatch.enabled",
@@ -228,6 +236,24 @@ try:
        row.get("critic_verdict") == "error"
        and "escalation orphaned by restart" in (row.get("critic_output") or ""),
        str({k: row.get(k) for k in ("critic_verdict", "critic_output")})[:200])
+    if pre_counts:
+        ph = ",".join("?" * len(pre_counts))
+
+        def _respawned():
+            rows = db.query_all(
+                f"SELECT id, started_at FROM agents WHERE id IN ({ph})",
+                tuple(pre_counts))
+            return len(rows) == len(pre_counts) and \
+                all((r.get("started_at") or 0) > t_restart for r in rows)
+        ok("[R2] lanes respawned after the boot", bool(wait_for(_respawned, timeout=90, step=3)))
+        post_counts = {a["id"]: int(a.get("restart_count") or 0)
+                       for a in db.query_all(
+                           f"SELECT id, restart_count FROM agents WHERE id IN ({ph})",
+                           tuple(pre_counts))}
+        ok("[R2] boot respawn did NOT increment the circuit-breaker counters",
+           post_counts == pre_counts, f"pre={pre_counts} post={post_counts}")
+    else:
+        ok("[R2] no running lanes to check (skipped — empty fleet)", True)
 finally:
     for tid in made_tasks:
         db.execute("DELETE FROM dispatches WHERE task_id=?", (tid,))
