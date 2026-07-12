@@ -177,6 +177,11 @@ try:
            "glm-4.5-air") == "medium"
        and eff({"spend_profile": "eco", "deliverable_type": "content",
                 "high_stakes": 0}, "glm-5.2") == "high")
+    ok("smart/high-stakes on a pinned LIGHT model caps at medium (never xhigh burn)",
+       eff({"spend_profile": "smart", "deliverable_type": "content",
+            "high_stakes": 0}, "glm-4.5-air") == "medium"
+       and eff({"spend_profile": "optimal", "deliverable_type": None,
+                "high_stakes": 1}, "glm-4.5-air") == "medium")
     db.set_setting("dispatch.session_effort", "0")
     ok("kill switch → None", eff({"spend_profile": "smart", "deliverable_type": None,
                                   "high_stakes": 0}, "glm-5.2") is None)
@@ -192,6 +197,15 @@ try:
     entry = (data.get("sessions") or {}).get(sid_probe) or {}
     ok("bridge entry merges effort next to api_key",
        entry.get("effort") == "high" and entry.get("api_key") == "probe-key", str(entry))
+    # a None effort on a REUSED session clears the stale published one
+    # (turn-cut park → mode switch → resume must not keep the old tier's effort)
+    hd_mod.publish_session_effort(sid_probe, {"spend_profile": "optimal",
+                                              "deliverable_type": "analysis",
+                                              "high_stakes": 0}, "glm-5.2")
+    data = json.load(open(os.path.expanduser("~/.hermes/session-keys.json")))
+    entry = (data.get("sessions") or {}).get(sid_probe) or {}
+    ok("stale effort cleared on mode switch (api_key survives)",
+       "effort" not in entry and entry.get("api_key") == "probe-key", str(entry))
     hd_mod.remove_session_key(sid_probe)
 
     # ── 5. retry slice honors the per-type baseline ──

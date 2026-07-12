@@ -679,6 +679,34 @@ def _rewrite_session_keys(mutate):
         db.log_activity("warn", "system", f"session-keys bridge write failed: {str(e)[:80]}")
 
 
+_UNSET = object()
+
+
+def _publish_session_entry(session_id: str, api_key=_UNSET, effort=_UNSET):
+    """ONE read-modify-write for any combination of bridge fields. The dispatch
+    path sets api_key + effort together so a plugin read between two sequential
+    writes can never see the key without its effort. effort=None actively
+    CLEARS a previously published effort (a reused session — turn-cut park →
+    mode switch → resume — must not keep applying the old tier's effort);
+    an entry left with no real fields is dropped."""
+
+    def _set(s):
+        entry = dict(s.get(session_id) or {})
+        if api_key is not _UNSET and api_key:
+            entry["api_key"] = api_key
+        if effort is not _UNSET:
+            if effort:
+                entry["effort"] = effort
+            else:
+                entry.pop("effort", None)
+        if any(k != "ts" for k in entry):
+            entry["ts"] = time.time()
+            s[session_id] = entry
+        else:
+            s.pop(session_id, None)
+    _rewrite_session_keys(_set)
+
+
 def publish_session_key(session_id: str, user_id: str | None, model_id: str | None):
     """Give this session the owner's API key (bridge entry) — no-op when the
     owner has no credential for the serving provider. MERGES into an existing
@@ -686,12 +714,15 @@ def publish_session_key(session_id: str, user_id: str | None, model_id: str | No
     key = _session_key_for(user_id, model_id)
     if not key:
         return
+    _publish_session_entry(session_id, api_key=key)
 
-    def _set(s):
-        entry = dict(s.get(session_id) or {})
-        entry.update({"api_key": key, "ts": time.time()})
-        s[session_id] = entry
-    _rewrite_session_keys(_set)
+
+def _is_light_model(model: str | None) -> bool:
+    """Light-tier detection by model-id substring. Keep in sync with the zai
+    plugin's session-effort mod (_is_light_model: air/flash) — full registry
+    unification is deferred; the plugin ships separately."""
+    m = (model or "").lower()
+    return "air" in m or "flash" in m or "turbo" in m
 
 
 def session_effort_for_task(task: dict, model: str | None) -> str | None:
@@ -701,7 +732,10 @@ def session_effort_for_task(task: dict, model: str | None) -> str | None:
     i.e. exactly the pre-feature behavior).
 
     Rules: high_stakes or Smart → xhigh (maximum thinking where quality is the
-    point); Eco → medium on light tiers, high once the cascade escalated it to
+    point) — capped at medium on light tiers: an explicitly pinned cheap model
+    must never be driven at 4-10× its reasoning-token burn (the zai plugin's
+    _LIGHT_MODEL_CAP, which a published session effort would short-circuit);
+    Eco → medium on light tiers, high once the cascade escalated it to
     the strong tier (cost-conscious even after escalation); Balanced content →
     high (creative generation gains little from maximum deliberation — the
     'when to think deeply' result; the rubric/judge still gate quality);
@@ -710,10 +744,9 @@ def session_effort_for_task(task: dict, model: str | None) -> str | None:
         return None
     sp = (task.get("spend_profile") or "").strip()
     dtype = (task.get("deliverable_type") or "").strip()
-    m = (model or "").lower()
-    light = "air" in m or "flash" in m or "turbo" in m
+    light = _is_light_model(model)
     if task.get("high_stakes") or sp == "smart":
-        return "xhigh"
+        return "medium" if light else "xhigh"
     if sp == "eco":
         return "medium" if light else "high"
     if dtype == "content" and not light:
@@ -723,16 +756,13 @@ def session_effort_for_task(task: dict, model: str | None) -> str | None:
 
 def publish_session_effort(session_id: str, task: dict, model: str | None):
     """Publish the per-task effort into the session bridge entry (merge-safe;
-    the zai plugin's session-effort core-mod reads it per request)."""
+    the zai plugin's session-effort core-mod reads it per request). A None
+    effort actively clears a previously published one — see
+    _publish_session_entry."""
     effort = session_effort_for_task(task, model)
-    if not effort:
-        return
-
-    def _set(s):
-        entry = dict(s.get(session_id) or {})
-        entry.update({"effort": effort, "ts": time.time()})
-        s[session_id] = entry
-    _rewrite_session_keys(_set)
+    if not effort and not os.path.isfile(_SESSION_KEYS_FILE):
+        return  # nothing to clear
+    _publish_session_entry(session_id, effort=effort)
 
 
 def remove_session_key(session_id: str):
@@ -1779,10 +1809,14 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         if 0 < cuts <= 3:
             # B2: this resume finishes work the budget already paid for — parking
             # it one step from the finish strands the whole spend. Grant the same
-            # one-slice headroom a judge retry gets (_retry_task), bounded to 3
-            # cut-turn extensions so a looping run can't mint budget forever.
+            # one-slice headroom a judge retry gets (_retry_task): the PER-TYPE
+            # baseline, not the global 5M — a NULL-budget content task capped at
+            # 2M must not mint 5M per cut. Bounded to 3 cut-turn extensions so a
+            # looping run can't mint budget forever.
             slice_ = int(task.get("budget_tokens")
-                         or int(sreg.conf("dispatch.default_task_budget") or 5000000))
+                         or _type_setting("dispatch.default_budget", task,
+                                          int(sreg.conf("dispatch.default_task_budget")
+                                              or 5000000)))
             new_budget = int(task.get("tokens_used") or 0) + slice_
             _set_task(task_id, budget_tokens=new_budget)
             task["budget_tokens"] = new_budget
@@ -1825,13 +1859,14 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         # facts, user tag isolates the owner's memories from other users.
         publish_session_scope(session_id, client=task.get("client"),
                               user=task.get("user_id"))
-        # Settings v2: the owner's personal API key (if configured) rides the
-        # same bridge mechanism — re-published on every (re)dispatch, removed
-        # at finalize.
-        publish_session_key(session_id, task.get("user_id"), run_model)
-        # Mode-coherence (2026-07-12b): per-task reasoning effort — the mode ×
-        # task-type × tier choice rides the same bridge (zai session-effort mod).
-        publish_session_effort(session_id, task, run_model)
+        # Settings v2 + mode-coherence in ONE bridge write: the owner's API key
+        # (if configured) and the per-task reasoning effort (mode × task-type ×
+        # tier; zai session-effort mod) land atomically — two sequential writes
+        # left a window where a zai request saw the key without its effort.
+        # A None effort clears a stale one from a reused session.
+        _publish_session_entry(session_id,
+                               api_key=_session_key_for(task.get("user_id"), run_model),
+                               effort=session_effort_for_task(task, run_model))
         _set_dispatch(dispatch_id, session_id=session_id, state="streaming",
                       heartbeat_at=time.time(), model=run_model)
         _set_task(task_id, dispatch_state="streaming", dispatch_error=None)
