@@ -105,6 +105,9 @@ try:
     ok("done task untouched", db.query_one("SELECT status FROM tasks WHERE id=?", (t2,))["status"] == "done")
 
     # ── 3. LIVE-stream stop: run the real executor on the stubbed stream ──
+    # The stub branch requires BOTH the setting and this in-process env marker,
+    # so a crashed gate can never leak stubbed dispatches to real lanes.
+    os.environ["NEXUS_GATE_STUB"] = "1"
     db.set_setting("dispatch.stub_stream", "1")
     t3 = mk_task(UID, status="in_progress", dispatch_state="none", claimed_by=agent_id)
     created_tasks.append(t3)
@@ -236,6 +239,7 @@ try:
         "path": os.path.expanduser("~/Projects"), "confirm": "nope"}).status_code in (400, 404))
 
 finally:
+    os.environ.pop("NEXUS_GATE_STUB", None)
     if stub_prev is None:
         db.execute("DELETE FROM settings WHERE key='dispatch.stub_stream'")
     else:

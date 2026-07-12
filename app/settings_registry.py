@@ -117,6 +117,12 @@ SECTIONS = [
              "default": "glm-5-turbo",
              "help": "Model that takes over when the primary model (e.g. glm-5.2) is overloaded — "
                      "used by both task dispatch and JARVIS chat. Turn the switch above off to never fall back."},
+            {"key": "dispatch.stub_stream", "label": "Stub the dispatch stream (gate hook)", "type": "bool",
+             "default": "0",
+             "help": "Verify-gate hook (mirrors plan.stub/agentmem.stub): verify_stop_e2e replaces "
+                     "the real Hermes stream with a synthetic keepalive loop. Only honored when the "
+                     "process also has NEXUS_GATE_STUB=1 (the gate sets it in-process), and cleared "
+                     "at every server boot. Leave OFF."},
         ],
     },
     {

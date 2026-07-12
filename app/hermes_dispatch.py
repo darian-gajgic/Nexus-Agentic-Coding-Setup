@@ -1845,9 +1845,17 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
             # Fresh dispatch, OR a "resume" whose session never heard the brief
             # (worker died before/at the first turn) — send the FULL brief.
             input_text = f"{task['title']}\n\n{task.get('description') or ''}".strip()
-        if db.get_setting("dispatch.stub_stream") == "1":
+        if (db.get_setting("dispatch.stub_stream") == "1"
+                and os.environ.get("NEXUS_GATE_STUB") == "1"):
             # Gate-only knob (verify_stop_e2e): a synthetic keepalive loop —
             # the cancel poll in on_event fires exactly as on a real stream.
+            # The env marker is set only inside the gate's own process, so a
+            # crashed gate can never turn REAL lane dispatches into stubs
+            # (the judge-stub leak class); startup() also clears the setting.
+            db.log_activity("warn", agent_id,
+                            f"Task {task_id}: STUBBED stream (dispatch.stub_stream "
+                            "gate knob) — no real model call",
+                            user_id=task.get("user_id"))
             deadline = time.time() + 120
             while time.time() < deadline:
                 on_event("_line", None)
