@@ -5281,7 +5281,11 @@ function viewProjects() {
   if (!projectsState.fetched) { loadProjects(); return skeletonView(); }
   if (projectsState.loading) return skeletonView();
   const projs = (projectsState.data && projectsState.data.projects) || [];
-  if (!projs.length) return `<div class="empty"><span class="e-ico">▣</span>No projects found.</div>`;
+  if (!projs.length) return `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+      <button class="btn-primary" onclick="newClientProjectUI()">➕ New project</button>
+    </div>
+    <div class="empty"><span class="e-ico">▣</span>No projects found. Create your first project to get started.</div>`;
   const langColor = l => ({ Python: '#3776ab', JavaScript: '#f7df1e', TypeScript: '#3178c6', Rust: '#dea584', 'C': '#a8b9cc', 'C++': '#00599c', Shell: '#89e051', Markdown: '#888', HTML: '#e34c26', CSS: '#563d7c' }[l] || '#888');
   const fmtSize = b => b > 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b > 1e6 ? (b / 1e6).toFixed(0) + ' MB' : (b / 1e3).toFixed(0) + ' KB';
   const fmtDays = ts => { const d = (Date.now() / 1000 - ts) / 86400; return d < 1 ? Math.round(d * 24) + 'h ago' : d < 30 ? Math.round(d) + 'd ago' : Math.round(d / 30) + 'mo ago'; };
