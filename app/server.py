@@ -2663,13 +2663,19 @@ async def meetings_list():
 
     items = await asyncio.to_thread(_scan)
     # Item 8: attach the project link + cached-analysis flags per meeting.
-    meta = {m["name"]: m for m in db.query_all("SELECT * FROM meeting_meta")}
+    # Booleans computed in SQL — SELECT * pulled the full summary/requirements
+    # blobs (up to 20k chars each) on the live-meeting 5s poll.
+    meta = {m["name"]: m for m in db.query_all(
+        "SELECT name, project_path, workflow_id, "
+        "(summary IS NOT NULL AND summary != '') AS has_summary, "
+        "(requirements IS NOT NULL AND requirements != '') AS has_requirements "
+        "FROM meeting_meta")}
     for it in items:
         mm = meta.get(it["name"]) or {}
         it["project_path"] = mm.get("project_path")
         it["workflow_id"] = mm.get("workflow_id")
-        it["has_summary"] = bool(mm.get("summary"))
-        it["has_requirements"] = bool(mm.get("requirements"))
+        it["has_summary"] = bool(mm.get("has_summary"))
+        it["has_requirements"] = bool(mm.get("has_requirements"))
     return {"meetings": items, "live": _live_meeting_name(), "dir": str(d)}
 
 
@@ -2715,36 +2721,74 @@ def _meeting_llm_turn(uid: str, transcript: str, framing: str, ask: str) -> dict
         hd.delete_session(sid)
 
 
+_MEETING_META_COLS = {"project_path", "workflow_id", "summary", "summary_ts",
+                      "requirements", "requirements_ts"}
+
+
+def _meeting_meta_upsert(name: str, **cols):
+    """Single-statement race-free upsert (PK=name). Writes only the given
+    columns; seeds user_id/created_at on first insert. Replaces four
+    hand-rolled SELECT-then-INSERT variants — two concurrent first-time
+    writes both saw 'no row' and the loser 500'd on the PK."""
+    assert set(cols) <= _MEETING_META_COLS, f"bad meeting_meta cols: {set(cols)}"
+    now = time.time()
+    cols["updated_at"] = now
+    keys = list(cols)
+    db.execute(
+        f"INSERT INTO meeting_meta (name, user_id, created_at, {', '.join(keys)}) "
+        f"VALUES (?,?,?,{','.join('?' * len(keys))}) "
+        "ON CONFLICT(name) DO UPDATE SET "
+        + ", ".join(f"{k}=excluded.{k}" for k in keys),
+        (name, auth.current_user_id(), now, *[cols[k] for k in keys]))
+
+
 @app.patch("/api/meetings/{name}/meta")
 async def meeting_set_meta(name: str, body: dict):
     """Item 8: assign a transcript to a project (and optionally one workflow).
+    Updates ONLY the keys present in the body (the tasks-PATCH pattern) — the
+    UI's project picker sends project_path alone, and the old unconditional
+    two-column rewrite silently nulled the workflow link on every (re)assign.
     Null project_path clears the assignment. Cached analyses survive."""
     if not auth.is_admin():
         return JSONResponse(status_code=403, content={"error": "admin only"})
     if not _valid_meeting_name(name) or not (_meeting_dir() / name).is_file():
         return JSONResponse(status_code=404, content={"error": "meeting not found"})
-    pp = (body.get("project_path") or "").strip() or None
-    if pp and not await _visible_repo_path_async(pp):
-        return JSONResponse(status_code=400, content={
-            "error": "project_path is not one of your git repositories"})
-    wf_id = (body.get("workflow_id") or "").strip() or None
-    if wf_id:
-        w = _owned_workflow(wf_id)
-        if not w:
-            return JSONResponse(status_code=404, content={"error": "workflow not found"})
-        if pp and w.get("project_path") and w["project_path"] != pp:
+    stored = db.query_one(
+        "SELECT project_path, workflow_id FROM meeting_meta WHERE name=?", (name,)) or {}
+    updates = {}
+    if "project_path" in body:
+        pp = (body.get("project_path") or "").strip() or None
+        if pp and not await _visible_repo_path_async(pp):
             return JSONResponse(status_code=400, content={
-                "error": "that workflow belongs to a different project"})
-    now = time.time()
-    cur = db.query_one("SELECT * FROM meeting_meta WHERE name=?", (name,))
-    if cur:
-        db.execute("UPDATE meeting_meta SET project_path=?, workflow_id=?, updated_at=? "
-                   "WHERE name=?", (pp, wf_id, now, name))
-    else:
-        db.execute("INSERT INTO meeting_meta (name, project_path, workflow_id, user_id, "
-                   "created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                   (name, pp, wf_id, auth.current_user_id(), now, now))
-    return {"ok": True, "project_path": pp, "workflow_id": wf_id}
+                "error": "project_path is not one of your git repositories"})
+        updates["project_path"] = pp
+    eff_pp = updates.get("project_path", stored.get("project_path"))
+    if "workflow_id" in body:
+        wf_id = (body.get("workflow_id") or "").strip() or None
+        if wf_id:
+            w = _owned_workflow(wf_id)
+            if not w:
+                return JSONResponse(status_code=404, content={"error": "workflow not found"})
+            if eff_pp and w.get("project_path") and w["project_path"] != eff_pp:
+                return JSONResponse(status_code=400, content={
+                    "error": "that workflow belongs to a different project"})
+        updates["workflow_id"] = wf_id
+    elif "project_path" in body and stored.get("workflow_id"):
+        # Keep the pair consistent, never silently: a project change/clear
+        # drops a stored workflow link only when it CONTRADICTS the new
+        # project (the workflow belongs to a different one, or is gone).
+        # A project-less workflow stays linked. The response reflects it.
+        w = db.query_one("SELECT project_path FROM workflows WHERE id=?",
+                         (stored["workflow_id"],))
+        if not w or (w.get("project_path") and w["project_path"] != eff_pp):
+            updates["workflow_id"] = None
+    if not updates:
+        return JSONResponse(status_code=400, content={"error": "nothing to update"})
+    _meeting_meta_upsert(name, **updates)
+    cur = db.query_one(
+        "SELECT project_path, workflow_id FROM meeting_meta WHERE name=?", (name,)) or {}
+    return {"ok": True, "project_path": cur.get("project_path"),
+            "workflow_id": cur.get("workflow_id")}
 
 
 @app.post("/api/meetings/{name}/summarize")
@@ -2779,14 +2823,7 @@ async def meeting_summarize(name: str, force: int = 0):
     if res.get("error") or not summary:
         return JSONResponse(status_code=502, content={
             "error": res.get("error") or "the model returned an empty summary"})
-    now = time.time()
-    if meta:
-        db.execute("UPDATE meeting_meta SET summary=?, summary_ts=?, updated_at=? WHERE name=?",
-                   (summary[:20000], now, now, name))
-    else:
-        db.execute("INSERT INTO meeting_meta (name, summary, summary_ts, user_id, created_at, "
-                   "updated_at) VALUES (?,?,?,?,?,?)",
-                   (name, summary[:20000], now, uid, now, now))
+    _meeting_meta_upsert(name, summary=summary[:20000], summary_ts=time.time())
     return {"ok": True, "summary": summary, "cached": False}
 
 
@@ -2828,14 +2865,8 @@ async def meeting_requirements(name: str, force: int = 0):
         reqs = [str(r).strip()[:200] for r in (data.get("requirements") or []) if str(r).strip()][:20]
     except Exception:
         return JSONResponse(status_code=502, content={"error": "unparseable extraction — try again"})
-    now = time.time()
-    if meta:
-        db.execute("UPDATE meeting_meta SET requirements=?, requirements_ts=?, updated_at=? "
-                   "WHERE name=?", (json.dumps(reqs), now, now, name))
-    else:
-        db.execute("INSERT INTO meeting_meta (name, requirements, requirements_ts, user_id, "
-                   "created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                   (name, json.dumps(reqs), now, uid, now, now))
+    _meeting_meta_upsert(name, requirements=json.dumps(reqs),
+                         requirements_ts=time.time())
     return {"ok": True, "requirements": reqs, "cached": False}
 
 
@@ -2847,15 +2878,34 @@ async def meeting_requirements_edit(name: str, body: dict):
     if not _valid_meeting_name(name):
         return JSONResponse(status_code=400, content={"error": "bad name"})
     reqs = [str(r).strip()[:200] for r in (body.get("requirements") or []) if str(r).strip()][:20]
-    now = time.time()
-    if db.query_one("SELECT 1 FROM meeting_meta WHERE name=?", (name,)):
-        db.execute("UPDATE meeting_meta SET requirements=?, requirements_ts=?, updated_at=? "
-                   "WHERE name=?", (json.dumps(reqs), now, now, name))
-    else:
-        db.execute("INSERT INTO meeting_meta (name, requirements, requirements_ts, user_id, "
-                   "created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                   (name, json.dumps(reqs), now, auth.current_user_id(), now, now))
+    _meeting_meta_upsert(name, requirements=json.dumps(reqs),
+                         requirements_ts=time.time())
     return {"ok": True, "requirements": reqs}
+
+
+@app.get("/api/meetings/{name}/requirements")
+async def meeting_requirements_cached(name: str):
+    """Read-only cached requirements — NEVER triggers the LLM. The ✨ Create
+    workflow button reads this: the POST above re-runs a ~1-minute extraction
+    whenever the transcript mtime changed, which that button must never do
+    silently. `stale` flags an edited transcript so the UI can ask."""
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    if not _valid_meeting_name(name):
+        return JSONResponse(status_code=400, content={"error": "bad name"})
+    meta = db.query_one(
+        "SELECT requirements, requirements_ts FROM meeting_meta WHERE name=?",
+        (name,)) or {}
+    if not meta.get("requirements"):
+        return JSONResponse(status_code=404, content={
+            "error": "no requirements extracted yet — run 📋 Requirements first"})
+    p = _meeting_dir() / name
+    stale = p.is_file() and p.stat().st_mtime > (meta.get("requirements_ts") or 0)
+    try:
+        reqs = json.loads(meta["requirements"])
+    except Exception:
+        reqs = []
+    return {"ok": True, "requirements": reqs, "stale": bool(stale)}
 
 
 @app.post("/api/meetings/{name}/memory")
