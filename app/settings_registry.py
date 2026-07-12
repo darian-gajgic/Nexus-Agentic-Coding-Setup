@@ -196,6 +196,12 @@ SECTIONS = [
                      "(external judgment-tier verifier via the frontier CLI): what fails, "
                      "what's missing, which criteria are untestable. Findings are advisory "
                      "annotations — they never block approval."},
+            {"key": "plan.auto_revise", "label": "Auto-revise the plan from findings", "type": "bool",
+             "default": "1",
+             "help": "When the premortem finds problems on a fresh draft, automatically run "
+                     "ONE revision turn that rewrites the plan to address them, then re-check. "
+                     "Findings needing a real operator decision come back as questions in the "
+                     "editor. Off = findings stay advisory annotations only."},
             {"key": "plan.critique_timeout_s", "label": "Premortem critique timeout (s)",
              "type": "int", "default": "600", "min": 60, "max": 3600,
              "help": "Hard cap on one premortem critique run (headless CLI, minutes are normal)."},

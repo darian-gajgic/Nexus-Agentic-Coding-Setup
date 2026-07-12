@@ -482,6 +482,12 @@ chk "replan seeds original spec"     "grep -q 'def _workflow_spec_md' server.py 
 chk "deep plan UI"                   "grep -q 'function startDeepPlan' static/app.js && grep -q 'function deepPlanModal' static/app.js && grep -q 'function deepPlanRunCritique' static/app.js && grep -q 'function deepPlanRecommendModal' static/app.js"
 chk "premortem annotations in editor" "grep -q 'planEd.annotations' static/app.js && grep -q 'planEd.planSessionId' static/app.js"
 chk "Step7 re-run premortem + diff flags" "grep -q 'wfRerunCritique' static/app.js && grep -q 'function planEdComputeDiff' static/app.js && grep -q 'planEd.diff' static/app.js"
+# Step 7b — revise loop (findings → corrected plan, 2026-07-12)
+chk "revise loop backend"            "grep -q 'def plan_session_revise' server.py && grep -q 'def _plan_revise_raw' server.py && grep -q 'def _distribute_criteria' server.py && grep -q 'def stub_revise' plan_engine.py"
+chk "revise loop UI + auto round"    "grep -q 'function deepPlanRevise' static/app.js && grep -q 'function deepPlanRenderQuestions' static/app.js && grep -q 'wfRevisePlan' static/app.js && grep -q 'autoRevised' static/app.js"
+chk "validator fuzzy coverage + common-token guard" "grep -q 'def _criterion_covered' server.py && grep -q 'def _sig_toks' server.py && grep -q 'plan.auto_revise' settings_registry.py"
+# repo grounding — the plan is a CHANGE to existing work (2026-07-12)
+chk "deep plan repo grounding"       "grep -q 'def _plan_repo_block' server.py && grep -q 'plan_sessions ADD COLUMN repo_path' database.py && grep -q 'context=_plan_repo_block' server.py && grep -q 'dpRepoChip' static/app.js"
 # Step 9 — JARVIS framing (rule 12)
 chk "JARVIS knows Deep Plan (+attach)" "grep -q 'DEEP PLAN:' server.py && grep -q '/api/plan/sessions' server.py && grep -q 'sessions/ID/attach' server.py"
 # Step 10 — gates

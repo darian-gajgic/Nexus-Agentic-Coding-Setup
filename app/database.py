@@ -651,6 +651,11 @@ def init_db():
         created_at REAL,
         updated_at REAL
     )""")
+    # 2026-07-12: sessions grounded on an existing repo — the interview, draft
+    # and revise turns all read this so the plan is a CHANGE, not a greenfield.
+    existing_ps_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_sessions)").fetchall()}
+    if "repo_path" not in existing_ps_cols:
+        conn.execute("ALTER TABLE plan_sessions ADD COLUMN repo_path TEXT")
 
     # One-time addition (2026-07-08): glm-5-turbo, the peak-hours overload
     # fallback (settings dispatch.fallback_model) — pre-existing installs

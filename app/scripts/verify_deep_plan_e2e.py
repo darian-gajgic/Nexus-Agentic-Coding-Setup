@@ -53,7 +53,8 @@ def delete(p, **k): return requests.delete(BASE + p, cookies=CK, verify=False, t
 # Fable-5 checker finding N1: NEVER wipe the whole table — that destroys the
 # operator's real planning history and orphans live Hermes sessions. Scope every
 # delete to THIS gate's known goals, and free a linked Hermes session first.
-GATE_GOALS = ("Build a login API", "another goal", "drafted goal")
+GATE_GOALS = ("Build a login API", "another goal", "drafted goal",
+              "repo grounding probe goal")
 
 
 def _wipe_gate_sessions():
@@ -143,6 +144,109 @@ chk("premortem stub → findings annotations payload",
     and c["findings"][0].get("task_idx") is not None)
 chk("critique returns structural warnings + advisory flag",
     isinstance(c.get("warnings"), list) and c.get("critique_enabled") is True)
+
+print("=== Step 7 — validator false-positive regressions (2026-07-12 fix) ===")
+# the standard coding template: 5 stage titles all repeating the goal name —
+# these mass-false-positived near-duplicate + cross-reference before the fix.
+goal5 = "voice-first restaurant assistant MVP"
+stages5 = [("Spec & plan", []), ("Implement + tests", [0]), ("Code review", [0, 1]),
+           ("Fix review findings", [1, 2]), ("Acceptance verification", [0, 2, 3])]
+five = [{"title": f"{p}: {goal5}", "depends_on_idx": dp,
+         "description": f"{p} for the {goal5} against the SPEC."} for p, dp in stages5]
+w5 = srv._validate_plan(five, "software", {"acceptance_criteria": []}, goal=goal5)
+chk("standard 5-stage template → zero near-dup/cross-ref false positives",
+    not any(("near-duplicate" in x["message"] or "seems to reference" in x["message"])
+            for x in w5))
+# a PARAPHRASED criterion (the draft model rewords) must count as covered now
+para = srv._validate_plan(
+    [{"title": "Implement dashboard", "depends_on_idx": [],
+      "description": "Build the dashboard: render the shopping list sorted by day, "
+                     "visible on page load."}],
+    "software",
+    {"acceptance_criteria": ["The shopping list is visible on the dashboard, sorted by day"]})
+chk("paraphrased criterion counts as covered (fuzzy match)",
+    not any("not covered" in x["message"] for x in para))
+chk("draft output itself carries zero orphan-criterion warnings",
+    not any("not covered" in x["message"] for x in (d.get("warnings") or [])))
+# deterministic coverage guarantee: uncovered criteria land verbatim on a task
+dist_tasks = [{"title": "Implement login", "specialist": "code-implementer",
+               "depends_on_idx": [], "description": "Implement the login flow."},
+              {"title": "Acceptance verification", "specialist": "acceptance-verifier",
+               "depends_on_idx": [0], "description": "Verify acceptance."}]
+notes = srv._distribute_criteria(
+    dist_tasks, "software", {"acceptance_criteria": ["Exports a weekly totals report"]})
+chk("_distribute_criteria appends the criterion verbatim (verifier fallback)",
+    len(notes) == 1 and "Done when: Exports a weekly totals report"
+    in dist_tasks[1]["description"])
+chk("_distribute_criteria is idempotent",
+    srv._distribute_criteria(dist_tasks, "software",
+                             {"acceptance_criteria": ["Exports a weekly totals report"]}) == [])
+chk("_plan_text marks any cut explicitly (no silent mid-sentence slice)",
+    "…[truncated]" in srv._plan_text([{"title": "t", "description": "x" * 9000,
+                                       "depends_on_idx": []}]))
+
+print("=== Step 7b — revise loop (findings → corrected plan, stub) ===")
+_ar0 = db.get_setting("plan.auto_revise", "1")
+db.set_setting("plan.auto_revise", "1")
+c1 = post(f"/api/plan/sessions/{sid}/critique", json={"tasks": tks}).json()
+chk("auto_revise flag plumbed on draft + critique responses",
+    d.get("auto_revise") is True and c1.get("auto_revise") is True)
+db.set_setting("plan.auto_revise", "0")
+chk("plan.auto_revise=0 → flag off",
+    post(f"/api/plan/sessions/{sid}/critique", json={"tasks": tks}).json()
+    .get("auto_revise") is False)
+db.set_setting("plan.auto_revise", _ar0)
+rv = post(f"/api/plan/sessions/{sid}/revise",
+          json={"tasks": tks, "findings": c["findings"], "warnings": []})
+rvj = rv.json() if rv.status_code == 200 else {}
+chk("revise 200 + repaired tasks returned",
+    rv.status_code == 200 and isinstance(rvj.get("tasks"), list) and rvj["tasks"])
+chk("revision addressed the findings in task descriptions",
+    any("Addressed finding" in (t.get("description") or "") for t in rvj.get("tasks", [])))
+chk("revise returns warnings + repairs lists",
+    isinstance(rvj.get("warnings"), list) and isinstance(rvj.get("repairs"), list))
+chk("stub revision asks ONE operator question on a notes-free round",
+    len(rvj.get("questions") or []) == 1 and (rvj["questions"][0].get("options")))
+rv2 = post(f"/api/plan/sessions/{sid}/revise",
+           json={"tasks": tks, "findings": c["findings"], "warnings": [],
+                 "notes": "keep the current scope"}).json()
+chk("operator notes (answers) → no further questions",
+    (rv2.get("questions") or []) == [])
+chk("revise keeps the session status drafted",
+    get(f"/api/plan/sessions/{sid}").json()["status"] == "drafted")
+chk("revise preserves operational task fields (deliverable_type survives)",
+    all(t.get("deliverable_type") == "code_change" for t in rvj.get("tasks", [])))
+# operator-owned fields must win over model CHANGES (not just drops): the plan
+# editor's dials would otherwise be silently rewritten by a revision turn.
+pf_new = [{"title": "Implement + tests: X", "deliverable_type": "analysis",
+           "model": None, "high_stakes": False, "budget_tokens": None}]
+pf_old = [{"title": "Implement + tests: X", "deliverable_type": "code_change",
+           "model": "glm-5.1", "high_stakes": True, "budget_tokens": 2000000}]
+srv._preserve_task_fields(pf_new, pf_old)
+chk("_preserve_task_fields: operator-owned fields win over model CHANGES",
+    pf_new[0]["deliverable_type"] == "code_change" and pf_new[0]["model"] == "glm-5.1"
+    and pf_new[0]["high_stakes"] is True and pf_new[0]["budget_tokens"] == 2000000)
+
+print("=== repo grounding — the plan is a CHANGE to existing work (2026-07-12) ===")
+repos = [p for p in get("/api/projects").json().get("projects", []) if p.get("is_repo")]
+chk("at least one visible git repo to ground on", bool(repos))
+_rp = repos[0]["path"] if repos else ""
+rg = post("/api/plan/sessions", json={"goal": "repo grounding probe goal",
+                                      "family": "software", "repo_path": _rp}).json()
+chk("session start accepts + persists repo_path",
+    rg.get("repo_path") == _rp and
+    (db.query_one("SELECT repo_path FROM plan_sessions WHERE id=?", (rg["id"],)) or {})
+    .get("repo_path") == _rp)
+rgd = post(f"/api/plan/sessions/{rg['id']}/draft", json={}).json()
+chk("draft echoes repo_path for the proposal-modal 🧬 preselect",
+    rgd.get("repo_path") == _rp)
+blk = srv._plan_repo_block(_rp)
+chk("_plan_repo_block reads the real project state (tree + languages)",
+    "EXISTING PROJECT" in blk and "[tree]" in blk and "[languages]" in blk)
+chk("invalid repo_path is rejected (400)",
+    post("/api/plan/sessions", json={"goal": "repo grounding probe goal",
+                                     "family": "software",
+                                     "repo_path": "/etc"}).status_code == 400)
 
 print("=== Step 8 — spec travels: attachment + critic context ===")
 wf = post("/api/workflows", json={"name": "Login API DP", "goal": "Build a login API"}).json()

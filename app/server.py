@@ -2199,8 +2199,8 @@ FILE EXCHANGE: the operator's shared folder with you is {files_dir} — files th
 SYSTEM CONTROL — you can drive the user's whole Nexus OS over its local REST API (curl, always -sk):
   curl -sk -H "x-nexus-internal: {auth.INTERNAL_TOKEN}" -H "x-nexus-user: {uid}" https://127.0.0.1:8777/api/...
   BOARD: GET /api/tasks · POST /api/tasks {{"title","description","status":"todo"}} · PATCH /api/tasks/ID {{"status"|"title"|...}} · DELETE /api/tasks/ID · POST /api/tasks/ID/dispatch (run it NOW on a real agent lane) · GET /api/tasks/ID/transcript (live agent output)
-  PLAN WELL: for anything non-trivial prefer POST /api/tasks/wizard {{"instruction":"…","super_result":true?,"spend_profile":"eco|optimal|smart"?,"autopilot":"full_auto|assisted|manual"?}} — it returns a best-practice multi-stage plan (spec→build→review→verify for code; research→create for content) with the right specialist, model and quality gates; then create the returned tasks. The wizard reply also carries triage {{complexity, ambiguity, recommend_deep_plan, recommend_super_result, reasons}} — when recommend_deep_plan is true the goal is complex/ambiguous enough to plan conversationally first (offer it, don't force it). The two preset axes (autopilot=how hands-on, spend_profile=how much fuel) also work on POST/PATCH /api/tasks and /api/workflows and set everything downstream (rounds, judge, Super Result, budget). This beats a bare one-line task.
-  DEEP PLAN: for a complex or ambiguous goal, "plan a project with me" runs a short structured interview that builds a SPEC before drafting. POST /api/plan/sessions {{"goal","family"?:"software|analysis-audit|content|research","super_result"?,"spend_profile"?}} starts it (returns the spec slots + first questions); POST /api/plan/sessions/ID/turn {{"message"}} answers a round (a spoken answer IS one turn — read the questions aloud, send their reply); PATCH /api/plan/sessions/ID/spec {{"updates":{{slot:value}}}} edits a slot directly; POST /api/plan/sessions/ID/draft returns the plan proposal (create it like any wizard plan — POST the returned tasks to /api/workflows or /api/tasks); POST /api/plan/sessions/ID/critique runs the external premortem. THEN — REQUIRED, don't skip — POST /api/plan/sessions/ID/attach {{"kind":"workflow"|"task","id":NEW_ID}} with the id you just created: this writes the SPEC into it (so it travels to every task, the critic, the judge) and closes the planning session. WITHOUT the attach the SPEC never reaches the run and the session strands unfinished. Cheap ($0.10–0.50) next to the run it steers.
+  PLAN WELL: for anything non-trivial prefer POST /api/tasks/wizard {{"instruction":"…","repo_path":"/abs/path/to/existing/repo"?,"super_result":true?,"spend_profile":"eco|optimal|smart"?,"autopilot":"full_auto|assisted|manual"?}} — set repo_path (a path from GET /api/projects with is_repo) whenever the goal CHANGES an existing project, so the plan is grounded in the real code instead of a greenfield build. It returns a best-practice multi-stage plan (spec→build→review→verify for code; research→create for content) with the right specialist, model and quality gates; then create the returned tasks. The wizard reply also carries triage {{complexity, ambiguity, recommend_deep_plan, recommend_super_result, reasons}} — when recommend_deep_plan is true the goal is complex/ambiguous enough to plan conversationally first (offer it, don't force it). The two preset axes (autopilot=how hands-on, spend_profile=how much fuel) also work on POST/PATCH /api/tasks and /api/workflows and set everything downstream (rounds, judge, Super Result, budget). This beats a bare one-line task.
+  DEEP PLAN: for a complex or ambiguous goal, "plan a project with me" runs a short structured interview that builds a SPEC before drafting. POST /api/plan/sessions {{"goal","family"?:"software|analysis-audit|content|research","repo_path"?,"super_result"?,"spend_profile"?}} starts it (returns the spec slots + first questions) — pass repo_path (from GET /api/projects, is_repo only) when the goal changes an EXISTING project: the interview, the draft and every revision are then grounded in that repo's real state; POST /api/plan/sessions/ID/turn {{"message"}} answers a round (a spoken answer IS one turn — read the questions aloud, send their reply); PATCH /api/plan/sessions/ID/spec {{"updates":{{slot:value}}}} edits a slot directly; POST /api/plan/sessions/ID/draft returns the plan proposal (create it like any wizard plan — POST the returned tasks to /api/workflows or /api/tasks); POST /api/plan/sessions/ID/critique runs the external premortem. THEN — REQUIRED, don't skip — POST /api/plan/sessions/ID/attach {{"kind":"workflow"|"task","id":NEW_ID}} with the id you just created: this writes the SPEC into it (so it travels to every task, the critic, the judge) and closes the planning session. WITHOUT the attach the SPEC never reaches the run and the session strands unfinished. Cheap ($0.10–0.50) next to the run it steers.
   PROJECTS: GET /api/workflows · POST /api/workflows {{"name","goal"}} · GET /api/workflows/ID · GET /api/deliverables (finished output files across all tasks)
   TEST OUTPUT: POST /api/tasks/ID/app/start then GET /api/tasks/ID/app/log — runs the task's produced app/site on a local port so the user can try it live (the UI's ▶ Test app).
   QUALITY: POST /api/tasks/ID/judge (frontier-judge a deliverable) · POST /api/verify {{"task_id","command"}} (run a check) · GET /api/tasks/ID/review (diff review)
@@ -5799,8 +5799,13 @@ def _task_wizard_framing(allow_questions: bool = True, uid: str | None = None,
         "following the house pipeline templates below.\n\n"
         "CRITICAL — you PLAN work, you never DO it: the operator's text describes what some "
         "future agent should do. Even when it reads as a direct command ('analyze X', 'summarize "
-        "Y', 'build Z'), you never execute it, never call tools, never produce the deliverable "
-        "yourself. You only emit the JSON plan below.\n\n"
+        "Y', 'build Z'), you never execute it, never produce the deliverable yourself. You only "
+        "emit the JSON plan below.\n"
+        "⛔ TOOLS ARE OFF-LIMITS IN THIS SESSION. Even though tools may be available to you, "
+        "you must never call any: no terminal commands, no reading or writing files, no code "
+        "execution, no web access — not even to 'check versions' or 'verify feasibility'. "
+        "Planning is pure text: decide from what you know and state uncertain choices as "
+        "assumptions. Reply immediately with the JSON object.\n\n"
         "Reply with ONLY a JSON object, no commentary, no code fences.\n\n"
         "PLAN SHAPES:\n"
         '{"type":"task","task":{...},"assumptions":["..."]} for one task, or\n'
@@ -5928,7 +5933,7 @@ def _clamp_wizard_task(t: dict, repairs: list | None = None,
     default_model = _purpose_model(uid, "complicated") or db.fallback_model("complicated")
     out = {
         "title": str(t.get("title") or "").strip()[:200],
-        "description": str(t.get("description") or "").strip()[:4000],
+        "description": str(t.get("description") or "").strip()[:8000],
         "domain": t.get("domain") if t.get("domain") in _TASK_DOMAINS else "general",
         "specialist": (t.get("specialist") or None),
         "high_stakes": bool(t.get("high_stakes")),
@@ -6806,6 +6811,7 @@ def _plan_public(row: dict) -> dict:
         "questions": last.get("questions") or [],
         "ready": bool(last.get("ready")),
         "triage": triage,
+        "repo_path": row.get("repo_path"),
         "created_at": row.get("created_at"), "updated_at": row.get("updated_at"),
     }
 
@@ -6825,8 +6831,21 @@ def _plan_turn_message(spec: dict, family: str, user_message: str) -> str:
     return "\n".join(parts)
 
 
+def _plan_repo_block(repo_path: str | None) -> str:
+    """Grounding block for a Deep Plan session that CHANGES existing work: the
+    same planning-time repo context the quick wizard uses (conventions file,
+    tree shape, languages). Empty when no repo is set or reading fails."""
+    if not repo_path:
+        return ""
+    try:
+        return _wizard_repo_context(repo_path) or ""
+    except Exception:
+        return ""
+
+
 def _plan_run_turn(uid: str | None, hermes_sid: str | None, family: str,
-                   spec: dict, user_message: str, turns: int) -> dict:
+                   spec: dict, user_message: str, turns: int,
+                   repo_path: str | None = None) -> dict:
     """Run ONE interview turn (model or stub) and return the parsed reply. Plain
     def — always shipped to a threadpool by the async endpoints (B7 no-block rule).
     plan.stub short-circuits the Hermes turn with canned slot-filling (mirrors
@@ -6850,14 +6869,16 @@ def _plan_run_turn(uid: str | None, hermes_sid: str | None, family: str,
     except Exception:
         max_q = 3
     goal = str((spec or {}).get("goal") or user_message or "")
-    framing = _pe.interview_framing(family, max_q, max_turns, goal)
+    framing = _pe.interview_framing(family, max_q, max_turns, goal,
+                                    context=_plan_repo_block(repo_path))
     res = hd.stream_turn(hermes_sid, msg, system_message=framing, max_seconds=180)
     if res.get("error"):
         raise RuntimeError(str(res["error"])[:200])
     return _pe.parse_turn(res.get("content") or "")
 
 
-def _plan_start_session(uid: str | None, family: str, goal: str) -> str | None:
+def _plan_start_session(uid: str | None, family: str, goal: str,
+                        repo_path: str | None = None) -> str | None:
     """Create the dedicated Hermes planning session (None under plan.stub).
     Plain def — called via threadpool."""
     import plan_engine as _pe
@@ -6868,7 +6889,8 @@ def _plan_start_session(uid: str | None, family: str, goal: str) -> str | None:
         max_turns = int(sreg.conf("plan.max_turns", "3") or 3)
     except Exception:
         max_q, max_turns = 3, 3
-    framing = _pe.interview_framing(family, max_q, max_turns, goal)
+    framing = _pe.interview_framing(family, max_q, max_turns, goal,
+                                    context=_plan_repo_block(repo_path))
     sid = hd.create_session(f"nexus:plan:{uuid.uuid4().hex[:8]}",
                             model=db.default_task_model(uid), system_prompt=framing)
     hd.publish_session_scope(sid, user=uid)
@@ -6940,14 +6962,22 @@ async def plan_session_start(body: dict):
     if not goal:
         return JSONResponse(status_code=400, content={"error": "describe the goal to plan"})
     family = body.get("family") if body.get("family") in _pe.FAMILIES else _pe.detect_family(goal)
+    # grounding on existing work: an optional repo makes the interview + draft +
+    # revise plan a CHANGE to the real project instead of a greenfield build
+    repo_req = (body.get("repo_path") or "").strip()
+    repo_path = await _visible_repo_path_async(repo_req) if repo_req else None
+    if repo_req and not repo_path:
+        return JSONResponse(status_code=400, content={
+            "error": f"repo_path is not one of your git repositories: {repo_req}"})
     spec = _pe.new_spec(family, goal)
     sid = f"plan-{uuid.uuid4().hex[:8]}"
     now = time.time()
     # carry the triage recommendation (and SR/preset intent) onto the session
     triage = _wizard_triage(goal, uid, (body.get("spend_profile") or "").strip() or None)
     try:
-        hermes_sid = await run_in_threadpool(_plan_start_session, uid, family, goal)
-        parsed = await run_in_threadpool(_plan_run_turn, uid, hermes_sid, family, spec, goal, 0)
+        hermes_sid = await run_in_threadpool(_plan_start_session, uid, family, goal, repo_path)
+        parsed = await run_in_threadpool(_plan_run_turn, uid, hermes_sid, family, spec,
+                                         goal, 0, repo_path)
     except hd.QuotaError:
         return JSONResponse(status_code=503, content={
             "error": "GLM is load-shedding right now — try again in a minute"})
@@ -6961,10 +6991,10 @@ async def plan_session_start(body: dict):
     ]
     db.execute(
         "INSERT INTO plan_sessions (id, user_id, goal, family, spec_json, transcript, "
-        "hermes_session_id, status, triage_json, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "hermes_session_id, status, triage_json, repo_path, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (sid, uid, goal, family, json.dumps(spec), json.dumps(transcript), hermes_sid,
-         "active", json.dumps(triage) if triage else None, now, now))
+         "active", json.dumps(triage) if triage else None, repo_path, now, now))
     db.log_activity("info", "plan", f"Deep Plan session started ({family})", user_id=uid)
     return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
 
@@ -6986,7 +7016,8 @@ async def plan_session_turn(sid: str, body: dict):
     turns = sum(1 for t in transcript if t.get("role") == "user")
     try:
         parsed = await run_in_threadpool(_plan_run_turn, row.get("user_id"),
-                                         row.get("hermes_session_id"), family, spec, message, turns)
+                                         row.get("hermes_session_id"), family, spec,
+                                         message, turns, row.get("repo_path"))
     except hd.QuotaError:
         return JSONResponse(status_code=503, content={
             "error": "GLM is load-shedding right now — try again in a minute"})
@@ -7020,31 +7051,77 @@ async def plan_session_spec_edit(sid: str, body: dict):
     return _plan_public(db.query_one("SELECT * FROM plan_sessions WHERE id=?", (sid,)))
 
 
-def _validate_plan(tasks: list, family: str, spec: dict) -> list:
+_PLAN_STOPWORDS = ("build", "implement", "create", "review", "verify",
+                   "acceptance", "project", "task", "against", "deliverable")
+
+
+def _sig_toks(s: str) -> set:
+    """Significant tokens for fuzzy plan-text matching: alphanumeric words of
+    length ≥4, minus the pipeline-stage stopwords."""
+    import re
+    return {w for w in re.findall(r"[a-z0-9]{4,}", (s or "").lower())
+            if w not in _PLAN_STOPWORDS}
+
+
+def _criterion_covered(crit: str, task_text: str) -> bool:
+    """Fuzzy criterion-coverage test: ≥60% of the criterion's significant tokens
+    appear in the task's text (the draft model paraphrases — an exact-substring
+    test false-flags every reworded criterion). Token-free criteria fall back to
+    the old first-50-chars substring test."""
+    ct = _sig_toks(crit)
+    if not ct:
+        return crit.lower()[:50] in task_text.lower()
+    return len(ct & _sig_toks(task_text)) >= max(1, -(-len(ct) * 3 // 5))
+
+
+def _short(s: str, n: int = 80) -> str:
+    """Quote a string for a warning message: cut at the last word boundary
+    before n and mark the cut explicitly — never a silent mid-word slice."""
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    if " " in cut[max(0, n - 20):]:
+        cut = cut[:cut.rfind(" ")]
+    return cut + "…"
+
+
+def _validate_plan(tasks: list, family: str, spec: dict, goal: str = "") -> list:
     """Deterministic structural validators (Step 7) — advisory WARNINGS, never
     blockers. Returns [{scope, task_idx?, slot?, level, message}]: orphan
-    acceptance criteria, cross-task output references without a dependency edge
-    (noun-match heuristic), duplicate/near-duplicate titles, per-task budget
-    sanity. The verifier/reconciler sink is already enforced by _repair_workflow."""
+    acceptance criteria (fuzzy token match), cross-task output references
+    without a dependency edge (noun-match heuristic), duplicate/near-duplicate
+    titles, per-task budget sanity. Tokens the whole plan shares (the goal name
+    every stage title repeats) are excluded from the title heuristics so the
+    standard 'Spec & plan: X' … 'Acceptance verification: X' template never
+    false-positives. The verifier/reconciler sink is already enforced by
+    _repair_workflow."""
     import re
     import plan_engine as _pe
     warnings: list = []
     tasks = tasks or []
-    descs = [((t.get("description") or "") + " " + (t.get("title") or "")).lower() for t in tasks]
+    descs = [((t.get("description") or "") + " " + (t.get("title") or "")) for t in tasks]
 
     # 1. Orphan acceptance criterion — every criterion owned by ≥1 task.
     slot = _pe.criteria_slot(family)
     for crit in _pe.list_criteria(spec, family):
-        key = crit.lower()[:50]
-        if key and not any(key in d for d in descs):
+        if crit.strip() and not any(_criterion_covered(crit, d) for d in descs):
             warnings.append({"scope": "spec", "slot": slot, "level": "warn",
                              "message": f"acceptance criterion not covered by any task: "
-                                        f"\"{crit[:80]}\""})
+                                        f"\"{_short(crit, 120)}\""})
 
     def _toks(s):
         return {w for w in re.findall(r"[a-z0-9]{5,}", (s or "").lower())
-                if w not in ("build", "implement", "create", "review", "verify",
-                             "acceptance", "project", "task", "against", "deliverable")}
+                if w not in _PLAN_STOPWORDS}
+
+    # Tokens common to the goal or most titles carry no signal between tasks —
+    # every stage title repeats the goal name ("Implement + tests: <goal>").
+    title_toks = [_toks(t.get("title")) for t in tasks]
+    common = _toks(goal)
+    if len(tasks) >= 3:
+        half = max(2, (len(tasks) + 1) // 2)
+        common |= {w for w in set().union(*title_toks)
+                   if sum(w in tt for tt in title_toks) >= half}
 
     # 2. Output reference without a dependency edge (WARN, noun-match heuristic).
     for i, ti in enumerate(tasks):
@@ -7052,24 +7129,24 @@ def _validate_plan(tasks: list, family: str, spec: dict) -> list:
         for j, tj in enumerate(tasks):
             if i == j or j in deps or i in set(tj.get("depends_on_idx") or []):
                 continue
-            jt = _toks(tj.get("title"))
+            jt = title_toks[j] - common
             if jt and len(jt & _toks(ti.get("description"))) >= 2 and j > i:
                 warnings.append({"scope": "task", "task_idx": i, "level": "warn",
-                                 "message": f"task '{(ti.get('title') or '')[:40]}' seems to "
-                                            f"reference '{(tj.get('title') or '')[:40]}' but "
+                                 "message": f"task '{_short(ti.get('title'))}' seems to "
+                                            f"reference '{_short(tj.get('title'))}' but "
                                             "doesn't depend on it"})
                 break
 
-    # 3. Duplicate / near-duplicate titles.
+    # 3. Duplicate / near-duplicate titles (on the distinctive tokens only).
     for i in range(len(tasks)):
         for j in range(i + 1, len(tasks)):
-            a, b = _toks(tasks[i].get("title")), _toks(tasks[j].get("title"))
-            # ≥2 distinctive tokens each side, so "Spec: X" vs "Implement: X" (one
-            # shared noun) never false-positives after stopword stripping.
+            a, b = title_toks[i] - common, title_toks[j] - common
+            # ≥2 distinctive tokens each side, so "Spec: X" vs "Implement: X"
+            # (only the shared goal name in common) never false-positives.
             if len(a) >= 2 and len(b) >= 2 and len(a & b) / max(1, len(a | b)) >= 0.8:
                 warnings.append({"scope": "task", "task_idx": j, "level": "warn",
                                  "message": f"near-duplicate title of task {i+1} "
-                                            f"('{(tasks[j].get('title') or '')[:40]}')"})
+                                            f"('{_short(tasks[j].get('title'))}')"})
 
     # 4. Per-task budget sanity vs the default.
     try:
@@ -7084,18 +7161,56 @@ def _validate_plan(tasks: list, family: str, spec: dict) -> list:
     return warnings[:20]
 
 
+def _distribute_criteria(tasks: list, family: str, spec: dict) -> list:
+    """Guarantee acceptance-criteria coverage after draft/revise + repair: any
+    criterion no task fuzzy-covers is appended VERBATIM as a 'Done when: …'
+    line to the best-matching task (max significant-token overlap; zero overlap
+    → the acceptance-verifier task, else the last task). Idempotent — covered
+    criteria are left alone. Returns repair notes for the proposal modal."""
+    import plan_engine as _pe
+    notes: list = []
+    tasks = tasks or []
+    if not tasks:
+        return notes
+    for crit in _pe.list_criteria(spec, family):
+        crit = str(crit or "").strip()
+        if not crit:
+            continue
+        texts = [((t.get("description") or "") + " " + (t.get("title") or "")) for t in tasks]
+        if any(_criterion_covered(crit, d) for d in texts):
+            continue
+        ct = _sig_toks(crit)
+        overlaps = [len(ct & _sig_toks(d)) for d in texts]
+        best = max(range(len(tasks)), key=lambda i: overlaps[i])
+        if overlaps[best] == 0:
+            verifiers = [i for i, t in enumerate(tasks)
+                         if t.get("specialist") == "acceptance-verifier"]
+            best = verifiers[-1] if verifiers else len(tasks) - 1
+        t = tasks[best]
+        t["description"] = ((t.get("description") or "").rstrip()
+                            + f"\nDone when: {crit}").strip()
+        notes.append(f"appended 'Done when: {_short(crit, 60)}' to task {best + 1} "
+                     "(criterion was not covered)")
+    return notes
+
+
 def _plan_text(tasks: list) -> str:
     """Render the task plan for the premortem reviewer (index + title + deps +
-    brief)."""
+    brief). Caps match the storage clamps (_clamp_wizard_task), and any cut is
+    marked explicitly — a silently truncated brief reads as a mid-sentence
+    defect and the reviewer (correctly) flags it."""
+    def _cap(s: str, n: int) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else s[:n] + " …[truncated]"
     lines = ["# PLAN", ""]
     for i, t in enumerate(tasks or []):
         deps = t.get("depends_on_idx")
         if deps is None:
             deps = t.get("depends_on") or []
-        lines.append(f"## task_{i}: {(t.get('title') or '').strip()[:120]}")
+        lines.append(f"## task_{i}: {_cap(t.get('title'), 200)}")
         lines.append(f"specialist: {t.get('specialist') or 'auto'} · depends_on: {list(deps)} · "
                      f"deliverable_type: {t.get('deliverable_type') or '-'}")
-        lines.append((t.get("description") or "").strip()[:1200])
+        lines.append(_cap(t.get("description"), 8000))
         lines.append("")
     return "\n".join(lines)
 
@@ -7118,7 +7233,7 @@ async def plan_session_critique(sid: str, body: dict):
     for t in tasks:
         if isinstance(t, dict) and t.get("depends_on_idx") is None:
             t["depends_on_idx"] = t.get("depends_on") or []
-    warnings = _validate_plan(tasks, family, spec)
+    warnings = _validate_plan(tasks, family, spec, goal=row.get("goal") or "")
     findings = []
     if db.get_setting("plan.critique_enabled", "1") == "1":
         model, key = _ev.spec_model_for(row.get("user_id"))
@@ -7136,11 +7251,25 @@ async def plan_session_critique(sid: str, body: dict):
             db.log_activity("warn", "plan", f"Premortem critique failed: {str(e)[:120]}",
                             user_id=row.get("user_id"))
     return {"findings": findings, "warnings": warnings,
-            "critique_enabled": db.get_setting("plan.critique_enabled", "1") == "1"}
+            "critique_enabled": db.get_setting("plan.critique_enabled", "1") == "1",
+            "auto_revise": db.get_setting("plan.auto_revise", "1") == "1"}
+
+
+def _spec_contract_block(spec_md: str) -> str:
+    """The SPEC contract framing block shared by the plan draft and the plan
+    revision turns (Deep Plan Steps 6/7b)."""
+    return (
+        "SPEC CONTRACT — this plan MUST satisfy the SPEC below. Copy EACH acceptance "
+        "criterion VERBATIM (word-for-word — never paraphrase or shorten it) into "
+        "exactly ONE task's description as a 'Done when: <criterion>' line; respect "
+        "out_of_scope; add nothing the SPEC excludes. Every task description must be "
+        "a complete, self-contained brief — never end mid-sentence and never use a "
+        "trailing ellipsis.\n"
+        "<<<SPEC\n" + spec_md + "\nSPEC>>>\n\n")
 
 
 def _plan_draft_raw(spec: dict, family: str, goal: str, uid: str | None,
-                    super_result: bool) -> dict:
+                    super_result: bool, repo_path: str | None = None) -> dict:
     """Turn the SPEC into a raw wizard plan (before _repair_workflow). Plain def
     — shipped to a threadpool. plan.stub short-circuits with a canned DAG that
     still flows through the real repair + criteria-distribution path."""
@@ -7148,11 +7277,7 @@ def _plan_draft_raw(spec: dict, family: str, goal: str, uid: str | None,
     if db.get_setting("plan.stub", "0") == "1":
         return _pe.stub_plan(spec, family, goal)
     spec_md = _pe.render_spec_md(spec, family, goal)
-    spec_block = (
-        "SPEC CONTRACT — this plan MUST satisfy the SPEC below. Distribute EACH "
-        "acceptance criterion onto exactly ONE task as a 'Done when: …' line in that "
-        "task's description; respect out_of_scope; add nothing the SPEC excludes.\n"
-        "<<<SPEC\n" + spec_md + "\nSPEC>>>\n\n")
+    spec_block = _spec_contract_block(spec_md)
     framing = _task_wizard_framing(allow_questions=False, uid=uid,
                                    super_result=super_result,
                                    fanout=bool(super_result and sreg.conf("super.fanout_default", "1") == "1"),
@@ -7160,7 +7285,8 @@ def _plan_draft_raw(spec: dict, family: str, goal: str, uid: str | None,
                                    spec_block=spec_block)
     user_msg = ("PLANNING REQUEST. Turn the SPEC in your instructions into the task plan for "
                 "this goal. Reply with ONLY the required JSON object.\n<<<GOAL\n"
-                + goal + "\nGOAL>>>")
+                + goal + "\nGOAL>>>"
+                + _plan_repo_block(repo_path))
     sid = hd.create_session("nexus:plan-draft", model=db.default_task_model(uid),
                             system_prompt=_WIZARD_ROLE_LOCK)
     hd.publish_session_scope(sid, user=uid)
@@ -7207,7 +7333,8 @@ async def plan_session_draft(sid: str, body: dict):
     fanout = bool(super_result and sreg.conf("super.fanout_default", "1") == "1")
     dtype = _pe.FAMILY_DELIVERABLE_TYPE.get(family)
     try:
-        data = await run_in_threadpool(_plan_draft_raw, spec, family, goal, uid, super_result)
+        data = await run_in_threadpool(_plan_draft_raw, spec, family, goal, uid,
+                                       super_result, row.get("repo_path"))
     except hd.QuotaError:
         return JSONResponse(status_code=503, content={
             "error": "GLM is load-shedding right now — try again in a minute"})
@@ -7233,6 +7360,10 @@ async def plan_session_draft(sid: str, body: dict):
                 t["autopilot"] = involvement
             if spend:
                 t["spend_profile"] = spend
+        # coverage guarantee: any criterion the model paraphrased away lands
+        # verbatim on the best-matching task (the validator stays as the net
+        # for later manual edits)
+        repairs += _distribute_criteria(tasks, family, spec)
         out = {"type": "workflow", "workflow": {
             "name": name, "goal": (goal[:500] or name),
             "domain": wf.get("domain") if wf.get("domain") in _TASK_DOMAINS else None,
@@ -7250,6 +7381,7 @@ async def plan_session_draft(sid: str, body: dict):
             t["autopilot"] = involvement
         if spend:
             t["spend_profile"] = spend
+        repairs += _distribute_criteria([t], family, spec)
         out = {"type": "task", "task": t, "assumptions": [], "repairs": repairs}
 
     db.execute("UPDATE plan_sessions SET status='drafted', updated_at=? WHERE id=?",
@@ -7259,16 +7391,235 @@ async def plan_session_draft(sid: str, body: dict):
     out["plan_session_id"] = sid
     out["spec_md"] = spec_md
     out["family"] = family
+    out["repo_path"] = row.get("repo_path")   # proposal modal preselects 🧬
     # structural validators run now (deterministic); the UI auto-runs the
     # premortem critique after draft when plan.critique_enabled (Step 7).
     plan_tasks = out["workflow"]["tasks"] if out["type"] == "workflow" else [out["task"]]
-    out["warnings"] = _validate_plan(plan_tasks, family, spec)
+    out["warnings"] = _validate_plan(plan_tasks, family, spec, goal=goal)
     out["critique_enabled"] = db.get_setting("plan.critique_enabled", "1") == "1"
+    out["auto_revise"] = db.get_setting("plan.auto_revise", "1") == "1"
     try:
         out["triage"] = json.loads(row.get("triage_json") or "null")
     except Exception:
         out["triage"] = None
     return out
+
+
+# model may re-route a repurposed task — fill these only when it drops them
+_REVISE_MODEL_FILL = ("specialist", "domain")
+# operator-owned knobs (edited in the plan editor / derived deterministically) —
+# on a matched task the original ALWAYS wins, even when the model rewrites them:
+# a revision turn's mandate is the plan's content, never the operator's dials
+_REVISE_OPERATOR_FIELDS = ("model", "budget_tokens", "deliverable_type",
+                           "autopilot", "spend_profile")
+
+
+def _preserve_task_fields(new_tasks: list, old_tasks: list) -> None:
+    """A revision turn owns titles/descriptions/deps — NOT the operational
+    fields the plan already carried (model, budget, deliverable_type, Q7a
+    axes …). Match each revised task to its original by normalized title, else
+    by index; operator-owned fields are restored from the original outright,
+    routing fields only when the model dropped them, and risk/verification
+    flags (high_stakes, super_result) can be raised but never dropped."""
+    def _norm(s):
+        return " ".join(str(s or "").lower().split())
+    by_title = {}
+    for t in (old_tasks or []):
+        if isinstance(t, dict) and _norm(t.get("title")):
+            by_title.setdefault(_norm(t.get("title")), t)
+    for i, nt in enumerate(new_tasks or []):
+        if not isinstance(nt, dict):
+            continue
+        old = by_title.get(_norm(nt.get("title")))
+        if old is None and i < len(old_tasks or []) and isinstance(old_tasks[i], dict):
+            old = old_tasks[i]
+        if old is None:
+            continue
+        for f in _REVISE_MODEL_FILL:
+            if nt.get(f) in (None, "") and old.get(f) not in (None, ""):
+                nt[f] = old.get(f)
+        for f in _REVISE_OPERATOR_FIELDS:
+            if old.get(f) not in (None, ""):
+                nt[f] = old.get(f)
+        if old.get("high_stakes"):
+            nt["high_stakes"] = True
+        if old.get("super_result"):
+            nt["super_result"] = True
+
+
+def _clamp_plan_questions(qs) -> list:
+    """Clamp a revision turn's optional operator questions to the wizard
+    question shape (≤3 questions, ≤5 options, exactly one recommended)."""
+    out = []
+    for q in (qs if isinstance(qs, list) else [])[:3]:
+        if not isinstance(q, dict) or not str(q.get("question") or "").strip():
+            continue
+        opts = []
+        for o in (q.get("options") if isinstance(q.get("options"), list) else [])[:5]:
+            if isinstance(o, dict) and str(o.get("label") or "").strip():
+                opts.append({"label": str(o.get("label")).strip()[:200],
+                             "recommended": bool(o.get("recommended"))})
+        if sum(1 for o in opts if o["recommended"]) != 1 and opts:
+            for o in opts:
+                o["recommended"] = False
+            opts[0]["recommended"] = True
+        out.append({"id": str(q.get("id") or f"q{len(out) + 1}")[:16],
+                    "question": str(q.get("question")).strip()[:400],
+                    "why": str(q.get("why") or "").strip()[:300],
+                    "options": opts})
+    return out
+
+
+def _plan_revise_raw(spec: dict, family: str, goal: str, uid: str | None,
+                     tasks: list, findings: list, warnings: list,
+                     notes: str, repo_path: str | None = None) -> dict:
+    """One revision turn: feed the current plan + the premortem/structural
+    findings back to the draft model and get the FULL corrected plan (plus, only
+    when a finding truly needs an operator decision, ≤3 questions). Plain def —
+    shipped to a threadpool. plan.stub short-circuits deterministically."""
+    import plan_engine as _pe
+    if db.get_setting("plan.stub", "0") == "1":
+        return _pe.stub_revise(spec, family, goal, tasks,
+                               (findings or []) + (warnings or []), notes)
+    spec_md = _pe.render_spec_md(spec, family, goal)
+    framing = _task_wizard_framing(allow_questions=False, uid=uid,
+                                   spec_block=_spec_contract_block(spec_md))
+    lines = []
+    for f in (findings or []):
+        tgt = f"task {f['task_idx'] + 1}" if isinstance(f.get("task_idx"), int) else "plan"
+        line = f"[{tgt}] {str(f.get('problem') or f.get('message') or '').strip()}"
+        if str(f.get("fix") or "").strip():
+            line += f" → suggested fix: {str(f.get('fix')).strip()}"
+        lines.append(line[:400])
+    for w in (warnings or []):
+        tgt = f"task {w['task_idx'] + 1}" if isinstance(w.get("task_idx"), int) else "plan"
+        lines.append(f"[{tgt}] {str(w.get('message') or '').strip()}"[:400])
+    numbered = "\n".join(f"{n + 1}. {ln}" for n, ln in enumerate(lines)) or "(none)"
+    plan_json = json.dumps({"tasks": [
+        {k: t.get(k) for k in ("title", "description", "specialist", "domain",
+                               "depends_on_idx", "model", "budget_tokens",
+                               "high_stakes", "super_result", "deliverable_type")
+         if t.get(k) is not None} for t in (tasks or []) if isinstance(t, dict)]},
+        indent=1)
+    user_msg = (
+        "REVISION REQUEST. A premortem review found problems in the plan drafted for "
+        "this goal. Reply with ONLY one JSON object of the same shape as a plan "
+        '({"type":"workflow","workflow":{"name":...,"tasks":[...]}}) containing the '
+        "FULL corrected plan — every task, not a diff — with every numbered finding "
+        "below addressed (edit the named task, add a missing task, or fix a "
+        "dependency edge).\n"
+        "RULES:\n"
+        "- Preserve every field of tasks you do not change (title, description, "
+        "specialist, domain, depends_on, model, budget_tokens, high_stakes, "
+        "super_result, deliverable_type).\n"
+        "- Copy each acceptance criterion from the SPEC VERBATIM into exactly one "
+        "task's description as a 'Done when: <criterion>' line.\n"
+        "- Descriptions must be complete briefs — no trailing ellipsis, no "
+        "placeholders.\n"
+        "- Do NOT call any tools (no terminal, no files, no web) — revise purely "
+        "from the SPEC, plan and findings above; unresolved facts become stated "
+        "assumptions or one of the questions.\n"
+        '- ONLY if a finding cannot be resolved without an operator decision (a real '
+        'trade-off or missing fact), add a top-level "questions" key: '
+        '[{"id":"q1","question":str,"why":str,"options":[{"label":str,'
+        '"recommended":bool}, 2-4 of these]}] — at most 3 questions. Decide '
+        "everything else yourself with stated assumptions.\n"
+        "<<<GOAL\n" + goal + "\nGOAL>>>\n"
+        + _plan_repo_block(repo_path)
+        + "<<<CURRENT_PLAN\n" + plan_json + "\nCURRENT_PLAN>>>\n"
+        "FINDINGS TO ADDRESS:\n" + numbered
+        + (("\nOPERATOR DECISIONS (treat as binding):\n" + notes.strip()[:2000])
+           if (notes or "").strip() else ""))
+    sid = hd.create_session("nexus:plan-revise", model=db.default_task_model(uid),
+                            system_prompt=_WIZARD_ROLE_LOCK)
+    hd.publish_session_scope(sid, user=uid)
+    hd.publish_session_key(sid, uid, db.default_task_model(uid))
+    try:
+        for _ in (0, 1):
+            # 600s (vs the draft's 300): a revision rewrites the FULL plan with
+            # expanded descriptions — a live 8-finding round blew the 300s cap
+            res = hd.stream_turn(sid, user_msg, system_message=framing, max_seconds=600)
+            raw = (res.get("content") or "").strip()
+            if res.get("error") or not raw:
+                raise RuntimeError(res.get("error") or "the model returned nothing")
+            s, e = raw.find("{"), raw.rfind("}")
+            if s == -1 or e == -1:
+                continue
+            try:
+                return json.loads(raw[s:e + 1])
+            except Exception:
+                continue
+        raise RuntimeError("revision did not converge on a plan")
+    finally:
+        hd.delete_session(sid)
+
+
+@app.post("/api/plan/sessions/{sid}/revise")
+async def plan_session_revise(sid: str, body: dict):
+    """Close the premortem loop (Step 7b): ONE revision turn folds the critique
+    findings + structural warnings back into a corrected plan. The result runs
+    the SAME deterministic pipeline as a fresh draft (_repair_workflow →
+    criteria distribution → validators). Findings the model cannot resolve
+    alone come back as ≤3 operator questions; answers return via `notes`.
+    Advisory like the premortem — the operator always confirms in the editor."""
+    import plan_engine as _pe
+    row = _owned_plan_session(sid)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "plan session not found"})
+    if row.get("status") == "abandoned":
+        return JSONResponse(status_code=409, content={"error": "session was abandoned"})
+    family = row.get("family") or "content"
+    spec = json.loads(row.get("spec_json") or "{}")
+    goal = row.get("goal") or ""
+    uid = row.get("user_id")
+    body = body or {}
+    tasks = body.get("tasks") if isinstance(body.get("tasks"), list) else []
+    if not tasks:
+        return JSONResponse(status_code=400, content={"error": "tasks required"})
+    findings = body.get("findings") if isinstance(body.get("findings"), list) else []
+    warns_in = body.get("warnings") if isinstance(body.get("warnings"), list) else []
+    notes = str(body.get("notes") or "")
+    for t in tasks:
+        if isinstance(t, dict) and t.get("depends_on_idx") is None:
+            t["depends_on_idx"] = t.get("depends_on") or []
+    try:
+        data = await run_in_threadpool(_plan_revise_raw, spec, family, goal, uid,
+                                       tasks, findings, warns_in, notes,
+                                       row.get("repo_path"))
+    except hd.QuotaError:
+        return JSONResponse(status_code=503, content={
+            "error": "GLM is load-shedding right now — try again in a minute"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+
+    wf = data.get("workflow") if isinstance(data.get("workflow"), dict) else {}
+    raw_tasks = wf.get("tasks") if isinstance(wf.get("tasks"), list) else []
+    if not raw_tasks and isinstance(data.get("task"), dict):
+        raw_tasks = [data["task"]]   # tolerate a single-task reply defensively
+    if not raw_tasks:
+        return JSONResponse(status_code=502, content={"error": "revision returned no tasks"})
+    for rt in raw_tasks:
+        if isinstance(rt, dict) and "depends_on" not in rt:
+            rt["depends_on"] = rt.get("depends_on_idx") or []
+    name = str(wf.get("name") or "").strip()[:120] or (goal[:80] or "Deep Plan project")
+    spend = next((t.get("spend_profile") for t in tasks
+                  if isinstance(t, dict) and t.get("spend_profile")), None)
+    new_tasks, repairs = _repair_workflow(raw_tasks, name, max_raw=7, uid=uid,
+                                          spend_profile=spend)
+    _preserve_task_fields(new_tasks, tasks)
+    dtype = _pe.FAMILY_DELIVERABLE_TYPE.get(family)
+    for t in new_tasks:
+        if dtype and not t.get("deliverable_type"):
+            t["deliverable_type"] = dtype
+    repairs += _distribute_criteria(new_tasks, family, spec)
+    warnings = _validate_plan(new_tasks, family, spec, goal=goal)
+    db.execute("UPDATE plan_sessions SET updated_at=? WHERE id=?", (time.time(), sid))
+    db.log_activity("info", "plan", f"Deep Plan revision applied {len(findings) + len(warns_in)} "
+                    f"finding(s) on '{name[:40]}'", user_id=uid)
+    return {"tasks": new_tasks, "repairs": repairs, "warnings": warnings,
+            "questions": _clamp_plan_questions(data.get("questions")),
+            "auto_revise": db.get_setting("plan.auto_revise", "1") == "1",
+            "critique_enabled": db.get_setting("plan.critique_enabled", "1") == "1"}
 
 
 def _write_session_spec(kind: str, oid: str, row: dict) -> bool:
