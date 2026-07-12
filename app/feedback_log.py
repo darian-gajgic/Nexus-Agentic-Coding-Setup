@@ -126,30 +126,47 @@ def insert_entry(kind: str, entry: str, user_id: str | None = None) -> str:
     return target
 
 
+def promote_file(src_path: str, domain: str, stem: str, provenance: str) -> str:
+    """Copy any deliverable file into domains/<domain>/examples/ as
+    {today}-{stem}.md, deduping with -2/-3… — a same-day re-promotion never
+    silently overwrites. Shared by win-promotion and the eval-improve
+    exemplar path (which used to re-implement this inline)."""
+    if not re.match(r"^[a-z0-9-]+$", domain) or domain == "general":
+        raise ValueError("a real domain is required to promote into")
+    if not os.path.isfile(src_path):
+        raise ValueError("no deliverable file to promote")
+    dest_dir = os.path.join(knowledge_root(), "domains", domain, "examples")
+    os.makedirs(dest_dir, exist_ok=True)
+    base = f"{_dt.date.today().isoformat()}-{stem}"
+    dest, n = os.path.join(dest_dir, f"{base}.md"), 2
+    while os.path.exists(dest):
+        dest, n = os.path.join(dest_dir, f"{base}-{n}.md"), n + 1
+    with open(src_path, encoding="utf-8", errors="replace") as fh:
+        content = fh.read()
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(provenance + content)
+    return dest
+
+
 def promote_deliverable(task: dict, headline: str, numbers: str = "",
                         by: str = "") -> str:
     """Copy the winning deliverable into domains/<domain>/examples/ — the
     directory golden_exemplars + dispatch framing already treat as the
     quality bar, so a promoted win immediately shapes future work."""
     domain = (task.get("domain") or "").strip()
-    if not re.match(r"^[a-z0-9-]+$", domain) or domain == "general":
-        raise ValueError("task needs a real domain to promote into")
     src = os.path.join(task.get("workspace_path") or "", "deliverable.md")
-    if not os.path.isfile(src):
-        raise ValueError("no deliverable.md to promote")
-    dest_dir = os.path.join(knowledge_root(), "domains", domain, "examples")
-    os.makedirs(dest_dir, exist_ok=True)
     today = _dt.date.today().isoformat()
     slug = re.sub(r"[^a-z0-9]+", "-", (headline or "win").lower()).strip("-")[:40] or "win"
-    dest = os.path.join(dest_dir, f"{today}-{task['id']}-{slug}.md")
-    with open(src) as fh:
-        content = fh.read()
     prov = (f"<!-- promoted from Nexus task {task['id']} on {today}"
             + (f" by {_one_line(by, 60)}" if by else "")
             + (f"; result: {_one_line(numbers, 200)}" if numbers else "") + " -->\n\n")
-    with open(dest, "w") as fh:
-        fh.write(prov + content)
-    return dest
+    try:
+        return promote_file(src, domain, f"{task['id']}-{slug}", prov)
+    except ValueError as e:
+        # keep the historical, task-specific error wording
+        if "domain" in str(e):
+            raise ValueError("task needs a real domain to promote into")
+        raise ValueError("no deliverable.md to promote")
 
 
 def parse_entries(text: str) -> list[dict]:

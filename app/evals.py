@@ -1706,15 +1706,13 @@ def apply_improvements(payload: dict, user_id: str | None, username: str = "oper
             continue
         try:
             import datetime as _dt
-            dest_dir = os.path.join(_lessons._knowledge_root(), "domains", domain, "examples")
-            os.makedirs(dest_dir, exist_ok=True)
+            import feedback_log as _fb
             today = _dt.date.today().isoformat()
-            dest = os.path.join(dest_dir, f"{today}-eval-{cid}.md")
-            content = open(src, encoding="utf-8", errors="replace").read()
             prov = (f"<!-- promoted from eval run {run_id} case {cid} on {today} "
                     f"by {username} (SHIP-quality eval result) -->\n\n")
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(prov + content)
+            # collision-proof shared writer — a same-day re-promotion of the
+            # same case used to silently overwrite the earlier exemplar
+            dest = _fb.promote_file(src, domain, f"eval-{cid}", prov)
             _lessons._git(_lessons._knowledge_root(), "add", dest)
             _lessons._git(_lessons._knowledge_root(), "-c", "user.name=nexus", "-c",
                           "user.email=nexus@local", "commit", "-m",
@@ -1722,10 +1720,18 @@ def apply_improvements(payload: dict, user_id: str | None, username: str = "oper
             applied.append({"kind": "exemplar", "case_id": cid, "path": dest})
         except Exception as e:
             skipped.append({"kind": "exemplar", "case_id": cid, "reason": str(e)[:100]})
-    db.execute("UPDATE eval_runs SET improve_status='applied' WHERE id=?", (run_id,))
+    # 'applied' ONLY when something actually landed — the UI treats it as
+    # terminal (the ✨ Improve button never re-arms), so an all-skipped run
+    # used to lock the operator out of retrying. 'none' re-arms it.
+    db.execute("UPDATE eval_runs SET improve_status=? WHERE id=?",
+               ("applied" if applied else "none", run_id))
+    skip_note = ""
+    if skipped and not applied:
+        skip_note = f" — nothing applied: {skipped[0].get('reason', 'unknown')}"
     db.log_activity("info", "evals",
                     f"Eval improvements applied for '{domain}' run {run_id}: "
-                    f"{len(applied)} applied, {len(skipped)} skipped", user_id=user_id)
+                    f"{len(applied)} applied, {len(skipped)} skipped{skip_note}",
+                    user_id=user_id)
     return {"applied": applied, "skipped": skipped}
 
 
