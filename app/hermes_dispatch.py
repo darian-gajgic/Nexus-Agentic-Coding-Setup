@@ -456,12 +456,28 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
 
 # ── Budgets & quota backoff (SPEC R7) ──
 
+def _type_setting(prefix: str, task: dict, fallback: int) -> int:
+    """Item 17: per-deliverable-type override (e.g. dispatch.turn_seconds.content)
+    falling back to the global value — content tasks don't need a 4h cap or a
+    5M budget."""
+    dtype = (task.get("deliverable_type") or "").strip()
+    if dtype:
+        v = sreg.conf(f"{prefix}.{dtype}")  # setting → registry default → ""
+        if v:
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                pass
+    return fallback
+
+
 def check_budgets(task: dict) -> str | None:
     """Return a blocked-state name if this task must NOT be dispatched now.
     Task-specific budget is checked BEFORE the global quota backoff so a budget
     verdict stays deterministic even in the middle of a 429 storm."""
     budget = task.get("budget_tokens") \
-        or int(sreg.conf("dispatch.default_task_budget") or 5000000)
+        or _type_setting("dispatch.default_budget", task,
+                         int(sreg.conf("dispatch.default_task_budget") or 5000000))
     if (task.get("tokens_used") or 0) >= budget:
         return "blocked_budget"
     backoff_until = float(db.get_setting("dispatch.quota_backoff_until", "0") or 0)
@@ -941,10 +957,13 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
             f"- Write {workspace}/deliverable.md as a CHANGE REPORT: what you added/changed "
             "and why, files touched, and follow-ups. The DIFF on the branch is the real "
             "deliverable — the operator reviews and merges it manually."
-            + (f"\n\nPROJECT CONVENTIONS {repo_ctx['conventions'][:6200]}"
+            # Item 17: conventions capped tighter (agents read the file on
+            # demand anyway); the code map only helps CODE work — a content
+            # task gains nothing from a language histogram (−4k chars/call).
+            + (f"\n\nPROJECT CONVENTIONS {repo_ctx['conventions'][:4000]}"
                if repo_ctx.get("conventions") else "")
             + (f"\n\nCODE MAP (repository layout):\n{repo_ctx['code_map']}"
-               if repo_ctx.get("code_map") else ""))
+               if is_code and repo_ctx.get("code_map") else ""))
         parts.append(common_head + body + common_tail)
     else:
         parts.append(
@@ -963,14 +982,17 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
         "verified assertions — the grounded critic and judge check unmarked claims to "
         "that standard and treat an unmarked-but-false claim as a critical failure, so "
         "flagging honest uncertainty PROTECTS your score.")
-    parts.append(
-        "When the task needs a STRUCTURED FACT — exchange rates, weather, country/market "
-        "data, public holidays, economic indicators, paper/package/repo metadata, "
-        "naming/word ideas, product barcodes, webshop seed data, music metadata/BPM — "
-        "read ~/.hermes/skills/fetching-structured-facts/SKILL.md first: curated keyless "
-        "APIs with exact commands (verified working). More precise than web search for "
-        "these; for everything else use web search as usual."
-    )
+    if (task.get("deliverable_type") or "") != "code_change":
+        # Item 17: dev stages virtually never need exchange rates/holidays —
+        # the skill stays discoverable on disk; content/research keep the hint.
+        parts.append(
+            "When the task needs a STRUCTURED FACT — exchange rates, weather, country/market "
+            "data, public holidays, economic indicators, paper/package/repo metadata, "
+            "naming/word ideas, product barcodes, webshop seed data, music metadata/BPM — "
+            "read ~/.hermes/skills/fetching-structured-facts/SKILL.md first: curated keyless "
+            "APIs with exact commands (verified working). More precise than web search for "
+            "these; for everything else use web search as usual."
+        )
     domain = (task.get("domain") or "").strip()
     if domain and domain != "general":
         kp = _knowledge_paths(task)
@@ -1035,10 +1057,13 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
         # are ever injected (task_dependencies resolves the direct depends_on list),
         # so in brief mode a member deep in the DAG leans on the DECISIONS.md brief
         # above for cross-stage context instead of a longer reading list.
-        brief_mode = db.get_setting("framing.brief_mode", "0") == "1"
+        brief_mode = db.get_setting("framing.brief_mode", "1") == "1"
+        shown_deps = deps[:8]  # item 17: bound the reading list (fan-out plans)
         lines = "\n".join(
             f"- {d['workspace_path'] or 'workspaces/' + d['id']}/deliverable.md "
-            f"(output of '{d['title']}')" for d in deps)
+            f"(output of '{d['title']}')" for d in shown_deps)
+        if len(deps) > len(shown_deps):
+            lines += f"\n- …{len(deps) - len(shown_deps)} more predecessor deliverable(s) in their workspaces"
         parts.append(
             "This task builds on completed predecessor tasks in the same workflow. "
             "FIRST read their deliverables with your file tools — they are your input:\n"
@@ -1051,10 +1076,15 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
     # retry feedback comes later (the final word).
     atts = _attachment_lines(task, workspace)
     if atts:
+        shown_atts = atts[:20]  # item 17: unbounded path lists cost tokens every call
+        att_lines = "\n".join(f"- {a}" for a in shown_atts)
+        if len(atts) > len(shown_atts):
+            att_lines += (f"\n- …{len(atts) - len(shown_atts)} more attached file(s) — "
+                          "list the attachments/ directories for the rest")
         parts.append(
             "The operator ATTACHED input files for this work — read them FIRST, they are "
             "part of the brief and take precedence over the project context above:\n"
-            + "\n".join(f"- {a}" for a in atts)
+            + att_lines
             + f"\nExtract pdf/docx/xlsx/pptx content with {DOC_TOOLS_PY} "
               "(pypdf, python-docx, openpyxl, python-pptx).")
     if task.get("retry_feedback"):
@@ -1778,8 +1808,10 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         else:
             result = stream_turn(session_id, input_text, system_message=framing,
                                  on_event=on_event,
-                                 max_seconds=int(db.get_setting("dispatch.max_turn_seconds",
-                                                                str(DEFAULT_MAX_TURN_SECONDS))),
+                                 max_seconds=_type_setting(
+                                     "dispatch.turn_seconds", task,
+                                     int(db.get_setting("dispatch.max_turn_seconds",
+                                                        str(DEFAULT_MAX_TURN_SECONDS)))),
                                  stall_seconds=int(db.get_setting(
                                      "dispatch.max_turn_stall_seconds",
                                      str(DEFAULT_TURN_STALL_SECONDS))))

@@ -56,6 +56,12 @@
       "path": "security.redact_secrets",
       "expected": true,
       "enforce": true
+    },
+    {
+      "path": "compression.threshold",
+      "expected": 0.35,
+      "enforce": true,
+      "note": "item 17 (2026-07-12): compact long agentic turns earlier \u2014 the working-context ceiling drops ~30%, the dominant token sink on 100+-tool-call dispatch turns"
     }
   ],
   "config_contains": [

@@ -48,6 +48,23 @@ SECTIONS = [
             {"key": "dispatch.max_concurrent_per_model", "label": "Max concurrent per model", "type": "int",
              "default": "8", "min": 1, "max": 32,
              "help": "Z.AI's concurrency limit is per model (~10). Per-model overrides live in Models & routing."},
+            {"key": "dispatch.turn_seconds.content", "label": "Turn cap: content tasks (s)", "type": "int",
+             "default": "5400", "min": 60, "max": 43200,
+             "help": "Item 17: a PowerPoint/copy/document task that hasn't finished in 1.5h "
+                     "is churning — cut earlier than the global 4h cap (the run itself "
+                     "detaches and is harvested as usual). Per-type twins exist for "
+                     "research/analysis; code tasks keep the global cap."},
+            {"key": "dispatch.turn_seconds.research", "label": "Turn cap: research tasks (s)", "type": "int",
+             "default": "10800", "min": 60, "max": 43200,
+             "help": "Item 17: wall-clock cap for research deliverables (3h default)."},
+            {"key": "dispatch.turn_seconds.analysis", "label": "Turn cap: analysis tasks (s)", "type": "int",
+             "default": "10800", "min": 60, "max": 43200,
+             "help": "Item 17: wall-clock cap for analysis deliverables (3h default)."},
+            {"key": "dispatch.default_budget.content", "label": "Budget: content tasks (tokens)", "type": "int",
+             "default": "2000000", "min": 10000,
+             "help": "Item 17: content deliverables rarely justify the global 5M default — "
+                     "this bounds the NEXT dispatch/retry once a content task has burned 2M. "
+                     "A task's own budget_tokens still overrides."},
             {"key": "models.auto_route", "label": "Auto-pick the best model per task", "type": "bool",
              "default": "1",
              "help": "Item 15: when a task is created WITHOUT an explicit model, pick the "
@@ -249,11 +266,12 @@ SECTIONS = [
                 "two-axis autopilot presets. All default to today's behavior.",
         "items": [
             {"key": "framing.brief_mode", "label": "Brief mode (project running-brief)", "type": "bool",
-             "default": "0",
-             "help": "Q4: when on, workflow members deep in the pipeline lean on the project "
+             "default": "1",
+             "help": "Q4: workflow members deep in the pipeline lean on the project "
                      "DECISION LOG for cross-stage context instead of a longer reading list "
                      "(only their direct predecessors' deliverables are injected either way). "
-                     "Saves tokens on long projects."},
+                     "Saves tokens on long projects. ON by default since 2026-07-12 (item 17) "
+                     "— turn off to restore the fuller reading-list note."},
             {"key": "pipeline.tests_first", "label": "Acceptance-tests-first (coding)", "type": "bool",
              "default": "1",
              "help": "Q3: coding pipelines have the spec stage deliver an executable "
