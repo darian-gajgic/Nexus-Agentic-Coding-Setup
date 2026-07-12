@@ -1365,6 +1365,20 @@ def _finalize_cancel(dispatch_id: str, task_id: str, agent_id: str):
     task back in Backlog, unclaimed. session_id is dropped ON PURPOSE — the
     orphaned upstream run (if any) must never be waited on or harvested (the
     operator said stop), and the next dispatch starts fresh."""
+    # Best-effort upstream abort: server._request_stop only POSTs when run_id
+    # was already captured at stop time — a ⏹ during 'dispatching' (run.started
+    # not yet seen) sent nothing, and the orphaned Hermes run burned tokens to
+    # end of turn. By the time the executor's cancel poll lands here, run_id is
+    # usually in the dispatches row — re-read and stop the run. No run_id
+    # (stopped before the run existed upstream, or the gate's stubbed stream)
+    # = nothing to stop. Never fails the cancel.
+    try:
+        row = db.query_one("SELECT run_id FROM dispatches WHERE id=?", (dispatch_id,))
+        if row and row.get("run_id"):
+            httpx.post(f"{HERMES_API_BASE}/v1/runs/{row['run_id']}/stop",
+                       headers=_headers(), timeout=5)
+    except Exception:
+        pass
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if task and task.get("session_id"):
         remove_session_key(task["session_id"])
