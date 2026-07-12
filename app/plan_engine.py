@@ -306,6 +306,8 @@ SPEC_TEMPLATES: dict = {
         ("data_integrations", "Data / integrations", "text", False, "stores, external services, APIs"),
         ("out_of_scope", "Out of scope", "text", False, "what this explicitly does NOT do"),
         ("risks", "Risks", "text", False, "what could go wrong; blast radius"),
+        ("notes", "Notes / decisions", "text", False,
+         "operator decisions made during plan revision"),
     ],
     "analysis-audit": [
         ("scope", "Scope", "text", True, "the subsystems / artifacts to examine, enumerated"),
@@ -315,6 +317,8 @@ SPEC_TEMPLATES: dict = {
          "what counts as proof (re-run commands, primary sources, A-gates)"),
         ("deliverable_format", "Deliverable format", "text", False, "report shape, length, audience"),
         ("out_of_scope", "Out of scope", "text", False, "what is explicitly NOT examined"),
+        ("notes", "Notes / decisions", "text", False,
+         "operator decisions made during plan revision"),
     ],
     "content": [
         ("audience", "Audience", "text", True, "who reads it and what they already know"),
@@ -324,6 +328,8 @@ SPEC_TEMPLATES: dict = {
         ("success_metric", "Success metric", "text", False, "what a win looks like"),
         ("length", "Length", "text", False, "word/section budget"),
         ("mandatories_taboos", "Mandatories / taboos", "text", False, "must-include and never-say"),
+        ("notes", "Notes / decisions", "text", False,
+         "operator decisions made during plan revision"),
     ],
     "research": [
         ("research_questions", "Research questions", "list", True,
@@ -334,6 +340,8 @@ SPEC_TEMPLATES: dict = {
         ("depth_breadth", "Depth / breadth", "text", False, "how wide vs how deep"),
         ("decision_it_informs", "Decision it informs", "text", False,
          "the decision this research feeds"),
+        ("notes", "Notes / decisions", "text", False,
+         "operator decisions made during plan revision"),
     ],
 }
 
@@ -423,16 +431,27 @@ def render_spec_md(spec: dict, family: str, goal: str = "") -> str:
 
 
 # ─────────────────────────── Interview framing + turn parsing ───────────────────────────
-def interview_framing(family: str, max_q: int, max_turns: int, goal: str) -> str:
+def interview_framing(family: str, max_q: int, max_turns: int, goal: str,
+                      context: str = "") -> str:
     """Scaffolded system framing for the planning session (LOCKED §3.3/§3.4).
     The model interviews the operator to fill the template; it asks ONLY for
     empty/ambiguous required slots, ≤max_q questions/turn with 3–5 ★-marked
-    options, and says READY once required slots are filled."""
+    options, and says READY once required slots are filled. `context` grounds
+    the interview in existing work (repo conventions/tree/languages) so the
+    questions target the CHANGE, not a greenfield rebuild."""
     slots = spec_slots(family)
     slot_lines = "\n".join(
         f"- {key} ({'list' if kind == 'list' else 'text'}"
         f"{', REQUIRED' if req else ', optional'}): {hint}"
         for key, _label, kind, req, hint in slots)
+    ctx_block = ""
+    if (context or "").strip():
+        ctx_block = (
+            "EXISTING PROJECT STATE — the goal is a CHANGE to this existing work. Ground "
+            "every question and every suggested option in it: never re-ask what the context "
+            "already answers (stack, framework, structure), ask how the change integrates "
+            "with what exists, and fill slots from it where possible.\n"
+            + context.strip()[:5000] + "\n\n")
     return (
         "You are the Deep Plan interviewer for the Nexus agent control plane. The operator "
         f"has a {FAMILY_LABELS.get(family, family)} goal and you are filling a structured SPEC "
@@ -444,6 +463,7 @@ def interview_framing(family: str, max_q: int, max_turns: int, goal: str) -> str
         "audit, a build, or research, that work happens LATER in the tasks this plan creates, "
         "never here. Reply immediately with the JSON object and nothing else.\n\n"
         f"OPERATOR GOAL: {goal.strip()[:1500]}\n\n"
+        + ctx_block +
         "SPEC SLOTS (fill these — required slots gate readiness):\n" + slot_lines + "\n\n"
         "EVERY reply is ONLY a JSON object, no prose outside it, no code fences:\n"
         '{"message": "<one short line to the operator>",\n'
@@ -559,6 +579,36 @@ def stub_plan(spec: dict, family: str, goal: str) -> dict:
         "deliverable_type": "content",
         "description": f"Create: {g}. Audience: {(spec or {}).get('audience','')}. "
                        f"Core message: {(spec or {}).get('core_message','')}.{done_when}"}}
+
+
+def stub_revise(spec: dict, family: str, goal: str, tasks: list,
+                findings: list, notes: str = "") -> dict:
+    """Deterministic canned REVISION for the verify gate (plan.stub): each
+    finding's problem line is appended to its target task ('Addressed finding
+    N: …'), and one canned operator question is returned on a notes-free round
+    (none once notes/answers are supplied) — so the gate can assert both the
+    revision and the guided-question path without a model call."""
+    import copy
+    out = copy.deepcopy(tasks or [])
+    for n, f in enumerate(findings or []):
+        if not out:
+            break
+        f = f if isinstance(f, dict) else {}
+        idx = f.get("task_idx")
+        idx = idx if isinstance(idx, int) and 0 <= idx < len(out) else 0
+        problem = str(f.get("problem") or f.get("message") or "finding").strip()[:120]
+        out[idx]["description"] = ((out[idx].get("description") or "").rstrip()
+                                   + f"\nAddressed finding {n + 1}: {problem}").strip()
+    questions = []
+    if (findings or []) and not (notes or "").strip():
+        questions = [{"id": "q1", "question": "[stub] Keep the current scope?",
+                      "why": "stub revision decision",
+                      "options": [{"label": "Yes", "recommended": True},
+                                  {"label": "No", "recommended": False}]}]
+    g = (goal or "revised plan").strip()[:120]
+    return {"type": "workflow",
+            "workflow": {"name": g, "goal": g, "tasks": out},
+            "questions": questions}
 
 
 def stub_turn(spec: dict, family: str, user_message: str, turns_so_far: int,

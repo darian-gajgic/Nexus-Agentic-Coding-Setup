@@ -215,3 +215,71 @@ From the repo root / `app/`:
 - `app/.venv/bin/python app/scripts/check_async_blocking.py` → PASS (B7).
 
 Working tree: fully committed, clean.
+
+---
+
+## 8. 2026-07-12 — operator-found live failure → validator fixes + the Step-7b revise loop
+
+A REAL Deep Plan run (restaurant-voice-assistant MVP) produced a wall of ⚠ warnings instead
+of a usable plan, and "Re-run premortem" only re-checked the same draft (more warnings, no
+guidance). Root causes verified in code, all fixed:
+
+1. **Orphan-criterion false positives (all 9 criteria flagged)** — `_validate_plan` matched a
+   criterion by exact case-insensitive substring of its first 50 chars; the draft model
+   paraphrases. Fix: `_criterion_covered` fuzzy match (≥60% of significant tokens, `_sig_toks`
+   ≥4 chars minus `_PLAN_STOPWORDS`; token-free criteria keep the substring fallback).
+2. **Near-duplicate + cross-reference false positives on the STANDARD template** — all 5 stage
+   titles share the goal name; after stopword stripping they collapse to the same token set
+   (Jaccard ≈ 1.0). Fix: both checks exclude goal-common tokens (goal tokens + tokens in ≥half
+   of titles when ≥3 tasks); thin distinctive sets skip the check.
+3. **Self-inflicted premortem truncation findings** — `_plan_text` fed the reviewer briefs cut
+   at 1200 chars (titles 120), so it correctly reported "prompts truncated mid-sentence". Fix:
+   caps now match storage (200/8000) and any cut carries an explicit ` …[truncated]` marker.
+   `_clamp_wizard_task` description clamp raised 4000→8000 (briefs are agent prompts; dispatch
+   uses them unclamped; UI truncates display-only).
+4. **Warning messages cut titles mid-word at [:40]** — `_short()` cuts at a word boundary and
+   marks the cut.
+5. **Coverage is now GUARANTEED, not warned about** — `_distribute_criteria` (draft + revise):
+   any criterion no task fuzzy-covers is appended VERBATIM as a `Done when:` line to the
+   best-matching task (acceptance-verifier fallback; idempotent; noted in `repairs`). The
+   spec_block also instructs verbatim copies + complete briefs (no trailing ellipsis).
+6. **NEW: the revise loop (Step 7b)** — `POST /api/plan/sessions/{sid}/revise`
+   (`_plan_revise_raw`, threadpooled, `nexus:plan-revise` session on the default task model):
+   feeds the current plan + numbered findings/warnings back and gets the FULL corrected plan;
+   result re-runs `_repair_workflow(max_raw=7)` → `_preserve_task_fields` (model/budget/SR/Q7a
+   fields survive) → family `deliverable_type` → `_distribute_criteria` → `_validate_plan`.
+   Findings needing an operator decision return as ≤3 questions (`_clamp_plan_questions`);
+   answers persist to the new universal SPEC `notes` slot AND ride the `notes` body field.
+   UI: ONE auto round after the first critique when `plan.auto_revise` (default 1) and findings
+   exist (`planEd.autoRevised` cap), then an automatic re-check; `🔧 Revise plan from findings`
+   runs manual rounds; `deepPlanRenderQuestions` renders the decision block (`#dpReviseQs`).
+   `plan_engine.stub_revise` stubs it for the gates.
+
+**Deviations / known limitations (recorded):** single-task Deep Plan drafts still skip
+critique/revise — the hook lives in the workflow proposal modal only, same scope the premortem
+always had. The revise endpoint tolerates a `{"type":"task"}` reply defensively but no UI path
+sends one.
+
+**Also 2026-07-12 — planning grounded on existing work (operator requirement):** the quick
+wizard already accepted `repo_path` + `_wizard_repo_context`; Deep Plan did not — a plan that
+CHANGES an existing project was drafted greenfield. Now: `plan_sessions.repo_path` column
+(guarded ALTER), start body accepts + validates `repo_path` (400 on a non-repo), and
+`_plan_repo_block` (reuses `_wizard_repo_context`: conventions file, tree, languages) grounds
+the interview framing EVERY turn plus the draft and revise prompts. Draft response echoes
+`repo_path` (proposal modal preselects 🧬); UI sends it from the ✨ modal's 📂 picker
+(`twDeep` opts + `wizardCtx` fallback in `startDeepPlan`) and shows a 🧬 chip on the Deep Plan
+modal; JARVIS PLAN WELL + DEEP PLAN framing lines document the field (the wizard's existing
+`repo_path` was previously undocumented there). Two prompt-hardening fixes from the live runs:
+the wizard/draft/revise framing now carries the interview's proven ⛔ TOOLS-ARE-OFF-LIMITS
+block (a live revise turn tried `node --version`/`npx playwright` "feasibility checks" that
+stalled as pending_approval), and the revise turn cap is 600s (a live 8-finding revision blew
+the draft's 300s cap; the orphaned stream also explains a benign gateway
+ClientConnectionResetError at 08:21).
+
+**Gate results (2026-07-12):** `verify.sh` **450/450** (three new §20 greps) ·
+`verify_deep_plan_e2e.py` **42/42** (validator regressions, `_distribute_criteria`
+verbatim+idempotent, `_plan_text` marker, revise happy path/questions/notes/status/fields,
+auto_revise plumbing, operator-owned fields win over model CHANGES) · `verify_deep_plan_ui.py` **13/13** (revise button, auto-revise folds
+stub findings into the plan, decision question renders; zero console errors) · repo grounding: 5 e2e checks (persist/echo/400/real tree read) ·
+`check_async_blocking.py` PASS · one REAL-model session (interview → draft → real premortem →
+revise) verified end-to-end.

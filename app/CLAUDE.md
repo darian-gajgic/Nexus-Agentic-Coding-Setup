@@ -255,18 +255,24 @@ It connects to Hermes Agent API (localhost:8642) for LLM, Piper TTS for voice, a
   the Q7a two-axis preset cards mount in BOTH the project proposal wizard and the task-create
   wizard. 17 checks, self-cleaning (seeded approval/task removed).
 - **Runtime gate — Deep Plan (DEEP-PLAN-MODE-PLAN):** `.venv/bin/python scripts/verify_deep_plan_e2e.py` —
-  21 checks with the PLANNING model stubbed via `plan.stub`: triage heuristics (simple vs
+  36 checks with the PLANNING model stubbed via `plan.stub`: triage heuristics (simple vs
   complex) + recommendation payload + spend-profile override + divergence math; session CRUD +
   resume + slot-fill READY stop rule + direct spec edit; draft seeds phase-2 + family→
   deliverable_type + criteria distribution; orphan-criterion validator + premortem-stub
-  annotations; SPEC lands as attachment + in the critic context; stale-session sweep (both
-  `active` AND `drafted` — the voice/API path can draft then never attach).
-  Self-cleaning (restores plan.stub).
+  annotations; validator false-positive regressions (5-stage template → zero near-dup/cross-ref,
+  paraphrased criterion counts as covered) + `_distribute_criteria` verbatim/idempotent +
+  `_plan_text` explicit truncation marker; the Step-7b revise loop (findings → corrected plan,
+  auto_revise flag plumbing, stub question on a notes-free round, notes answer it, status stays
+  drafted, fields preserved); SPEC lands as attachment + in the critic context; stale-session
+  sweep (both `active` AND `drafted` — the voice/API path can draft then never attach).
+  Self-cleaning (restores plan.stub + plan.auto_revise).
 - **Runtime gate — Deep Plan UI (Playwright):** `.venv/bin/python scripts/verify_deep_plan_ui.py` —
-  10 checks (plan.stub-driven): the recommendation banner accept/deny over the wizard flow, the
+  13 checks (plan.stub-driven): the recommendation banner accept/deny over the wizard flow, the
   two-pane Deep Plan modal (conversation + spec), family switcher, a turn, a direct spec edit
   persisting, and Draft → the proposal modal with the Deep Plan banner + a premortem ⚠
-  annotation on a task card + the re-run premortem button; asserts zero console errors. Self-cleaning.
+  annotation on a task card + the re-run premortem button + the 🔧 revise button, the auto-revise
+  round folding stub findings into the plan, and the revision decision question rendering;
+  asserts zero console errors. Self-cleaning.
 - **Runtime gate — Settings v2 (SPEC-SETTINGS-V2):** `.venv/bin/python scripts/verify_settings_e2e.py` —
   settings schema/registry round-trip, encrypted credential store (masked responses, plaintext
   never leaves the API, per-user isolation), machine-default key view/rotation (scratch env
@@ -542,7 +548,13 @@ core (families, triage, divergence, spec templates, stubs); model calls live in 
   `plan.recommend` (eco→never/optimal→auto/smart→always).
 - **Sessions** (`plan_sessions` table, `/api/plan/sessions` CRUD): start creates the row + a
   dedicated Hermes planning session (scaffolded per-family system framing) and runs the
-  opening turn; `/turn` fills slots (≤`plan.max_questions_per_turn` questions, 3–5 ★ options,
+  opening turn; start also accepts **`repo_path`** (validated like task repo_path, 400 on a
+  non-repo, persisted on the session) — when set, `_plan_repo_block` (= the quick wizard's
+  `_wizard_repo_context`: conventions file, tree, languages) grounds the INTERVIEW framing
+  every turn AND the draft + revise prompts, so the plan is a CHANGE to the existing project
+  instead of a greenfield build. The UI sends it from the ✨ modal's 📂 project picker
+  (`twDeep` / `wizardCtx.repo_path`), shows a 🧬 chip on the Deep Plan modal, and the draft
+  response echoes `repo_path` so the proposal modal preselects the 🧬 repo select; `/turn` fills slots (≤`plan.max_questions_per_turn` questions, 3–5 ★ options,
   READY once required slots filled or `plan.max_turns`); PATCH `/spec` edits slots directly;
   GET list/one resume; DELETE abandons. Owner-scoped. Every model-calling endpoint ships its
   blocking work to `run_in_threadpool` (B7; `check_async_blocking.py` enforces it). `plan.stub`
@@ -551,27 +563,49 @@ core (families, triage, divergence, spec templates, stubs); model calls live in 
   actives >7d + deletes their Hermes sessions, at startup + hourly on the scheduler; create/
   abandon delete the Hermes session too.
 - **Draft** (`/draft`): seeds the phase-2 wizard framing with the rendered SPEC (an optional
-  `spec_block` on `_task_wizard_framing`), runs `_repair_workflow`, sets `deliverable_type`
-  from the family map (software→`code_change`/analysis-audit→`analysis`/content→`content`/
-  research→`research` — `plan_engine.FAMILY_DELIVERABLE_TYPE`) on every task, distributes
-  acceptance criteria as `Done when:` lines, status→`drafted`. Reuses the wizard proposal modal.
+  `spec_block` on `_task_wizard_framing` — instructs VERBATIM criterion copies + complete
+  briefs), runs `_repair_workflow`, sets `deliverable_type` from the family map
+  (software→`code_change`/analysis-audit→`analysis`/content→`content`/
+  research→`research` — `plan_engine.FAMILY_DELIVERABLE_TYPE`) on every task, then
+  `_distribute_criteria` GUARANTEES coverage: any acceptance criterion no task fuzzy-covers is
+  appended verbatim as a `Done when:` line to the best-matching task (verifier fallback,
+  idempotent, noted in repairs), status→`drafted`. Reuses the wizard proposal modal.
 - **Verify** (`server._validate_plan` + `/critique`): deterministic structural validators
-  (orphan criterion, output-ref-without-dep noun-match WARN, near-duplicate titles, budget
-  sanity) + ONE external premortem on the `spec_model` purpose (`evals.run_plan_critique`,
+  (orphan criterion via FUZZY token match `_criterion_covered` — ≥60% of significant tokens,
+  never exact-substring; output-ref-without-dep noun-match WARN; near-duplicate titles —
+  both title checks exclude goal-common tokens so the standard 5-stage template never
+  false-positives; budget sanity; `_short()` word-boundary quotes in messages) + ONE external
+  premortem on the `spec_model` purpose (`evals.run_plan_critique`, fed FULL task briefs by
+  `_plan_text` — caps match storage, any cut carries an explicit `…[truncated]` marker;
   through the SAME `_FRONTIER_GATE` semaphore as the judge/critic — premortem P1; quota-
   classified; `plan.stub`/`plan.critique_cmd` stub it). Findings render as ⚠ annotations on
   the plan-editor task cards (`planEd.annotations`) — advisory, never block approval. Auto-runs on
   first draft; re-runnable via the `🔍 Re-run premortem` button (`wfRerunCritique`). When the plan
   checker changes an edited plan, `planEdComputeDiff` flags ＋added/✎changed/removed cards.
+- **Revise loop** (`/revise`, Step 7b, 2026-07-12): closes the premortem loop — ONE revision
+  turn (`_plan_revise_raw`, model = default task model, `nexus:plan-revise` session) folds the
+  critique findings + structural warnings back into a corrected FULL plan, which re-runs the
+  same deterministic pipeline as a fresh draft (`_repair_workflow` max_raw=7 →
+  `_preserve_task_fields` restores model/budget/SR/Q7a fields the model dropped →
+  `deliverable_type` → `_distribute_criteria` → `_validate_plan`). Findings the model cannot
+  resolve alone return as ≤3 operator questions (`_clamp_plan_questions`); answers persist to
+  the SPEC `notes` slot (now on all four families) and return via the `notes` body field.
+  UI: auto-fires ONE round after the first critique when `plan.auto_revise` (default on) finds
+  anything (`planEd.autoRevised` caps it), then re-checks; the `🔧 Revise plan from findings`
+  button (`deepPlanRevise`) runs manual rounds; questions render via `deepPlanRenderQuestions`
+  (`#dpReviseQs`). Session status stays `drafted` (sweepable). `plan.stub` short-circuits to
+  `plan_engine.stub_revise` (finding lines appended + one canned question on notes-free rounds).
+  Known limitation: single-task Deep Plan drafts skip critique/revise (no `planEd` session hook)
+  — same scope as the premortem itself.
 - **Downstream** (`/attach`, Step 8): on create, `SPEC.md` + `spec.json` are written into the
   workflow/task `attachments/` (MUST-READ framing); `evals.build_critic_sandbox` copies
   `spec.json` into `_critic_context` (`ctx["spec"]`); `cjudge` reads `JUDGE_SPEC`; `replan_draft`
   seeds from the SPEC. `spec_model` registry purpose (default = frontier judge, in
   `db.MODEL_PURPOSES` + `sreg.PURPOSES`/`CLI_PURPOSES` + the assignment API/UI).
 - Settings section `plan` (`deep_enabled/recommend/triage_samples/max_turns/
-  max_questions_per_turn/critique_enabled/critique_timeout_s/critique_cmd/stub`). Gate:
-  `scripts/verify_deep_plan_e2e.py` (21 checks). Step 11 (deep-plan-vs-quick benchmark) is
-  deferred to the one Phase-8 measurement campaign.
+  max_questions_per_turn/critique_enabled/auto_revise/critique_timeout_s/critique_cmd/stub`).
+  Gate: `scripts/verify_deep_plan_e2e.py` (42 checks). Step 11 (deep-plan-vs-quick benchmark)
+  is deferred to the one Phase-8 measurement campaign.
 
 ### Block 3 (2026-07-08, docs/SPEC-BLOCK3.md is source of truth)
 - **Plan editor in the proposal modal (R1)**: every wizard-proposed task is editable in place

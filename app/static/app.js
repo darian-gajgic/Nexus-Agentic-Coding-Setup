@@ -9377,6 +9377,7 @@ function describeTaskUI() {
     if (!instruction.trim()) { toast('Describe the goal first', 'err'); return; }
     startDeepPlan(instruction.trim(), {
       super_result: !!($('#twSuper') && $('#twSuper').checked),
+      repo_path: ($('#twRepo') || {}).value || null,   // ground on the existing project
       family: null }, twDeep);
   };
   const twSel = $('#twRepo');
@@ -9810,6 +9811,11 @@ function proposeWorkflowModal(wf, meta) {
     repairs: (meta && meta.repairs) || [],
     roster: specialistNamesCache || [],
     planSessionId, annotations, specWarnings,
+    // Step 7b revise loop: last critique payloads feed /revise; autoRevised
+    // caps the automatic loop at ONE round (manual rounds stay unlimited).
+    lastFindings: [], lastWarnings: (meta && meta.warnings) || [],
+    questions: [], autoRevised: false, revising: false,
+    autoRevise: !!(meta && meta.auto_revise),
   };
   planEdLoadRoster().then(() => planEdRender());
   const assumptions = (meta && meta.assumptions) || [];
@@ -9817,13 +9823,15 @@ function proposeWorkflowModal(wf, meta) {
     <h2>${planSessionId ? '✦ Deep Plan' : '✨'} — proposed project: ${esc(wf.name)}</h2>
     <div class="view-intro" style="margin-bottom:8px">${esc(wf.goal || '')}</div>
     ${planSessionId ? `<div class="agentic-row" style="margin-bottom:6px;background:rgba(94,234,212,.06)">📋 Built from your Deep Plan spec — it will travel with the project (every task, the critic, the judge). <span id="dpCritiqueStatus" style="color:var(--text-faint)"></span></div>
-    <div id="dpSpecWarnings" style="margin-bottom:6px"></div>` : ''}
+    <div id="dpSpecWarnings" style="margin-bottom:6px"></div>
+    <div id="dpReviseQs" style="margin-bottom:6px"></div>` : ''}
     ${assumptions.length ? `<div style="font-size:12px;color:var(--warn,#eab308);margin-bottom:6px"><strong>Assumed:</strong><br>${assumptions.map(a => '· ' + esc(a)).join('<br>')}<br><span style="color:var(--text-faint)">Wrong assumption? Cancel and rephrase — or ✏️ edit the affected task right here.</span></div>` : ''}
     <div id="wfRepairs" style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px"></div>
     <div id="wfStages" style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto"></div>
     <div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <button class="btn-sm" id="wfAddTask">➕ Add a task</button>
-      ${planSessionId ? `<button class="btn-sm" id="wfRerunCritique" title="Re-run the premortem on the current (edited) plan">🔍 Re-run premortem</button>` : ''}
+      ${planSessionId ? `<button class="btn-sm" id="wfRerunCritique" title="Re-run the premortem on the current (edited) plan">🔍 Re-run premortem</button>
+      <button class="btn-sm" id="wfRevisePlan" title="One AI revision turn rewrites the plan to address the current findings">🔧 Revise plan from findings</button>` : ''}
       <span class="form-hint" style="margin:0">✏️ edit any task — the plan checker re-verifies edited plans (quality gates, wiring) before anything is created.</span>
     </div>
     ${isCoding ? `
@@ -9880,6 +9888,9 @@ function proposeWorkflowModal(wf, meta) {
   // Step 7: re-run the premortem after edits (auto-run only fires on first draft).
   const rerunBtn = $('#wfRerunCritique');
   if (rerunBtn) rerunBtn.onclick = () => deepPlanRunCritique();
+  // Step 7b: manual revision round from the current findings.
+  const reviseBtn = $('#wfRevisePlan');
+  if (reviseBtn) reviseBtn.onclick = () => deepPlanRevise({});
   const b = $('#wfCreateBtn');
   // repo picker options (coding projects only)
   const repoSel = $('#wf-repo');
@@ -10044,6 +10055,7 @@ async function startDeepPlan(goal, opts, btn) {
     logDecision('deep_plan_accept');
     const s = await api('POST', '/api/plan/sessions', {
       goal: goal.trim(), family: opts.family || null,
+      repo_path: opts.repo_path || wizardCtx.repo_path || null,
       super_result: !!opts.super_result, spend_profile: opts.spend_profile || null,
       autopilot: opts.autopilot || null });
     deepPlan = { session: s, super_result: !!opts.super_result,
@@ -10063,7 +10075,7 @@ function logDecision(kind) {
 
 function deepPlanModal() {
   showModal(`
-    <h2>✦ Deep Plan <span class="chip c-cyan" id="dpFamilyChip"></span></h2>
+    <h2>✦ Deep Plan <span class="chip c-cyan" id="dpFamilyChip"></span> <span class="chip" id="dpRepoChip" style="display:none" title="The interview, draft and revisions are grounded in this repository's real state"></span></h2>
     <div class="view-intro" style="margin-bottom:8px">A few targeted questions build a structured
       spec, then it drafts and premortem-checks the plan. You can edit any slot directly, type
       freely, switch the plan type, or <strong>Draft plan</strong> at any time.</div>
@@ -10086,6 +10098,12 @@ function deepPlanRender() {
   if (!deepPlan || !deepPlan.session) return;
   const s = deepPlan.session;
   const chip = $('#dpFamilyChip'); if (chip) chip.textContent = s.family_label || s.family || '';
+  const rchip = $('#dpRepoChip');
+  if (rchip) {
+    const rp = s.repo_path || '';
+    rchip.style.display = rp ? '' : 'none';
+    rchip.textContent = rp ? '🧬 ' + (rp.split('/').pop() || rp) : '';
+  }
   const convo = $('#dpConvo'), spec = $('#dpSpec');
   if (convo) convo.innerHTML = deepPlanConvoHTML(s);
   if (spec) spec.innerHTML = deepPlanSpecHTML(s);
@@ -10268,14 +10286,111 @@ async function deepPlanRunCritique() {
         (planEd.annotations[f.task_idx] = planEd.annotations[f.task_idx] || []).push(msg);
       } else { planEd.specWarnings.push(msg + (f.slot ? ` (spec: ${f.slot})` : '')); }
     });
+    // Step 7b: the raw payloads feed /revise (auto once, manual any time).
+    planEd.lastFindings = r.findings || [];
+    planEd.lastWarnings = r.warnings || [];
     planEdRender();
     const nb = $('#dpCritiqueStatus');
     if (nb) nb.textContent = r.critique_enabled
       ? `✓ Premortem done — ${(r.findings || []).length} finding(s), ${(r.warnings || []).length} structural note(s). Advisory only.`
       : `Structural checks: ${(r.warnings || []).length} note(s).`;
+    const autoRev = (r.auto_revise != null) ? !!r.auto_revise : !!planEd.autoRevise;
+    if (autoRev && !planEd.autoRevised && planEd.editing == null
+        && (planEd.lastFindings.length || planEd.lastWarnings.length)) {
+      planEd.autoRevised = true;   // ONE automatic round — the operator drives further ones
+      deepPlanRevise({ auto: true });
+    }
   } catch (e) {
     const nb = $('#dpCritiqueStatus'); if (nb) nb.textContent = 'Premortem unavailable (advisory only).';
   }
+}
+
+// Step 7b: one revision turn folds the premortem findings + structural warnings
+// back into a corrected plan (the server re-runs repair + criteria distribution
+// + validators on the result). Auto-fires once after the first critique when
+// plan.auto_revise is on; the 🔧 button runs further rounds on demand.
+async function deepPlanRevise(opts) {
+  opts = opts || {};
+  if (!planEd || !planEd.planSessionId || planEd.revising) return;
+  if (planEd.editing != null) { toast('Finish the open ✏️ edit first', 'err'); return; }
+  planEd.revising = true;
+  const banner = $('#dpCritiqueStatus');
+  if (banner) banner.textContent = '🔧 Revising the plan from the findings…';
+  const btns = ['#wfRevisePlan', '#wfRerunCritique'].map(s => $(s)).filter(Boolean);
+  btns.forEach(b => { b.disabled = true; });
+  try {
+    const before = planEd.tasks.map(t => ({ title: t.title }));
+    const r = await api('POST', `/api/plan/sessions/${planEd.planSessionId}/revise`, {
+      tasks: planEd.tasks, findings: planEd.lastFindings || [],
+      warnings: planEd.lastWarnings || [], notes: opts.notes || '',
+    });
+    planEd.tasks = r.tasks || [];
+    planEd.keep = planEd.tasks.map(() => true);
+    planEd.repairs = r.repairs || [];
+    planEd.diff = planEdComputeDiff(before, planEd.tasks);
+    planEd.edited = false;   // the server ran the same repair as revalidate
+    planEd.annotations = {}; planEd.specWarnings = [];
+    (r.warnings || []).forEach(w => {
+      if (w.scope === 'task' && w.task_idx != null) {
+        (planEd.annotations[w.task_idx] = planEd.annotations[w.task_idx] || []).push('⚠ ' + w.message);
+      } else { planEd.specWarnings.push('⚠ ' + w.message); }
+    });
+    planEd.lastWarnings = r.warnings || [];
+    planEd.lastFindings = [];   // consumed by this round; a re-check refills them
+    planEd.questions = r.questions || [];
+    planEdRender();
+    deepPlanRenderQuestions();
+    const nb = $('#dpCritiqueStatus');
+    if (nb) nb.textContent = '🔧 Plan revised.'
+      + (planEd.questions.length ? ` It needs ${planEd.questions.length} decision(s) from you below.` : '');
+    if (opts.auto) await deepPlanRunCritique();   // one re-check; autoRevised caps the loop
+  } catch (e) {
+    const nb = $('#dpCritiqueStatus');
+    if (nb) nb.textContent = 'Revision unavailable (findings stay advisory).';
+    toast('Plan revision failed: ' + e.message, 'err');
+  } finally {
+    planEd.revising = false;
+    btns.forEach(b => { if (b.isConnected) b.disabled = false; });
+  }
+}
+
+// Revision questions: findings the model can't settle alone become operator
+// decisions. Answers persist to the SPEC (notes slot) and drive another round.
+function deepPlanRenderQuestions() {
+  const box = $('#dpReviseQs');
+  if (!box) return;
+  const qs = (planEd && planEd.questions) || [];
+  if (!qs.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="agentic-row" style="background:rgba(124,92,255,.08)">
+    <strong>🤔 The revised plan needs ${qs.length} decision(s) from you</strong>
+    ${qs.map((q, i) => `
+      <div style="margin-top:6px">
+        <div>${esc(q.question)}</div>
+        ${q.why ? `<div class="form-hint">${esc(q.why)}</div>` : ''}
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin:4px 0">
+          ${(q.options || []).map(o => `<button class="btn-sm dp-q-opt" data-q="${i}" data-v="${esc(o.label)}">${o.recommended ? '★ ' : ''}${esc(o.label)}</button>`).join('')}
+        </div>
+        <input class="form-input" id="dpQAns${i}" placeholder="your answer…" style="max-width:420px">
+      </div>`).join('')}
+    <div style="margin-top:8px"><button class="btn-sm" id="dpQSubmit">✅ Answer & revise again</button></div>
+  </div>`;
+  box.querySelectorAll('.dp-q-opt').forEach(btn => {
+    btn.onclick = () => { const inp = $('#dpQAns' + btn.dataset.q); if (inp) inp.value = btn.dataset.v; };
+  });
+  const sub = $('#dpQSubmit');
+  if (sub) sub.onclick = async () => {
+    const answers = qs.map((q, i) => {
+      const v = (($('#dpQAns' + i) || {}).value || '').trim();
+      return v ? `Q: ${q.question} → A: ${v}` : '';
+    }).filter(Boolean).join('\n');
+    if (!answers) { toast('Answer at least one question first', 'err'); return; }
+    planEd.questions = [];
+    deepPlanRenderQuestions();
+    try {   // best-effort: decisions persist into the SPEC (notes slot)
+      await api('PATCH', `/api/plan/sessions/${planEd.planSessionId}/spec`, { updates: { notes: answers } });
+    } catch (e) { /* advisory — the notes still travel in the revise body */ }
+    deepPlanRevise({ notes: answers });
+  };
 }
 
 // ═══════════════════ HERMES SKILL WIZARD ═══════════════════

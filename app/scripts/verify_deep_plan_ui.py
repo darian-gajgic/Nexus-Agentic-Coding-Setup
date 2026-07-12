@@ -116,12 +116,31 @@ async def main():
             ok("draft → proposal modal renders with Deep Plan banner",
                "Deep Plan" in body and await page.locator("#dpSpecWarnings").count() == 1)
             # premortem auto-runs (stub) → a ⚠ annotation lands on a task card
-            await page.wait_for_timeout(1500)
-            body2 = await page.locator("#wfStages").inner_text()
-            ok("premortem annotation renders on a task card", "⚠" in body2)
+            # (wait_for_function: the auto-revise chain re-renders annotations,
+            # so a fixed sleep could sample the between-rounds gap)
+            try:
+                await page.wait_for_function(
+                    "() => ($('#wfStages') || {}).innerText && $('#wfStages').innerText.includes('⚠')",
+                    timeout=8000)
+                ok("premortem annotation renders on a task card", True)
+            except Exception:
+                ok("premortem annotation renders on a task card", False)
             # Step 7: the re-run premortem button is available for a Deep-Plan proposal
             ok("Step 7 re-run premortem button renders",
                await page.locator("#wfRerunCritique").count() == 1)
+
+            # ── Step 7b: the revise loop — findings fold back into the plan ──
+            ok("revise button renders", await page.locator("#wfRevisePlan").count() == 1)
+            try:
+                await page.wait_for_function(
+                    "() => planEd && planEd.autoRevised && "
+                    "planEd.tasks.some(t => (t.description || '').includes('Addressed finding'))",
+                    timeout=10000)
+                ok("auto-revise folded the premortem findings into the plan", True)
+            except Exception:
+                ok("auto-revise folded the premortem findings into the plan", False)
+            qs_text = await page.locator("#dpReviseQs").inner_text()
+            ok("revision decision question renders for the operator", "[stub]" in qs_text)
 
             ok("no console errors", not console_errors, str(console_errors[:2]))
             await browser.close()
