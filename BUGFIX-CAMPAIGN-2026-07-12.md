@@ -62,7 +62,7 @@ which now validates the FIXED drain.
 > failure-branch + sweep writers) do unlocked read-modify-writes of the same loop_config JSON;
 > a stale sweep save can erase the esc_used bump → escalations past super.escalation_max
 > (CONFIRMED by review; race class pre-dates this campaign, consequence widened by D2's bump
-> move). Needs a small locking/fresh-read-RMW design, not done here (would redesign §D2).
+> move). Promoted to S2 item [R1] with pre-made design §D6 (user decision 2026-07-12).
 > **Reboot test is now ready for the user.**
 
 ## Session 2 — cleanups + installer/doc drift (13 findings, 2-3 grouped commits)
@@ -82,6 +82,7 @@ which now validates the FIXED drain.
 | ☐ | [17] | double _turn_cut_count query in the cut-turn budget block |
 | ☐ | [18] | _lessons_safe getattr-by-string → direct callables |
 | ☐ | [19] | eval judge spend stuffed into frontier_ledger.workflow_id → proper source column (small migration) |
+| ☐ | [R1] | loop_config lost-update race (session-1 exit review, CONFIRMED) → implement §D6; also collapses the 3 duplicated locate/unpack/save blocks in _escalation_thread |
 
 **Session-2 exit:** verify.sh + verify_autopilot_e2e + verify_deep_plan_e2e + screenshot
 sweep → final `/code-review` on the combined campaign diff → update program memory files.
@@ -197,6 +198,35 @@ Verify (verify_autopilot_e2e): eco-template job → `scheduler._trigger(job_row)
 task has `budget_tokens == 2_500_000` (0.5 × 5M default) + normalized axes (cleanup after);
 cascade check: a member with its own enabled loop_config gets re-derived on workflow PATCH
 (round cap follows the profile) with `used` counters preserved.
+
+### D6 — loop_config lost-update race [R1] (session-1 carry-over)
+All loop_config writers live in ONE process (server request threads, escalation
+daemon threads, the loop-engine sweep thread), so a module lock suffices:
+1. `loop_engine._CFG_LOCK = threading.RLock()` (module level, next to _save_cfg).
+2. New `loop_engine._mutate_super_cfg(task_id, fn) -> bool`: under _CFG_LOCK,
+   FRESH `_locate_super_cfg(task_id)` → `fn(trig, per_task)` → `_save_cfg`;
+   returns False when loc is None (manual /escalate without loop config — keep
+   the existing tolerance). Replace the THREE server.py blocks with one-line
+   calls: deferral state-clear (`fn=lambda trig, pt: _set_super_state(trig, pt, None)`),
+   budget bump (`fn=lambda trig, pt: _bump_escalations(trig, pt)`), failure
+   re-arm (same as deferral). Kills the triple locate/unpack/save duplication.
+3. The sweep keeps DECIDING on its query-time snapshots (never hold the lock
+   across `_api` HTTP calls), but every mutate+persist goes through the same
+   fresh-read path: wrap `_bump_rounds/_set_super_state/_bump_escalations +
+   _save_cfg` pairs in `_sweep_task_loops`/`_sweep_super_result` (and the
+   approve/reject helpers ~795-813) in `_CFG_LOCK` with a RE-LOCATED cfg —
+   e.g. route them through `_mutate_super_cfg` too (the trig identity check is
+   by trigger id, so a fresh read is safe even if another writer landed).
+   Decision staleness (acting on a snapshot) is acceptable — the idempotence
+   guards (`handled_ts == critic_ts`, verdict CAS on the endpoints) already
+   bound double-acting; only the WRITE must never be lost.
+4. Edge: `_regen_loop_for_profile` (server.py) also rewrites whole cfgs — take
+   `_le._CFG_LOCK` around its read→design→save too (import loop_engine there).
+Verify (verify_super_result_e2e new in-process check): one workflow cfg with
+two member esc entries; two threads × 50 iterations each calling
+`_mutate_super_cfg` bumping THEIR member's esc_tasks; assert both counters
+land at exactly 50 (no lost updates). Plus a static verify.sh grep pinning
+`_CFG_LOCK` + `def _mutate_super_cfg`.
 
 ---
 
