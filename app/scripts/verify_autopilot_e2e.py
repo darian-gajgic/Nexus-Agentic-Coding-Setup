@@ -185,6 +185,76 @@ chk("F2 PATCH persisted the user's edits (mode/max_rounds)",
 chk("F2 PATCH grafted engine accounting (used/esc_used/state survive)",
     _tr2.get("used") == 2 and _tr2.get("esc_used") == 1
     and (_tr2.get("state") or {}).get("handled_ts") == 123.0)
+
+print("=== Final-review F5 — _CFG_LOCK contention never blocks the event loop ===")
+# In-process mechanism check (server + loop_engine share this process's module
+# instances, so le._CFG_LOCK IS the lock the helper takes): a thread holds the
+# lock ~3s while an asyncio loop awaits the REAL handler helper through the
+# SAME run_in_threadpool offload the endpoints use. The helper must WAIT for
+# the lock (proving contention was real), the loop's ticker must keep running
+# the whole time (proving the loop never blocked), and the graft must still
+# land correctly after the lock frees. Static enforcement lives in
+# check_async_blocking.py (helper names in BLOCKING_NAMES).
+import asyncio
+import threading as _th
+import server as _srv
+from starlette.concurrency import run_in_threadpool as _ritp
+
+_f5_tid = post("/api/tasks", json={"title": "f5 lock probe", "status": "backlog"}).json().get("id")
+_cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE id=?", (_f5_tid,)))
+db.execute("UPDATE tasks SET loop_config=? WHERE id=?", (json.dumps({
+    "enabled": True, "mode": "closed",
+    "triggers": [{"id": "super_result", "enabled": True, "max_rounds": 3, "used": 2}]}),
+    _f5_tid))
+_f5_held = _th.Event()
+
+
+def _f5_hold():
+    with le._CFG_LOCK:
+        _f5_held.set()
+        time.sleep(3.0)
+
+
+_f5_thread = _th.Thread(target=_f5_hold, daemon=True)
+_f5_thread.start()
+_f5_held.wait(timeout=10)
+
+
+async def _f5_run():
+    tick = {"n": 0}
+    stop = asyncio.Event()
+
+    async def _ticker():
+        while not stop.is_set():
+            await asyncio.sleep(0.05)
+            tick["n"] += 1
+
+    tk = asyncio.ensure_future(_ticker())
+    t0 = time.time()
+    await _ritp(_srv._write_loop_cfg_grafted, "task", _f5_tid,
+                {"enabled": True, "mode": "open",
+                 "triggers": [{"id": "super_result", "enabled": True,
+                               "max_rounds": 5, "used": 0}]})
+    dur = time.time() - t0
+    stop.set()
+    await asyncio.sleep(0)
+    tk.cancel()
+    return tick["n"], dur
+
+
+_f5_ticks, _f5_dur = asyncio.run(_f5_run())
+_f5_thread.join(timeout=5)
+chk("F5 helper genuinely waited on the held lock (>=2s)", _f5_dur >= 2.0)
+# a blocked loop would leave ticks near 0; a live one ticks ~20/s — demand
+# at least a THIRD of the ideal count so a loaded box can't flake the gate
+chk("F5 event loop stayed live while the helper waited on the lock",
+    _f5_ticks >= int(_f5_dur / 0.05 / 3))
+_f5_cfg = json.loads(db.query_one("SELECT loop_config FROM tasks WHERE id=?",
+                                  (_f5_tid,))["loop_config"])
+_f5_tr = (_f5_cfg.get("triggers") or [{}])[0]
+chk("F5 graft still correct after the contended write (used survives, edits land)",
+    _f5_cfg.get("mode") == "open" and _f5_tr.get("max_rounds") == 5
+    and _f5_tr.get("used") == 2)
 tws = hd.WORKSPACES / "t2ws"; tws.mkdir(parents=True, exist_ok=True)
 _cleanup.append(lambda: shutil.rmtree(tws, ignore_errors=True))
 fr = hd.build_framing({"id": "t2", "title": "Stage Two", "workflow_id": wid,

@@ -525,7 +525,11 @@ chk "restart-prep gate committed" "[ -f scripts/verify_restart_prep_e2e.py ]"
 chk "D6: cfg lock + locked mutate"   "grep -q '_CFG_LOCK = threading.RLock()' loop_engine.py && grep -q 'def _mutate_super_cfg' loop_engine.py && grep -q 'def _mutate_cfg_trigger' loop_engine.py && grep -q '_mutate_super_cfg(task_id' server.py && grep -q '_CFG_LOCK' server.py"
 # Final-review F1/F2: the client-facing loop_config writers (task/workflow
 # PATCH + replan apply) go through the locked graft/fresh-read paths too.
-chk "F2: PATCH loop_config grafts"   "grep -q 'def _write_loop_cfg_grafted' server.py && [ \$(grep -c '_write_loop_cfg_grafted(' server.py) -ge 3 ]"
+chk "F2: PATCH loop_config grafts"   "grep -q 'def _write_loop_cfg_grafted' server.py && [ \$(grep -c '_write_loop_cfg_grafted' server.py) -ge 3 ]"
+# Final-review F5: the _CFG_LOCK-taking helpers are pinned in the async-
+# blocking gate's BLOCKING_NAMES, so a direct on-loop call fails verify.sh
+# (section 2's 'no blocking calls in async handlers' runs that checker).
+chk "F5: cfg helpers in async gate"  "grep -q '_sync_super_result_loop' scripts/check_async_blocking.py && grep -q '_regen_loop_for_profile' scripts/check_async_blocking.py && grep -q '_write_loop_cfg_grafted' scripts/check_async_blocking.py && grep -q '_inherit_super_result' scripts/check_async_blocking.py"
 # [R2]: the watchdog counts lane deaths toward the circuit breaker ONLY
 # outside the post-boot grace window (clean restarts retired the fleet).
 chk "R2: watchdog boot grace"        "grep -q '_BOOT_TS = time.time()' watchdog.py && grep -q 'BOOT_GRACE_S' watchdog.py && grep -q 'boot_respawn' watchdog.py"

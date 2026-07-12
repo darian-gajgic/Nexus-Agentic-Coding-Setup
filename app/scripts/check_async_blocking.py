@@ -15,6 +15,11 @@ import sys
 BLOCKING_NAMES = {
     "_visible_repo_path", "_valid_repo_path", "_run_git_action",
     "_run_curate", "_memory_access", "_wizard_repo_context", "_retry_task",
+    # F5: these take loop_engine._CFG_LOCK, which background threads hold
+    # across contended SQLite writes (busy_timeout 10s) — waiting on it from
+    # the event loop stalls every connected client. Threadpool only.
+    "_sync_super_result_loop", "_regen_loop_for_profile",
+    "_write_loop_cfg_grafted", "_inherit_super_result",
 }
 BLOCKING_ATTRS = {
     ("subprocess", "run"), ("_sp", "run"), ("sp", "run"),

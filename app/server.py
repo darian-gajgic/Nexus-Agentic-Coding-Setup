@@ -699,12 +699,15 @@ async def create_task(body: TaskCreate):
     db.log_activity("info", "system", f"Task created: '{body.title}'", user_id=uid)
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     if body.super_result:
-        _sync_super_result_loop("task", task)
+        # F5: takes loop_engine._CFG_LOCK — a background thread holding it
+        # across a contended write would stall the event loop; run off-loop.
+        await run_in_threadpool(_sync_super_result_loop, "task", task)
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     else:
         # No explicit flag → inherit the project's Super Result contract when
         # this task is created directly into a super_result workflow.
-        task = _inherit_super_result(task)
+        # F5: off-loop — the helper syncs loops under _CFG_LOCK.
+        task = await run_in_threadpool(_inherit_super_result, task)
     await mgr.broadcast({"type": "task_created", "data": task}, user_id=uid)
     return task
 
@@ -752,8 +755,9 @@ async def update_task(task_id: str, body: TaskUpdate):
                          "(each waiting for the other, no lane ever claims them)"})
         updates["depends_on"] = json.dumps(deps) if deps else None
     if body.loop_config is not None:
-        # Final-review F2 (D6/[R1]): graft engine-owned accounting under the lock
-        _write_loop_cfg_grafted("task", task_id,
+        # Final-review F2 (D6/[R1]): graft engine-owned accounting under the
+        # lock — off-loop (F5: never wait on _CFG_LOCK from the event loop).
+        await run_in_threadpool(_write_loop_cfg_grafted, "task", task_id,
                                 body.loop_config if body.loop_config else None)
     if body.client is not None:
         updates["client"] = (body.client or "").strip().lower() or None
@@ -792,15 +796,16 @@ async def update_task(task_id: str, body: TaskUpdate):
         # Q7a: the operator set/changed a preset → regenerate the loop so its
         # derived knobs (preference, mode, round caps) follow (P10b: only ever on
         # an explicit profile set, never a silent flip of a legacy item).
-        _regen_loop_for_profile("task", task)
+        # F5: off-loop — regen holds _CFG_LOCK across its fresh-read + write.
+        await run_in_threadpool(_regen_loop_for_profile, "task", task)
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if super_flipped:
-        _sync_super_result_loop("task", task)
+        await run_in_threadpool(_sync_super_result_loop, "task", task)  # F5
         task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     elif body.workflow_id is not None:
         # (Re)attached to a workflow without an explicit flag → inherit its SR
         # contract (clearing the workflow_id is a no-op inside the helper).
-        task = _inherit_super_result(task)
+        task = await run_in_threadpool(_inherit_super_result, task)  # F5
     await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
     return task
 
@@ -7273,8 +7278,9 @@ async def create_workflow(body: dict):
                 1 if body.get("super_result") else 0, ap_inv, ap_spend))
     db.log_activity("info", "system", f"Workflow created: '{name}'", user_id=uid)
     if body.get("super_result"):
-        _sync_super_result_loop("workflow",
-                                db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
+        await run_in_threadpool(  # F5: holds _CFG_LOCK — never on the event loop
+            _sync_super_result_loop, "workflow",
+            db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     w = _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wid,)))
     await mgr.broadcast({"type": "workflow_created", "data": w}, user_id=uid)
     return w
@@ -7323,8 +7329,10 @@ async def update_workflow(wf_id: str, body: dict):
             db.execute("UPDATE tasks SET client=COALESCE(client, ?) WHERE workflow_id=?", (cl, wf_id))
     if "loop_config" in body:
         lc = body["loop_config"]
-        # Final-review F2 (D6/[R1]): graft engine-owned accounting under the lock
-        _write_loop_cfg_grafted("workflow", wf_id, lc if isinstance(lc, dict) else None)
+        # Final-review F2 (D6/[R1]): graft engine-owned accounting under the
+        # lock — off-loop (F5: never wait on _CFG_LOCK from the event loop).
+        await run_in_threadpool(_write_loop_cfg_grafted, "workflow", wf_id,
+                                lc if isinstance(lc, dict) else None)
     if "client" in body:
         cl = (body.get("client") or "").strip().lower() or None
         db.execute("UPDATE workflows SET client=?, updated_at=? WHERE id=?",
@@ -7354,8 +7362,9 @@ async def update_workflow(wf_id: str, body: dict):
         db.execute("UPDATE tasks SET super_result=? WHERE workflow_id=?", (sr, wf_id))
         db.log_activity("info", "system",
                         f"Workflow {wf_id}: super_result={'on' if sr else 'off'} applied to all member tasks")
-        _sync_super_result_loop("workflow",
-                                db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+        await run_in_threadpool(  # F5: holds _CFG_LOCK — never on the event loop
+            _sync_super_result_loop, "workflow",
+            db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
     # Q7a: the preset axes cascade to member tasks exactly like high_stakes.
     if "autopilot" in body or "spend_profile" in body:
         import autopilot as _ap
@@ -7369,15 +7378,22 @@ async def update_workflow(wf_id: str, body: dict):
             db.execute("UPDATE tasks SET spend_profile=? WHERE workflow_id=?", (sp, wf_id))
         db.log_activity("info", "system",
                         f"Workflow {wf_id}: autopilot preset applied to all member tasks")
-        _regen_loop_for_profile("workflow", db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
-        # [11]: members carrying their OWN loop_config re-derive too — the
-        # task-PATCH path does this, and without it a Smart→Eco project switch
-        # left member loops burning Smart-level rounds/judge scope. Budgets are
-        # NOT re-derived (rule 4 is creation-only, matching the task-PATCH path).
-        for _member in db.query_all(
-                "SELECT * FROM tasks WHERE workflow_id=? AND loop_config IS NOT NULL",
-                (wf_id,)):
-            _regen_loop_for_profile("task", _member)
+
+        # F5: each regen holds _CFG_LOCK across a fresh-read + write — run the
+        # workflow regen AND the whole [11] member cascade as ONE threadpool
+        # job, so a large project never iterates lock-taking work on the loop.
+        def _regen_all():
+            _regen_loop_for_profile("workflow",
+                                    db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
+            # [11]: members carrying their OWN loop_config re-derive too — the
+            # task-PATCH path does this, and without it a Smart→Eco project switch
+            # left member loops burning Smart-level rounds/judge scope. Budgets are
+            # NOT re-derived (rule 4 is creation-only, matching the task-PATCH path).
+            for _member in db.query_all(
+                    "SELECT * FROM tasks WHERE workflow_id=? AND loop_config IS NOT NULL",
+                    (wf_id,)):
+                _regen_loop_for_profile("task", _member)
+        await run_in_threadpool(_regen_all)
     return _workflow_rollup(db.query_one("SELECT * FROM workflows WHERE id=?", (wf_id,)))
 
 
@@ -7632,20 +7648,23 @@ async def replan_apply(wf_id: str, body: dict):
     # this is a whole-cfg rewrite — re-read FRESH under the engine lock; the
     # entry snapshot `w` predates everything above, and writing it back would
     # erase any esc bump / handled-state a locked writer landed meanwhile.
-    import loop_engine as _le
-    with _le._CFG_LOCK:
-        _row = db.query_one("SELECT loop_config FROM workflows WHERE id=?", (wf_id,))
-        cfg = None
-        try:
-            cfg = json.loads((_row or {}).get("loop_config") or "null")
-        except Exception:
-            pass
-        if isinstance(cfg, dict):
-            for trig in cfg.get("triggers") or []:
-                trig["used"] = 0
-                trig.pop("used_tasks", None)
-            db.execute("UPDATE workflows SET loop_config=? WHERE id=?",
-                       (json.dumps(cfg), wf_id))
+    # F5: the locked read-modify-write runs off-loop.
+    def _reset_loop_rounds():
+        import loop_engine as _le
+        with _le._CFG_LOCK:
+            _row = db.query_one("SELECT loop_config FROM workflows WHERE id=?", (wf_id,))
+            cfg = None
+            try:
+                cfg = json.loads((_row or {}).get("loop_config") or "null")
+            except Exception:
+                pass
+            if isinstance(cfg, dict):
+                for trig in cfg.get("triggers") or []:
+                    trig["used"] = 0
+                    trig.pop("used_tasks", None)
+                db.execute("UPDATE workflows SET loop_config=? WHERE id=?",
+                           (json.dumps(cfg), wf_id))
+    await run_in_threadpool(_reset_loop_rounds)
     rp = _parse_replan(db.query_one("SELECT replan FROM workflows WHERE id=?", (wf_id,))) or {}
     rp.update({"status": "applied", "applied_at": now, "created_task_ids": ids,
                "archived_task_ids": [t["id"] for t in superseded], "error": None})
