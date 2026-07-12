@@ -15,6 +15,7 @@ session, same pattern as the feedback AI-draft); `agentmem.stub=1` short-
 circuits it for gates. Everything is best-effort — memory must never break
 dispatching."""
 
+import threading
 import time
 import uuid
 
@@ -47,9 +48,13 @@ def expire_sweep() -> int:
 
 
 def _fresh_experiences(agent_id: str, since: float) -> list[dict]:
+    # ASC + LIMIT = a paging window: oldest unseen rows first, so the
+    # consumption watermark (max created_at of THIS window) never jumps past
+    # unconsumed rows — a >40 backlog pages across sweeps instead of the
+    # overflow being skipped forever.
     return db.query_all(
         "SELECT content, created_at FROM memory WHERE agent_id=? AND "
-        "scope='experience' AND created_at > ? ORDER BY created_at DESC LIMIT 40",
+        "scope='experience' AND created_at > ? ORDER BY created_at ASC LIMIT 40",
         (agent_id, since))
 
 
@@ -68,7 +73,11 @@ def consolidate_agent(agent_id: str, force: bool = False) -> str | None:
     threshold = 1 if force else _setting_int("agentmem.consolidate_after", 10)
     if len(fresh) < threshold:
         return None
-    lines = "\n".join(r["content"] for r in fresh)
+    # The summary row's created_at IS the consumption watermark: the newest
+    # row actually consumed, NOT time.time() after the (up-to-120s) model
+    # call — rows logged during the call stay above it for the next sweep.
+    watermark = max(r["created_at"] for r in fresh)
+    lines = "\n".join(r["content"] for r in reversed(fresh))  # newest first (prompt contract)
     prev_text = (prev or {}).get("content") or "(none)"
     if db.get_setting("agentmem.stub") == "1":
         summary = f"[stub summary] {len(fresh)} task(s) consolidated"
@@ -100,24 +109,36 @@ def consolidate_agent(agent_id: str, force: bool = False) -> str | None:
         "INSERT INTO memory (id, agent_id, scope, kind, content, source, created_at) "
         "VALUES (?,?,?,?,?,?,?)",
         (f"mem-{uuid.uuid4().hex[:10]}", agent_id, "lts", "auto-summary",
-         summary[:1200], "auto", time.time()))
+         summary[:1200], "auto", watermark))
     return summary
 
 
+# The sweep now runs detached from the scheduler thread (its N×120s model
+# calls used to block every due cron job) — this lock keeps a slow sweep from
+# stacking on the next hourly tick.
+_SWEEP_LOCK = threading.Lock()
+
+
 def consolidate_sweep() -> int:
-    """Hourly (scheduler): expiry first, then consolidate every non-retired
-    lane that accumulated enough fresh experience. Skips entirely while the
-    quota backoff is active (the summary call would just add pressure)."""
-    if db.get_setting("agentmem.enabled", "1") != "1":
-        return 0
-    expire_sweep()
-    if float(db.get_setting("dispatch.quota_backoff_until", "0") or 0) > time.time():
-        return 0
-    done = 0
-    for a in db.query_all("SELECT id FROM agents WHERE status != 'retired'"):
-        try:
-            if consolidate_agent(a["id"]):
-                done += 1
-        except Exception:
-            continue  # one lane's failure never blocks the others
-    return done
+    """Hourly (scheduler, in a daemon thread): expiry first, then consolidate
+    every non-retired lane that accumulated enough fresh experience. Skips
+    entirely while the quota backoff is active (the summary call would just
+    add pressure), and while a previous sweep is still summarizing."""
+    if not _SWEEP_LOCK.acquire(blocking=False):
+        return 0  # a previous sweep is still running — never stack
+    try:
+        if db.get_setting("agentmem.enabled", "1") != "1":
+            return 0
+        expire_sweep()
+        if float(db.get_setting("dispatch.quota_backoff_until", "0") or 0) > time.time():
+            return 0
+        done = 0
+        for a in db.query_all("SELECT id FROM agents WHERE status != 'retired'"):
+            try:
+                if consolidate_agent(a["id"]):
+                    done += 1
+            except Exception:
+                continue  # one lane's failure never blocks the others
+        return done
+    finally:
+        _SWEEP_LOCK.release()

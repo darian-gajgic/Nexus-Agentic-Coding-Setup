@@ -1409,6 +1409,15 @@ def _finalize_cancel(dispatch_id: str, task_id: str, agent_id: str):
                        headers=_headers(), timeout=5)
     except Exception:
         pass
+    try:
+        # The lane's "working on …" scratchpad row: only _write_experience
+        # consumed it, and the cancel path never gets there — the Agent-memory
+        # tab kept showing the stopped task for the full 48h TTL.
+        db.execute("DELETE FROM memory WHERE agent_id=? AND scope='stm' "
+                   "AND kind='inflight' AND content LIKE ?",
+                   (agent_id, f"%{task_id}%"))
+    except Exception:
+        pass
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if task and task.get("session_id"):
         remove_session_key(task["session_id"])

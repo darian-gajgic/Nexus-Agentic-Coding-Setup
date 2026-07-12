@@ -193,12 +193,24 @@ def scheduler_loop(stop_event: threading.Event):
                     print(f"[scheduler] plan-session sweep error: {e}", file=sys.stderr)
                 # Item 3: agent lane memory — expire stale rows + condense each
                 # lane's task log into its rolling summary (one cheap call/lane).
+                # Detached: the sweep makes up to one 120s model call PER LANE —
+                # inline it blocked this single trigger thread for minutes and
+                # no due cron job fired meanwhile. consolidate_sweep's own lock
+                # keeps a slow sweep from stacking on the next tick.
                 try:
                     import agent_memory as _am
-                    n = _am.consolidate_sweep()
-                    if n:
-                        db.log_activity("info", "scheduler",
-                                        f"Agent memory: consolidated {n} lane(s)")
+
+                    def _am_sweep():
+                        try:
+                            n = _am.consolidate_sweep()
+                            if n:
+                                db.log_activity("info", "scheduler",
+                                                f"Agent memory: consolidated {n} lane(s)")
+                        except Exception as e:
+                            print(f"[scheduler] agent-memory sweep error: {e}",
+                                  file=sys.stderr)
+                    threading.Thread(target=_am_sweep, daemon=True,
+                                     name="agentmem-sweep").start()
                 except Exception as e:
                     print(f"[scheduler] agent-memory sweep error: {e}", file=sys.stderr)
         except Exception as e:
