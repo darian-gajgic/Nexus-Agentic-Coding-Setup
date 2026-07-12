@@ -1324,8 +1324,9 @@ async function kanbanStartAll() {
   try {
     const r = await api('POST', '/api/tasks/bulk-status', { ids, status: 'todo' });
     toast(`${(r.changed || []).length} started${(r.skipped || []).length ? `, ${r.skipped.length} skipped` : ''}`, 'ok');
-    state.tasks = await api('GET', '/api/tasks');
-    render();
+    // no manual refetch: the tasks_bulk_updated WS broadcast already refetches
+    // + softRenders (a second identical GET raced it); the 3s tick heals a
+    // dropped socket.
   } catch (e) { toast('Bulk start failed: ' + e.message, 'err'); }
 }
 
@@ -1339,8 +1340,7 @@ async function kanbanStopAll() {
     const r = await api('POST', '/api/tasks/bulk-stop', { ids });
     const n = (r.results || []).filter(x => x.stopped !== 'skipped' && x.stopped !== 'noop').length;
     toast(`${n} stopping (live runs abort within ~30s)`, 'ok');
-    state.tasks = await api('GET', '/api/tasks');
-    render();
+    // no manual refetch — see kanbanStartAll
   } catch (e) { toast('Bulk stop failed: ' + e.message, 'err'); }
 }
 
@@ -8690,12 +8690,22 @@ async function loadSpecialists() {
       specialistsState.pending = (p && p.pending) || [];
       specialistsState.shared = (sh && sh.memories) || [];
     }
-    if ((first || changed) && currentView === 'specialists' && !uiLocked()) render();
+    if ((first || changed) && currentView === 'specialists') {
+      // A render skipped for an open modal must still happen on unlock —
+      // otherwise the roster stays stale until the payload changes again.
+      if (uiLocked()) pendingRender = true; else render();
+    }
   }
   catch (e) {
     specialistsState.data = { error: String(e) };
+    // Reset the hash: a later SUCCESSFUL refetch returning the same payload
+    // as the last good one must not hash equal and leave the error panel
+    // pinned forever (one transient 502 used to latch the tab).
+    specialistsState.lastJSON = '';
     specialistsState.loading = false; specialistsState.fetched = true;
-    if (currentView === 'specialists' && !uiLocked()) render();
+    if (currentView === 'specialists') {
+      if (uiLocked()) pendingRender = true; else render();
+    }
   }
 }
 
@@ -10726,6 +10736,15 @@ function planEdRemove(i) {
   planEd.keep.splice(i, 1);
   planEd.tasks.forEach((t, j) => {
     if (j >= i) t.depends_on_idx = (t.depends_on_idx || []).filter(d => d !== i).map(d => d > i ? d - 1 : d);
+  });
+  // Staged wizard attachments target plan indexes too — remap them exactly
+  // like depends_on_idx, or a stale in-range index silently uploads the file
+  // to the WRONG task (the clamp only catches out-of-range).
+  ((attachStaged || {})['wz-attach'] || []).forEach(f => {
+    if (typeof f._target === 'number') {
+      if (f._target === i) f._target = 'wf';
+      else if (f._target > i) f._target -= 1;
+    }
   });
   if (planEd.editing === i) planEd.editing = null;
   else if (planEd.editing != null && planEd.editing > i) planEd.editing -= 1;
