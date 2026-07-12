@@ -104,8 +104,25 @@ files. Reminder of the standing rule (user re-confirmed): if the code contradict
 > phase7 source pin updated to the locked pattern) + restart_prep 28/28 (new [R2]
 > real-restart breaker-counter checks). Exit sweep green: verify.sh 444/444,
 > autopilot 63/63, deep_plan 21/21, screenshot sweep 14 tabs no console errors.
-> **PAUSED at the human checkpoint — awaiting the user's explicit go-ahead before
-> the final /code-review on the combined campaign diff + memory updates.**
+> Human checkpoint passed (user go-ahead 2026-07-12).
+>
+> **FINAL COMBINED /code-review (0d113ca..HEAD, medium: 8 finders → dedup 37→10 → 1-vote
+> verify) — 8 findings survived, REPORTED ONLY (not fixed; follow-up is a user decision):**
+> (1) CONF replan_apply ~server.py:7610 unlocked whole-cfg RMW of workflows.loop_config
+> from a request-entry snapshot — bypasses [R1]'s _CFG_LOCK; (2) CONF workflow PATCH
+> ~7295 + task PATCH ~754 write the client's whole loop_config unlocked (UI modal
+> round-trips a stale GET → engine counters rewound); (3) CONF+repro harvest_decisions:
+> a \n in the title strands the [6] marker off the ### line → rework decisions silently
+> dropped; (4) CONF STT first-use model download runs silent past the 180s inactivity
+> kill (fresh installs / stt_model change; cached here); (5) CONF _CFG_LOCK taken inside
+> sync helpers called from async handlers — cross-thread lock wait can stall the event
+> loop up to ~busy_timeout; (6) PLAUS nexus-up label fallback lacks a compose-project
+> filter (foreign postgres/redis startable, dormant here); (7) CONF /api/loop/design is
+> a 3rd meta builder skipping _loop_meta, already drifted on workflow high_stakes;
+> (8) CONF _resolve_cli + pr.cmd token loop duplicate the [R3] resolver (verify.sh pin
+> is evals/lessons-scoped only). Refuted: watchdog grace-vs-interval (first sweep runs
+> at boot); legacy unmarked DECISIONS blocks (population zero, self-sealing). Program
+> memory files updated. **CAMPAIGN COMPLETE.**
 
 ---
 
