@@ -18,19 +18,13 @@ import time
 import uuid
 from pathlib import Path
 
-import httpx
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-for _env_path in [os.path.expanduser("~/.hermes/.env"), ".env"]:
-    if os.path.exists(_env_path):
-        for _line in open(_env_path):
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+sys.path.insert(0, str(ROOT / "scripts"))
+from _gate_common import load_env, preclean_probe_user  # noqa: E402
+load_env()
 
 import database as db          # noqa: E402
 import auth                    # noqa: E402
@@ -38,7 +32,6 @@ import agent_memory as am      # noqa: E402
 import feedback_log as fb      # noqa: E402
 import routing                 # noqa: E402
 
-BASE = "https://127.0.0.1:8777"
 PASS = FAIL = 0
 
 
@@ -66,6 +59,7 @@ def restore_settings():
 
 
 MEMBER_PW = "probe-" + _secrets.token_urlsafe(9)
+preclean_probe_user(db, auth, "probe-c-member")  # a hard-killed prior run leaves the row
 member_u, err = auth.create_user("probe-c-member", "Probe C Member", MEMBER_PW, role="member")
 assert member_u, err
 MUID = member_u["id"]
