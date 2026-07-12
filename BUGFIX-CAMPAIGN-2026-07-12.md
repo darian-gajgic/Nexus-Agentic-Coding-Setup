@@ -122,7 +122,21 @@ files. Reminder of the standing rule (user re-confirmed): if the code contradict
 > (8) CONF _resolve_cli + pr.cmd token loop duplicate the [R3] resolver (verify.sh pin
 > is evals/lessons-scoped only). Refuted: watchdog grace-vs-interval (first sweep runs
 > at boot); legacy unmarked DECISIONS blocks (population zero, self-sealing). Program
-> memory files updated. **CAMPAIGN COMPLETE.**
+> memory files updated.
+>
+> **Follow-up fix pass (user decision 2026-07-12: fix all except finding 5):**
+> commit `9acd52a` — F1 replan_apply locked fresh-read reset; F2 task/workflow PATCH
+> loop_config via `_write_loop_cfg_grafted` (engine accounting grafted under _CFG_LOCK);
+> F3 harvest title whitespace collapse; F4 STT load keepalive ticker in _get_model;
+> F4b nexus-up fallback pinned to our compose projects (qdrant/infra/langfuse);
+> F6 /api/loop/design → _loop_meta; F7 _resolve_cli → evals._fallback_local_bin,
+> pr.cmd → resolve_cmd_tokens, last 'u_owner' literals → auth.DEFAULT_USER_ID.
+> Gates: verify.sh 445/445 (R3 pin now covers server.py + new F2 pin), autopilot 66/66
+> (new F3 + F2 PATCH-graft checks), block3 33/33, stt 24/24, super_result 90/90.
+> **DEFERRED (report-only, user decision):** finding 5 — _CFG_LOCK-taking helpers run
+> on the async event loop; a contended background write can stall requests up to
+> ~busy_timeout. Fix shape: run _sync_super_result_loop/_regen_loop_for_profile via
+> run_in_threadpool + compute design_loop before taking the lock. **CAMPAIGN COMPLETE.**
 
 ---
 
