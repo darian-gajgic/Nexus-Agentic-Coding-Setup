@@ -456,11 +456,11 @@ def reconcile_stalled_dispatches(stale_s: int | None = None, source: str = "watc
 
 # ── Budgets & quota backoff (SPEC R7) ──
 
-def _type_setting(prefix: str, task: dict, fallback: int) -> int:
+def type_setting(prefix: str, dtype: str | None, fallback: int) -> int:
     """Item 17: per-deliverable-type override (e.g. dispatch.turn_seconds.content)
     falling back to the global value — content tasks don't need a 4h cap or a
-    5M budget."""
-    dtype = (task.get("deliverable_type") or "").strip()
+    5M budget. Public dtype-first form (autopilot.preset_fields shares it)."""
+    dtype = (dtype or "").strip()
     if dtype:
         v = sreg.conf(f"{prefix}.{dtype}")  # setting → registry default → ""
         if v:
@@ -469,6 +469,10 @@ def _type_setting(prefix: str, task: dict, fallback: int) -> int:
             except (TypeError, ValueError):
                 pass
     return fallback
+
+
+def _type_setting(prefix: str, task: dict, fallback: int) -> int:
+    return type_setting(prefix, task.get("deliverable_type"), fallback)
 
 
 def check_budgets(task: dict) -> str | None:

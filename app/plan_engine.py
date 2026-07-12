@@ -21,6 +21,14 @@ from __future__ import annotations
 import hashlib
 import re
 
+# THE mechanical-work signal (single source — routing imports this; the two
+# copies had already diverged: this one knew the German verbs, routing's
+# didn't, so a German mechanical goal got an Eco recommendation whose routing
+# then disagreed).
+MECHANICAL_RE = re.compile(
+    r"\b(format|convert|extract|rename|transcrib\w*|csv|cleanup|dedup\w*|"
+    r"reformat|normali[sz]e|umbenenn\w*|konvertier\w*)\b", re.I)
+
 # ─────────────────────────── Families ───────────────────────────
 # Same four families as evals.DELIVERABLE_TYPES, but with friendly planning
 # labels. The stored family KEY is the enum value used downstream (Step 6 map).
@@ -316,9 +324,7 @@ def recommend_spend(heur: dict, div: dict | None = None) -> tuple[str, list]:
     # Eco only for MECHANICAL-looking work (same signal family the model router
     # uses) — a short but CREATIVE deliverable (a landing page, an ad) still
     # deserves the Balanced pipeline; cheapness there comes from the cascade.
-    mechanical = re.search(
-        r"\b(format|convert|extract|rename|transcrib\w*|csv|cleanup|dedup\w*|"
-        r"reformat|normali[sz]e|umbenenn\w*|konvertier\w*)\b", (heur.get("goal") or joined), re.I)
+    mechanical = MECHANICAL_RE.search(heur.get("goal") or joined)
     if complexity <= 2.0 and ambiguity < 0.4 and not multi and mechanical:
         return "eco", [f"mechanical single-step goal (\"{mechanical.group(0)}\") — the "
                        "light tier handles this; the judge escalates it only if needed"]

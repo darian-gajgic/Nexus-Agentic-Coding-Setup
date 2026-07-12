@@ -69,15 +69,11 @@ def preset_fields(autopilot, spend, high_stakes: bool = False,
     if sp and explicit_budget is None:
         try:
             base = int(db.get_setting("dispatch.default_task_budget", "5000000") or 5000000)
-            dtype = (deliverable_type or "").strip()
-            if dtype:
-                try:
-                    import settings_registry as sreg
-                    tv = sreg.conf(f"dispatch.default_budget.{dtype}")
-                    if tv:
-                        base = int(float(tv))
-                except (TypeError, ValueError):
-                    pass
+            # shared per-type lookup — the inline copy of this logic had
+            # already been one edit away from disagreeing with dispatch-time
+            # checks (hermes_dispatch._type_setting)
+            import hermes_dispatch as hd
+            base = hd.type_setting("dispatch.default_budget", deliverable_type, base)
             budget = derive(inv, sp, high_stakes=bool(high_stakes), base_budget=base)["budget"]
         except Exception:
             budget = explicit_budget

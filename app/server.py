@@ -717,8 +717,8 @@ async def create_task(body: TaskCreate):
             "deliverable_type": body.deliverable_type,
             "high_stakes": body.high_stakes, "model": None,
             "spend_profile": ap_spend}, uid)  # I-2: the mode composes with routing
-        if task_model and task_model not in db.task_models_for(uid):
-            task_model, model_reason = None, None
+        # no re-validation: every select_model_for_task return path is already
+        # membership-checked against db.task_models_for(uid)
     tid = f"task-{uuid.uuid4().hex[:8]}"
     now = time.time()
     db.execute("""INSERT INTO tasks
@@ -6404,8 +6404,8 @@ def _specialist_roster() -> str:
     return "\n".join(lines)
 
 
-_DEV_SPECIALISTS = {"tech-lead-orchestrator", "code-implementer", "code-reviewer",
-                    "debugger", "acceptance-verifier"}
+# Single source: routing.DEV_SPECIALISTS (this was one of four literal copies).
+from routing import DEV_SPECIALISTS as _DEV_SPECIALISTS  # noqa: E402
 # The quality-gate stages carry a MANDATORY high_stakes flag independent of the
 # work's real risk (the acceptance-verifier is ALWAYS high-stakes — see
 # _verify_gate_task / the wizard prompt "high_stakes TRUE always"). They must be
@@ -7869,10 +7869,15 @@ def _validate_plan(tasks: list, family: str, spec: dict, goal: str = "") -> list
             ti, tj = tasks[i], tasks[j]
             # Fan-out plans create intentional near-twins (parallel lenses /
             # drafts) — the known false-positive class; skip those pairs.
+            # Word membership (plus simple plurals), NOT substring — 'rectangle'
+            # contains 'angle' and 'overdraft' contains 'draft', which silently
+            # disabled the near-duplicate advisory for unrelated titles.
             both_text = (str(ti.get("title") or "") + " " + str(tj.get("title") or "")).lower()
+            both_words = set(_re.findall(r"[a-z0-9]+", both_text))
             if (ti.get("super_result") and tj.get("super_result")) or (
                     ti.get("specialist") and ti.get("specialist") == tj.get("specialist")
-                    and any(t in both_text for t in _fanout_toks)):
+                    and any(w in both_words
+                            for t in _fanout_toks for w in (t, t + "s", t + "es"))):
                 continue
             a, b = title_toks[i] - common, title_toks[j] - common
             # ≥2 distinctive tokens each side, so "Spec: X" vs "Implement: X"

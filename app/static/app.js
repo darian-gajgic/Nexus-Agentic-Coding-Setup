@@ -30,6 +30,10 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (t) => String(t == null ? '' : t)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+// Dev-pipeline stages (fixed model floor, repo-native by default). Mirror of
+// routing.DEV_SPECIALISTS — no build step, keep in sync by hand.
+const DEV_SPECIALISTS = ['code-implementer', 'tech-lead-orchestrator',
+  'code-reviewer', 'acceptance-verifier', 'debugger'];
 // For string ARGUMENTS inside inline on*="fn('…')" handlers. esc() alone is NOT
 // enough there: the HTML parser decodes &#39; back to ' before the JS engine
 // runs, so the JS string context must be backslash-escaped FIRST.
@@ -10490,8 +10494,7 @@ function applyWizardTask(t, meta) {
     // (a PowerPoint, a report) that runs in a repo commits its output to the
     // branch, where the Deliverables view used to lose it. The picker stays
     // available for deliberate opt-in.
-    const devShaped = ['code-implementer', 'tech-lead-orchestrator', 'code-reviewer',
-      'acceptance-verifier', 'debugger'].includes(t.specialist) || t.deliverable_type === 'code_change';
+    const devShaped = DEV_SPECIALISTS.includes(t.specialist) || t.deliverable_type === 'code_change';
     if ($('#m-task-repo') && (meta && meta.repo_path) && devShaped) {
       const rs = $('#m-task-repo');
       if (![...rs.options].some(o => o.value === meta.repo_path)) {
@@ -10972,8 +10975,6 @@ function proposeWorkflowModal(wf, meta) {
     const projClient = $('#wf-client') ? ($('#wf-client').value.trim().toLowerCase() || null) : null;
     const repo = $('#wf-repo') ? ($('#wf-repo').value || null) : null;
     const projAp = selectedAutopilot('wf');  // Q7a: two preset axes for the project
-    const DEV_SPECIALISTS = new Set(['code-implementer', 'tech-lead-orchestrator',
-      'code-reviewer', 'acceptance-verifier', 'debugger']);
     let wfLoop = null;
     if ($('#wf-loop') && $('#wf-loop').checked) {
       try {
@@ -11009,7 +11010,7 @@ function proposeWorkflowModal(wf, meta) {
           workflow_id: w.id,
           // repo-native: coding stages work inside the chosen repo (they
           // share one branch, so review/fix/verify see each other's work)
-          repo_path: repo && DEV_SPECIALISTS.has(t.specialist) ? repo : null,
+          repo_path: repo && DEV_SPECIALISTS.includes(t.specialist) ? repo : null,
           client: projClient,
           depends_on: (t.depends_on_idx || []).map(x => ids[x]).filter(Boolean),
         });
