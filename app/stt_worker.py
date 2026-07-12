@@ -39,6 +39,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.request
@@ -166,7 +167,24 @@ def _get_model() -> WhisperModel:
             _ensure_vram(NEEDED_MIB.get(args.compute, 3000))
         t0 = time.time()
         log(f"loading {args.model} on {_device} ({compute})")
-        _model = WhisperModel(args.model, device=_device, compute_type=compute)
+        # Final-review F4: the load includes the FIRST-USE HuggingFace
+        # download (~2.9GB for large-v3), which can run silent far past the
+        # parent's 180s inactivity kill (D4) — tick keepalives from a side
+        # thread until the load returns. The main thread is blocked in
+        # WhisperModel() the whole time, so the ticker is the only stdout
+        # writer (no interleaving); it is joined before anything else writes.
+        _stop = threading.Event()
+
+        def _tick():
+            while not _stop.wait(5.0):
+                _keepalive(force=True)
+        _t = threading.Thread(target=_tick, daemon=True, name="load-keepalive")
+        _t.start()
+        try:
+            _model = WhisperModel(args.model, device=_device, compute_type=compute)
+        finally:
+            _stop.set()
+            _t.join(timeout=2)
         log(f"loaded in {time.time() - t0:.1f}s")
     return _model
 

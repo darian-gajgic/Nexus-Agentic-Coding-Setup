@@ -49,8 +49,12 @@ start_container() {
     # fall back to whatever container carries that compose service label.
     local svc="$1" name="$2" found
     docker start "$name" >/dev/null 2>&1 && return 0
+    # Only accept a fallback from OUR stacks: service names like postgres/redis
+    # are generic, and an unfiltered label match could start a foreign compose
+    # project's container (e.g. an app-preview stack) while reporting success.
     found=$(docker ps -a --filter "label=com.docker.compose.service=$svc" \
-                --format '{{.Names}}' | head -n1)
+                --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}' \
+            | awk -F'\t' '$2=="qdrant" || $2=="infra" || $2=="langfuse" {print $1; exit}')
     if [ -n "$found" ] && docker start "$found" >/dev/null 2>&1; then
         echo "started $found for compose service $svc ($name absent on this box)"
         return 0

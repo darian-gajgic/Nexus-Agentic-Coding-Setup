@@ -49,6 +49,7 @@ def chk(name, cond):
 
 def get(p, **k): return requests.get(BASE + p, cookies=CK, verify=False, timeout=15, **k)
 def post(p, **k): return requests.post(BASE + p, cookies=CK, verify=False, timeout=20, **k)
+def patch(p, **k): return requests.patch(BASE + p, cookies=CK, verify=False, timeout=20, **k)
 def patch(p, **k): return requests.patch(BASE + p, cookies=CK, verify=False, timeout=25, **k)
 
 
@@ -151,6 +152,39 @@ _dtxt = dpath.read_text()
 chk("Q4 [6] rework harvest supersedes the task's old block",
     "Chose SQLite after the retry" in _dtxt and "Chose Postgres" not in _dtxt
     and _dtxt.count("<!-- task:t1 -->") == 1)
+# Final-review F3: a NEWLINE in the title must not strand the marker off the
+# `### ` line — round 2 must still supersede round 1 (it used to silently
+# no-op: `marker in text` true but the header regex matched nothing).
+hd.harvest_decisions({"id": "t-nl", "title": "Multi line\ntitle case", "workflow_id": wid},
+                     "# R\n\n## Decisions\n- First-round choice.\n")
+hd.harvest_decisions({"id": "t-nl", "title": "Multi line\ntitle case", "workflow_id": wid},
+                     "# R\n\n## Decisions\n- Reworked choice.\n")
+_dtxt = dpath.read_text()
+chk("Q4 F3 newline-title block still supersedes on rework",
+    "Reworked choice" in _dtxt and "First-round choice" not in _dtxt
+    and _dtxt.count("<!-- task:t-nl -->") == 1)
+
+print("=== Final-review F2 — PATCH loop_config grafts engine accounting ===")
+# The UI loop modal PATCHes the WHOLE cfg from a stale GET; engine-owned
+# counters (used/esc_used/state) written in between must survive the save.
+_gid = post("/api/tasks", json={"title": "graft probe", "status": "backlog"}).json().get("id")
+_cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE id=?", (_gid,)))
+db.execute("UPDATE tasks SET loop_config=? WHERE id=?", (json.dumps({
+    "enabled": True, "mode": "closed",
+    "triggers": [{"id": "super_result", "enabled": True, "max_rounds": 3,
+                  "used": 2, "esc_used": 1,
+                  "state": {"kind": "retried", "handled_ts": 123.0}}]}), _gid))
+_stale = {"enabled": True, "mode": "open",
+          "triggers": [{"id": "super_result", "enabled": True, "max_rounds": 5,
+                        "used": 0}]}
+_pr = patch(f"/api/tasks/{_gid}", json={"loop_config": _stale})
+_cfg2 = json.loads(db.query_one("SELECT loop_config FROM tasks WHERE id=?", (_gid,))["loop_config"])
+_tr2 = (_cfg2.get("triggers") or [{}])[0]
+chk("F2 PATCH persisted the user's edits (mode/max_rounds)",
+    _pr.status_code == 200 and _cfg2.get("mode") == "open" and _tr2.get("max_rounds") == 5)
+chk("F2 PATCH grafted engine accounting (used/esc_used/state survive)",
+    _tr2.get("used") == 2 and _tr2.get("esc_used") == 1
+    and (_tr2.get("state") or {}).get("handled_ts") == 123.0)
 tws = hd.WORKSPACES / "t2ws"; tws.mkdir(parents=True, exist_ok=True)
 _cleanup.append(lambda: shutil.rmtree(tws, ignore_errors=True))
 fr = hd.build_framing({"id": "t2", "title": "Stage Two", "workflow_id": wid,
