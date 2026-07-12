@@ -3,7 +3,7 @@
   "mods": [
     {
       "name": "mem0-per-agent-scoping",
-      "description": "mem0 provider honors a per-call agent_id and does two-scope recall \u2014 a specialist reads its own private lessons layered on the shared base, while the primary agent is unchanged. Foundation of per-specialist memory.",
+      "description": "mem0 provider honors a per-call agent_id and does two-scope recall — a specialist reads its own private lessons layered on the shared base, while the primary agent is unchanged. Foundation of per-specialist memory.",
       "file": "plugins/memory/mem0/__init__.py",
       "patch": "phase1-mem0-scoping.patch",
       "sentinel": "_shared_agent_id",
@@ -30,7 +30,7 @@
       "file": "tools/delegate_tool.py",
       "patch": "phase2-delegate.patch",
       "sentinel": "provider_memory=bool(memory_agent_id)",
-      "description": "delegate_tool: bind a specialist to a child \u2014 inject its playbook (standing rules), scope its mem0 agent_id (read-only), and pass its tool allowlist.",
+      "description": "delegate_tool: bind a specialist to a child — inject its playbook (standing rules), scope its mem0 agent_id (read-only), and pass its tool allowlist.",
       "impact_if_dropped": "Delegated subagents can't run as specialists (no playbook, no scoped memory, no tool allowlist)."
     },
     {
@@ -46,7 +46,7 @@
       "file": "gateway/platforms/api_server.py",
       "patch": "session-model-api-server.patch",
       "sentinel": "NEXUS CORE-MOD (session-model)",
-      "description": "api_server honors the per-session stored model on session chat turns (upstream always ran the config.yaml default \u2014 Nexus per-task models were cosmetic) + accepts an optional per-turn body 'model' override on /api/sessions/{id}/chat[/stream] (JARVIS peak-overload fallback runs ONE turn on dispatch.fallback_model in the SAME session).",
+      "description": "api_server honors the per-session stored model on session chat turns (upstream always ran the config.yaml default — Nexus per-task models were cosmetic) + accepts an optional per-turn body 'model' override on /api/sessions/{id}/chat[/stream] (JARVIS peak-overload fallback runs ONE turn on dispatch.fallback_model in the SAME session).",
       "impact_if_dropped": "Every api_server session turn silently runs the config.yaml default model again: per-task models (glm-5.1/glm-4.5-air pools), the dispatch overload fallback and the JARVIS glm-5-turbo fallback all stop switching models."
     },
     {
@@ -54,16 +54,16 @@
       "file": "agent/prompt_builder.py",
       "patch": "zai-prompt-fingerprint.patch",
       "sentinel": "NEXUS CORE-MOD (zai-prompt-fingerprint)",
-      "description": "Rewords HERMES_AGENT_HELP_GUIDANCE: Z.AI's coding endpoint 429-blocks (code 1305, disguised as 'temporarily overloaded') every glm-5.2 request whose system prompt contains the upstream phrase 'You run on Hermes Agent' \u2014 verified 2026-07-10 by replaying the gateway's dumped request and bisecting the prompt to that exact sentence. glm-5-turbo is not filtered, which is why only the fallback answered.",
-      "impact_if_dropped": "Every glm-5.2 turn through Hermes (JARVIS, CLI, agent lanes) gets 429 code 1305 again and JARVIS permanently falls back to glm-5-turbo while direct API calls work \u2014 looks exactly like a provider overload."
+      "description": "Rewords HERMES_AGENT_HELP_GUIDANCE: Z.AI's coding endpoint 429-blocks (code 1305, disguised as 'temporarily overloaded') every glm-5.2 request whose system prompt contains the upstream phrase 'You run on Hermes Agent' — verified 2026-07-10 by replaying the gateway's dumped request and bisecting the prompt to that exact sentence. glm-5-turbo is not filtered, which is why only the fallback answered.",
+      "impact_if_dropped": "Every glm-5.2 turn through Hermes (JARVIS, CLI, agent lanes) gets 429 code 1305 again and JARVIS permanently falls back to glm-5-turbo while direct API calls work — looks exactly like a provider overload."
     },
     {
       "name": "session-run-stop",
       "file": "gateway/platforms/api_server.py",
       "patch": "session-run-stop.patch",
       "sentinel": "NEXUS CORE-MOD (session-run-stop)",
-      "description": "session-chat runs register their live agent in _active_run_agents (one-element list, unwrapped by _handle_stop_run) so POST /v1/runs/{run_id}/stop interrupts dispatch/JARVIS session runs too \u2014 upstream only registered /v1/runs, so the Nexus task-stop button (item 5, 2026-07-12) could not abort the upstream run and orphaned runs burned tokens to end of turn. Client-disconnect semantics unchanged (R3 wait-and-harvest intact).",
-      "impact_if_dropped": "Stopping a running Nexus task no longer aborts the upstream Hermes run: the \u23f9 button still parks the task, but the orphaned run keeps consuming GLM tokens until the turn ends on its own."
+      "description": "session-chat runs register their live agent in _active_run_agents ([None, run_id] list, unwrapped by _handle_stop_run) so POST /v1/runs/{run_id}/stop interrupts dispatch/JARVIS session runs too — upstream only registered /v1/runs, so the Nexus task-stop button (item 5, 2026-07-12) could not abort the upstream run and orphaned runs burned tokens to end of turn. A stop that lands while the agent is still being created (the old 404 race) is recorded in _pending_run_stops and honored by _run_agent right after creation — the endpoint answers 200 'stopping' instead of 404. Client-disconnect semantics unchanged (R3 wait-and-harvest intact).",
+      "impact_if_dropped": "Stopping a running Nexus task no longer aborts the upstream Hermes run: the ⏹ button still parks the task, but the orphaned run keeps consuming GLM tokens until the turn ends on its own."
     }
   ]
 }
