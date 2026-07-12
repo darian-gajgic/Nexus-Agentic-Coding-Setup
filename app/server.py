@@ -165,6 +165,15 @@ def startup():
                             "Restart preparation complete — dispatch restored after restart")
     except Exception as _e:
         print(f"[startup] restart-prep restore failed: {_e}", flush=True)
+    # Gate hygiene: dispatch.stub_stream is a verify-gate-only knob restored by
+    # the gate's own finally — a crashed gate leaks it, and every dispatch would
+    # turn into a synthetic stub (the judge-stub leak class, 2026-07-08). The
+    # stub branch is also env-gated (NEXUS_GATE_STUB), so this clear is belt
+    # and braces + a loud tell that a gate died hard.
+    if db.get_setting("dispatch.stub_stream") == "1":
+        db.execute("DELETE FROM settings WHERE key='dispatch.stub_stream'")
+        db.log_activity("warn", "system",
+                        "dispatch.stub_stream was left ON (crashed gate?) — cleared at boot")
     # Dispatch rows stranded in an active state with a dead heartbeat (a worker
     # died, or a task's kanban status drifted so it matches no lane query) match
     # neither the resume nor the auto-claim path — they strand the task and any

@@ -78,6 +78,13 @@ def consolidate_agent(agent_id: str, force: bool = False) -> str | None:
         if easy and easy.get("model_id"):
             model = easy["model_id"]
         sid = hd.create_session("nexus:agentmem", model=model)
+        # Consolidation input carries EVERY user's task titles (lanes are
+        # shared; experience rows have no user column). Scope the session to a
+        # sentinel "user" so mem0 extractions are tagged and therefore filtered
+        # out of every real user's recall — UNTAGGED rows are global-visible,
+        # which was a cross-user leak. ':' is illegal in usernames, so the
+        # sentinel can never collide with a real account.
+        hd.publish_session_scope(sid, user="nexus:agentmem")
         try:
             res = hd.stream_turn(
                 sid, f"PREVIOUS SUMMARY:\n{prev_text}\n\nRECENT TASK LOG:\n{lines}",
