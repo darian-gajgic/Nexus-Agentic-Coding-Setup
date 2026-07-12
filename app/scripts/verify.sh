@@ -389,6 +389,9 @@ chk "Q2 distill endpoint"            "grep -q '/api/lessons/distill' server.py &
 chk "Q2 distillation sweep hook"     "grep -q 'sweep_distillation' loop_engine.py && grep -q 'def sweep_distillation' lessons.py"
 chk "Q2 settings"                    "grep -q 'lessons.auto_distill' settings_registry.py && grep -q 'lessons.min_evidence' settings_registry.py && grep -q 'lessons.cmd' settings_registry.py"
 chk "Q2 cdistill vendored+installed" "[ -f ../setup/bin/cdistill ] && [ -f \$HOME/.local/bin/cdistill ] && grep -q 'NEXUS_LESSONS_JSON_BEGIN' ../setup/bin/cdistill"
+# [R3] ONE frontier-hook cmd resolver: the shlex+per-token-replace+PATH-fallback
+# block must exist exactly once (evals.resolve_cmd_tokens) — no inline copies.
+chk "R3 one cmd-token resolver"      "grep -q 'def resolve_cmd_tokens' evals.py && grep -q 'resolve_cmd_tokens' lessons.py && [ \$(grep -c 'local/bin/{tokens\[0\]}' evals.py) = 1 ] && ! grep -q 'local/bin/{tokens\[0\]}' lessons.py && [ \$(grep -c 'shlex\.split' evals.py) = 1 ] && ! grep -q 'shlex\.split' lessons.py"
 chk "P7 approvals scope column"      "grep -q \"ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'\" database.py"
 chk "L2 overlay-vs-canonical"        "grep -q 'user_overlay' lessons.py && grep -q 'def _delta_path' lessons.py"
 # Q7a — autopilot presets (two axes) + guardrail rules
