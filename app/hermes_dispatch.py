@@ -681,12 +681,58 @@ def _rewrite_session_keys(mutate):
 
 def publish_session_key(session_id: str, user_id: str | None, model_id: str | None):
     """Give this session the owner's API key (bridge entry) — no-op when the
-    owner has no credential for the serving provider."""
+    owner has no credential for the serving provider. MERGES into an existing
+    entry (a published per-task effort must survive)."""
     key = _session_key_for(user_id, model_id)
     if not key:
         return
-    _rewrite_session_keys(lambda s: s.__setitem__(
-        session_id, {"api_key": key, "ts": time.time()}))
+
+    def _set(s):
+        entry = dict(s.get(session_id) or {})
+        entry.update({"api_key": key, "ts": time.time()})
+        s[session_id] = entry
+    _rewrite_session_keys(_set)
+
+
+def session_effort_for_task(task: dict, model: str | None) -> str | None:
+    """Mode-coherence (2026-07-12b, I-3 follow-up): the per-task reasoning
+    effort — the last mode-blind knob. Deterministic, hermes effort scale;
+    None = no bridge entry (the config default / per-model setting applies,
+    i.e. exactly the pre-feature behavior).
+
+    Rules: high_stakes or Smart → xhigh (maximum thinking where quality is the
+    point); Eco → medium on light tiers, high once the cascade escalated it to
+    the strong tier (cost-conscious even after escalation); Balanced content →
+    high (creative generation gains little from maximum deliberation — the
+    'when to think deeply' result; the rubric/judge still gate quality);
+    Balanced research/analysis/code → None (xhigh default, reasoning-heavy)."""
+    if db.get_setting("dispatch.session_effort", "1") != "1":
+        return None
+    sp = (task.get("spend_profile") or "").strip()
+    dtype = (task.get("deliverable_type") or "").strip()
+    m = (model or "").lower()
+    light = "air" in m or "flash" in m or "turbo" in m
+    if task.get("high_stakes") or sp == "smart":
+        return "xhigh"
+    if sp == "eco":
+        return "medium" if light else "high"
+    if dtype == "content" and not light:
+        return "high"
+    return None
+
+
+def publish_session_effort(session_id: str, task: dict, model: str | None):
+    """Publish the per-task effort into the session bridge entry (merge-safe;
+    the zai plugin's session-effort core-mod reads it per request)."""
+    effort = session_effort_for_task(task, model)
+    if not effort:
+        return
+
+    def _set(s):
+        entry = dict(s.get(session_id) or {})
+        entry.update({"effort": effort, "ts": time.time()})
+        s[session_id] = entry
+    _rewrite_session_keys(_set)
 
 
 def remove_session_key(session_id: str):
@@ -1769,6 +1815,9 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
         # same bridge mechanism — re-published on every (re)dispatch, removed
         # at finalize.
         publish_session_key(session_id, task.get("user_id"), run_model)
+        # Mode-coherence (2026-07-12b): per-task reasoning effort — the mode ×
+        # task-type × tier choice rides the same bridge (zai session-effort mod).
+        publish_session_effort(session_id, task, run_model)
         _set_dispatch(dispatch_id, session_id=session_id, state="streaming",
                       heartbeat_at=time.time(), model=run_model)
         _set_task(task_id, dispatch_state="streaming", dispatch_error=None)

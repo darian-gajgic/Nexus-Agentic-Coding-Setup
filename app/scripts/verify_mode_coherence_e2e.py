@@ -37,7 +37,8 @@ def ok(name, cond, detail=""):
 
 saved = {k: db.get_setting(k) for k in
          ("dispatch.default_budget.content", "dispatch.default_task_budget",
-          "models.auto_route", "dispatch.escalate_on_revise")}
+          "models.auto_route", "dispatch.escalate_on_revise",
+          "dispatch.session_effort")}
 created_tasks, created_models = [], []
 
 try:
@@ -152,6 +153,46 @@ try:
     ok("kill switch respected",
        db.query_one("SELECT model FROM tasks WHERE id=?", (t5,))["model"] == easy_model)
     db.set_setting("dispatch.escalate_on_revise", "1")
+
+    # ── 4b. per-task reasoning effort (I-3 follow-up) ──
+    print("=== I-3: per-task reasoning effort (session bridge) ===")
+    import hermes_dispatch as hd_mod
+    db.set_setting("dispatch.session_effort", "1")
+    eff = hd_mod.session_effort_for_task
+    ok("smart → xhigh", eff({"spend_profile": "smart", "deliverable_type": "content",
+                             "high_stakes": 0}, "glm-5.2") == "xhigh")
+    ok("high-stakes → xhigh regardless of mode",
+       eff({"spend_profile": "eco", "deliverable_type": None, "high_stakes": 1},
+           "glm-5.2") == "xhigh")
+    ok("Balanced content → high (creative work: judge gates quality)",
+       eff({"spend_profile": "optimal", "deliverable_type": "content",
+            "high_stakes": 0}, "glm-5.2") == "high")
+    ok("Balanced analysis/code → None (xhigh default, reasoning-heavy)",
+       eff({"spend_profile": "optimal", "deliverable_type": "analysis",
+            "high_stakes": 0}, "glm-5.2") is None
+       and eff({"spend_profile": "optimal", "deliverable_type": "code_change",
+                "high_stakes": 0}, "glm-5.2") is None)
+    ok("eco light tier → medium / eco escalated to strong tier → high",
+       eff({"spend_profile": "eco", "deliverable_type": "content", "high_stakes": 0},
+           "glm-4.5-air") == "medium"
+       and eff({"spend_profile": "eco", "deliverable_type": "content",
+                "high_stakes": 0}, "glm-5.2") == "high")
+    db.set_setting("dispatch.session_effort", "0")
+    ok("kill switch → None", eff({"spend_profile": "smart", "deliverable_type": None,
+                                  "high_stakes": 0}, "glm-5.2") is None)
+    db.set_setting("dispatch.session_effort", "1")
+    # bridge round-trip: publish merges next to an existing api_key entry
+    sid_probe = f"probe-effort-{uuid.uuid4().hex[:8]}"
+    hd_mod._rewrite_session_keys(lambda s: s.__setitem__(
+        sid_probe, {"api_key": "probe-key", "ts": time.time()}))
+    hd_mod.publish_session_effort(sid_probe, {"spend_profile": "optimal",
+                                              "deliverable_type": "content",
+                                              "high_stakes": 0}, "glm-5.2")
+    data = json.load(open(os.path.expanduser("~/.hermes/session-keys.json")))
+    entry = (data.get("sessions") or {}).get(sid_probe) or {}
+    ok("bridge entry merges effort next to api_key",
+       entry.get("effort") == "high" and entry.get("api_key") == "probe-key", str(entry))
+    hd_mod.remove_session_key(sid_probe)
 
     # ── 5. retry slice honors the per-type baseline ──
     print("=== I-1b: retry budget slice per type ===")
