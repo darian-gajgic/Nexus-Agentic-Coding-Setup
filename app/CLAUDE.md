@@ -698,3 +698,83 @@ mechanics themselves (claiming, watchdog, approvals, cost, worktrees, scheduler)
   cron scheduler (create/toggle/delete jobs), cost guardrails summary.
 - **Enhanced kanban** — task cards now show claimed_by (⚑ owner), verify_status badge, and the
   claim flow is wired through the WS broadcast.
+
+## 2026-07-12 batch (items 1–18: user-reported bugs + improvements)
+
+- **Task STOP (item 5)**: `POST /api/tasks/{id}/stop` (+ `/api/tasks/bulk-stop`,
+  `/api/tasks/bulk-status` for item 11's ▶▶/⏹⏹ column + workflow buttons).
+  `tasks.cancel_requested` is the flag; the executor's throttled on_event poll raises
+  `DispatchCancelled` (≤~30s), `_finalize_cancel` parks the task in Backlog
+  (dispatch_state='cancelled' — reconciler/claim exclude it; session dropped, repo work
+  snapshotted). `run_task_dispatch` top-checks the flag before spending. The
+  **`session-run-stop` core-mod (#8)** makes the best-effort upstream
+  `/v1/runs/{run_id}/stop` REAL for session-chat runs (dispatches.run_id captured from
+  run.started) — without it orphaned runs burn to end of turn. Gate knob
+  `dispatch.stub_stream` (verify_stop_e2e).
+- **Real deletion (item 2)**: task delete also rmtree's its workspace;
+  `DELETE /api/workflows/{id}?cascade=tasks` (type-name-confirmed modal); NEW
+  `POST /api/projects/delete` (admin, typed confirm; workflows+tasks+workspaces+
+  project_owners+scheduler-job cleanup; repo dir → ~/.nexus-trash | purge | keep).
+  The "near-duplicate title" plan check is now visibly ADVISORY (dismissable chips;
+  fan-out twins skipped) — it compares tasks INSIDE one proposed plan, never the board.
+- **Deliverable surfacing (item 1)**: repo-mode artifact files (pptx/pdf/… —
+  ARTIFACT_EXTS) added on the task branch are mirrored into `workspace/artifacts/` at
+  EVERY finalize (`_copy_branch_artifacts`); `GET /api/tasks/{id}/branch-files[/{name}]`
+  lists/serves the branch diff-set via `git show` (membership = injection gate);
+  Deliverables view stars the ⭐ primary output; the wizard only auto-assigns repo_path
+  to dev-shaped tasks; content-repo framing also copies final files into the workspace.
+- **Agent lane memory (item 3)**: the `memory` table finally has writers —
+  `_write_experience` per finalize, stm at dispatch start, hourly
+  `agent_memory.consolidate_sweep()` (expiry enforcement + ONE cheap-model rolling
+  'lts/auto-summary' per lane; `agentmem.*` settings, `agentmem.stub` gate). Lane
+  longterm rules + summary ride into that lane's framing (`build_framing(agent_id=…)`;
+  evals stay agent-less). UI explains all four scopes + a Memory-hub systems intro.
+- **Per-user learning (item 7)**: feedback ledgers are per user (owner = canonical =
+  the shared "General" bucket; members → `~/knowledge/users/<uid>/feedback/`);
+  `dispatch_block(domain, user_id)` merges own+adopted first, then General;
+  `POST /api/feedback/adopt` copies with provenance (Origin key dedupe); scope subtabs
+  + author badges in Wins & Lessons; `feedback.cross_user_visible` kill switch.
+- **Eval → improvement loop (item 6)**: after a completed run with non-SHIP cases
+  (`evals.auto_improve`), ONE frontier call (vendored `cimprove`, stub via
+  `evals.improve_cmd`) drafts ≤5 whitelisted deltas (knowledge edit / specialist
+  standing-rule edit / exemplar promotion) → ONE admin `eval_improve` decisions card
+  (per-delta checkbox + editable text) → apply reuses `lessons.apply_deltas` + git.
+  `eval_runs.improve_status` tracks it; boot reconcile resets orphaned drafts.
+  Eval deliverables/judge output render via the escape-first `mdLite()` (raw toggle).
+- **Model routing (item 15)**: `user_models.description` ("Strengths/Weaknesses/
+  Best for/Avoid for") + ✨ auto-describe (web-researching throwaway session, returns a
+  DRAFT); deterministic `routing.select_model_for_task` at the task-create choke point
+  (mechanical/easy heuristics + Best-for phrase match, Avoid-for veto, dev-floor +
+  high-stakes never downgraded), reason stored in `tasks.model_reason` (🧭 in detail).
+  `models.auto_route` default ON.
+- **Notes (item 14)**: 📝 fixed button → bottom-left NON-modal panel (Save General /
+  Save Project from focusCtx); `notes` table + user-scoped CRUD; Notes tab with
+  date/project/workflow sort + filters. **Sort/filter (item 10)** on Projects
+  (last-modified default) + Workflows (updated_at default), localStorage-persisted.
+- **Meeting intelligence (item 8)**: `meeting_meta` links transcript→project; 🧠
+  Summarize / 📋 Requirements (LLM one-shots, cached vs mtime, requirements
+  operator-editable) / 💾 Add to memory (mem0 user-level, project+client tags) /
+  ✨ Create workflow (prefills the normal wizard via `describeTaskUI(prefill)`).
+- **Per-user GitHub (item 9)**: credentials provider `github` (user row only) +
+  `users.github_username/git_email`; publish/push/tag/PR run as the project owner via
+  GH_TOKEN env + env-config credential helper (https github.com origins only — token
+  never in argv/.git/config/logs); 🐙 Settings card + server-side
+  `GET /api/github/whoami` test. No PAT = machine gh (old behavior).
+- **Known issues (item 4)**: admin sees/edits/deletes ALL users' reports (filer chip);
+  members keep their own. **Specialists flicker (item 6)**: hash-diff refetches,
+  skeleton only on first load (house tick() pattern).
+- **Token efficiency (item 17)**: Hermes `compression.threshold 0.5→0.35`
+  (guardian-enforced config value; ~20-35% input cut on long turns);
+  `framing.brief_mode` default ON; framing trims (code_map only for code, conventions
+  cap 4000, structured-facts skipped for code_change, attachment list ≤20, predecessor
+  list ≤8); per-type caps `dispatch.turn_seconds.{content,research,analysis}` + budget
+  `dispatch.default_budget.content` (resolved by `_type_setting`); light-tier model
+  efforts set to medium (`model.effort.*` bridge); tokens/cost visible on task cards +
+  deliverable rows. Judge/critic/5-stage pipeline untouched.
+- **mem0 extraction fix (item 18)**: `~/.hermes/mem0.json` max_tokens 2000→8000 (was
+  TRUNCATING grammar-constrained JSON → dropped memory writes); golden + manifest sha
+  updated. **Brave (item 13)**: not a bug — the brave_context plugin uses Brave's
+  separately-metered LLM Context API; the classic Web Search meter froze at 498.
+- New gates: `verify_stop_e2e.py` (31), `verify_phase_c_e2e.py` (24); Phase-D smoke in
+  session scratch. All pre-existing gates stay green (452-check verify.sh, agentic 32,
+  v3_ui 24, block2 48, block3 33, feedback 32).

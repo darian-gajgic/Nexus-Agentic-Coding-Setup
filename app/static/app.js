@@ -1297,6 +1297,7 @@ function taskCard(t) {
         ${assignee ? `<span class="chip c-cyan">${esc(assignee.name)}</span>` : ''}
         ${claimer ? `<span class="chip c-yellow" title="claimed by ${esc(claimer.name)}">⚑ ${esc(claimer.name)}</span>` : ''}
         ${t.model ? `<span class="chip c-blue" title="AI model for this task">${esc(t.model)}</span>` : ''}
+        ${t.tokens_used ? `<span class="chip" title="tokens consumed so far — watch this to spot runaway tasks">${fmtTokens(t.tokens_used)}</span>` : ''}
         ${dispatchChip(t)}
         ${superChip(t)}
         ${judgeChip ? `<span class="chip ${judgeChip}" title="frontier judge verdict">${esc(t.judge_verdict)}</span>` : ''}

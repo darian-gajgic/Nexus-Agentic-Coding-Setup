@@ -84,7 +84,7 @@ tool_loop_guardrails:
     idempotent_no_progress: 5
 compression:
   enabled: true
-  threshold: 0.5
+  threshold: 0.35
   target_ratio: 0.2
   protect_last_n: 20
   protect_first_n: 3

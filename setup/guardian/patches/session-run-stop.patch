@@ -1,0 +1,51 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1990,6 +1990,17 @@
+                 event_name = event_type.replace("tool.", "tool.")
+                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+ 
++        # NEXUS CORE-MOD (session-run-stop): register the live agent so
++        # POST /v1/runs/{run_id}/stop can interrupt session-chat runs too —
++        # upstream only registers /v1/runs, so stopping a dispatch/JARVIS run
++        # 404'd and the orphaned run burned tokens to the end of the turn.
++        # The one-element list is filled by _run_agent once the executor
++        # thread creates the agent; _handle_stop_run unwraps it. Popped in
++        # _run_and_signal's finally. Client-disconnect semantics UNCHANGED
++        # (load-bearing for Nexus R3 wait-and-harvest self-heal).
++        chat_agent_ref: list = [None]
++        self._active_run_agents[run_id] = chat_agent_ref
++
+         async def _run_and_signal() -> None:
+             try:
+                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
+@@ -2002,6 +2013,7 @@
+                     session_id=session_id,
+                     stream_delta_callback=_delta,
+                     tool_progress_callback=_tool_progress,
++                    agent_ref=chat_agent_ref,
+                     gateway_session_key=gateway_session_key,
+                     route=route,
+                 )
+@@ -2027,6 +2039,9 @@
+                 logger.exception("[api_server] session chat stream failed")
+                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+             finally:
++                # NEXUS CORE-MOD (session-run-stop): sync pop first — runs even
++                # under cancellation, so no stale registry entries accumulate.
++                self._active_run_agents.pop(run_id, None)
+                 await queue.put(_event_payload("done", {}))
+                 await queue.put(None)
+ 
+@@ -4649,6 +4664,11 @@
+ 
+         run_id = request.match_info["run_id"]
+         agent = self._active_run_agents.get(run_id)
++        # NEXUS CORE-MOD (session-run-stop): session-chat runs register a
++        # one-element list (filled once the executor thread creates the
++        # agent) — unwrap it; a not-yet-created agent stays None.
++        if isinstance(agent, list):
++            agent = agent[0]
+         task = self._active_run_tasks.get(run_id)
+ 
+         if agent is None and task is None:
