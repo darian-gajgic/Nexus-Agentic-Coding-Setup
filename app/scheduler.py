@@ -121,7 +121,7 @@ def _trigger(job: dict):
         # Eco job on 2x its promised cap).
         inv, sp, budget = autopilot.preset_fields(
             tmpl.get("autopilot"), tmpl.get("spend_profile"),
-            bool(tmpl.get("high_stakes")), None)
+            bool(tmpl.get("high_stakes")), None, dtype)
         db.execute(
             "INSERT INTO tasks (id, title, description, status, priority, "
             "assignee_id, created_at, updated_at, tags, position, user_id, "

@@ -65,6 +65,14 @@ SECTIONS = [
              "help": "Item 17: content deliverables rarely justify the global 5M default — "
                      "this bounds the NEXT dispatch/retry once a content task has burned 2M. "
                      "A task's own budget_tokens still overrides."},
+            {"key": "dispatch.escalate_on_revise", "label": "Escalate model tier on judge REVISE", "type": "bool",
+             "default": "1",
+             "help": "Mode-coherence (2026-07-12b): when a LIGHT-TIER attempt (easy/"
+                     "mechanical models — Eco floor or mechanical routing) is sent back by "
+                     "the judge, its retry runs on the strong 'complicated' model — cheap "
+                     "first, strong only when verification fails (the cascade pattern that "
+                     "buys quality-per-$). Never touches high-stakes or dev-pipeline tasks; "
+                     "bounded by the per-mode round caps."},
             {"key": "models.auto_route", "label": "Auto-pick the best model per task", "type": "bool",
              "default": "1",
              "help": "Item 15: when a task is created WITHOUT an explicit model, pick the "
@@ -352,8 +360,11 @@ SECTIONS = [
              "default": "optimal",
              "help": "Q7a axis 2 (How much should this cost?): eco | optimal | smart. Sets model "
                      "routing, Super Result, fan-out width, round caps, auto-judge scope and the "
-                     "token budget multiplier (×0.5/×1/×2). 'optimal' is balanced (best result "
-                     "per fuel — validated in the deferred benchmark phase)."},
+                     "token budget multiplier (×0.5/×1/×2 of the per-type baseline). The wizard "
+                     "also SUGGESTS a profile per goal (triage-based, always overridable). "
+                     "'optimal' is Balanced — best value as a HEURISTIC: the quality-per-$ claim "
+                     "is validated only by running the deferred Phase-8 benchmark campaign "
+                     "(benchmarks/added-value/)."},
             {"key": "autopilot.auto_approve_ship_hours", "label": "Auto-approve SHIP after (hours)",
              "type": "int", "default": "0", "min": 0, "max": 336,
              "help": "Q7b: in Full Auto only, a SHIP-verdict FINAL deliverable approval may "

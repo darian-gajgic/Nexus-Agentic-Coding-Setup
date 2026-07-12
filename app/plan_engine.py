@@ -162,6 +162,7 @@ def triage_heuristics(goal: str) -> dict:
         "blast_radius": blast,
         "reasons": reasons,
         "family": detect_family(goal),
+        "goal": g[:400],  # 2026-07-12b: recommend_spend's mechanical-work signal
     }
 
 
@@ -277,14 +278,55 @@ def recommend(heur: dict, div: dict | None = None,
     # high complexity OR real-world blast radius warrants the grounded critic.
     recommend_sr = bool(complexity >= 6.0 or heur.get("blast_radius"))
 
+    spend_rec, spend_reasons = recommend_spend(heur, div)
     return {
         "complexity": round(complexity, 1),
         "ambiguity": round(ambiguity, 2),
         "recommend_deep_plan": bool(recommend_deep),
         "recommend_super_result": recommend_sr,
+        # Mode-coherence I-4 (2026-07-12b): the same triage suggests the spend
+        # profile per task — preselected in the UI, always user-overridable.
+        "recommend_spend": spend_rec,
+        "spend_reasons": spend_reasons,
         "reasons": reasons[:6],
         "family": heur.get("family") or "content",
     }
+
+
+def recommend_spend(heur: dict, div: dict | None = None) -> tuple[str, list]:
+    """Deterministic per-task spend-profile suggestion (mode-coherence I-4 +
+    gap b, 2026-07-12b): 'smart' when the goal is complex/risky, 'eco' when it
+    is short/simple/mechanical, else 'optimal' (Balanced). Type-aware through
+    the family + multi-artifact/cross-domain signals; NEVER binding — the UI
+    preselects the card and the user just clicks another to override."""
+    heur = heur or {}
+    complexity = float(heur.get("complexity") or 0)
+    ambiguity = float(heur.get("ambiguity") or 0)
+    if div and div.get("score"):
+        ambiguity = max(ambiguity, float(div["score"]))
+    joined = " ".join(heur.get("reasons") or [])
+    multi = ("multiple deliverables" in joined) or ("spans ≥2 domains" in joined)
+    family = heur.get("family") or "content"
+    if heur.get("blast_radius"):
+        return "smart", ["real-world blast radius (deploy / send / money) — maximum "
+                         "verification pays for itself here"]
+    if complexity >= 6.0:
+        return "smart", [f"high complexity ({complexity:.0f}/10) — extra verification "
+                         "rounds and fan-out are worth the spend"]
+    # Eco only for MECHANICAL-looking work (same signal family the model router
+    # uses) — a short but CREATIVE deliverable (a landing page, an ad) still
+    # deserves the Balanced pipeline; cheapness there comes from the cascade.
+    mechanical = re.search(
+        r"\b(format|convert|extract|rename|transcrib\w*|csv|cleanup|dedup\w*|"
+        r"reformat|normali[sz]e|umbenenn\w*|konvertier\w*)\b", (heur.get("goal") or joined), re.I)
+    if complexity <= 2.0 and ambiguity < 0.4 and not multi and mechanical:
+        return "eco", [f"mechanical single-step goal (\"{mechanical.group(0)}\") — the "
+                       "light tier handles this; the judge escalates it only if needed"]
+    reasons = [f"moderate complexity ({complexity:.0f}/10) — the balanced default "
+               "gives the standard pipeline with up to 2 rework rounds"]
+    if family == "software" and complexity >= 4.0:
+        reasons.append("software goal — the coding pipeline's review/verify gates apply either way")
+    return "optimal", reasons
 
 
 def goal_hash(goal: str, uid: str | None = None) -> str:
