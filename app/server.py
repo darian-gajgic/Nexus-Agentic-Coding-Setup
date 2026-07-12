@@ -752,7 +752,9 @@ async def update_task(task_id: str, body: TaskUpdate):
                          "(each waiting for the other, no lane ever claims them)"})
         updates["depends_on"] = json.dumps(deps) if deps else None
     if body.loop_config is not None:
-        updates["loop_config"] = json.dumps(body.loop_config) if body.loop_config else None
+        # Final-review F2 (D6/[R1]): graft engine-owned accounting under the lock
+        _write_loop_cfg_grafted("task", task_id,
+                                body.loop_config if body.loop_config else None)
     if body.client is not None:
         updates["client"] = (body.client or "").strip().lower() or None
     if body.repo_path is not None:
@@ -4802,6 +4804,43 @@ def _loop_meta(kind: str, row: dict, super_result: bool) -> dict:
             "autopilot": row.get("autopilot"), "spend_profile": row.get("spend_profile")}
 
 
+_LOOP_ACCOUNTING_KEYS = ("used", "used_tasks", "state", "state_tasks",
+                         "esc_used", "esc_tasks")
+
+
+def _write_loop_cfg_grafted(kind: str, oid: str, incoming) -> None:
+    """Final-review F2 (D6/[R1]): persist a CLIENT-supplied loop_config
+    without losing engine bookkeeping. The UI round-trips the whole cfg from
+    a GET that may predate several locked engine writes (round bumps, handled
+    state, escalation budget) — and those fields are read-only in the modal,
+    so they are never user intent. Under _CFG_LOCK, graft the accounting keys
+    from the FRESH row onto the incoming blob per trigger id (absent-in-fresh
+    means the engine cleared it — drop the stale copy too), then write."""
+    import loop_engine as _le
+    table = "tasks" if kind == "task" else "workflows"
+    with _le._CFG_LOCK:
+        if isinstance(incoming, dict):
+            row = db.query_one(f"SELECT loop_config FROM {table} WHERE id=?", (oid,))
+            try:
+                fresh = json.loads((row or {}).get("loop_config") or "null")
+            except Exception:
+                fresh = None
+            if isinstance(fresh, dict):
+                by_id = {t.get("id"): t for t in fresh.get("triggers") or []}
+                for t in incoming.get("triggers") or []:
+                    o = by_id.get(t.get("id"))
+                    if not o:
+                        continue
+                    for k in _LOOP_ACCOUNTING_KEYS:
+                        if k in o:
+                            t[k] = o[k]
+                        else:
+                            t.pop(k, None)
+        db.execute(f"UPDATE {table} SET loop_config=?, updated_at=? WHERE id=?",
+                   (json.dumps(incoming) if isinstance(incoming, dict) else None,
+                    time.time(), oid))
+
+
 def _sync_super_result_loop(kind: str, row: dict):
     """Keep the loop_config's super_result trigger in lockstep with the flag:
     flag ON + no trigger → regenerate the design (preserving used counts of
@@ -6193,25 +6232,17 @@ async def loop_design(body: dict):
     meta = body.get("meta") or {}
     # When designing for an EXISTING object, pull its real shape from the DB.
     oid = body.get("id")
+    # Final-review F6/[10]: the shared _loop_meta builder — an inline copy here
+    # had already drifted (workflow branch dropped the row's own high_stakes
+    # flag), making the UI preview disagree with the persisted regen paths.
     if oid and kind == "task":
         t = _owned_task(oid)
         if t:
-            meta = {"title": t.get("title"), "domain": t.get("domain"),
-                    "high_stakes": bool(t.get("high_stakes")),
-                    "super_result": bool(t.get("super_result")),
-                    "autopilot": t.get("autopilot"), "spend_profile": t.get("spend_profile"),
-                    "specialist": t.get("specialist"), **meta}
+            meta = {**_loop_meta("task", t, bool(t.get("super_result"))), **meta}
     elif oid and kind == "workflow":
         w = _owned_workflow(oid)
         if w:
-            specs = [r.get("specialist") for r in db.query_all(
-                "SELECT specialist FROM tasks WHERE workflow_id=?", (oid,)) if r.get("specialist")]
-            hs = db.query_one(
-                "SELECT COUNT(*) c FROM tasks WHERE workflow_id=? AND high_stakes=1", (oid,))
-            meta = {"title": w.get("name"), "domain": w.get("domain"),
-                    "specialists": specs, "high_stakes": bool((hs or {}).get("c")),
-                    "super_result": bool(w.get("super_result")),
-                    "autopilot": w.get("autopilot"), "spend_profile": w.get("spend_profile"), **meta}
+            meta = {**_loop_meta("workflow", w, bool(w.get("super_result"))), **meta}
     cfg = _loop.design_loop(kind, meta,
                             preference=body.get("preference") or "quality",
                             mode=body.get("mode") or "closed")
@@ -7292,8 +7323,8 @@ async def update_workflow(wf_id: str, body: dict):
             db.execute("UPDATE tasks SET client=COALESCE(client, ?) WHERE workflow_id=?", (cl, wf_id))
     if "loop_config" in body:
         lc = body["loop_config"]
-        db.execute("UPDATE workflows SET loop_config=?, updated_at=? WHERE id=?",
-                   (json.dumps(lc) if isinstance(lc, dict) else None, time.time(), wf_id))
+        # Final-review F2 (D6/[R1]): graft engine-owned accounting under the lock
+        _write_loop_cfg_grafted("workflow", wf_id, lc if isinstance(lc, dict) else None)
     if "client" in body:
         cl = (body.get("client") or "").strip().lower() or None
         db.execute("UPDATE workflows SET client=?, updated_at=? WHERE id=?",
@@ -7597,17 +7628,24 @@ async def replan_apply(wf_id: str, body: dict):
         db.execute(
             "UPDATE approvals SET status='expired', decided_at=?, decided_by='superseded by replan' "
             "WHERE status='pending' AND payload LIKE ?", (now, f'%"task_id": "{t["id"]}"%'))
-    # A new plan earns fresh automatic-fix rounds.
-    cfg = None
-    try:
-        cfg = json.loads(w.get("loop_config") or "null")
-    except Exception:
-        pass
-    if isinstance(cfg, dict):
-        for trig in cfg.get("triggers") or []:
-            trig["used"] = 0
-            trig.pop("used_tasks", None)
-        db.execute("UPDATE workflows SET loop_config=? WHERE id=?", (json.dumps(cfg), wf_id))
+    # A new plan earns fresh automatic-fix rounds. Final-review F1 (D6/[R1]):
+    # this is a whole-cfg rewrite — re-read FRESH under the engine lock; the
+    # entry snapshot `w` predates everything above, and writing it back would
+    # erase any esc bump / handled-state a locked writer landed meanwhile.
+    import loop_engine as _le
+    with _le._CFG_LOCK:
+        _row = db.query_one("SELECT loop_config FROM workflows WHERE id=?", (wf_id,))
+        cfg = None
+        try:
+            cfg = json.loads((_row or {}).get("loop_config") or "null")
+        except Exception:
+            pass
+        if isinstance(cfg, dict):
+            for trig in cfg.get("triggers") or []:
+                trig["used"] = 0
+                trig.pop("used_tasks", None)
+            db.execute("UPDATE workflows SET loop_config=? WHERE id=?",
+                       (json.dumps(cfg), wf_id))
     rp = _parse_replan(db.query_one("SELECT replan FROM workflows WHERE id=?", (wf_id,))) or {}
     rp.update({"status": "applied", "applied_at": now, "created_task_ids": ids,
                "archived_task_ids": [t["id"] for t in superseded], "error": None})
@@ -8905,13 +8943,11 @@ def project_tag(body: dict):
 
 
 def _resolve_cli(tokens: list[str]) -> list[str]:
-    """Under the systemd unit PATH may lack ~/.local/bin (gh, cjudge live there)."""
-    import shutil as _sh
-    if tokens and not _sh.which(tokens[0]):
-        candidate = os.path.expanduser(f"~/.local/bin/{tokens[0]}")
-        if os.path.isfile(candidate):
-            tokens[0] = candidate
-    return tokens
+    """Under the systemd unit PATH may lack ~/.local/bin (gh, cjudge live
+    there). Final-review F7/[R3]: delegates to the ONE resolver home in evals
+    instead of carrying a byte-identical copy."""
+    import evals as _ev
+    return _ev._fallback_local_bin(tokens)
 
 
 @app.post("/api/tasks/{task_id}/pr")
@@ -8969,16 +9005,16 @@ async def task_create_pr(task_id: str):
     bodyfile = os.path.join(ws if ws and os.path.isdir(ws) else "/tmp", "_pr_body.md")
     with open(bodyfile, "w") as f:
         f.write("\n".join(body_lines))
-    import shlex
+    import evals as _ev
     template = db.get_setting(
         "pr.cmd",
         "gh pr create --head {branch} --base {base} --title {title} --body-file {bodyfile}")
-    # .replace, not .format: task titles may legally contain braces
-    tokens = _resolve_cli([
-        t.replace("{branch}", branch).replace("{base}", base)
-         .replace("{title}", title).replace("{bodyfile}", bodyfile)
-         .replace("{repo}", repo)
-        for t in shlex.split(template)])
+    # Final-review F7/[R3]: the shared brace-safe resolver (task titles may
+    # legally contain braces); every value here is non-empty, so the
+    # resolver's empty-token drop is a no-op.
+    tokens = _ev.resolve_cmd_tokens(template, {
+        "branch": branch, "base": base, "title": title,
+        "bodyfile": bodyfile, "repo": repo})
     try:
         rcode, rout, rerr = await _sp_run_async(tokens, cwd=repo, timeout=180)
     except Exception as e:

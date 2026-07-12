@@ -20,6 +20,8 @@ import os
 import re
 import time
 
+import auth
+
 try:
     import database as db
 except Exception:  # pragma: no cover — standalone import
@@ -96,7 +98,7 @@ def _context_style_paths(uid: str | None) -> tuple[str, str]:
     files. PLAYBOOK/RUBRIC stay shared (craft, not identity)."""
     root = knowledge_root()
     u = (uid or "").strip()
-    if u and u != "u_owner":
+    if u and u != auth.DEFAULT_USER_ID:
         d = os.path.join(root, "users", u)
         ctx = os.path.join(d, "BUSINESS-CONTEXT.md")
         style = os.path.join(d, "STYLE-VOICE.md")

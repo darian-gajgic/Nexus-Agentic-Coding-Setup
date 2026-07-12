@@ -391,7 +391,7 @@ chk "Q2 settings"                    "grep -q 'lessons.auto_distill' settings_re
 chk "Q2 cdistill vendored+installed" "[ -f ../setup/bin/cdistill ] && [ -f \$HOME/.local/bin/cdistill ] && grep -q 'NEXUS_LESSONS_JSON_BEGIN' ../setup/bin/cdistill"
 # [R3] ONE frontier-hook cmd resolver: the shlex+per-token-replace+PATH-fallback
 # block must exist exactly once (evals.resolve_cmd_tokens) — no inline copies.
-chk "R3 one cmd-token resolver"      "grep -q 'def resolve_cmd_tokens' evals.py && grep -q 'resolve_cmd_tokens' lessons.py && [ \$(grep -c 'local/bin/{tokens\[0\]}' evals.py) = 1 ] && ! grep -q 'local/bin/{tokens\[0\]}' lessons.py && [ \$(grep -c 'shlex\.split' evals.py) = 1 ] && ! grep -q 'shlex\.split' lessons.py"
+chk "R3 one cmd-token resolver"      "grep -q 'def resolve_cmd_tokens' evals.py && grep -q 'resolve_cmd_tokens' lessons.py && [ \$(grep -c 'local/bin/{tokens\[0\]}' evals.py) = 1 ] && ! grep -q 'local/bin/{tokens\[0\]}' lessons.py && [ \$(grep -c 'shlex\.split' evals.py) = 1 ] && ! grep -q 'shlex\.split' lessons.py && ! grep -q 'local/bin/{tokens\[0\]}' server.py && ! grep -q 'shlex\.split' server.py"
 chk "P7 approvals scope column"      "grep -q \"ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'\" database.py"
 chk "L2 overlay-vs-canonical"        "grep -q 'user_overlay' lessons.py && grep -q 'def _delta_path' lessons.py"
 # Q7a — autopilot presets (two axes) + guardrail rules
@@ -523,6 +523,9 @@ chk "restart-prep gate committed" "[ -f scripts/verify_restart_prep_e2e.py ]"
 # D6/[R1]: loop_config writes are serialized — the lock + the locked mutate
 # exist and the escalation thread routes through them (no bare locate/save).
 chk "D6: cfg lock + locked mutate"   "grep -q '_CFG_LOCK = threading.RLock()' loop_engine.py && grep -q 'def _mutate_super_cfg' loop_engine.py && grep -q 'def _mutate_cfg_trigger' loop_engine.py && grep -q '_mutate_super_cfg(task_id' server.py && grep -q '_CFG_LOCK' server.py"
+# Final-review F1/F2: the client-facing loop_config writers (task/workflow
+# PATCH + replan apply) go through the locked graft/fresh-read paths too.
+chk "F2: PATCH loop_config grafts"   "grep -q 'def _write_loop_cfg_grafted' server.py && [ \$(grep -c '_write_loop_cfg_grafted(' server.py) -ge 3 ]"
 # [R2]: the watchdog counts lane deaths toward the circuit breaker ONLY
 # outside the post-boot grace window (clean restarts retired the fleet).
 chk "R2: watchdog boot grace"        "grep -q '_BOOT_TS = time.time()' watchdog.py && grep -q 'BOOT_GRACE_S' watchdog.py && grep -q 'boot_respawn' watchdog.py"

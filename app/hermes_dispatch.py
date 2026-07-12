@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 
+import auth
 import database as db
 import settings_registry as sreg
 
@@ -768,7 +769,7 @@ def _knowledge_paths(task: dict) -> dict:
     files. PLAYBOOK/RUBRIC stay shared (craft, not identity)."""
     root = Path(db.get_setting("onboarding.root", "") or os.path.expanduser("~/knowledge"))
     uid = (task.get("user_id") or "").strip()
-    if uid and uid != "u_owner":
+    if uid and uid != auth.DEFAULT_USER_ID:
         d = root / "users" / uid
         if (d / "BUSINESS-CONTEXT.md").is_file() and (d / "STYLE-VOICE.md").is_file():
             return {"context": str(d / "BUSINESS-CONTEXT.md"),
@@ -1085,7 +1086,11 @@ def harvest_decisions(task: dict, content: str):
         stamp = time.strftime("%Y-%m-%d")
         header = "# Project decisions\n\nThe binding choices each stage made. Later stages MUST respect these.\n"
         marker = f"<!-- task:{task['id']} -->"
-        block = f"\n### {(task.get('title') or task['id'])[:120]} ({stamp}) {marker}\n{body}\n"
+        # Final-review F3: collapse whitespace — a newline in the title would
+        # strand the marker off the `### ` line, so the supersede regex below
+        # silently no-ops and the rework's decisions never land.
+        title = re.sub(r"\s+", " ", str(task.get("title") or task["id"])).strip()[:120]
+        block = f"\n### {title} ({stamp}) {marker}\n{body}\n"
         # Read-modify-write under an exclusive lock: parallel lanes finalizing
         # siblings of the same workflow must not erase each other's blocks.
         with path.open("a+") as f:

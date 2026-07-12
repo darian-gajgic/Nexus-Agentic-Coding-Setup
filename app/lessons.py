@@ -264,7 +264,7 @@ def _delta_path(root: str, domain: str, file: str, target: str, user_id: str | N
     the domain; STYLE-VOICE is business-wide. L2: user_overlay STYLE-VOICE goes
     to the user's overlay dir (users/<uid>/), everything else canonical."""
     if file == "STYLE-VOICE.md":
-        if target == "user_overlay" and user_id and user_id != "u_owner":
+        if target == "user_overlay" and user_id and user_id != auth.DEFAULT_USER_ID:
             d = os.path.join(root, "users", user_id)
             os.makedirs(d, exist_ok=True)
             return os.path.join(d, "STYLE-VOICE.md")
