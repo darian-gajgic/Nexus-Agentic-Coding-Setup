@@ -3490,6 +3490,7 @@ async function rvSelectPair(val) {
 function rvFindingsHTML() {
   const all = _review.comments || [];
   if (!all.length) return '';
+  const t = (state.tasks || []).find(x => x.id === _review.taskId) || {};
   const paths = new Set((_review.r.files || []).map(f => f.path));
   const srcIco = c => c.source === 'critic' ? '🤖' : c.source === 'judge' ? '⚖' : '👤';
   const row = c => {
@@ -3508,12 +3509,33 @@ function rvFindingsHTML() {
   };
   const open = all.filter(c => c.status === 'open');
   const done = all.filter(c => c.status !== 'open').slice(0, 40);
-  return `<details style="margin-bottom:10px;border:1px solid rgba(94,234,212,.25);border-radius:8px;padding:6px 10px" ${open.length ? 'open' : ''}>
+  // Addressed findings grouped by the rework they were drained into (comments
+  // consumed by one retry share a consumed_at) — this IS "the instructions
+  // that run received", the thing the operator kept asking to see.
+  const batches = [];
+  done.forEach(c => {
+    const b = batches.find(x => Math.abs(x.t - (c.consumed_at || 0)) < 120);
+    if (b) b.items.push(c); else batches.push({ t: c.consumed_at || 0, items: [c] });
+  });
+  batches.sort((a, b) => b.t - a.t);
+  // REVISE with ZERO open findings confuses everyone (observed): explain the
+  // two real cases — a stale verdict whose findings were already drained, or
+  // an unparsed report.
+  const vd = t.judge_verdict;
+  const stale = !!(t.judge_ts && t.completed_at && t.judge_ts < t.completed_at);
+  let zeroOpenNote = '';
+  if ((vd === 'REVISE' || vd === 'REWRITE') && !open.length) {
+    zeroOpenNote = stale
+      ? `<div style="font-size:12px;color:var(--warn,#eab308);margin:4px 0">⚠ This ${esc(vd)} verdict is from a <b>previous version</b>: its findings were already sent into an earlier rework (listed below) and the CURRENT version has <b>not been re-judged</b>. Nothing is "still to fix" until a fresh judge run says so — use ⚖ Re-judge (task detail or the Decisions card), or approve directly if the changes look right.</div>`
+      : `<div style="font-size:12px;color:var(--warn,#eab308);margin:4px 0">⚠ The judge said ${esc(vd)} but filed no line findings — read the full judge report in the task detail. A retry still attaches the judge's fix-list text automatically.</div>`;
+  }
+  return `<details style="margin-bottom:10px;border:1px solid rgba(94,234,212,.25);border-radius:8px;padding:6px 10px" ${open.length || zeroOpenNote ? 'open' : ''}>
     <summary style="cursor:pointer;font-size:12.5px">📋 Findings — <b>${open.length}</b> open · ${done.length} addressed</summary>
-    <div class="form-hint" style="margin:6px 0 4px"><b>open</b> = still unresolved; attaches automatically to the next rework (retry / request changes) · <b>addressed</b> = already sent into an earlier rework round — it refers to THAT round's version, which is why it doesn't pin to a line of the current files; the next judge round verifies the fix. Nothing here needs manual copying.</div>
+    ${zeroOpenNote}
+    <div class="form-hint" style="margin:6px 0 4px"><b>open</b> = still unresolved; attaches automatically to the next rework (retry / request changes) · <b>addressed</b> = already sent into a rework as its instructions — it refers to THAT round's version, which is why it doesn't pin to a line of the current files; the next judge round verifies the fix. Nothing here needs manual copying.</div>
     <div style="display:flex;flex-direction:column;gap:2px;margin-top:2px">
       ${open.map(row).join('') || '<span class="muted" style="font-size:12px">no open findings</span>'}
-      ${done.length ? `<div class="muted" style="font-size:11px;margin-top:6px">addressed in earlier rounds:</div>` + done.map(row).join('') : ''}
+      ${batches.map(b => `<div class="muted" style="font-size:11px;margin-top:6px">↩ sent as instructions into the rework of ${fmtAgo(b.t)}:</div>` + b.items.map(row).join('')).join('')}
     </div></details>`;
 }
 
