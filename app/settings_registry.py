@@ -156,10 +156,13 @@ SECTIONS = [
                      "as JUDGE_MODEL to the subprocess. Gates stub this — restore after testing."},
             {"key": "judge.auto_scope", "label": "Auto-judge scope", "type": "str",
              "default": "high_stakes",
-             "help": "N5: which quality-mode deliverables the closed loop judges automatically. "
-                     "'high_stakes' (default = today's behavior) judges only high-stakes work; "
-                     "'all_quality' judges EVERY quality-mode deliverable with a domain rubric "
-                     "(+1 judge call each) so the loop auto-retries non-high-stakes work too."},
+             "help": "Which deliverables the loop auto-judges when a task has NO spend "
+                     "profile (profiled tasks derive their own scope: Eco=high_stakes, "
+                     "Balanced=sinks, Smart=all_quality). 'high_stakes' (default) judges "
+                     "only high-stakes work; 'sinks' (2026-07-13) frontier-judges final/"
+                     "client-facing deliverables and gives interior pipeline members the "
+                     "GLM screen; 'all_quality' frontier-judges EVERY deliverable with a "
+                     "domain rubric (+1 Opus call each)."},
             {"key": "judge.on_blind_reject", "label": "Judge before a blind retry", "type": "bool",
              "default": "0",
              "help": "N7: when an approval is rejected with NO feedback and the current version "
