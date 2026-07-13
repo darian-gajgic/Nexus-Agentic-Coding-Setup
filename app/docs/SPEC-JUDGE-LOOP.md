@@ -306,6 +306,17 @@ line and startup restore guard it.
   status); PATCH-time re-derive has no runtime gate check (registry grep only).
 - The screen prompt is inline in `_screen_thread` (not a synced script like
   cjudge) — fine at one call site; extract it if a second consumer appears.
+- **Recorded deviations from the approved plan** (flagged independently by the
+  2026-07-13 tool-documentation review): (a) the pre-gate deliberately DROPPED
+  the planned "rubric self-score line present" check — self-score formats vary
+  per domain and a false-positive pre-gate failure costs a full GLM round; the
+  Gate-evidence framing table covers the same intent on the worker side.
+  (b) `judge.auto_scope`'s registry DEFAULT stays `high_stakes` (the plan table
+  said `sinks`): profiles govern scope for every profiled task, so the global
+  key only affects profile-less/legacy tasks, and those keep pre-overhaul
+  behavior — flipping the global would silently widen judging for legacy rows.
+  (c) The review pair API landed as `?pair=` + `from_v`/`to_v` (plan wrote
+  `?from=&to=`); the workspace UI selector only sends `from_v` (to = live).
 - `rounds.json` SHAs can dangle if the operator prunes/rebases the task
   branch — `build_task_review` falls back to 'base' when the diff comes back
   empty; a stronger fix would validate SHAs with `git cat-file`.
