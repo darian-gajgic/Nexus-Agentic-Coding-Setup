@@ -22,6 +22,8 @@ import autopilot as ap         # noqa: E402
 import routing                 # noqa: E402
 import plan_engine as pe       # noqa: E402
 
+db.init_db()  # idempotent — the gate may run before the service migrated new columns
+
 PASS = FAIL = 0
 
 
@@ -208,13 +210,99 @@ try:
        "effort" not in entry and entry.get("api_key") == "probe-key", str(entry))
     hd_mod.remove_session_key(sid_probe)
 
-    # ── 5. retry slice honors the per-type baseline ──
-    print("=== I-1b: retry budget slice per type ===")
+    # ── 5. retry slice honors the per-type baseline × slice fraction ──
+    print("=== I-1b: retry budget slice per type (0.5× original, 2026-07-13) ===")
     t6 = mk(model=None, judge_verdict=None, tokens_used=2_500_000, budget_tokens=None)
     srv._retry_task(t6, "probe feedback")
-    b6 = db.query_one("SELECT budget_tokens FROM tasks WHERE id=?", (t6,))["budget_tokens"]
-    ok("NULL-budget content task extends by the 2M content slice (used+2M)",
-       b6 == 4_500_000, str(b6))
+    row6 = db.query_one("SELECT budget_tokens, budget_original FROM tasks WHERE id=?", (t6,))
+    ok("NULL-budget content task extends by HALF the 2M content baseline (used+1M)",
+       row6["budget_tokens"] == 3_500_000, str(dict(row6)))
+    ok("first retry pins budget_original to the type baseline",
+       row6["budget_original"] == 2_000_000, str(row6["budget_original"]))
+    # ceiling: past rework_ceiling_mult × original the retry files ONE budget
+    # card instead of extending
+    t6b = mk(model=None, judge_verdict=None, tokens_used=4_100_000,
+             budget_tokens=4_000_000, budget_original=2_000_000)
+    srv._retry_task(t6b, "probe feedback")
+    row6b = db.query_one("SELECT budget_tokens FROM tasks WHERE id=?", (t6b,))
+    card = db.query_one(
+        "SELECT id FROM approvals WHERE status='pending' AND action_type='budget' "
+        "AND payload LIKE ?", (f'%"task_id": "{t6b}"%',))
+    ok("at the 2× ceiling: budget NOT extended", row6b["budget_tokens"] == 4_000_000,
+       str(row6b["budget_tokens"]))
+    ok("at the 2× ceiling: ONE pending 'budget' decision card filed", bool(card))
+    srv._retry_task(t6b, "probe feedback again")
+    n_cards = db.query_one(
+        "SELECT COUNT(*) AS n FROM approvals WHERE status='pending' AND "
+        "action_type='budget' AND payload LIKE ?", (f'%"task_id": "{t6b}"%',))["n"]
+    ok("budget card is idempotent (second retry files no duplicate)", n_cards == 1)
+
+    # ── 6. derive matrix (2026-07-13 mode-ladder) ──
+    print("=== mode ladder: derive() matrix ===")
+    d_eco = ap.derive("assisted", "eco")
+    d_opt = ap.derive("assisted", "optimal")
+    d_sm = ap.derive("full_auto", "smart")
+    ok("judge_scope: eco=high_stakes / optimal=sinks / smart=all_quality",
+       d_eco["judge_scope"] == "high_stakes" and d_opt["judge_scope"] == "sinks"
+       and d_sm["judge_scope"] == "all_quality",
+       f"{d_eco['judge_scope']}/{d_opt['judge_scope']}/{d_sm['judge_scope']}")
+    ok("assisted sr_mode=closed (terminal checkpoints only), manual stays open",
+       d_opt["sr_mode"] == "closed" and ap.derive("manual", "optimal")["sr_mode"] == "open")
+    ok("escalation thresholds derive (armed): eco off / optimal rewrite / smart rewrite_or_cap",
+       d_eco.get("escalation") == "off" and d_opt.get("escalation") == "rewrite"
+       and d_sm.get("escalation") == "rewrite_or_cap",
+       f"{d_eco.get('escalation')}/{d_opt.get('escalation')}/{d_sm.get('escalation')}")
+    ok("plan_recommend derives (dead deep_plan.enabled key fixed)",
+       d_opt.get("plan_recommend") == "triage" and d_sm.get("plan_recommend") == "always",
+       f"{d_opt.get('plan_recommend')}/{d_sm.get('plan_recommend')}")
+
+    # ── 7. judge tier + sink + frontier cost cap (loop engine) ──
+    print("=== mode ladder: _judge_tier / _is_sink / cost cap ===")
+    import loop_engine as le
+    saved["judge.screen"] = db.get_setting("judge.screen")
+    saved["frontier.task_cost_cap_usd"] = db.get_setting("frontier.task_cost_cap_usd")
+    db.set_setting("judge.screen", "interior")
+    wf_probe = f"wf-{uuid.uuid4().hex[:8]}"
+    db.execute("INSERT INTO workflows (id, name, status, created_at, updated_at, user_id) "
+               "VALUES (?,?,?,?,?,?)",
+               (wf_probe, "probe wf", "active", time.time(), time.time(), "u_owner"))
+    t_int = mk(judge_verdict=None, workflow_id=wf_probe, spend_profile="optimal")
+    t_snk = mk(judge_verdict=None, workflow_id=wf_probe, spend_profile="optimal",
+               depends_on=json.dumps([t_int]))
+    ok("_is_sink: member with a dependent is interior, last member is the sink",
+       not le._is_sink(db.query_one("SELECT * FROM tasks WHERE id=?", (t_int,)))
+       and le._is_sink(db.query_one("SELECT * FROM tasks WHERE id=?", (t_snk,))))
+    row_int = db.query_one("SELECT * FROM tasks WHERE id=?", (t_int,))
+    row_snk = db.query_one("SELECT * FROM tasks WHERE id=?", (t_snk,))
+    ok("optimal: interior member → screen, sink → frontier",
+       le._judge_tier(row_int, "high_stakes") == "screen"
+       and le._judge_tier(row_snk, "high_stakes") == "frontier",
+       f"{le._judge_tier(row_int, 'high_stakes')}/{le._judge_tier(row_snk, 'high_stakes')}")
+    ok("high-stakes forces frontier on any profile (rule-2 floor)",
+       le._judge_tier({**row_int, "high_stakes": 1}, "high_stakes") == "frontier")
+    ok("eco → none; smart → frontier",
+       le._judge_tier({**row_int, "spend_profile": "eco"}, "high_stakes") == "none"
+       and le._judge_tier({**row_int, "spend_profile": "smart"}, "high_stakes") == "frontier")
+    db.set_setting("judge.screen", "off")
+    ok("judge.screen=off: interior member gets no verdict tier",
+       le._judge_tier(db.query_one("SELECT * FROM tasks WHERE id=?", (t_int,)),
+                      "high_stakes") == "none")
+    db.set_setting("judge.screen", "interior")
+    ok("profile-less task follows judge.auto_scope ('sinks' screens interiors, "
+       "'all_quality' fronts everything)",
+       le._judge_tier({**row_int, "spend_profile": None}, "sinks") == "screen"
+       and le._judge_tier({**row_int, "spend_profile": None}, "all_quality") == "frontier"
+       and le._judge_tier({**row_int, "spend_profile": None}, "high_stakes") == "none")
+    db.set_setting("frontier.task_cost_cap_usd", "3.0")
+    ok("frontier cost cap scales with the profile multiplier",
+       le._frontier_cost_capped({"spend_profile": "optimal", "frontier_cost_usd": 3.1})
+       and not le._frontier_cost_capped({"spend_profile": "optimal", "frontier_cost_usd": 2.9})
+       and not le._frontier_cost_capped({"spend_profile": "smart", "frontier_cost_usd": 5.9})
+       and le._frontier_cost_capped({"spend_profile": "eco", "frontier_cost_usd": 1.6}))
+    db.set_setting("frontier.task_cost_cap_usd", "0")
+    ok("cost cap 0 = uncapped",
+       not le._frontier_cost_capped({"spend_profile": "optimal", "frontier_cost_usd": 99.0}))
+    db.execute("DELETE FROM workflows WHERE id=?", (wf_probe,))
 
 finally:
     for k, v in saved.items():
