@@ -813,3 +813,27 @@ mechanics themselves (claiming, watchdog, approvals, cost, worktrees, scheduler)
 - **Honest labeling**: 'Balanced — best value' is a HEURISTIC until the deferred Phase-8
   benchmark (`benchmarks/added-value/`) is run; the Eco card carries the same caveat.
   Gate: `scripts/verify_mode_coherence_e2e.py`.
+
+### Judge loop overhaul (2026-07-13, docs/SPEC-JUDGE-LOOP.md is source of truth)
+**READ `docs/SPEC-JUDGE-LOOP.md` before touching judge/screen/retry/closure code —
+it holds the full cascade, state inventory, settings table and the INVARIANTS
+list (§11) that changes must not break.** One-paragraph orientation: deliverable
+verification is a cheap→expensive cascade — free deterministic pre-gate
+(`evals.judge_pregate`) → per-task tier (`loop_engine._judge_tier`: high-stakes/
+smart→frontier cjudge; Balanced→frontier for SINKS, GLM screen (`_screen_thread`)
+for interior members; eco→none) → SHIP-with-notes verdict contract (only
+blockers block; `[F#]` fix-list briefs; cjudge in setup/bin + ~/.local/bin,
+byte-identical) → first automated rework CONTINUES its session with a
+targeted-revision turn (epoch marker guards the harvest ladder) → round ≥2 =
+DELTA re-judge (prior fix-list + version diff, criteria frozen) → bounded by
+judge.max_runs=4 + keys⊆prev convergence + frontier.task_cost_cap_usd → every
+exhausted path files a decision card (screen tier: accept-with-notes).
+`super.escalation` is ARMED (C5 profile thresholds live). Budgets: retry slice
+0.5× `budget_original`, 2× ceiling → 'budget' card. Review defaults to
+round-over-round diffs (rounds.json) with a diffed deliverable.md Report entry
++ a Findings panel (judge comments finally render for repo tasks). Cost:
+frontier_ledger kinds (judge/judge_screen/…), task True-cost line, Usage
+Quality-Loop panel, health light. Gates: `verify_judge_loop_e2e.py` (41),
+verify.sh §22, mode-coherence 47 / autopilot 72 / SR 90. Why-evidence:
+repo-root `IMPLEMENTATION-REPORT-JUDGE-LOOP-2026-07-13.md`. STILL UNMEASURED:
+quality-per-$ claims await the paid A/B replay (`benchmarks/judge-loop-ab/`).
