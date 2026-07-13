@@ -598,6 +598,7 @@ chk "CR#6: retry clears stale stop flag" "grep -q 'cancel_requested=NULL' server
 chk "CR#26: dev specialists single source" "grep -q '_DEV_SPECIALISTS' server.py && grep -q 'DEV_SPECIALISTS' routing.py"
 # gates exist and are wired
 chk "judge-loop gate present"         "[ -f scripts/verify_judge_loop_e2e.py ] && grep -q 'judge_pregate' scripts/verify_judge_loop_e2e.py"
+chk "judge-loop spec committed"       "[ -f docs/SPEC-JUDGE-LOOP.md ] && grep -q 'INVARIANTS' docs/SPEC-JUDGE-LOOP.md && grep -q 'SPEC-JUDGE-LOOP' CLAUDE.md"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
