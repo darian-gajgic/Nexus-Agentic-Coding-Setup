@@ -125,10 +125,36 @@ def detect_app(workspace: str) -> dict | None:
     for d in candidates:
         for entry in ("app.py", "main.py", "server.py"):
             if (d / entry).is_file():
+                # requirements.txt may live NEXT TO the entry or at the
+                # WORKSPACE ROOT (entry in a subdir, e.g. app/main.py with
+                # root requirements.txt — the bench-02 shop shape). Missing
+                # this launched bare python3 → instant ModuleNotFoundError.
+                reqs = next((p for p in (d / "requirements.txt",
+                                         ws / "requirements.txt") if p.is_file()), None)
+                # A PACKAGE entry (subdir with __init__.py) cannot run as
+                # `python main.py` — relative imports die with "no known
+                # parent package". Run it from the WORKSPACE ROOT: an ASGI
+                # app (FastAPI/Starlette + uvicorn in requirements) via
+                # `python -m uvicorn pkg.entry:app --port N` (which also pins
+                # the port), anything else via `python -m pkg.entry`.
+                module = asgi = None
+                run_dir = str(d)
+                if d != ws and (d / "__init__.py").is_file():
+                    module = f"{d.name}.{entry[:-3]}"
+                    run_dir = str(ws)
+                    try:
+                        src = (d / entry).read_text(errors="replace")
+                        reqs_txt = reqs.read_text(errors="replace").lower() if reqs else ""
+                        if re.search(r"(?m)^app\s*=", src) and "uvicorn" in reqs_txt:
+                            asgi = "app"
+                    except OSError:
+                        pass
                 return {"type": "python", "dir": str(d), "entry": entry,
+                        "run_dir": run_dir, "module": module, "asgi": asgi,
                         "label": f"Python app ({d.name or 'root'} · {entry})",
-                        "installed": not (d / "requirements.txt").is_file()
-                        or (d / ".venv-preview").is_dir()}
+                        "reqs": str(reqs) if reqs else None,
+                        "installed": reqs is None
+                        or (Path(run_dir) / ".venv-preview").is_dir()}
     for d in candidates:
         if (d / "index.html").is_file():
             return {"type": "static", "dir": str(d), "installed": True,
@@ -408,16 +434,29 @@ def start_app(task_id: str, workspace: str) -> dict:
             # else: the proxy target already answers (e.g. a sibling preview
             # state's backend) — share it instead of colliding on the port
         elif app["type"] == "python":
-            venv = Path(app["dir"]) / ".venv-preview"
+            run_dir = app.get("run_dir") or app["dir"]
+            venv = Path(run_dir) / ".venv-preview"
+            # detect_app resolved requirements.txt (entry dir OR workspace
+            # root); legacy registry entries without 'reqs' fall back to the
+            # old entry-dir-only probe.
+            reqs = app.get("reqs") or (
+                str(Path(app["dir"]) / "requirements.txt")
+                if (Path(app["dir"]) / "requirements.txt").is_file() else None)
             pre = ""
-            if (Path(app["dir"]) / "requirements.txt").is_file():
+            if reqs:
                 pre = (f"[ -d .venv-preview ] || python3 -m venv .venv-preview; "
                        f". .venv-preview/bin/activate && "
-                       f"pip install -q -r requirements.txt && ")
-            else:
-                pre = ""
+                       f"pip install -q -r {shlex.quote(reqs)} && ")
             py = f"{venv}/bin/python" if pre else "python3"
-            inner = pre + f"exec {py} {app['entry']}"
+            if app.get("asgi") and app.get("module"):
+                # package-shaped ASGI app: uvicorn pins OUR port directly
+                inner = pre + (f"exec {py} -m uvicorn {app['module']}:{app['asgi']} "
+                               f"--host 127.0.0.1 --port {port}")
+            elif app.get("module"):
+                inner = pre + f"exec {py} -m {app['module']}"
+            else:
+                inner = pre + f"exec {py} {app['entry']}"
+            app = {**app, "dir": run_dir}  # Popen cwd below uses app['dir']
         else:  # static
             inner = f"exec python3 -m http.server {port} --bind 127.0.0.1"
         cmd = ["bash", "-c", inner]
@@ -442,11 +481,19 @@ def start_app(task_id: str, workspace: str) -> dict:
 
 
 def instances(prefix: str) -> list[dict]:
-    """Live registry entries whose key starts with prefix — how project
-    previews (keys wf:<id>:<state>) enumerate their running states."""
+    """Registry entries whose key starts with prefix — how project previews
+    (keys wf:<id>:<state>) enumerate their states. Dead-pid entries are
+    reported as state='crashed' WITH the log tail (2026-07-13): they used to
+    be silently skipped here and pruned by the reaper within seconds, so a
+    preview that died on startup (e.g. missing dependency) just vanished —
+    'not working and no error message'."""
     out = []
     for key, a in _load().items():
-        if not key.startswith(prefix) or not _pid_is_ours(a.get("pid", -1)):
+        if not key.startswith(prefix):
+            continue
+        if not _pid_is_ours(a.get("pid", -1)):
+            out.append({**a, "key": key, "ready": False, "state": "crashed",
+                        "log_tail": log_tail(a.get("workspace", ""), 12)})
             continue
         ready = _listening(a["port"]) or _adopt_logged_port(key, a)
         if a.get("backend_port"):
@@ -518,7 +565,15 @@ def reaper_thread(stop_event: threading.Event):
             for tid, a in list(reg.items()):
                 alive = _pid_is_ours(a.get("pid", -1))
                 if not alive:
-                    reg.pop(tid, None)
+                    # Keep crashed entries visible for ~10 min so the preview
+                    # modal can SHOW the failure (state='crashed' + log tail)
+                    # instead of the state silently vanishing; ⏹ stop or a
+                    # restart of the same state clears them immediately.
+                    crashed_at = float(a.get("crashed_at") or 0)
+                    if not crashed_at:
+                        a["crashed_at"] = now
+                    elif now - crashed_at > 600:
+                        reg.pop(tid, None)
                 elif now > float(a.get("expires_at") or 0):
                     _kill(a["pid"])
                     reg.pop(tid, None)

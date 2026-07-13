@@ -1310,7 +1310,10 @@ function taskCard(t) {
         ${t.tokens_used ? `<span class="chip" title="tokens consumed so far — watch this to spot runaway tasks">${fmtTokens(t.tokens_used)}</span>` : ''}
         ${dispatchChip(t)}
         ${superChip(t)}
-        ${judgeChip ? `<span class="chip ${judgeChip}" title="${t.judge_tier === 'screen' ? 'GLM screening judge verdict (cheap tier)' : 'frontier judge verdict'}">${t.judge_tier === 'screen' ? '◍ ' : ''}${esc(t.judge_verdict)}</span>` : ''}
+        ${judgeChip ? (() => {
+          const stale = !!(t.judge_ts && t.completed_at && t.judge_ts < t.completed_at);
+          return `<span class="chip ${judgeChip}" style="${stale ? 'opacity:.55' : ''}" title="${stale ? 'verdict from a PREVIOUS version — the task was reworked after this judge run; open the task to re-judge or approve' : (t.judge_tier === 'screen' ? 'GLM screening judge verdict (cheap tier)' : 'frontier judge verdict')}">${t.judge_tier === 'screen' ? '◍ ' : ''}${esc(t.judge_verdict)}${stale ? ' ⏳' : ''}</span>`;
+        })() : ''}
         ${Number(t.frontier_cost_usd) > 0 ? `<span class="chip c-orange" title="frontier quality-loop spend on this task (judge + critic + escalation, API-equivalent $)">$${Number(t.frontier_cost_usd).toFixed(2)}</span>` : ''}
         ${vsChip ? `<span class="chip ${vsChip}"><i></i>${esc(vs)}</span>` : ''}
         <span class="task-age">${fmtAgo(t.updated_at || t.created_at)}</span>
@@ -3507,7 +3510,8 @@ function rvFindingsHTML() {
   const done = all.filter(c => c.status !== 'open').slice(0, 40);
   return `<details style="margin-bottom:10px;border:1px solid rgba(94,234,212,.25);border-radius:8px;padding:6px 10px" ${open.length ? 'open' : ''}>
     <summary style="cursor:pointer;font-size:12.5px">📋 Findings — <b>${open.length}</b> open · ${done.length} addressed</summary>
-    <div style="display:flex;flex-direction:column;gap:2px;margin-top:6px">
+    <div class="form-hint" style="margin:6px 0 4px"><b>open</b> = still unresolved; attaches automatically to the next rework (retry / request changes) · <b>addressed</b> = already sent into an earlier rework round — it refers to THAT round's version, which is why it doesn't pin to a line of the current files; the next judge round verifies the fix. Nothing here needs manual copying.</div>
+    <div style="display:flex;flex-direction:column;gap:2px;margin-top:2px">
       ${open.map(row).join('') || '<span class="muted" style="font-size:12px">no open findings</span>'}
       ${done.length ? `<div class="muted" style="font-size:11px;margin-top:6px">addressed in earlier rounds:</div>` + done.map(row).join('') : ''}
     </div></details>`;
@@ -3853,14 +3857,16 @@ function projectAppModal(wfId, name, info) {
       const st = await api('GET', `/api/workflows/${wfId}/app`);
       const run = st.running || [];
       const rows = run.map(a => `
-        <div class="agentic-row slim" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <div class="agentic-row slim" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap${a.state === 'crashed' ? ';border-left:2px solid var(--red,#ef4444);padding-left:6px' : ''}">
           <span style="font-family:var(--font-mono);font-size:11px">${esc(a.version)}</span>
-          <span class="chip ${a.ready ? 'c-green' : 'c-orange'}">${a.ready ? '✅ running' : (a.state === 'installing' ? '📦 installing…' : '⏳ starting…')}</span>
+          <span class="chip ${a.ready ? 'c-green' : (a.state === 'crashed' ? 'c-red' : 'c-orange')}">${a.ready ? '✅ running' : a.state === 'crashed' ? '✕ crashed' : (a.state === 'installing' ? '📦 installing…' : '⏳ starting…')}</span>
           ${a.backend_port ? `<span class="chip ${a.backend_ready ? 'c-green' : 'c-orange'}" title="API backend on 127.0.0.1:${a.backend_port}">${a.backend_ready ? '⚙ api ✅' : '⚙ api ⏳'}</span>` : ''}
           <span style="flex:1;font-size:11px;color:var(--text-faint)">${esc(a.label || '')}</span>
           ${a.ready ? `<a class="btn-sm" href="${esc(a.url)}" target="_blank" style="text-decoration:none;border-color:var(--accent-2)">↗ Open</a>` : ''}
           <button class="btn-sm" onclick="projAppFocus='${esc(a.version)}'">📜 Log</button>
-          <button class="btn-sm danger" onclick="projAppStop('${esc(wfId)}','${esc(a.version)}')">⏹</button>
+          <button class="btn-sm danger" title="${a.state === 'crashed' ? 'Dismiss this crashed state' : 'Stop this state'}" onclick="projAppStop('${esc(wfId)}','${esc(a.version)}')">⏹</button>
+          ${a.state === 'crashed' ? `<div style="flex-basis:100%;font-size:11px;color:var(--red,#ef4444);font-family:var(--font-mono);white-space:pre-wrap">${esc(((a.log_tail || '').trim().split('\n').slice(-3).join('\n')) || 'the process exited before answering')}
+<span style="color:var(--text-dim);font-family:var(--font-ui)">The app exited before becoming ready — 📜 Log has the full error. Fix the cause (or retry ▶ Start: dependencies install automatically now).</span></div>` : ''}
         </div>`).join('') || '<span class="muted" style="font-size:11.5px">none — start one above</span>';
       if (rows !== projAppLastHtml && $('#pa-running')) { $('#pa-running').innerHTML = rows; projAppLastHtml = rows; }
       run.forEach(a => {
@@ -4268,11 +4274,21 @@ function judgeSectionHTML(t) {
   if (v && v !== 'error') {
     const cls = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[v] || '';
     const learn = (t.judge_output || '').match(/Learning note:?\s*(.+)/i);
-    return `<div class="form-group"><label class="form-label">Frontier judge verdict</label>
+    // Stale verdict (2026-07-13): the verdict predates the CURRENT version —
+    // the task was reworked/re-finished after this judge run, so the chip is
+    // about an EARLIER attempt. Seen live: a reworked implement stage wearing
+    // a 12h-old REVISE while the fixed version sat unjudged.
+    const stale = !!(t.judge_ts && t.completed_at && t.judge_ts < t.completed_at);
+    return `<div class="form-group"><label class="form-label">Frontier judge verdict${t.judge_tier === 'screen' ? ' <span class="muted">(GLM screening tier)</span>' : ''}</label>
       <div style="display:flex;flex-direction:column;gap:6px">
-        <div><span class="chip ${cls}" style="font-size:13px;font-weight:700">${esc(v)}</span></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="chip ${cls}" style="font-size:13px;font-weight:700${stale ? ';opacity:.55' : ''}">${esc(v)}</span>
+          ${stale ? `<span class="chip c-orange" title="The judge ran BEFORE the current version finished — this verdict grades an earlier attempt.">⏳ from a previous version</span>
+          <button class="btn-sm" style="border-color:var(--accent-2)" onclick="runJudgeUI('${esc(t.id)}')" title="Run the frontier judge on the CURRENT version (a few minutes, ~$1–3)">⚖ Re-judge current version</button>` : ''}
+        </div>
+        ${stale ? `<div class="form-hint">The deliverable was reworked after this verdict — the findings below may already be fixed. Re-judge for a fresh verdict, or review the changes and approve directly.</div>` : ''}
         ${learn ? `<div style="font-size:12.5px;color:var(--text-dim)">📖 ${esc(learn[1])}</div>` : ''}
-        <details><summary style="cursor:pointer;font-size:12px;color:var(--text-dim)">full judge report</summary>
+        <details><summary style="cursor:pointer;font-size:12px;color:var(--text-dim)">full judge report${stale ? ' (previous version)' : ''}</summary>
           <div style="max-height:260px;overflow-y:auto;font-size:12px;margin-top:6px">${mdLite(t.judge_output || '')}</div></details>
       </div></div>`;
   }
@@ -7142,16 +7158,10 @@ async function openApprovalTask(taskId) {
 }
 
 async function decideApproval(id, decision) {
+  if (decision === 'rejected') { requestChangesModal(id); return; }
   const body = { status: decision, decided_by: 'operator' };
-  if (decision === 'rejected') {
-    const fb = prompt('Rejecting — what should change? (optional: leave EMPTY to automatically attach the frontier judge’s findings; the task retries either way)');
-    if (fb === null) return; // cancelled — no decision made
-    if (fb.trim()) body.feedback = fb.trim();
-  }
   await api('PATCH', `/api/approvals/${id}`, body);
-  toast(decision === 'approved'
-    ? 'Approved — shipped to Done'
-    : 'Rejected — back on the board; a lane will retry it with the feedback attached', 'ok');
+  toast('Approved — shipped to Done', 'ok');
   await loadAgenticData();
   state.tasks = await api('GET', '/api/tasks');
   render();
@@ -10044,10 +10054,36 @@ const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.m
 function decisionCardHTML(c) {
   const reasons = (c.reasons || []).filter(Boolean).slice(0, 3)
     .map(r => `<li>${esc(String(r))}</li>`).join('');
+  const ctx = c.task_ctx;
+  // Verdict context block (2026-07-13): the card is where the operator
+  // decides — verdict + staleness + rounds + spend + the blocking findings
+  // render ON it instead of three clicks away.
+  let ctxHtml = '';
+  if (ctx) {
+    const vcls = { SHIP: 'c-green', REVISE: 'c-orange', REWRITE: 'c-red' }[ctx.verdict] || '';
+    const chips = [];
+    if (ctx.verdict) chips.push(`<span class="chip ${vcls}" style="${ctx.verdict_stale ? 'opacity:.55' : ''}" title="${ctx.verdict_stale ? 'this verdict grades a PREVIOUS version — the task was reworked after the judge ran' : (ctx.tier === 'screen' ? 'GLM screening verdict' : 'frontier judge verdict')}">${ctx.tier === 'screen' ? '◍' : '⚖'} ${esc(ctx.verdict)}</span>`);
+    if (ctx.verdict_stale) chips.push(`<span class="chip c-orange" title="The deliverable was reworked AFTER this verdict — its findings may already be fixed. Re-judge for a fresh verdict, or open the review and approve directly.">⏳ verdict from a previous version</span>`);
+    if (ctx.critic_verdict && ctx.critic_verdict !== 'running') chips.push(`<span class="chip">🤖 critic: ${esc(ctx.critic_verdict)}</span>`);
+    if (ctx.judge_round) chips.push(`<span class="chip" title="automated judge/rework rounds already spent on this task">round ${ctx.judge_round}</span>`);
+    if (ctx.frontier_cost_usd > 0) chips.push(`<span class="chip" title="frontier quality-loop spend on this task so far">$${ctx.frontier_cost_usd.toFixed(2)}</span>`);
+    if (ctx.open_findings) chips.push(`<span class="chip c-orange" title="open findings — they attach to the next rework automatically">💬 ${ctx.open_findings} open</span>`);
+    if (ctx.addressed_findings) chips.push(`<span class="chip" title="findings already sent into earlier rework rounds">✓ ${ctx.addressed_findings} addressed</span>`);
+    const blockers = (ctx.blockers || []).map(b => `<li>${esc(b)}</li>`).join('');
+    ctxHtml = `<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${chips.join('')}</div>
+      ${blockers ? `<div style="font-size:11.5px"><span style="color:var(--text-dim)">What blocked${ctx.verdict_stale ? ' (previous version)' : ''}:</span>
+        <ul style="margin:2px 0 0 18px;color:var(--text-dim)">${blockers}</ul></div>` : ''}`;
+  }
   let actions = '';
   if (c.source === 'replan') {
     actions = `<button class="btn-primary" onclick="openWorkflowDetail('${esc(c.workflow_id)}')">★ ${esc(c.recommendation)}</button>
       <button class="btn-ghost" onclick="openWorkflowDetail('${esc(c.workflow_id)}')">Open project</button>`;
+  } else if (c.kind === 'deliverable' || c.kind === 'super_result') {
+    actions = `<button class="btn-primary" title="Accept this version and mark the task Done — open findings stay recorded as notes" onclick="decideDecision('${esc(c.id)}','approved')">✅ Approve & ship</button>
+      <button class="btn-ghost" style="border-color:var(--accent-2)" title="One more automated round, zero typing: the ${c.kind === 'super_result' ? 'inspector' : 'judge'}'s fix-list attaches automatically and a lane reworks the task now" onclick="decideAutoRound('${esc(c.id)}')">🔁 Auto-fix round</button>
+      <button class="btn-ghost" title="Send it back with YOUR instructions (a proper editor, not a popup)" onclick="requestChangesModal('${esc(c.id)}')">✍️ Request changes</button>
+      ${ctx && ctx.verdict_stale && c.task_id ? `<button class="btn-ghost" title="The verdict is from a previous version — run the frontier judge on the CURRENT one (a few minutes, ~$1–3)" onclick="rejudgeFromCard('${esc(c.task_id)}')">⚖ Re-judge now</button>` : ''}
+      ${c.task_id ? `<button class="btn-ghost" onclick="reviewTaskUI('${esc(c.task_id)}')">🔍 Open review</button>` : ''}`;
   } else {
     const details = c.kind === 'lesson_deltas'
       ? `<button class="btn-ghost" onclick="openLessonCard('${esc(c.id)}')">Open details</button>`
@@ -10055,7 +10091,7 @@ function decisionCardHTML(c) {
         ? `<button class="btn-ghost" onclick="openEvalImproveCard('${esc(c.id)}')">Open details</button>`
         : (c.task_id ? `<button class="btn-ghost" onclick="reviewTaskUI('${esc(c.task_id)}')">Open details</button>` : '');
     actions = `<button class="btn-primary" onclick="decideDecision('${esc(c.id)}','approved')">★ ${esc(c.recommendation)}</button>
-      <button class="btn-ghost" onclick="decideDecision('${esc(c.id)}','rejected')">Request changes</button>
+      <button class="btn-ghost" onclick="requestChangesModal('${esc(c.id)}')">Request changes</button>
       ${details}`;
   }
   const kindChip = { deliverable: '📄 deliverable', super_result: '🔎 inspector', lesson_deltas: '📚 lessons', eval_improve: '📏 eval lessons', replan: '🧭 replan' }[c.kind] || c.kind;
@@ -10064,9 +10100,10 @@ function decisionCardHTML(c) {
       <strong style="font-size:13px">${esc(c.headline)}</strong>
       <span class="chip">${kindChip}${c.scope === 'admin' ? ' · admin' : ''}</span>
     </div>
+    ${ctxHtml}
     ${reasons ? `<ul style="margin:0;padding-left:18px;font-size:11.5px;color:var(--text-dim)">${reasons}</ul>` : ''}
     ${c.cost_hint ? `<div style="font-size:11px;color:var(--text-faint)">💡 ${esc(c.cost_hint)}</div>` : ''}
-    <div class="row-actions" style="gap:8px">${actions}</div>
+    <div class="row-actions" style="gap:8px;flex-wrap:wrap">${actions}</div>
   </div>`;
 }
 
@@ -10085,13 +10122,65 @@ function viewDecisions() {
 
 function bindDecisions() { /* cards are self-contained; tick() keeps them fresh */ }
 
+// Reject WITHOUT feedback = one automated round: _retry_task auto-attaches the
+// judge/inspector fix-list; the operator types nothing.
+async function decideAutoRound(id) {
+  try {
+    await api('PATCH', `/api/approvals/${id}`, { status: 'rejected', decided_by: 'operator' });
+    toast('Sent back for one automated fix round — the judge/inspector fix-list attaches itself; a lane reworks it now and it comes back for your decision', 'ok');
+    await loadAgenticData();
+    state.tasks = await api('GET', '/api/tasks');
+    render();
+  } catch (e) { toast('Could not send back: ' + e.message, 'err'); }
+}
+
+async function rejudgeFromCard(taskId) {
+  try {
+    await api('POST', `/api/tasks/${taskId}/judge`);
+    toast('Frontier judge started on the CURRENT version — the verdict lands in a few minutes; this card updates itself', 'ok');
+  } catch (e) { toast('Judge failed to start: ' + e.message, 'err'); }
+}
+
+// Proper request-changes editor (2026-07-13) — replaces the window prompt():
+// a real textarea, the open findings in view, and an explicit choice between
+// "my instructions" and "just re-run with the recorded findings".
+function requestChangesModal(apprId) {
+  const c = ((state.decisions || {}).decisions || []).find(x => x.id === apprId)
+    || ((state.approvals || []).find(x => x.id === apprId) ? { id: apprId } : null);
+  const ctx = (c && c.task_ctx) || {};
+  const blockers = (ctx.blockers || []).map(b => `<li>${esc(b)}</li>`).join('');
+  showModal(`
+    <h2>✍️ Request changes</h2>
+    <div class="view-intro" style="margin-bottom:10px">${esc((c && c.headline) || 'Send this deliverable back for rework.')}</div>
+    ${blockers ? `<div class="form-group"><label class="form-label">Recorded findings${ctx.verdict_stale ? ' (from the previous version — may already be fixed)' : ''}</label>
+      <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text-dim)">${blockers}</ul></div>` : ''}
+    <div class="form-group">
+      <label class="form-label">Your instructions — what must change?</label>
+      <textarea class="form-textarea" id="rq-fb" style="height:110px" placeholder="Be concrete: what is wrong, what the fixed version must do. Leave EMPTY to send back with just the recorded findings above."></textarea>
+      <div class="form-hint">Whatever you write leads the rework brief; the ${ctx.critic_verdict ? 'inspector' : 'judge'} findings and any open review line-comments ride along automatically either way. The task retries on its own — it returns here for your decision when done.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="rq-send">↩ Send back for rework</button>
+    </div>`);
+  $('#rq-send').onclick = async () => {
+    const fb = ($('#rq-fb').value || '').trim();
+    const body = { status: 'rejected', decided_by: 'operator' };
+    if (fb) body.feedback = fb;
+    try {
+      await api('PATCH', `/api/approvals/${apprId}`, body);
+      closeModal();
+      toast(fb ? 'Sent back with your instructions — a lane reworks it now' : 'Sent back — the recorded findings attach automatically', 'ok');
+      await loadAgenticData();
+      state.tasks = await api('GET', '/api/tasks');
+      render();
+    } catch (e) { toast('Could not send back: ' + e.message, 'err'); }
+  };
+}
+
 async function decideDecision(id, decision) {
+  if (decision === 'rejected') { requestChangesModal(id); return; }
   const body = { status: decision, decided_by: 'operator' };
-  if (decision === 'rejected') {
-    const fb = prompt('Request changes — what should change? (optional: leave EMPTY to attach the inspector/judge findings automatically)');
-    if (fb === null) return;
-    if (fb.trim()) body.feedback = fb.trim();
-  }
   try {
     await api('PATCH', `/api/approvals/${id}`, body);
     toast(decision === 'approved' ? 'Approved' : 'Sent back with your notes', 'ok');

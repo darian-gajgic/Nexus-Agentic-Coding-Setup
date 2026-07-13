@@ -3828,7 +3828,7 @@ def _decision_card_from_approval(ap: dict) -> dict:
                                       "recommendation": "Approve", "cost_hint": ""})
     reason = payload.get("reason")  # SR escalation reason → blocking
     blocking = bool(reason) or (ap.get("risk_level") == "high") or at in ("super_result",)
-    return {
+    card = {
         "id": ap["id"], "kind": at, "scope": ap.get("scope") or "user",
         "headline": payload.get("headline") or ap.get("description") or fb["headline"],
         "recommendation": payload.get("recommendation") or fb["recommendation"],
@@ -3844,6 +3844,60 @@ def _decision_card_from_approval(ap: dict) -> dict:
         "requested_at": ap.get("requested_at"),
         "source": "approval",
     }
+    # Deliverable/SR cards carry LIVE task context (2026-07-13): the card is
+    # where the operator decides — the verdict, its staleness (judged BEFORE
+    # the current version finished), rounds, spend and the blocking findings
+    # belong ON the card, not three clicks away. All fields are byte-stable
+    # between polls unless the task itself changed (which SHOULD re-render).
+    tid = payload.get("task_id")
+    if tid and at in ("deliverable", "super_result"):
+        t = db.query_one(
+            "SELECT judge_verdict, judge_tier, judge_ts, judge_round, completed_at, "
+            "critic_verdict, critic_round, frontier_cost_usd, high_stakes, "
+            "workspace_path, workflow_id, judge_output FROM tasks WHERE id=?", (tid,))
+        if t:
+            stale = bool(t.get("judge_ts")) and \
+                (t.get("judge_ts") or 0) < (t.get("completed_at") or 0)
+            counts = db.query_one(
+                "SELECT SUM(status='open') AS o, SUM(status='consumed') AS c "
+                "FROM review_comments WHERE task_id=?", (tid,)) or {}
+            blockers = []
+            try:
+                ws = t.get("workspace_path") or ""
+                jr = int(t.get("judge_round") or 0)
+                rf = os.path.join(ws, "_judge", f"round-{jr}.json") if ws and jr else ""
+                findings = []
+                if rf and os.path.isfile(rf):
+                    with open(rf, encoding="utf-8") as fh:
+                        findings = (json.load(fh) or {}).get("findings") or []
+                elif t.get("judge_verdict") in ("REVISE", "REWRITE") and t.get("judge_output"):
+                    # pre-overhaul verdicts have no round file — parse the output
+                    import evals as _ev
+                    findings = _ev.parse_judge_metrics(t["judge_output"]).get("findings") or []
+                blockers = [
+                    f"[{(f.get('severity') or '?').upper()}] "
+                    f"{(f.get('problem') or f.get('claim') or '')[:150]}"
+                    for f in findings
+                    if (f.get("severity") or "") in ("critical", "high")][:3]
+                if not blockers and findings:
+                    blockers = [f"[{(f.get('severity') or '?').upper()}] "
+                                f"{(f.get('problem') or f.get('claim') or '')[:150]}"
+                                for f in findings[:2]]
+            except Exception:
+                blockers = []
+            card["task_ctx"] = {
+                "verdict": t.get("judge_verdict"), "tier": t.get("judge_tier"),
+                "verdict_stale": stale,
+                "judge_round": int(t.get("judge_round") or 0),
+                "critic_verdict": t.get("critic_verdict"),
+                "frontier_cost_usd": round(float(t.get("frontier_cost_usd") or 0), 2),
+                "open_findings": int(counts.get("o") or 0),
+                "addressed_findings": int(counts.get("c") or 0),
+                "blockers": blockers,
+                "high_stakes": bool(t.get("high_stakes")),
+                "workflow_id": t.get("workflow_id"),
+            }
+    return card
 
 
 def _collect_decision_cards(uid: str, admin: bool) -> list[dict]:
@@ -6194,6 +6248,18 @@ def _retry_task(task_id: str, feedback: str | None, origin: str = "operator"):
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not task:
         return None
+    if origin == "operator":
+        # ANY operator retry door (task ↻, review retry, approval reject) is a
+        # new version family: re-arm the judge loop + reset its counters.
+        # Observed gap (bench-02 implement task): a manual ↻ after the round
+        # cap left the family CLOSED, so the reworked version finished and sat
+        # wearing the previous version's stale REVISE, never re-judged.
+        try:
+            import loop_engine as _loop
+            _loop.reopen_judge_loop(task_id)
+            task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        except Exception:
+            pass
     fb = (feedback or task.get("retry_feedback") or "").strip()
     if not fb and task.get("judge_verdict") in ("REVISE", "REWRITE") and task.get("judge_output"):
         # N4: prefer the judge's structured revision_brief (a textual gradient)
