@@ -334,3 +334,13 @@ line and startup restore guard it.
   (GitHub resolved-conversation model — [F#] keys exist, no thread UI);
   an "Edit & ship" card action (operator fixes the artifact directly, then
   approves — today: edit files manually, then Approve).
+- **`tasks.completed_at` = when THIS VERSION finished** (2026-07-13b): stamped
+  on EVERY successful finalize, review-status included. It was done-only, so a
+  high-stakes task's reworks never refreshed it — `judged_this_version`
+  (judge_ts ≥ completed_at) then counted an 18h-old verdict as covering three
+  fresh reworks (observed live) and the staleness marker could never fire.
+  One-time repair backfilled 19 existing rows from their latest completed
+  dispatch. Ship time is the STATUS transition, not this column. The review
+  findings panel groups addressed comments by consumed_at batch ("sent as
+  instructions into the rework of <t>") and explains a REVISE-with-zero-open
+  state (stale verdict vs unparsed report).

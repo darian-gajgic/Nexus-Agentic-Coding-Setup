@@ -1567,8 +1567,14 @@ def _finalize_result(dispatch_id: str, task_id: str, agent_id: str, workspace: P
     fields = dict(dispatch_state="completed", result_summary=content[:4000],
                   rubric_score=rubric, learn_section=learn, status=new_status,
                   retry_feedback=None)
-    if new_status == "done":
-        fields["completed_at"] = time.time()
+    # completed_at = when THIS VERSION of the work finished — stamped on EVERY
+    # successful finalize, review-status included (2026-07-13b). It used to be
+    # done-only, so a high-stakes task's reworks never refreshed it: the sweep's
+    # judged_this_version (judge_ts >= completed_at) then treated an 18h-old
+    # verdict as covering brand-new reworks (observed live: 3 reworks under one
+    # stale REVISE, none re-judged) and the stale-verdict UI marker never fired.
+    # Ship time is a STATUS transition, not this timestamp.
+    fields["completed_at"] = time.time()
     _set_task(task_id, **fields)
     if new_status == "review":
         # R4: a high-stakes deliverable PAUSES here — a pending approval row
