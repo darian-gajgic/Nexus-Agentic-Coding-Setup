@@ -79,9 +79,13 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
     has_verifier = "acceptance-verifier" in specialists
     has_fixer = "code-implementer" in specialists
     judge_ok = _judgeable(domain)
-    # N5: widen auto-judge from high-stakes-only to every quality-mode deliverable
-    # with a rubric, when the operator opts in (judge.auto_scope=all_quality).
-    all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
+    # N5 + 2026-07-13 three-tier scope: judge.auto_scope is now
+    # high_stakes | sinks | all_quality. 'sinks' (the Balanced default via the
+    # profile) frontier-judges only client-facing deliverables and lets the
+    # GLM screen cover interior members; 'all_quality' keeps the old
+    # everything-with-a-rubric behavior. The trigger below is created for any
+    # widened scope — the SWEEP resolves the per-task tier at runtime.
+    scope = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes")
 
     triggers, reasoning = [], []
     reasoning.append(
@@ -147,8 +151,9 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
 
     # Q7a: when a profile is present, its judge scope governs; else the setting.
     if ap is not None:
-        all_quality = ap["judge_scope"] == "all_quality"
-    if judge_ok and (high_stakes or kind == "task" or all_quality) and not meta.get("super_result"):
+        scope = ap["judge_scope"]
+    wide_scope = scope in ("sinks", "all_quality")
+    if judge_ok and (high_stakes or kind == "task" or wide_scope) and not meta.get("super_result"):
         rounds = 2 if q else 1
         if round_cap is not None:
             rounds = min(rounds, round_cap)
@@ -173,14 +178,18 @@ def design_loop(kind: str, meta: dict, preference: str = "quality",
 
     # rule 2 (risk hard floor): a high-stakes deliverable is auto-judged + gated in
     # closed mode regardless of the spend profile — even Eco (speed) cannot skip
-    # it. Non-high-stakes auto-judge follows the quality + scope decision.
+    # it. Non-high-stakes auto-judge follows the quality + scope decision; the
+    # sweep resolves each task's TIER (frontier / GLM screen / none) at runtime.
     auto_judge = bool(judge_ok and mode == "closed" and not meta.get("super_result")
-                      and (high_stakes or (q and all_quality)))
+                      and (high_stakes or (q and wide_scope)))
     if auto_judge:
         reasoning.append(
             "Because you chose quality"
             + (" and this is high-stakes" if high_stakes else
-               " (auto-judge scope = every quality deliverable)")
+               (" (scope: final/client-facing deliverables get the frontier "
+                "judge, interior stages the cheap screening check)"
+                if scope == "sinks" else
+                " (auto-judge scope = every quality deliverable)"))
             + ", the judge is run AUTOMATICALLY when a deliverable is ready — you "
             "review work that already survived the judge, instead of judging it "
             "yourself first.")
@@ -453,6 +462,67 @@ def _bump_escalations(trig: dict, task_id: str | None):
 
 # ── Plain judge loop: closure, convergence, hard cap (2026-07-13) ──
 
+def _is_sink(t: dict) -> bool:
+    """A workflow member no non-archived member depends on, or any standalone
+    task — i.e. the client-facing deliverable of its project. Coding pipelines
+    are unaffected: their sink is the acceptance-verifier, which is always
+    high_stakes and frontier-judged regardless."""
+    if not t.get("workflow_id"):
+        return True
+    for r in db.query_all(
+            "SELECT depends_on FROM tasks WHERE workflow_id=? AND status != 'archived' "
+            "AND id != ?", (t["workflow_id"], t["id"])):
+        try:
+            deps = json.loads(r.get("depends_on") or "[]") or []
+        except Exception:
+            deps = []
+        if t["id"] in deps:
+            return False
+    return True
+
+
+def _judge_tier(t: dict, auto_scope: str) -> str:
+    """Which verdict tier this task's fresh deliverable gets:
+    'frontier' — the Opus judge (cjudge);
+    'screen'   — the cheap GLM screening judge (same contract, no artifacts;
+                 its REVISE loops one fix round, its SHIP never authorizes);
+    'none'     — deterministic pre-gate only.
+    Estimator-tier fix (2026-07-13): the most expensive estimator was bound to
+    the WIDEST scope — Balanced/Smart frontier-judged every rubric'd task
+    (75%+ of frontier spend, interior members included). Profile governs;
+    profile-less tasks follow judge.auto_scope (high_stakes|sinks|all_quality).
+    high_stakes always → frontier (rule-2 floor)."""
+    if t.get("high_stakes"):
+        return "frontier"
+    prof = (t.get("spend_profile") or "").strip()
+    screen_on = (db.get_setting("judge.screen", "interior") or "interior") != "off"
+    if prof == "smart":
+        return "frontier"
+    if prof == "eco":
+        return "none"
+    if prof == "optimal" or (not prof and auto_scope == "sinks"):
+        if _is_sink(t):
+            return "frontier"
+        return "screen" if screen_on else "none"
+    if not prof and auto_scope == "all_quality":
+        return "frontier"
+    return "none"
+
+
+def _frontier_cost_capped(t: dict) -> bool:
+    """Per-task frontier cost cap (frontier.task_cost_cap_usd × the profile's
+    budget multiplier). At the cap the loop behaves as at-round-cap instead of
+    spending another frontier pass — observed: $8.02 of Opus on ONE task."""
+    try:
+        cap = float(db.get_setting("frontier.task_cost_cap_usd", "3.0") or 3.0)
+    except (TypeError, ValueError):
+        cap = 3.0
+    if cap <= 0:
+        return False  # 0 = uncapped
+    mult = {"eco": 0.5, "optimal": 1.0, "smart": 2.0}.get(
+        (t.get("spend_profile") or "").strip(), 1.0)
+    return float(t.get("frontier_cost_usd") or 0.0) >= cap * mult
+
 def _judge_closed(trig: dict, task_id: str | None) -> bool:
     """Operator accepted this family at its cap — the sweep must neither
     retry nor re-judge it (per-task for inherited configs)."""
@@ -530,7 +600,8 @@ def reopen_judge_loop(task_id: str):
     db.execute("UPDATE tasks SET judge_round=0, judge_keys=NULL WHERE id=?", (task_id,))
 
 
-def _close_judge_loop(t: dict, owner_kind, owner_id, per_task, reason: str) -> bool:
+def _close_judge_loop(t: dict, owner_kind, owner_id, per_task, reason: str,
+                      card: bool = True) -> bool:
     """At-cap / converged / error closure for the plain judge loop: the old
     code silently `continue`d, leaving non-high-stakes tasks 'done' wearing an
     unresolved REVISE — tokens spent, no gate, no closure. File ONE pending
@@ -538,10 +609,18 @@ def _close_judge_loop(t: dict, owner_kind, owner_id, per_task, reason: str) -> b
     the notes recorded; reject = one more round with your feedback — existing
     decide_approval semantics) and mark the trigger closed so the sweep never
     re-files. High-stakes tasks already hold their finalize-time approval;
-    the pending-probe folds them in without a second card."""
+    the pending-probe folds them in without a second card. card=False =
+    accept-with-notes (GLM-screened interior members: close + log, no human
+    card — a card per interior stage would flood the inbox)."""
     tid = t["id"]
     _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
                         lambda t2: _set_judge_closed(t2, per_task, True))
+    if not card:
+        db.log_activity("info", "loop",
+                        f"Screened stage '{(t.get('title') or '')[:50]}' accepted with "
+                        f"notes ({reason}) — open findings stay recorded as comments",
+                        user_id=t.get("user_id"))
+        return True
     pending = db.query_one(
         "SELECT id FROM approvals WHERE status='pending' AND action_type='deliverable' "
         "AND payload LIKE ?", (f'%"task_id": "{tid}"%',))
@@ -595,7 +674,7 @@ def _sweep_task_loops(actions_left: int) -> int:
                    t.get("_wf_id"), t["id"]) for t in inherited]
     # [16] loop-invariant: ONE settings read per sweep, not one per candidate
     # (design_loop hoists the identical read the same way).
-    all_quality = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes") == "all_quality"
+    auto_scope = (db.get_setting("judge.auto_scope", "high_stakes") or "high_stakes")
     for t, cfg, owner_kind, owner_id, per_task in candidates:
         if actions_left <= 0:
             break
@@ -609,13 +688,13 @@ def _sweep_task_loops(actions_left: int) -> int:
         verdict = t.get("judge_verdict")
         judged_this_version = bool(t.get("judge_ts")) and \
             (t.get("judge_ts") or 0) >= (t.get("completed_at") or t.get("updated_at") or 0)
-        # 1) auto-judge a fresh deliverable (quality mode, rubric; high-stakes, or
-        # every quality deliverable when judge.auto_scope=all_quality — N5). The
-        # cfg.auto_judge flag already encodes the scope decision from design_loop.
-        # Q7a: a task under the optimal/smart spend profile carries all_quality
-        # scope of its own, independent of the global setting.
-        prof = (t.get("spend_profile") or "").strip()
-        scope_ok = bool(t.get("high_stakes")) or all_quality or prof in ("optimal", "smart")
+        # 1) auto-judge a fresh deliverable. Three-tier scope (2026-07-13):
+        # _judge_tier resolves frontier / GLM screen / none per task — the
+        # profile governs (smart=frontier, optimal=frontier for sinks + screen
+        # interior, eco=none), high-stakes always frontier (rule-2 floor),
+        # profile-less tasks follow judge.auto_scope.
+        tier = _judge_tier(t, auto_scope)
+        scope_ok = tier != "none"
         trig_jr = next((x for x in (cfg.get("triggers") or [])
                         if x.get("id") == "judge_revise" and x.get("enabled")), None)
         if trig_jr and _judge_closed(trig_jr, per_task):
@@ -633,8 +712,20 @@ def _sweep_task_loops(actions_left: int) -> int:
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \
                 and scope_ok and _judgeable(t.get("domain")):
             # frontier quota/rate-limit backoff (premortem P1): don't auto-judge
-            # straight into a quota wall — retry a later sweep.
-            if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+            # straight into a quota wall — retry a later sweep. (The GLM screen
+            # rides the dispatch quota backoff instead — it's a Hermes call.)
+            if tier == "frontier" and \
+                    float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+                continue
+            if tier == "screen" and \
+                    float(db.get_setting("dispatch.quota_backoff_until", "0") or 0) > time.time():
+                continue
+            # Per-task frontier cost cap: at the cap, close out instead of
+            # spending another pass (behaves exactly as at-round-cap).
+            if tier == "frontier" and _frontier_cost_capped(t):
+                if _close_judge_loop(t, owner_kind, owner_id, per_task,
+                                     "frontier cost cap reached for this task"):
+                    actions_left -= 1
                 continue
             # Deterministic pre-gate (2026-07-13): catch trivially-unjudgeable
             # deliverables for FREE before burning a frontier pass. A pre-gate
@@ -662,10 +753,13 @@ def _sweep_task_loops(actions_left: int) -> int:
                                         + (" (project loop)" if per_task else ""))
                         actions_left -= 1
                     continue
-            if _api("POST", f"/api/tasks/{t['id']}/judge", {"source": "loop"},
+            if _api("POST", f"/api/tasks/{t['id']}/judge",
+                    {"source": "loop", "tier": tier},
                     user_id=t.get("user_id")):
                 db.log_activity("info", "loop",
-                                f"Loop auto-ran the frontier judge on '{t['title'][:50]}'"
+                                f"Loop auto-ran the "
+                                f"{'GLM screening judge' if tier == 'screen' else 'frontier judge'} "
+                                f"on '{t['title'][:50]}'"
                                 + (" (project loop)" if per_task else ""))
                 actions_left -= 1
             continue
@@ -676,17 +770,27 @@ def _sweep_task_loops(actions_left: int) -> int:
         # an unresolved REVISE forever.
         if verdict in ("REVISE", "REWRITE", "error") and judged_this_version:
             trig = trig_jr
+            screened = (t.get("judge_tier") or "") == "screen"
             converged = _judge_keys_converged(t)
             over_runs = int(t.get("judge_round") or 0) >= max_runs
-            at_cap = not trig or \
-                _trigger_rounds(trig, per_task) >= int(trig.get("max_rounds") or 0)
-            if verdict == "error" or converged or over_runs or at_cap:
+            # A screened interior member gets exactly ONE fix round — the
+            # screen is a cheap tripwire, not a quality loop; its residual
+            # findings close as notes, never as an inbox card.
+            trig_cap = int(trig.get("max_rounds") or 0) if trig else 0
+            if screened:
+                trig_cap = min(trig_cap, 1)
+            at_cap = not trig or _trigger_rounds(trig, per_task) >= trig_cap
+            over_cost = tier == "frontier" and _frontier_cost_capped(t)
+            if verdict == "error" or converged or over_runs or at_cap or over_cost:
                 reason = ("the judge run errored" if verdict == "error"
                           else "the judge repeats the same findings — the rework "
                                "is not resolving them" if converged
                           else f"judge invocation cap reached ({max_runs} runs)"
-                          if over_runs else "automatic round cap reached")
-                if _close_judge_loop(t, owner_kind, owner_id, per_task, reason):
+                          if over_runs
+                          else "frontier cost cap reached for this task"
+                          if over_cost else "automatic round cap reached")
+                if _close_judge_loop(t, owner_kind, owner_id, per_task, reason,
+                                     card=not screened):
                     actions_left -= 1
                 continue
             if _api("POST", f"/api/tasks/{t['id']}/retry", {"origin": "loop_judge"},
@@ -770,7 +874,7 @@ def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
     to the GLM retry; 'no' = not eligible. The escalation budget is spent by
     server._escalation_thread only when a frontier run actually executed, so a
     quota-deferred attempt costs nothing. The endpoint CAS-guards a double-spawn."""
-    if db.get_setting("super.escalation", "0") != "1":
+    if db.get_setting("super.escalation", "1") != "1":
         return "no"
     mode = _escalation_mode(t)  # C5 threshold
     if mode == "off":
@@ -780,6 +884,10 @@ def _try_escalate_super(t: dict, trig: dict, per_task: str | None,
     used = _escalations_used(trig, per_task)
     cap = int(db.get_setting("super.escalation_max", "1") or 1)
     if used >= cap:
+        return "no"
+    # Per-task frontier cost cap (2026-07-13): an escalated rework is a full
+    # frontier write pass — at the cap it falls through to the human checkpoint.
+    if _frontier_cost_capped(t):
         return "no"
     # eligibility established — only NOW consult the backoff, so an armed window
     # parks the escalation as pending instead of silently disqualifying it
@@ -896,6 +1004,13 @@ def _sweep_super_result(actions_left: int) -> int:
             # Frontier quota/rate-limit backoff (premortem P1): don't hammer the
             # one Claude subscription — retry a later sweep once the window ends.
             if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
+                continue
+            # Per-task frontier cost cap (2026-07-13): the sandboxed critic is
+            # the most expensive frontier path — at the cap, checkpoint to the
+            # human instead of spending another run.
+            if _frontier_cost_capped(t):
+                if _escalate_super(t, "frontier cost cap reached for this task"):
+                    actions_left -= 1
                 continue
             if _api("POST", f"/api/tasks/{tid}/critic", {}, user_id=t.get("user_id")):
                 db.log_activity("info", "loop",
@@ -1127,12 +1242,23 @@ def _sweep_auto_approve_ship():
         "WHERE a.status='pending' AND a.action_type='deliverable' AND a.requested_at <= ?",
         (cutoff,))
     for a in rows:
-        if a.get("t_hs"):            # rule 2: high-stakes never auto-approves
-            continue
+        # 2026-07-13 semantics fix: the setting was structurally DEAD — the
+        # only 'deliverable' approvals were high-stakes finalize gates and the
+        # old high-stakes skip excluded exactly those. Now: Full Auto + a
+        # FRONTIER judge SHIP may auto-approve after the window, high-stakes
+        # included (that is the entire point of the setting; default stays 0 =
+        # never). REVISE closure cards, screen verdicts, SR and escalations
+        # still never auto-approve.
         if a.get("t_ap") != "full_auto":   # Full Auto involvement only
             continue
         if a.get("t_jv") != "SHIP":        # only a SHIP verdict auto-ships
             continue
+        trow = db.query_one("SELECT judge_tier, super_result FROM tasks WHERE id=?",
+                            (a.get("t_id"),))
+        if (trow or {}).get("judge_tier") == "screen":
+            continue  # a screen SHIP never authorizes an auto-approve
+        if (trow or {}).get("super_result"):
+            continue  # SR checkpoints keep their own human gate
         cur = db.execute(
             "UPDATE approvals SET status='approved', decided_at=?, decided_by=? "
             "WHERE id=? AND status='pending'", (time.time(), "autopilot", a["id"]))

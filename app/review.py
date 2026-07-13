@@ -11,6 +11,7 @@ Sources of truth per task type:
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import re
 import shutil
@@ -20,7 +21,8 @@ TEXT_EXTS = {".md", ".txt", ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".html
              ".css", ".csv", ".yml", ".yaml", ".toml", ".sh", ".sql", ".xml",
              ".svg", ".env.example", ".mjs", ".cjs", ".diff", ".patch"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-SKIP_DIRS = {"_history", "_judge", "attachments", "node_modules", ".venv", ".venv-preview",
+SKIP_DIRS = {"_history", "_judge", "attachments", "artifacts", "node_modules",
+             ".venv", ".venv-preview",
              "__pycache__", ".git", ".next", "dist", "build", "coverage"}
 SKIP_FILES = {"_dispatch.json", "_preview.log", ".preview-apps.json"}
 MAX_DIFF_BYTES = 400_000
@@ -291,29 +293,110 @@ def compare_dirs(old_root: str | None, new_root: str, url_base: str) -> list[dic
     return out
 
 
-def build_task_review(task: dict) -> dict:
+def repo_rounds(ws: str) -> list[dict]:
+    """Per-finalize HEAD records ([{round, head_sha, ts}]) written by
+    _capture_repo_result — the round-over-round diff's source of truth."""
+    p = Path(ws) / "_history" / "rounds.json"
+    try:
+        rounds = json.loads(p.read_text()) if p.is_file() else []
+        return rounds if isinstance(rounds, list) else []
+    except Exception:
+        return []
+
+
+def _report_entry(ws: str) -> dict | None:
+    """The deliverable.md report as a review file entry for REPO tasks
+    (2026-07-13): the judge/critic anchor findings to deliverable.md, but the
+    branch diff never contains it — so 0 of a task's judge comments could
+    render (verified live: 44/44 invisible on one task). Rendering the report
+    as its own diffed entry (previous _history version vs live) gives those
+    anchors a surface; first version = all-added but present."""
+    cur = Path(ws) / "deliverable.md"
+    if not cur.is_file():
+        return None
+    versions = list_versions(ws)
+    old_t = ""
+    if versions:
+        oldp = Path(ws) / "_history" / versions[-1] / "deliverable.md"
+        if oldp.is_file():
+            old_t = oldp.read_text(errors="replace")
+    new_t = cur.read_text(errors="replace")
+    f = _difflib_files(old_t, new_t, "deliverable.md")
+    entry = {"path": "deliverable.md", "kind": "text", "binary": False,
+             "status": "modified" if old_t else "added",
+             "hunks": f["hunks"], "additions": f["additions"],
+             "deletions": f["deletions"],
+             "note": "the task report (repo tasks: shown alongside the code diff "
+                     "— judge findings anchor here)"}
+    return entry if entry["hunks"] else None
+
+
+def build_task_review(task: dict, pair: str | None = None,
+                      from_v: str | None = None, to_v: str | None = None) -> dict:
     """The task's change review: git diff for repo tasks, version comparison
-    for workspace tasks."""
+    for workspace tasks.
+
+    2026-07-13 pair selection: repo tasks default to the ROUND-OVER-ROUND diff
+    (previous finalize HEAD → current) once ≥2 rounds exist — the old
+    branch-vs-base view showed a spec-stage rework as the same all-green new
+    files every round ("looks like a complete new file"); it stays one click
+    away as pair='base'. Workspace tasks accept ?from_v=vN[&to_v=vM|live]."""
     ws = task.get("workspace_path") or ""
     tid = task.get("id")
     if task.get("repo_path"):
-        diff_file = Path(ws) / "changes.diff"
-        if diff_file.is_file():
-            files = parse_unified(diff_file.read_text(errors="replace"))
-            highlight_files(files)
-            return {"mode": "git", "source": "branch diff vs base",
-                    "files": files,
-                    "additions": sum(f["additions"] for f in files),
-                    "deletions": sum(f["deletions"] for f in files)}
-        return {"mode": "git", "files": [], "additions": 0, "deletions": 0,
-                "note": "no changes.diff captured (task not finished yet?)"}
+        rounds = repo_rounds(ws)
+        pairs = []
+        if len(rounds) >= 2:
+            pairs.append({"id": "round",
+                          "label": f"Round {rounds[-2]['round']} → {rounds[-1]['round']} (latest rework)"})
+        pairs.append({"id": "base", "label": "All changes vs base (whole branch)"})
+        selected = pair if pair in {p["id"] for p in pairs} else pairs[0]["id"]
+        files, src = [], ""
+        if selected == "round":
+            import worktree as wt
+            wt_dir = os.path.join(task["repo_path"], ".worktrees",
+                                  "nexus-" + (task.get("workflow_id") or tid or "")
+                                  .replace("wf-", "").replace("task-", ""))
+            root = wt_dir if os.path.isdir(wt_dir) else task["repo_path"]
+            diff = wt.capture_diff_between(root, rounds[-2]["head_sha"],
+                                           rounds[-1]["head_sha"])
+            files = parse_unified(diff)
+            src = (f"round {rounds[-2]['round']} → round {rounds[-1]['round']} "
+                   "(what the rework changed)")
+            if not files:
+                selected = "base"  # SHAs pruned/unreachable → fall back
+        if selected == "base":
+            diff_file = Path(ws) / "changes.diff"
+            if diff_file.is_file():
+                files = parse_unified(diff_file.read_text(errors="replace"))
+                src = "branch diff vs base"
+            else:
+                return {"mode": "git", "files": [], "additions": 0, "deletions": 0,
+                        "pairs": pairs, "selected": "base",
+                        "note": "no changes.diff captured (task not finished yet?)"}
+        report = _report_entry(ws)
+        if report and not any(f.get("path") == "deliverable.md" for f in files):
+            files = [report] + files
+        highlight_files(files)
+        return {"mode": "git", "source": src, "files": files,
+                "pairs": pairs, "selected": selected,
+                "rounds": len(rounds),
+                "additions": sum(f["additions"] for f in files),
+                "deletions": sum(f["deletions"] for f in files)}
     versions = list_versions(ws)
-    prev = str(Path(ws) / "_history" / versions[-1]) if versions else None
-    files = compare_dirs(prev, ws, f"/api/tasks/{tid}/files")
+    frm = from_v if from_v in versions else (versions[-1] if versions else None)
+    to_dir = ws
+    to_label = "current output"
+    if to_v and to_v != "live" and to_v in versions:
+        to_dir = str(Path(ws) / "_history" / to_v)
+        to_label = to_v
+    prev = str(Path(ws) / "_history" / frm) if frm else None
+    files = compare_dirs(prev, to_dir, f"/api/tasks/{tid}/files")
     highlight_files(files)
     return {"mode": "workspace",
-            "source": f"current output vs {versions[-1] if versions else 'nothing (first version — everything is new)'}",
-            "versions": versions,
+            "source": f"{to_label} vs {frm if frm else 'nothing (first version — everything is new)'}",
+            "versions": versions, "selected_from": frm,
+            "selected_to": (to_v if to_dir != ws else "live"),
             "files": files,
             "additions": sum(f["additions"] for f in files),
             "deletions": sum(f["deletions"] for f in files)}

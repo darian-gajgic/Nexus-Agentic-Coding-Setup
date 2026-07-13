@@ -1310,7 +1310,8 @@ function taskCard(t) {
         ${t.tokens_used ? `<span class="chip" title="tokens consumed so far — watch this to spot runaway tasks">${fmtTokens(t.tokens_used)}</span>` : ''}
         ${dispatchChip(t)}
         ${superChip(t)}
-        ${judgeChip ? `<span class="chip ${judgeChip}" title="frontier judge verdict">${esc(t.judge_verdict)}</span>` : ''}
+        ${judgeChip ? `<span class="chip ${judgeChip}" title="${t.judge_tier === 'screen' ? 'GLM screening judge verdict (cheap tier)' : 'frontier judge verdict'}">${t.judge_tier === 'screen' ? '◍ ' : ''}${esc(t.judge_verdict)}</span>` : ''}
+        ${Number(t.frontier_cost_usd) > 0 ? `<span class="chip c-orange" title="frontier quality-loop spend on this task (judge + critic + escalation, API-equivalent $)">$${Number(t.frontier_cost_usd).toFixed(2)}</span>` : ''}
         ${vsChip ? `<span class="chip ${vsChip}"><i></i>${esc(vs)}</span>` : ''}
         <span class="task-age">${fmtAgo(t.updated_at || t.created_at)}</span>
         ${['queued', 'dispatching', 'streaming', 'finalizing'].includes(t.dispatch_state)
@@ -1503,6 +1504,7 @@ function openTaskDetail(id) {
       ${t.session_id ? `<span class="chip" title="Hermes session" style="font-family:var(--font-mono)">${esc(t.session_id)}</span>` : ''}
       ${vs !== 'unknown' ? `<span class="chip ${{ passing: 'c-green', failing: 'c-red' }[vs] || 'c-orange'}"><i></i>verify: ${esc(vs)}</span>` : ''}
     </div>
+    <div id="td-truecost" class="form-hint" style="margin:-6px 0 10px"></div>
     ${t.dispatch_error ? `<div class="form-group"><div class="chip c-red" style="white-space:normal">✕ ${esc(t.dispatch_error)}</div></div>` : ''}
     ${t.rubric_score ? `<div class="form-group"><label class="form-label">Specialist self-score (rubric)</label>
       <div class="chip c-accent" style="white-space:normal">${esc(t.rubric_score)}</div></div>` : ''}
@@ -3387,9 +3389,21 @@ function renderReviewModal() {
   const statChip = f => `<span class="review-stat"><span class="rf-add">+${f.additions}</span> <span class="rf-del">−${f.deletions}</span></span>`;
   const icon = f => f.status === 'added' ? '🟢' : f.status === 'deleted' ? '🔴' : '🟡';
   const nOpen = rcOpenCount();
+  // Pair/version selector (2026-07-13): repo tasks pick round-over-round vs
+  // whole-branch; workspace tasks pick any snapshot as the comparison base.
+  const pairSel = (r.pairs && r.pairs.length > 1)
+    ? `<select class="form-select" style="width:auto;padding:2px 8px;font-size:12px" title="Which comparison to show" onchange="rvSelectPair(this.value)">
+        ${r.pairs.map(p => `<option value="${esc(p.id)}" ${p.id === r.selected ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}
+      </select>`
+    : (r.mode === 'workspace' && (r.versions || []).length > 1)
+      ? `<select class="form-select" style="width:auto;padding:2px 8px;font-size:12px" title="Compare the current output against which earlier round" onchange="rvSelectPair(this.value)">
+          ${r.versions.map(v => `<option value="${esc(v)}" ${v === r.selected_from ? 'selected' : ''}>${esc(v)} → current</option>`).join('')}
+        </select>`
+      : '';
   showModal(`
     <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔍 ${esc(title)}
       <span class="chip">${esc(r.mode === 'git' ? 'git diff' : 'version comparison')}</span>
+      ${pairSel}
       <span class="review-toggle" id="rvToggle">
         <button class="${mode === 'unified' ? 'active' : ''}" onclick="setReviewMode('unified')">Unified</button>
         <button class="${mode === 'split' ? 'active' : ''}" onclick="setReviewMode('split')">Side-by-side</button>
@@ -3397,6 +3411,7 @@ function renderReviewModal() {
       <span class="review-stat" style="margin-left:auto"><span class="rf-add">+${r.additions || 0}</span> <span class="rf-del">−${r.deletions || 0}</span> · ${files.length} file(s)</span></h2>
     <div class="view-intro" style="margin-bottom:10px">${esc(r.source || '')}${r.note ? ' — ' + esc(r.note) : ''}. 🟢 added · 🟡 changed · 🔴 removed — click a file to inspect it, hover a line and hit ＋ to comment.</div>
     <div id="rvCritic"></div>
+    ${rvFindingsHTML()}
     ${files.length ? `
     <div class="review-layout">
       <div class="review-files">
@@ -3450,6 +3465,63 @@ function setReviewMode(m) {
   _review.mode = m;
   localStorage.setItem('nexusReviewMode', m);
   renderReviewModal();
+}
+
+// Pair/version switch (2026-07-13): refetch the review with the picked
+// comparison — repo tasks pass ?pair=round|base, workspace tasks ?from_v=vN.
+async function rvSelectPair(val) {
+  const q = _review.r.mode === 'git'
+    ? `?pair=${encodeURIComponent(val)}` : `?from_v=${encodeURIComponent(val)}`;
+  try {
+    const r = await api('GET', `/api/tasks/${_review.taskId}/review${q}`);
+    _review.r = r; _review.sel = 0; _review.composing = null;
+    renderReviewModal();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// Findings panel (2026-07-13): EVERY judge/critic/reviewer comment for the
+// task, anchored or not, open or addressed — verified live: on repo tasks 0 of
+// 44 judge findings could render as gutter threads (they anchor to
+// deliverable.md, which the branch diff never contains), so the operator never
+// saw what the judge said. Anchored rows jump to the diff line.
+function rvFindingsHTML() {
+  const all = _review.comments || [];
+  if (!all.length) return '';
+  const paths = new Set((_review.r.files || []).map(f => f.path));
+  const srcIco = c => c.source === 'critic' ? '🤖' : c.source === 'judge' ? '⚖' : '👤';
+  const row = c => {
+    const anchored = c.file_path && paths.has(c.file_path);
+    const loc = c.line_no ? `${c.file_path}:${c.line_no}` : (c.file_path || '');
+    return `<div class="agentic-row slim" style="align-items:flex-start;gap:8px">
+      <span title="${esc(c.source || 'user')}">${srcIco(c)}</span>
+      ${anchored
+        ? `<a href="#" onclick="rvJump('${escArg(c.file_path)}');return false" style="font-family:var(--font-mono);font-size:11px;white-space:nowrap">${esc(loc)}</a>`
+        : `<span class="muted" style="font-family:var(--font-mono);font-size:11px;white-space:nowrap" title="this file is not part of the current diff view">${esc(loc)}</span>`}
+      <span style="flex:1;font-size:12px">${esc(c.body)}</span>
+      ${c.status === 'open'
+        ? '<span class="chip c-orange" style="padding:1px 7px;font-size:10px">open</span>'
+        : `<span class="chip" style="padding:1px 7px;font-size:10px" title="drained into a rework round${c.consumed_at ? ' ' + fmtAgo(c.consumed_at) : ''}">addressed</span>`}
+    </div>`;
+  };
+  const open = all.filter(c => c.status === 'open');
+  const done = all.filter(c => c.status !== 'open').slice(0, 40);
+  return `<details style="margin-bottom:10px;border:1px solid rgba(94,234,212,.25);border-radius:8px;padding:6px 10px" ${open.length ? 'open' : ''}>
+    <summary style="cursor:pointer;font-size:12.5px">📋 Findings — <b>${open.length}</b> open · ${done.length} addressed</summary>
+    <div style="display:flex;flex-direction:column;gap:2px;margin-top:6px">
+      ${open.map(row).join('') || '<span class="muted" style="font-size:12px">no open findings</span>'}
+      ${done.length ? `<div class="muted" style="font-size:11px;margin-top:6px">addressed in earlier rounds:</div>` + done.map(row).join('') : ''}
+    </div></details>`;
+}
+
+function rvJump(path) {
+  const i = (_review.r.files || []).findIndex(f => f.path === path);
+  if (i < 0) return;
+  _review.sel = i; _review.composing = null;
+  renderReviewFilePane();
+  document.querySelectorAll('.review-file').forEach((el, j) =>
+    el.classList.toggle('active', j === i));
+  const el = document.getElementById('rf-' + i);
+  if (el) el.scrollIntoView({ block: 'nearest' });
 }
 
 function rcThreadHTML(f, l) {
@@ -4115,6 +4187,19 @@ const NEXUS_DOMAINS = ['general', 'marketing', 'content-creation', 'brand', 'eco
 let specialistNamesCache = null;
 
 async function loadTaskExtras(t) {
+  // True cost line (C3 ledger): GLM + frontier in one figure, so the quality
+  // loop's tax is visible where the operator already looks.
+  try {
+    const led = await api('GET', `/api/tasks/${t.id}/ledger`);
+    const el = $('#td-truecost');
+    if (el && led && (led.total_usd > 0 || led.glm_tokens > 0)) {
+      const runs = (led.runs || []).length;
+      el.innerHTML = `💰 True cost ≈ <b>$${(led.total_usd || 0).toFixed(2)}</b>`
+        + ` = GLM $${(led.glm_usd || 0).toFixed(2)} (${fmtTokens(led.glm_tokens || 0)} tok)`
+        + (led.frontier_usd > 0 ? ` + quality loop $${led.frontier_usd.toFixed(2)} (${runs} frontier run${runs === 1 ? '' : 's'})` : '')
+        + ` <span class="muted">· API-equivalent, not a bill</span>`;
+    }
+  } catch { /* ledger is optional decoration */ }
   // specialists into the picker (cached across modal opens)
   try {
     if (!specialistNamesCache) {
@@ -6798,6 +6883,17 @@ function viewUsage() {
     html += `<h3 class="section-title">By Model</h3><div class="panel"><table class="data-table"><thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Calls</th><th>Cost</th></tr></thead><tbody>`;
     for (const [m, v] of models) {
       html += `<tr><td><code>${esc(m)}</code></td><td>${fmtT(v.in)}</td><td>${fmtT(v.out)}</td><td>${v.count}</td><td>$${v.cost.toFixed(2)}</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  const ql = d.quality_loop;
+  if (ql && ql.runs) {
+    const kindLabel = { judge: 'Frontier judge (Opus)', judge_screen: 'Screening judge (GLM)', critic: 'Grounded critic (SR)', escalation: 'Escalated rework', judge_eval: 'Eval judging', premortem: 'Plan premortem' };
+    html += `<h3 class="section-title">Quality Loop (judge / critic / escalation)</h3>
+      <div class="panel"><div class="stat-pair" style="padding:8px 12px 0"><span><b>$${(ql.total_usd || 0).toFixed(2)}</b> across ${ql.runs} run(s), ${fmtT(ql.total_tokens)} tokens</span><span class="muted">bills the Claude subscription (screen = GLM) — API-equivalent $, separate from the transcript totals above</span></div>
+      <table class="data-table"><thead><tr><th>Kind</th><th>Runs</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>`;
+    for (const [k, v] of Object.entries(ql.kinds || {}).sort((a, b) => b[1].usd - a[1].usd)) {
+      html += `<tr><td>${esc(kindLabel[k] || k)}</td><td>${v.runs}</td><td>${fmtT(v.tokens)}</td><td>$${v.usd.toFixed(2)}</td></tr>`;
     }
     html += `</tbody></table></div>`;
   }
