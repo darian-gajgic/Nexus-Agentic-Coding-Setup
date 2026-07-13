@@ -1,5 +1,7 @@
 # Research & Learning Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Score any research report or learning plan using this file alone — no taste required.
 Procedure: run the gates (any FAIL → revise before scoring), score the dimensions 0–4,
 scan the kill list. Definitions of tiers, rungs, and labels are in `PLAYBOOK.md`.

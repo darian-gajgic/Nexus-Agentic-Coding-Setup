@@ -3634,12 +3634,19 @@ async def decide_approval(approval_id: str, body: dict):
             task_id = None
         task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,)) if task_id else None
         if task:
+            import loop_engine as _loop
             if decision == "approved":
                 db.execute("UPDATE tasks SET status='done', completed_at=?, updated_at=? WHERE id=?",
                            (time.time(), time.time(), task_id))
+                # Accepting bumps completed_at, which would re-arm auto-judge on
+                # the accepted version — close the family instead (2026-07-13).
+                _loop.close_judge_loop_marker(task_id)
                 db.log_activity("info", "system", f"Deliverable approved — task {task_id} shipped")
                 _capture_accept_diff(task)  # Q2: rejected→accepted diff is the strongest lesson signal
             else:
+                # An operator reject starts a NEW version family: re-arm the
+                # judge loop and reset its invocation counter + convergence keys.
+                _loop.reopen_judge_loop(task_id)
                 # N7: a blind reject (no feedback) on an unjudged version gate-runs
                 # the judge first so the retry carries real findings (setting-gated).
                 fb = (body.get("feedback") or "").strip() or None
@@ -3676,6 +3683,40 @@ async def decide_approval(approval_id: str, body: dict):
                 _loop.bump_super_round(task_id)
             t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
             _record_routing_outcome(task_id)  # L1: reject→overridden / approve→terminal
+            await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
+    # Budget-ceiling card (2026-07-13): the rework budget hit its hard ceiling
+    # (dispatch.rework_ceiling_mult × original). Approve = grant one more slice
+    # past the ceiling (the blocked dispatch then clears on its own — the lane's
+    # retry mode re-checks budgets); reject = accept the current version as-is.
+    elif ap.get("action_type") == "budget":
+        try:
+            payload = json.loads(ap.get("payload") or "{}") or {}
+        except Exception:
+            payload = {}
+        task_id = payload.get("task_id")
+        task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,)) if task_id else None
+        if task:
+            import loop_engine as _loop
+            if decision == "approved":
+                slice_ = int(payload.get("slice") or 0) or \
+                    max(1, int((task.get("budget_original") or 1_000_000) * 0.5))
+                new_budget = int(task.get("tokens_used") or 0) + slice_
+                db.execute("UPDATE tasks SET budget_tokens=?, updated_at=? WHERE id=?",
+                           (new_budget, time.time(), task_id))
+                db.log_activity("info", "system",
+                                f"Budget ceiling override approved — task {task_id} "
+                                f"granted one more {slice_:,}-token slice")
+            else:
+                if not task.get("high_stakes"):
+                    db.execute("UPDATE tasks SET status='done', completed_at=?, "
+                               "updated_at=?, retry_feedback=NULL WHERE id=?",
+                               (time.time(), time.time(), task_id))
+                _loop.close_judge_loop_marker(task_id)
+                db.log_activity("info", "system",
+                                f"Budget ceiling reject — task {task_id} accepted "
+                                "as-is at the ceiling")
+            t2 = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            _record_routing_outcome(task_id)
             await mgr.broadcast({"type": "task_updated", "data": t2}, user_id=t2.get("user_id"))
     # Q2/L2: an admin-scoped lesson_deltas card — approve applies the (possibly
     # edited) deltas to the knowledge base + git-commits; reject with feedback
@@ -4417,7 +4458,10 @@ def _kroot() -> str:
 # site/), and a top-level-only listing made them look like "just a .md".
 _WS_SKIP_DIRS = {".next", "node_modules", ".git", "__pycache__", "dist", "build",
                  ".venv", "venv", ".cache", ".turbo", "coverage", ".pytest_cache",
-                 ".playwright"}
+                 ".playwright",
+                 # internal state dirs, not deliverables: review snapshots +
+                 # judge round memory (2026-07-13)
+                 "_history", "_judge"}
 _WS_MAX_FILES = 400
 
 
@@ -4831,6 +4875,91 @@ def _parse_judge_output(text: str):
 
 
 def _judge_thread(task_id: str, file_path: str, domain: str):
+    """Crash-safe wrapper: the judge runs in a daemon thread, so an exception
+    anywhere in the body (contract build, artifact copy, ledger write) would
+    strand judge_verdict='running' until the boot reconcile — and with the
+    manual-start posture the server runs for days (observed live on
+    task-ebf6f61a). Mirror of the critic's B1 catch-all: heal only a row still
+    mid-flight — a persisted real verdict (crash in the post-store comment
+    insert) is kept via the WHERE guard."""
+    task = db.query_one("SELECT user_id FROM tasks WHERE id=?", (task_id,))
+    owner = (task or {}).get("user_id")
+    try:
+        _judge_thread_inner(task_id, file_path, domain)
+    except Exception as e:
+        try:
+            db.execute(
+                "UPDATE tasks SET judge_verdict='error', "
+                "judge_output=COALESCE(judge_output,'')||?, judge_ts=? "
+                "WHERE id=? AND judge_verdict='running'",
+                (f"\n[judge thread crashed: {str(e)[:300]}]", time.time(), task_id))
+        except Exception:
+            pass
+        db.log_activity("error", "judge",
+                        f"Frontier judge thread on {task_id} crashed: {str(e)[:160]}",
+                        user_id=owner)
+        _broadcast_task_row(task_id, owner)
+
+
+def _build_judge_prior(task: dict, jround: int):
+    """Delta re-judge bundle (2026-07-13): the previous round's blocker
+    fix-list [F1..Fn] + a unified diff of the previous deliverable version vs
+    the current one. Returns (path, prior_ts) or (None, None) when any piece
+    is missing — the judge then falls back to a full re-judge. Round files are
+    written by _judge_thread_inner at verdict-store time (the 'running' flip
+    NULLs judge_output, so the file is the only cross-round memory)."""
+    ws = task.get("workspace_path") or ""
+    rf = os.path.join(ws, "_judge", f"round-{jround}.json")
+    if not ws or not os.path.isfile(rf):
+        return None, None
+    try:
+        with open(rf, encoding="utf-8") as fh:
+            prior = json.load(fh)
+    except Exception:
+        return None, None
+    cur_p = os.path.join(ws, "deliverable.md")
+    try:
+        vers = sorted((f for f in os.listdir(ws)
+                       if _re.match(r"deliverable\.v\d+\.md$", f)),
+                      key=lambda f: int(_re.search(r"\d+", f).group()))
+    except OSError:
+        vers = []
+    if not vers or not os.path.isfile(cur_p):
+        return None, None
+    try:
+        import difflib
+        with open(os.path.join(ws, vers[-1]), encoding="utf-8", errors="replace") as fh:
+            old_lines = fh.read().splitlines(keepends=True)
+        with open(cur_p, encoding="utf-8", errors="replace") as fh:
+            new_lines = fh.read().splitlines(keepends=True)
+        diff = "".join(difflib.unified_diff(old_lines, new_lines,
+                                            fromfile=vers[-1], tofile="deliverable.md"))
+    except Exception:
+        return None, None
+    findings = prior.get("findings") or []
+    blockers = [f for f in findings if (f.get("severity") or "") in ("critical", "high")] \
+        or findings
+    lines = [f"# Previous judge round {prior.get('round')} — blocker findings to VERIFY", ""]
+    for i, f in enumerate(blockers, 1):
+        loc = (f"{f.get('file_path')}:{f.get('line_no')}" if f.get("line_no")
+               else (f.get("file_path") or "deliverable.md"))
+        lines.append(f"[F{i}] ({f.get('severity')}) {loc} — "
+                     f"{f.get('problem') or f.get('claim') or ''}"
+                     + (f" FIX: {f.get('suggested_fix')}" if f.get("suggested_fix") else ""))
+    if prior.get("revision_brief"):
+        lines += ["", "## Previous revision brief", str(prior["revision_brief"])]
+    lines += ["", "## Unified diff (previous version → current)",
+              "```diff", diff[:200000] or "(no textual change)", "```"]
+    try:
+        path = os.path.join(ws, "_judge", f"prior-r{prior.get('round')}.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+    except OSError:
+        return None, None
+    return path, float(prior.get("ts") or 0)
+
+
+def _judge_thread_inner(task_id: str, file_path: str, domain: str):
     """Run the frontier judge (minutes) and persist the verdict. The command
     execution is shared with the eval runner (evals.run_judge_cmd — template in
     settings key judge.cmd so gates can stub it, R4.3). Settings v2: the model
@@ -4856,10 +4985,20 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
     # about files it structurally couldn't read.
     contract = _judge_task_contract(task) if task else None
     art_dirs = _judge_artifact_dirs(task) if task else None
+    # Delta re-judge (2026-07-13): round ≥2 gets the prior round's blocker
+    # fix-list + version diff and only the artifacts touched since — instead of
+    # rebuilding the full (≤40MB) bundle every round (observed judge input
+    # GROWING 470k→689k→849k tokens across one task's rounds).
+    jround = int((task or {}).get("judge_round") or 0)
+    prior_path, prior_ts = (None, None)
+    if task and jround >= 1 and db.get_setting("judge.delta_rejudge", "1") == "1":
+        prior_path, prior_ts = _build_judge_prior(task, jround)
     sink: dict = {}
     out = _ev.run_judge_cmd(file_path, domain, model=jmodel, api_key=jkey,
                             type_rubric=trubric, spec_path=spec_path, usage_sink=sink,
-                            task_contract=contract, artifact_dirs=art_dirs)
+                            task_contract=contract, artifact_dirs=art_dirs,
+                            prior_path=prior_path, judge_round=jround + 1,
+                            artifacts_since=(prior_ts if prior_path else None))
     # C3 ledger: record this frontier run's tokens + API-equivalent $ (from the
     # claude-JSON envelope, else a transcript-size estimate). Real spend, so it
     # is captured even if the verdict doesn't parse.
@@ -4887,13 +5026,46 @@ def _judge_thread(task_id: str, file_path: str, domain: str):
         return
     if verdict:
         _ev.note_frontier_quota_ok()  # a clean run resets the escalation counter
-    db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=? WHERE id=?",
-               (verdict or "error", out[-30000:], time.time(), task_id))
+    try:
+        m = _ev.parse_judge_metrics(out)
+    except Exception:
+        m = {}
+    # Judge-loop state (2026-07-13): judge_round counts stored verdicts (the
+    # quota path above returns early and doesn't count); judge_keys mirrors
+    # critic_keys so the sweep's convergence guard can see "same findings
+    # again". Only sentinel-format output carries keys — legacy stays NULL.
+    new_round = jround + 1
+    jkeys = None
+    if m.get("_keys"):
+        try:
+            old_keys = json.loads((task or {}).get("judge_keys") or "null") or {}
+        except Exception:
+            old_keys = {}
+        jkeys = json.dumps({"round": new_round, "keys": m.get("_keys") or [],
+                            "prev": old_keys.get("keys") or []})
+    db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=?, "
+               "judge_round=?, judge_keys=COALESCE(?, judge_keys) WHERE id=?",
+               (verdict or "error", out[-30000:], time.time(), new_round, jkeys, task_id))
+    # Round memory for the delta re-judge: the 'running' flip NULLs
+    # judge_output, so this file is the only place round N's findings survive
+    # for round N+1's fix-list.
+    try:
+        ws = (task or {}).get("workspace_path") or ""
+        if ws and os.path.isdir(ws):
+            jdir = os.path.join(ws, "_judge")
+            os.makedirs(jdir, exist_ok=True)
+            with open(os.path.join(jdir, f"round-{new_round}.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"round": new_round, "verdict": verdict or "error",
+                           "ts": time.time(), "findings": m.get("findings") or [],
+                           "revision_brief": m.get("revision_brief"),
+                           "keys": m.get("_keys") or []}, fh)
+    except Exception:
+        pass
     # N3: when the (upgraded) judge emitted structured findings, auto-fill the
     # side-by-side review — ungrounded but free, human-editable, drained by
     # the existing retry. Best-effort: old-format judge output has none.
     try:
-        m = _ev.parse_judge_metrics(out)
         if task and m.get("findings"):
             n = _insert_critic_comments(task, {"findings": m["findings"]}, source="judge")
             if n:
@@ -4942,11 +5114,20 @@ def _blind_reject_judge_if_wanted(task_id: str, feedback: str | None) -> bool:
 
 
 @app.post("/api/tasks/{task_id}/judge")
-async def run_judge(task_id: str):
-    """R4.2: 'Run frontier judge' — async; poll GET /api/tasks/{id}/judge."""
+async def run_judge(task_id: str, body: dict | None = None):
+    """R4.2: 'Run frontier judge' — async; poll GET /api/tasks/{id}/judge.
+    body.source='loop' (2026-07-13) marks loop-engine invocations: those are
+    bounded by judge.max_runs per version family. The manual button sends no
+    source and always runs — operator intent wins."""
     task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
+    if (body or {}).get("source") == "loop":
+        max_runs = int(db.get_setting("judge.max_runs", "4") or 4)
+        if int(task.get("judge_round") or 0) >= max_runs:
+            return JSONResponse(status_code=409, content={
+                "error": f"judge invocation cap reached ({max_runs} runs) — "
+                         "the loop files a decision card instead"})
     domain = (task.get("domain") or "").strip()
     if not _re.match(r"^[a-z0-9-]+$", domain or ""):
         return JSONResponse(status_code=400, content={"error": "task needs a valid domain to be judged"})
@@ -5828,13 +6009,21 @@ async def users_names():
                       for r in rows]}
 
 
-def _retry_task(task_id: str, feedback: str | None):
-    """X6: put a task back on the board for a FRESH re-dispatch with feedback
+def _retry_task(task_id: str, feedback: str | None, origin: str = "operator"):
+    """X6: put a task back on the board for a re-dispatch with feedback
     attached; the old deliverable is versioned, never destroyed.
 
     Feedback priority: operator's words > previous feedback > AUTOMATIC judge
     findings (a REVISE/REWRITE verdict carries the blockers — the operator
-    only needs to type when they want to say something the judge didn't)."""
+    only needs to type when they want to say something the judge didn't).
+
+    origin (2026-07-13): 'operator' (default) | 'loop_judge' | 'loop_sr'.
+    The FIRST automated rework round keeps its session and continues it
+    (dispatch.rework_continue_session) — a fresh session re-reads the entire
+    input set, which made rework rounds cost MORE than the original attempt
+    (observed 68% of a task's GLM tokens spent on rework). Round ≥2 and every
+    operator retry stay fresh: past two corrections a polluted context loses
+    to a clean restart (the research result the loop caps encode)."""
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not task:
         return None
@@ -5858,13 +6047,17 @@ def _retry_task(task_id: str, feedback: str | None):
         "ORDER BY file_path, COALESCE(line_no, 0), created_at", (task_id,))
     if open_comments:
         notes = []
-        for c in open_comments:
+        # [F#] ids (2026-07-13): number the drained findings so the retry
+        # framing's '## Fixes applied' echo and the delta re-judge can refer
+        # to the same finding by id (comments are already severity-ordered
+        # by the insert; drain order is file/line — ids are per-drain).
+        for i, c in enumerate(open_comments, 1):
             loc = f"{c['file_path']}:{c['line_no']}" if c.get("line_no") else c["file_path"]
             excerpt = (c.get("line_text") or "").strip()
             quoted = f' "{excerpt[:160]}"' if excerpt else ""
             src = c.get("source") or "user"
             tag = "CRITIC" if src == "critic" else ("JUDGE" if src == "judge" else "REVIEWER")
-            note = f"- [{tag}] {loc} [{c.get('side') or 'new'}]{quoted} → {c['body']}"
+            note = f"- [F{i}] [{tag}] {loc} [{c.get('side') or 'new'}]{quoted} → {c['body']}"
             # C1b: a critic-proposed patch travels with its comment as a fenced
             # diff — apply it verbatim rather than re-deriving the fix from prose.
             if c.get("patch"):
@@ -5873,11 +6066,27 @@ def _retry_task(task_id: str, feedback: str | None):
                          + "\n  ```")
             notes.append(note)
         fb = ((fb + "\n\n") if fb else "") + \
-            "Reviewer LINE COMMENTS (address EVERY one):\n" + "\n".join(notes)
+            "Reviewer LINE COMMENTS (address EVERY one, echo its [F#] id in '## Fixes applied'):\n" \
+            + "\n".join(notes)
         db.execute(
             "UPDATE review_comments SET status='consumed', consumed_at=? "
             "WHERE task_id=? AND status='open'", (time.time(), task_id))
     ws = task.get("workspace_path")
+    # Continue-session rework (2026-07-13): the FIRST automated rework keeps
+    # its session — decided BEFORE the version rename below (zero existing
+    # deliverable.v* files = first rework). The worker sees retry_feedback +
+    # session_id and dispatches a targeted continue-turn (rework=True) instead
+    # of a fresh full re-brief. Kill switch dispatch.rework_continue_session.
+    keep_session = False
+    try:
+        if origin in ("loop_judge", "loop_sr") and task.get("session_id") \
+                and db.get_setting("dispatch.rework_continue_session", "1") == "1" \
+                and ws and os.path.isdir(ws):
+            n_prev = len([f for f in os.listdir(ws)
+                          if _re.match(r"deliverable\.v\d+\.md$", f)])
+            keep_session = n_prev == 0
+    except OSError:
+        keep_session = False
     if ws and os.path.isdir(ws) and not task.get("repo_path"):
         # review engine: each rework round becomes a comparable version
         import review as _review
@@ -5892,20 +6101,63 @@ def _retry_task(task_id: str, feedback: str | None):
     # A retry means "spend another attempt": the budget is checked against
     # LIFETIME tokens_used, so without extending it, any task at/over budget
     # re-blocks instantly (observed: a rejected 10.4M-token implement task
-    # could never rework). Grant the new attempt one budget-slice of headroom.
-    # Mode-coherence (2026-07-12b): the slice honors the per-type baseline
-    # (content 2M) so a content task extends 2M at a time, not the global 5M.
+    # could never rework). Budget honesty (2026-07-13): the old code granted a
+    # FULL budget-sized slice per retry with no ceiling — a 5M task silently
+    # grew to 16.96M. Now: slice = dispatch.retry_slice_frac × the ORIGINAL
+    # derived budget (a rework is a fix, not a second build), hard lifetime
+    # ceiling = dispatch.rework_ceiling_mult × original; at the ceiling the
+    # loop parks with ONE 'budget' decision card instead of extending.
     default_budget = int(db.get_setting("dispatch.default_task_budget", "5000000"))
     type_default = hd._type_setting("dispatch.default_budget", task, default_budget)
-    slice_ = int(task.get("budget_tokens") or type_default)
+    original = int(task.get("budget_original") or 0)
+    if not original:
+        # Lazy baseline capture for pre-overhaul tasks: the first retry pins
+        # the family's original budget (creation-derived when available).
+        original = int(task.get("budget_tokens") or type_default)
+        db.execute("UPDATE tasks SET budget_original=? WHERE id=?", (original, task_id))
+    try:
+        slice_frac = float(db.get_setting("dispatch.retry_slice_frac", "0.5") or 0.5)
+        ceil_mult = float(db.get_setting("dispatch.rework_ceiling_mult", "2.0") or 2.0)
+    except (TypeError, ValueError):
+        slice_frac, ceil_mult = 0.5, 2.0
+    slice_ = max(1, int(original * slice_frac))
+    ceiling = int(original * ceil_mult)
     used = int(task.get("tokens_used") or 0)
     effective = int(task.get("budget_tokens") or type_default)
     if effective - used < slice_:  # less than one attempt's headroom left
-        db.execute("UPDATE tasks SET budget_tokens=? WHERE id=?",
-                   (used + slice_, task_id))
-        db.log_activity("info", "system",
-                        f"Task {task_id}: budget extended to {used + slice_:,} "
-                        "for the retry attempt")
+        new_budget = min(used + slice_, max(ceiling, effective))
+        if new_budget > effective:
+            db.execute("UPDATE tasks SET budget_tokens=? WHERE id=?",
+                       (new_budget, task_id))
+            db.log_activity("info", "system",
+                            f"Task {task_id}: budget extended to {new_budget:,} "
+                            f"for the retry attempt (ceiling {ceiling:,})")
+        else:
+            # At the ceiling: file ONE pending 'budget' decision card (approve =
+            # one more slice past the ceiling; reject = accept the current
+            # version as-is). The retry still queues — dispatch blocks it as
+            # blocked_budget, visibly, until the card is decided.
+            probe = db.query_one(
+                "SELECT 1 FROM approvals WHERE status='pending' AND action_type='budget' "
+                "AND payload LIKE ?", (f'%"task_id": "{task_id}"%',))
+            if not probe:
+                db.execute(
+                    "INSERT INTO approvals (id, user_id, action_type, description, "
+                    "risk_level, payload, status, requested_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (f"appr-{uuid.uuid4().hex[:10]}", task.get("user_id"), "budget",
+                     f"Budget ceiling reached on '{(task.get('title') or '')[:60]}': "
+                     f"{used:,} tokens used of a {original:,} original budget "
+                     f"(ceiling ×{ceil_mult:g}). Approve = grant one more "
+                     f"{slice_:,}-token slice; reject = accept the current version as-is.",
+                     "medium",
+                     json.dumps({"task_id": task_id, "task_title": task.get("title"),
+                                 "used": used, "original": original,
+                                 "ceiling": ceiling, "slice": slice_}),
+                     "pending", time.time()))
+                db.log_activity("warn", "system",
+                                f"Task {task_id}: rework budget ceiling reached "
+                                f"({used:,}/{ceiling:,}) — decision card filed",
+                                user_id=task.get("user_id"))
     # Cascade completion (2026-07-12b, mode-coherence gap a): a LIGHT-TIER
     # attempt the judge sent back gets its retry on the strong tier — "cheap
     # first, strong model only when verification fails" (the FrugalGPT/AutoMix
@@ -5940,12 +6192,14 @@ def _retry_task(task_id: str, feedback: str | None):
     # cancel_requested=NULL: a retry is an explicit restart — a stale stop flag
     # (⏹ during finalizing, or the immediate-stop race guard) would make the
     # next dispatch insta-cancel at its entry check. Matches the other restart
-    # doors (update_task→todo, /dispatch, bulk-start).
+    # doors (update_task→todo, /dispatch, bulk-start). session_id survives only
+    # for the first automated rework (keep_session above).
     db.execute(
-        "UPDATE tasks SET status='todo', dispatch_state='none', session_id=NULL, "
+        "UPDATE tasks SET status='todo', dispatch_state='none', "
+        "session_id=CASE WHEN ? THEN session_id ELSE NULL END, "
         "claimed_by=NULL, claimed_at=NULL, dispatch_error=NULL, cancel_requested=NULL, "
         "retry_feedback=?, updated_at=? WHERE id=?",
-        (fb[:16000] or None, now, task_id))  # 16000 (§4.8): 25 critic findings ≈ 12.5k+ chars
+        (1 if keep_session else 0, fb[:16000] or None, now, task_id))  # 16000 (§4.8): 25 critic findings ≈ 12.5k+ chars
     # The old deliverable's pending approval is now moot — expire it so the
     # Agentic tab never offers a decision on superseded work. Super Result
     # checkpoints are versioned the same way.
@@ -5962,7 +6216,12 @@ async def retry_task(task_id: str, body: dict):
     if not _owned_task(task_id):
         return JSONResponse(status_code=404, content={"error": "task not found"})
     # _retry_task snapshots the whole workspace (copytree) — off the loop.
-    task = await run_in_threadpool(_retry_task, task_id, (body or {}).get("feedback"))
+    # origin: the loop engine tags its automated rounds ('loop_judge'/'loop_sr')
+    # so the first one may continue its session; anything else is an operator.
+    origin = (body or {}).get("origin")
+    if origin not in ("loop_judge", "loop_sr"):
+        origin = "operator"
+    task = await run_in_threadpool(_retry_task, task_id, (body or {}).get("feedback"), origin)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
     await mgr.broadcast({"type": "task_updated", "data": task}, user_id=task.get("user_id"))
@@ -6028,6 +6287,29 @@ async def health_full():
                    "ok": not dead,
                    "detail": ("all workers alive" if not dead else f"dead: {', '.join(dead)} (watchdog will heal in ~10s)"),
                    "fix": "restart the lane from the Agents tab (↻), or wait for the watchdog"})
+    # Quality loop: stranded frontier verdicts ('running'/'escalating' past any
+    # legitimate runtime — the loop-engine reaper clears them within a sweep)
+    # and zombie dispatches (active state, stale heartbeat, live lane — the
+    # watchdog step-7 detector logs them). Green = neither class present.
+    now_ = time.time()
+    stale_v = db.query_one(
+        "SELECT COUNT(*) AS n FROM tasks WHERE "
+        "(judge_verdict='running' AND COALESCE(judge_ts,0) < ?) OR "
+        "(critic_verdict IN ('running','escalating') AND COALESCE(critic_ts,0) < ?)",
+        (now_ - 7200, now_ - 7200))["n"]
+    zombies_n = db.query_one(
+        "SELECT COUNT(*) AS n FROM dispatches d JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.state IN ('dispatching','streaming','finalizing') "
+        "AND COALESCE(d.heartbeat_at, d.started_at, 0) < ? AND t.status='in_progress'",
+        (now_ - 600,))["n"]
+    ql_ok = not stale_v and not zombies_n
+    checks.append({"id": "quality_loop", "name": "Quality loop (judge/critic/dispatch)",
+                   "ok": ql_ok,
+                   "detail": ("no stranded verdicts or zombie dispatches" if ql_ok else
+                              f"{stale_v} stranded verdict(s), {zombies_n} zombie dispatch(es)"),
+                   "fix": "the loop-engine reaper clears stranded verdicts within ~20s; "
+                          "a zombie dispatch means a wedged lane — restart that lane "
+                          "from the Agents tab (↻)"})
     return {"ok": all(c["ok"] for c in checks), "checks": checks, "ts": time.time()}
 
 

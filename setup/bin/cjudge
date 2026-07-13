@@ -58,23 +58,34 @@ if [ -n "${JUDGE_ARTIFACTS:-}" ] && [ -d "${JUDGE_ARTIFACTS:-}" ]; then
   ART_BLOCK="The task's actually-produced files are at $JUDGE_ARTIFACTS (read-only copies, size-capped). Before refuting any claim about a created/changed file, OPEN that file there and check — 'evidence on the page' extends to these artifacts. A claim the artifacts substantiate counts as verified even when the deliverable does not quote it inline (note the missing inline evidence as a LOW finding at most); a claim the artifacts contradict is CRITICAL."
 fi
 
-PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC. $TYPE_RUBRIC_BLOCK $TASK_BLOCK $SPEC_BLOCK $ART_BLOCK
+# Delta re-judge (2026-07-13): on rework round ≥2 Nexus passes the previous
+# round's blocker findings + a unified diff of previous vs current version
+# (env JUDGE_PRIOR, round number in JUDGE_ROUND). The judge then verifies the
+# fix-list and scans only changed regions — the criteria set is FROZEN at
+# round 1, which kills cross-round finding churn. Optional; absent = full
+# original single-round behavior.
+DELTA_BLOCK=""
+if [ -n "${JUDGE_PRIOR:-}" ] && [ -f "${JUDGE_PRIOR:-}" ]; then
+  DELTA_BLOCK="This is DELTA RE-JUDGE round ${JUDGE_ROUND:-2} of a rework. $JUDGE_PRIOR contains the previous round's blocker findings [F1..Fn] and a unified diff of the previous vs current version; the deliverable's '## Fixes applied' section claims what changed. THIS round: (1) verify each prior blocker is actually fixed — quote the fixed line; unfixed or regressed = still a blocker; (2) scan ONLY the changed regions shown in the diff for NEW blockers at critical/high severity; (3) the criteria set is FROZEN at round 1 — do not add new criteria, do not re-litigate unchanged text you passed before; new notes on unchanged text are forbidden. Verdict rule unchanged: SHIP when zero blockers remain."
+fi
 
-Stance: REFUTE BY DEFAULT. The deliverable's own assertions and self-scores are never evidence. You cannot run its commands, so judge the EVIDENCE ON THE PAGE: a load-bearing conclusion must rest on cited primary evidence (exact file:line, command + quoted output, source + date). A conclusion resting on a proxy inference ('tests pass' therefore 'code healthy') or on unlocated hand-waving FAILS the gate that covers it, no matter how plausible it reads. Check claims tagged '[UNSURE: reason]' FIRST — the author flagged them as unconfirmed; a marked claim that proves false is a medium finding, an UNMARKED claim that proves false is critical (it was presented as verified).
+PROMPT="You are the frontier judge — a second, stronger model reviewing work produced by a weaker one. Judge the deliverable at $FILE against the rubric at $RUBRIC. $TYPE_RUBRIC_BLOCK $TASK_BLOCK $SPEC_BLOCK $ART_BLOCK $DELTA_BLOCK
+
+Stance: REFUTE BY DEFAULT — scoped to FACTUAL CLAIMS inside this deliverable's binding contract. The deliverable's own assertions and self-scores are never evidence. You cannot run its commands, so judge the EVIDENCE ON THE PAGE: a load-bearing conclusion must rest on cited primary evidence (exact file:line, command + quoted output, source + date) on the page or in the artifacts directory. A conclusion resting on a proxy inference ('tests pass' therefore 'code healthy') or on unlocated hand-waving fails its gate, no matter how plausible it reads. Do NOT extend refutation into taste: flag ONLY gaps that affect correctness or the binding contract's stated criteria — polish, style, extra depth, and improvements beyond the contract are NOTES (severity medium/low), never blockers. A reviewer prompted to find gaps will usually report some even when the work is sound; do not manufacture findings to appear thorough. Check claims tagged '[UNSURE: reason]' FIRST — the author flagged them as unconfirmed; a marked claim that proves false is a medium finding, an UNMARKED claim that proves false is critical (it was presented as verified).
 
 Steps:
 1. Read $FILE, $RUBRIC, $KNOW/BUSINESS-CONTEXT.md, and $KNOW/STYLE-VOICE.md (plus the stage contract, the type rubric, and the Deep Plan SPEC if named above; browse the artifacts directory as needed to verify claims).
-2. Must-pass gates: render ONE binary table covering every gate of every rubric read — | gate | PASS/FAIL | one-line reason |. No partial credit, no 'mostly'.
+2. Must-pass gates: render ONE table covering every gate of every rubric read — | gate | PASS / FAIL / N-A (owned by a later stage) / UNVERIFIABLE-HERE (evidence cannot exist on the page for this deliverable type and the artifacts neither confirm nor contradict it) | one-line reason |. No partial credit on PASS/FAIL. UNVERIFIABLE-HERE is a note, not a FAIL, unless the binding contract explicitly requires that evidence inline.
 3. Scored dimensions: score each 0-4 with a one-line justification.
 4. Kill-list scan: quote any hits verbatim.
 5. Top 3 highest-leverage improvements — concrete edits (quote the before, give the after), not vibes.
-6. VERDICT: SHIP | REVISE (list exactly what blocks) | REWRITE (why salvaging is worse than restarting). SHIP requires every gate PASS.
+6. VERDICT: SHIP | REVISE (list exactly what blocks) | REWRITE (why salvaging is worse than restarting). BLOCKERS are only: a binding in-scope must-pass gate at FAIL, or a critical/high finding — an unmarked factually-false claim, a contradiction with the stage contract/SPEC, or a binding 'Done when:' criterion not met. SHIP when zero blockers exist, even with medium/low findings open — record those as notes; they do not trigger rework. REVISE requires at least one blocker; the revision_brief lists only blockers.
 7. One 'Learning note:' line for the junior humans — the single most instructive gap between this and professional work.
 8. END the reply with exactly one JSON object between these sentinel lines, nothing after the closing sentinel:
 NEXUS_JUDGE_JSON_BEGIN
 {\"verdict\": \"SHIP|REVISE|REWRITE\",
  \"findings\": [{\"severity\": \"critical|high|medium|low\", \"file_path\": \"deliverable.md\", \"line_no\": 12, \"line_text\": \"verbatim quote of that line (<=200)\", \"problem\": \"what is wrong (<=300)\", \"fix\": \"concrete edit (<=300)\"}],
- \"revision_brief\": \"<=2500 chars — the exact instruction the reworking agent needs\"}
+ \"revision_brief\": \"<=2500 chars — a NUMBERED fix-list [F1]..[Fn], one entry per blocker finding in findings order: the exact edit needed, highest priority first\"}
 NEXUS_JUDGE_JSON_END
 Findings most severe first, at most 15; line_no/line_text must quote a real line of the deliverable or be null.
 

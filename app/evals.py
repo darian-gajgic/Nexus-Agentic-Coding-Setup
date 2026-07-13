@@ -404,16 +404,23 @@ def resolve_cmd_tokens(tmpl: str, mapping: dict) -> list[str]:
 
 
 _ARTIFACT_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__",
-                       ".worktrees", ".next", "dist", "build", "attachments"}
+                       ".worktrees", ".next", "dist", "build", "attachments",
+                       # internal state, never judge evidence: review snapshots
+                       # + the judge's own round memory (2026-07-13)
+                       "_history", "_judge"}
 
 
 def _copy_judge_artifacts(sources: list, dest: Path,
-                          per_file: int = 1_000_000, total_cap: int = 40_000_000) -> int:
+                          per_file: int = 1_000_000, total_cap: int = 40_000_000,
+                          mtime_after: float | None = None) -> int:
     """Size-capped read-only copy of the task's produced files for the judge
     (judge-scope fix 2026-07-12: the judge previously saw ONLY deliverable.md,
     so every claim about a created file was unverifiable-by-construction).
     Each source tree lands under dest/<basename>; oversized files and vendor
-    dirs are skipped. Returns the number of files copied."""
+    dirs are skipped. Returns the number of files copied.
+    mtime_after (2026-07-13, delta re-judge): only files touched AFTER that
+    timestamp are copied — round ≥2 verifies fixes against the changed files
+    instead of re-copying (and re-reading) up to 40MB every round."""
     import shutil
     copied, total = 0, 0
     for src in sources or []:
@@ -428,8 +435,11 @@ def _copy_judge_artifacts(sources: list, dest: Path,
             if not p.is_file():
                 continue
             try:
-                sz = p.stat().st_size
+                st = p.stat()
+                sz = st.st_size
             except OSError:
+                continue
+            if mtime_after is not None and st.st_mtime <= mtime_after:
                 continue
             if sz > per_file or total + sz > total_cap:
                 continue
@@ -448,7 +458,9 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
                   api_key: str | None = None, type_rubric: str | None = None,
                   spec_path: str | None = None, usage_sink: dict | None = None,
                   task_contract: str | None = None,
-                  artifact_dirs: list | None = None) -> str:
+                  artifact_dirs: list | None = None,
+                  prior_path: str | None = None, judge_round: int | None = None,
+                  artifacts_since: float | None = None) -> str:
     """Run the frontier judge command on a file (shared with the task judge).
     Template lives in settings judge.cmd so gates can stub it (R4.3).
 
@@ -500,9 +512,24 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         # Optional parameter: absent = exactly today's behavior (eval runner
         # passes it only when the case opts in via frontmatter).
         env["JUDGE_TYPE_RUBRIC"] = type_rubric
-    if spec_path and os.path.isfile(spec_path):
+    prior_tmp = None
+    if prior_path and os.path.isfile(prior_path):
+        # Delta re-judge (2026-07-13): previous round's blocker fix-list + the
+        # unified diff of previous vs current version. cjudge's DELTA block
+        # then verifies fixes + scans only changed regions, criteria frozen.
+        try:
+            prior_tmp = tmpdir / f"PRIOR-{uuid.uuid4().hex[:8]}.md"
+            shutil.copy2(prior_path, prior_tmp)
+            env["JUDGE_PRIOR"] = str(prior_tmp)
+            if judge_round:
+                env["JUDGE_ROUND"] = str(judge_round)
+        except Exception:
+            prior_tmp = None
+    if spec_path and os.path.isfile(spec_path) and not prior_tmp:
         # Deep Plan (Step 8): the ORIGINAL SPEC contract — cjudge also checks the
         # deliverable against it when set (optional token; absent = today's behavior).
+        # Bundle diet: omitted on delta rounds (the stage contract governs and the
+        # SPEC was already background there — cjudge:44-50).
         try:
             spec_tmp = tmpdir / f"SPEC-{uuid.uuid4().hex[:8]}.md"
             shutil.copy2(spec_path, spec_tmp)
@@ -523,7 +550,8 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         # unquoted claim.
         try:
             art_tmp = tmpdir / f"artifacts-{uuid.uuid4().hex[:8]}"
-            if _copy_judge_artifacts(artifact_dirs, art_tmp):
+            if _copy_judge_artifacts(artifact_dirs, art_tmp,
+                                     mtime_after=artifacts_since):
                 env["JUDGE_ARTIFACTS"] = str(art_tmp)
             else:
                 shutil.rmtree(art_tmp, ignore_errors=True)
@@ -557,6 +585,11 @@ def run_judge_cmd(file_path: str, domain: str, model: str | None = None,
         try:
             if contract_tmp:
                 os.unlink(contract_tmp)
+        except Exception:
+            pass
+        try:
+            if prior_tmp:
+                os.unlink(prior_tmp)
         except Exception:
             pass
         try:
@@ -645,10 +678,72 @@ def parse_judge_metrics(text: str) -> dict:
                 if findings:
                     findings.sort(key=lambda x: SEVERITY_ORDER[x["severity"]])
                     out["findings"] = findings
+                    # Convergence/delta keys — exact mirror of parse_critic_json's
+                    # `_keys` (file|severity|claim-or-problem prefix), so the judge
+                    # loop can detect "same findings again" (keys ⊆ prev) the way
+                    # the SR sweep already does.
+                    out["_keys"] = [
+                        hashlib.sha1(
+                            (f["file_path"] + "|" + f["severity"] + "|"
+                             + ((f.get("claim") or f.get("problem") or "")[:120]).lower()
+                             ).encode()).hexdigest()[:12]
+                        for f in findings]
                 rb = _clip(data.get("revision_brief"), 2500)
                 if rb:
                     out["revision_brief"] = rb
     return out
+
+
+def judge_pregate(task: dict) -> list[str]:
+    """Deterministic pre-checks before ANY loop-sourced frontier judge run
+    (<50ms, filesystem only). Returns failure strings — empty means 'worth
+    judging'. Catches the trivially-unjudgeable classes (missing/stub
+    deliverable, placeholder text, a repo task with no branch changes) for
+    free instead of burning a $1-2 frontier pass on a guaranteed REVISE.
+    The manual judge button never runs this — operator intent wins."""
+    fails: list[str] = []
+    if db.get_setting("judge.pregate", "1") != "1":
+        return fails
+    ws = task.get("workspace_path") or ""
+    deliv = os.path.join(ws, "deliverable.md")
+    if not os.path.isfile(deliv):
+        return ["deliverable.md does not exist yet — produce the deliverable first"]
+    try:
+        with open(deliv, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ["deliverable.md is unreadable"]
+    try:
+        min_chars = int(db.get_setting("judge.pregate_min_chars", "400"))
+    except (TypeError, ValueError):
+        min_chars = 400
+    stripped = text.strip()
+    if len(stripped) < min_chars:
+        fails.append(f"deliverable.md is only {len(stripped)} chars (< {min_chars}) — "
+                     "write the complete deliverable, not a stub")
+    if len(re.findall(r"(?m)^#{1,6}\s+\S", text)) < 2:
+        fails.append("deliverable.md has fewer than 2 markdown headings — structure it "
+                     "(summary, evidence, decisions …)")
+    if re.search(r"\bTBD\b|TODO\(", text[:2000]):
+        fails.append("placeholder text (TBD/TODO) in the opening section — finish it")
+    if task.get("repo_path"):
+        diff_p = os.path.join(ws, "changes.diff")
+        diff_txt = ""
+        try:
+            if os.path.isfile(diff_p):
+                with open(diff_p, encoding="utf-8", errors="replace") as fh:
+                    diff_txt = fh.read().strip()
+        except OSError:
+            pass
+        # A legitimately-empty round exists (the pipeline's fix stage is a
+        # documented NO-OP when review is clean) — only flag an empty diff
+        # when the deliverable doesn't declare it.
+        noop = re.search(r"no.?op|no changes (were )?(needed|required)|review (was )?clean",
+                         text[:3000], re.I)
+        if (not diff_txt or diff_txt.startswith("(no changes on the branch)")) and not noop:
+            fails.append("repo task has no branch changes (changes.diff is empty) — commit "
+                         "the actual work to the task branch")
+    return fails
 
 
 # ─────────────────────────── Grounded critic (Super Result) ───────────────────────────

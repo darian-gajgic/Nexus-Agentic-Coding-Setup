@@ -1,5 +1,7 @@
 # Software Engineering Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Scoreable quality gate for every engineering deliverable (code, PR, spec). Companion to `PLAYBOOK.md`; worked artifacts in `examples/`.
 
 How to apply, in order:

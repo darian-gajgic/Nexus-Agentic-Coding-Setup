@@ -105,6 +105,10 @@ def _recent_actions(limit=20) -> list[dict]:
     )
 
 
+# Zombie-dispatch log throttle: dispatch id → last activity-log ts (step 7).
+_ZOMBIE_LOGGED: dict = {}
+
+
 def _once(cfg: dict) -> list[dict]:
     """Run one watchdog sweep. Returns the list of actions taken this sweep."""
     if SHUTTING_DOWN.is_set():
@@ -213,6 +217,37 @@ def _once(cfg: dict) -> list[dict]:
             actions.append({"task": tid, "action": "reconciled_orphan_dispatch"})
     except Exception as e:
         db.log_activity("error", "watchdog", f"Orphan-dispatch reconcile failed: {e}")
+
+    # 7. Zombie-dispatch DETECTOR (2026-07-13): step 6's reconciler deliberately
+    # skips a task claimed by a live lane with status='in_progress' ("the lane
+    # handles it") — but a wedged lane can keep its AGENT heartbeat fresh while
+    # the dispatch heartbeat sits stale for hours (observed live: a 'streaming'
+    # dispatch 2h stale mid-benchmark). Detection only: surface it loudly so the
+    # next occurrence is diagnosable in the moment; the runaway ceiling
+    # (2× dispatch.max_turn_seconds, worker.py) remains the enforcement.
+    try:
+        zombie_s = _setting("watchdog.zombie_dispatch_s", int, 600)
+        zombies = db.query_all(
+            "SELECT d.id AS did, d.task_id, d.state, "
+            "COALESCE(d.heartbeat_at, d.started_at, 0) AS hb, t.title, t.claimed_by "
+            "FROM dispatches d JOIN tasks t ON t.id = d.task_id "
+            "WHERE d.state IN ('dispatching','streaming','finalizing') "
+            "AND COALESCE(d.heartbeat_at, d.started_at, 0) < ? "
+            "AND t.status='in_progress'", (now - zombie_s,))
+        for z in zombies:
+            last = _ZOMBIE_LOGGED.get(z["did"], 0)
+            if now - last < 600:      # re-log every ~10 min, not every 10s sweep
+                continue
+            _ZOMBIE_LOGGED[z["did"]] = now
+            age = int(now - (z["hb"] or 0))
+            db.log_activity("error", "watchdog",
+                f"ZOMBIE dispatch: task '{(z['title'] or '')[:50]}' ({z['task_id']}) is "
+                f"'{z['state']}' with a {age}s-stale dispatch heartbeat while lane "
+                f"{z['claimed_by']} still heartbeats — the lane's resume path is wedged")
+            actions.append({"task": z["task_id"], "action": "zombie_dispatch_detected",
+                            "hb_age": age})
+    except Exception as e:
+        db.log_activity("error", "watchdog", f"Zombie-dispatch detector failed: {e}")
     return actions
 
 

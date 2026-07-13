@@ -83,6 +83,25 @@ SECTIONS = [
                      "first, strong only when verification fails (the cascade pattern that "
                      "buys quality-per-$). Never touches high-stakes or dev-pipeline tasks; "
                      "bounded by the per-mode round caps."},
+            {"key": "dispatch.rework_continue_session", "label": "Continue the session on the first rework", "type": "bool",
+             "default": "1",
+             "help": "Judge-loop overhaul (2026-07-13): the FIRST automated rework round "
+                     "(judge/critic REVISE) continues the SAME Hermes session with a targeted "
+                     "revision turn instead of a fresh full re-brief — a fresh session re-reads "
+                     "the entire input set (observed: rework rounds cost MORE than the original "
+                     "attempt; 68% of one task's tokens went to rework). Round ≥2 and every "
+                     "operator reject still start fresh (clean context beats a polluted one)."},
+            {"key": "dispatch.retry_slice_frac", "label": "Retry budget slice (× original)", "type": "float",
+             "default": "0.5", "min": 0.1, "max": 1.0,
+             "help": "Budget honesty (2026-07-13): each retry extends the budget by this "
+                     "fraction of the ORIGINAL derived budget (a rework is a fix, not a "
+                     "second full build). The old behavior granted a full budget per retry."},
+            {"key": "dispatch.rework_ceiling_mult", "label": "Rework budget ceiling (× original)", "type": "float",
+             "default": "2.0", "min": 1.0, "max": 10.0,
+             "help": "Hard lifetime ceiling on rework budget growth: past ceiling × the "
+                     "original budget, the loop STOPS extending and files one 'budget' "
+                     "decision card (approve = one more slice; reject = accept as-is). "
+                     "Observed without it: a 5M task silently grew to 16.96M."},
             {"key": "models.auto_route", "label": "Auto-pick the best model per task", "type": "bool",
              "default": "1",
              "help": "Item 15: when a task is created WITHOUT an explicit model, pick the "
@@ -146,6 +165,27 @@ SECTIONS = [
              "help": "N7: when an approval is rejected with NO feedback and the current version "
                      "was never judged, run the frontier judge first so the retry carries real "
                      "findings instead of re-running on nothing."},
+            {"key": "judge.pregate", "label": "Deterministic pre-gate", "type": "bool",
+             "default": "1",
+             "help": "Free filesystem checks before every LOOP-triggered judge run (deliverable "
+                     "exists, not a stub, no placeholders, repo tasks committed real changes). "
+                     "A failure retries the task with the exact fix list instead of spending a "
+                     "frontier pass. The manual judge button never pre-gates."},
+            {"key": "judge.pregate_min_chars", "label": "Pre-gate minimum size (chars)", "type": "int",
+             "default": "400", "min": 0, "max": 20000,
+             "help": "deliverable.md shorter than this fails the pre-gate as a stub."},
+            {"key": "judge.max_runs", "label": "Max judge runs per version family", "type": "int",
+             "default": "4", "min": 1, "max": 10,
+             "help": "Hard cap on LOOP-triggered frontier judge invocations for one task's "
+                     "rework family (round caps count retries, not judge calls — observed "
+                     "live: 7 full Opus passes on one task). At the cap the loop files a "
+                     "decision card instead. Manual runs bypass; an operator reject resets."},
+            {"key": "judge.delta_rejudge", "label": "Delta re-judge on rework rounds", "type": "bool",
+             "default": "1",
+             "help": "Round ≥2 judges get the previous round's blocker fix-list + a unified "
+                     "diff and verify THOSE against the changed regions (criteria frozen at "
+                     "round 1) instead of re-reading everything from scratch — kills "
+                     "cross-round finding churn and cuts judge input ~60-80%."},
             {"key": "evals.auto_improve", "label": "Auto-draft improvements after evals", "type": "bool",
              "default": "1",
              "help": "Item 6c: when an eval run finishes with any case below SHIP, one "

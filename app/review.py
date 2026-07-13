@@ -20,7 +20,7 @@ TEXT_EXTS = {".md", ".txt", ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".html
              ".css", ".csv", ".yml", ".yaml", ".toml", ".sh", ".sql", ".xml",
              ".svg", ".env.example", ".mjs", ".cjs", ".diff", ".patch"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-SKIP_DIRS = {"_history", "attachments", "node_modules", ".venv", ".venv-preview",
+SKIP_DIRS = {"_history", "_judge", "attachments", "node_modules", ".venv", ".venv-preview",
              "__pycache__", ".git", ".next", "dist", "build", "coverage"}
 SKIP_FILES = {"_dispatch.json", "_preview.log", ".preview-apps.json"}
 MAX_DIFF_BYTES = 400_000

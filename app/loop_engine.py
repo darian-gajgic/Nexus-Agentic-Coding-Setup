@@ -451,6 +451,132 @@ def _bump_escalations(trig: dict, task_id: str | None):
         trig["esc_used"] = int(trig.get("esc_used") or 0) + 1
 
 
+# ── Plain judge loop: closure, convergence, hard cap (2026-07-13) ──
+
+def _judge_closed(trig: dict, task_id: str | None) -> bool:
+    """Operator accepted this family at its cap — the sweep must neither
+    retry nor re-judge it (per-task for inherited configs)."""
+    if task_id is not None:
+        return bool((trig.get("closed_tasks") or {}).get(task_id))
+    return bool(trig.get("closed"))
+
+
+def _set_judge_closed(trig: dict, task_id: str | None, val: bool):
+    if task_id is not None:
+        ct = trig.setdefault("closed_tasks", {})
+        if val:
+            ct[task_id] = 1
+        else:
+            ct.pop(task_id, None)
+    else:
+        if val:
+            trig["closed"] = 1
+        else:
+            trig.pop("closed", None)
+
+
+def _judge_keys_converged(t: dict) -> bool:
+    """Plain-loop convergence guard (parity with the SR sweep's keys ⊆ prev):
+    round >1 and every finding key already appeared last round → the rework
+    is not landing; more rounds would repeat the same REVISE."""
+    try:
+        jk = json.loads(t.get("judge_keys") or "null") or {}
+    except Exception:
+        return False
+    keys, prev = jk.get("keys") or [], jk.get("prev") or []
+    return int(jk.get("round") or 0) > 1 and bool(keys) and set(keys) <= set(prev)
+
+
+def _locate_judge_cfg(task_id: str):
+    """(owner_kind, owner_id, per_task) for the task's EFFECTIVE loop config
+    when it carries a judge_revise trigger — mirror of _locate_super_cfg."""
+    t = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not t:
+        return None
+    if t.get("loop_config"):
+        cfg, owner_kind, owner_id, per_task = _cfg(t), "task", task_id, None
+    elif t.get("workflow_id"):
+        w = db.query_one("SELECT * FROM workflows WHERE id=?", (t["workflow_id"],))
+        if not w or not w.get("loop_config"):
+            return None
+        cfg, owner_kind, owner_id, per_task = _cfg(w), "workflow", w["id"], task_id
+    else:
+        return None
+    if not cfg or not any(x.get("id") == "judge_revise"
+                          for x in (cfg.get("triggers") or [])):
+        return None
+    return owner_kind, owner_id, per_task
+
+
+def close_judge_loop_marker(task_id: str):
+    """Deliverable APPROVED → accept this version; the sweep must not re-judge
+    it (approval bumps completed_at, which would otherwise re-arm auto-judge)."""
+    loc = _locate_judge_cfg(task_id)
+    if loc:
+        owner_kind, owner_id, per_task = loc
+        _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
+                            lambda t2: _set_judge_closed(t2, per_task, True))
+
+
+def reopen_judge_loop(task_id: str):
+    """Deliverable REJECTED → a NEW version family: clear the closed marker,
+    reset the judge invocation counter + convergence keys. Only an operator
+    decision re-arms the family — automation cannot."""
+    loc = _locate_judge_cfg(task_id)
+    if loc:
+        owner_kind, owner_id, per_task = loc
+        _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
+                            lambda t2: _set_judge_closed(t2, per_task, False))
+    db.execute("UPDATE tasks SET judge_round=0, judge_keys=NULL WHERE id=?", (task_id,))
+
+
+def _close_judge_loop(t: dict, owner_kind, owner_id, per_task, reason: str) -> bool:
+    """At-cap / converged / error closure for the plain judge loop: the old
+    code silently `continue`d, leaving non-high-stakes tasks 'done' wearing an
+    unresolved REVISE — tokens spent, no gate, no closure. File ONE pending
+    'deliverable' approval as the decision card (approve = accept as-is with
+    the notes recorded; reject = one more round with your feedback — existing
+    decide_approval semantics) and mark the trigger closed so the sweep never
+    re-files. High-stakes tasks already hold their finalize-time approval;
+    the pending-probe folds them in without a second card."""
+    tid = t["id"]
+    _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
+                        lambda t2: _set_judge_closed(t2, per_task, True))
+    pending = db.query_one(
+        "SELECT id FROM approvals WHERE status='pending' AND action_type='deliverable' "
+        "AND payload LIKE ?", (f'%"task_id": "{tid}"%',))
+    if pending:
+        db.log_activity("warn", "loop",
+                        f"Judge loop closed on '{(t.get('title') or '')[:50]}' ({reason}) "
+                        "— the existing pending approval is the gate",
+                        user_id=t.get("user_id"))
+        return True
+    verdict = t.get("judge_verdict")
+    payload = {
+        "task_id": tid, "task_title": t.get("title"), "verdict": verdict,
+        "reason": reason,
+        "headline": (f"The judge still says {verdict} on "
+                     f"“{(t.get('title') or '')[:50]}” after its last automatic "
+                     f"round — your call: {reason}"),
+        "recommendation": ("Review the deliverable; approve to accept as-is "
+                           "(open findings stay recorded as notes) or reject "
+                           "with feedback for one more round"),
+        "reasons": [reason],
+        "cost_hint": "another round ≈ one frontier judge run + a full rework dispatch",
+    }
+    db.execute(
+        "INSERT INTO approvals (id, agent_id, action_type, description, payload, "
+        "status, risk_level, requested_at, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
+        (f"appr-{uuid.uuid4().hex[:10]}", "loop-engine", "deliverable",
+         f"Judge loop finished without SHIP on '{(t.get('title') or '')[:60]}' — {reason}",
+         json.dumps(payload), "pending", "medium", time.time(), t.get("user_id")))
+    db.log_activity("warn", "loop",
+                    f"Judge-loop closure card filed on '{(t.get('title') or '')[:50]}': {reason}",
+                    user_id=t.get("user_id"))
+    _broadcast_task(tid, t.get("user_id"))
+    return True
+
+
 def _sweep_task_loops(actions_left: int) -> int:
     """judge_revise + auto_judge on loop-enabled tasks. A task with its own
     loop_config uses it; otherwise it INHERITS its project's loop (the
@@ -490,25 +616,80 @@ def _sweep_task_loops(actions_left: int) -> int:
         # scope of its own, independent of the global setting.
         prof = (t.get("spend_profile") or "").strip()
         scope_ok = bool(t.get("high_stakes")) or all_quality or prof in ("optimal", "smart")
+        trig_jr = next((x for x in (cfg.get("triggers") or [])
+                        if x.get("id") == "judge_revise" and x.get("enabled")), None)
+        if trig_jr and _judge_closed(trig_jr, per_task):
+            continue  # operator accepted this family — no re-judge, no rework
+        # Hard invocation cap (judge.max_runs): the round caps bound RETRIES,
+        # not judge calls — 3-7 full frontier passes per task were observed.
+        # A fresh version past the cap goes straight to closure.
+        max_runs = int(db.get_setting("judge.max_runs", "4") or 4)
+        if int(t.get("judge_round") or 0) >= max_runs \
+                and cfg.get("auto_judge") and not judged_this_version:
+            if _close_judge_loop(t, owner_kind, owner_id, per_task,
+                                 f"judge invocation cap reached ({max_runs} runs)"):
+                actions_left -= 1
+            continue
         if cfg.get("auto_judge") and not judged_this_version and verdict != "running" \
                 and scope_ok and _judgeable(t.get("domain")):
             # frontier quota/rate-limit backoff (premortem P1): don't auto-judge
             # straight into a quota wall — retry a later sweep.
             if float(db.get_setting("frontier.quota_backoff_until", "0") or 0) > time.time():
                 continue
-            if _api("POST", f"/api/tasks/{t['id']}/judge", {}, user_id=t.get("user_id")):
+            # Deterministic pre-gate (2026-07-13): catch trivially-unjudgeable
+            # deliverables for FREE before burning a frontier pass. A pre-gate
+            # retry consumes a judge_revise round so it can never ping-pong;
+            # with rounds exhausted we fall through to ONE real judge run —
+            # its REVISE then reaches the at-cap closure instead of limbo.
+            try:
+                import evals as _ev
+                pregate_fails = _ev.judge_pregate(t)
+            except Exception:
+                pregate_fails = []
+            if pregate_fails:
+                trig = trig_jr
+                if trig and _trigger_rounds(trig, per_task) < int(trig.get("max_rounds") or 0):
+                    fb = ("DETERMINISTIC PRE-CHECK FAILED — fix every point below "
+                          "before the frontier judge runs:\n- " + "\n- ".join(pregate_fails))
+                    if _api("POST", f"/api/tasks/{t['id']}/retry",
+                            {"feedback": fb, "origin": "loop_judge"},
+                            user_id=t.get("user_id")):
+                        _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
+                                            lambda t2: _bump_rounds(t2, per_task))
+                        db.log_activity("warn", "loop",
+                                        f"Pre-gate failed on '{t['title'][:50]}' — retried "
+                                        "for free (no judge run spent)"
+                                        + (" (project loop)" if per_task else ""))
+                        actions_left -= 1
+                    continue
+            if _api("POST", f"/api/tasks/{t['id']}/judge", {"source": "loop"},
+                    user_id=t.get("user_id")):
                 db.log_activity("info", "loop",
                                 f"Loop auto-ran the frontier judge on '{t['title'][:50]}'"
                                 + (" (project loop)" if per_task else ""))
                 actions_left -= 1
             continue
-        # 2) judge said REVISE/REWRITE on THIS version → automatic rework round
-        if verdict in ("REVISE", "REWRITE") and judged_this_version:
-            trig = next((x for x in (cfg.get("triggers") or [])
-                         if x.get("id") == "judge_revise" and x.get("enabled")), None)
-            if not trig or _trigger_rounds(trig, per_task) >= int(trig.get("max_rounds") or 0):
+        # 2) judge said REVISE/REWRITE (or errored) on THIS version → one more
+        # automatic rework round, bounded by round cap + judge.max_runs +
+        # convergence. Every exhausted path CLOSES with a decision card —
+        # the old silent `continue` left non-high-stakes tasks 'done' wearing
+        # an unresolved REVISE forever.
+        if verdict in ("REVISE", "REWRITE", "error") and judged_this_version:
+            trig = trig_jr
+            converged = _judge_keys_converged(t)
+            over_runs = int(t.get("judge_round") or 0) >= max_runs
+            at_cap = not trig or \
+                _trigger_rounds(trig, per_task) >= int(trig.get("max_rounds") or 0)
+            if verdict == "error" or converged or over_runs or at_cap:
+                reason = ("the judge run errored" if verdict == "error"
+                          else "the judge repeats the same findings — the rework "
+                               "is not resolving them" if converged
+                          else f"judge invocation cap reached ({max_runs} runs)"
+                          if over_runs else "automatic round cap reached")
+                if _close_judge_loop(t, owner_kind, owner_id, per_task, reason):
+                    actions_left -= 1
                 continue
-            if _api("POST", f"/api/tasks/{t['id']}/retry", {},
+            if _api("POST", f"/api/tasks/{t['id']}/retry", {"origin": "loop_judge"},
                     user_id=t.get("user_id")):  # retry auto-attaches judge findings
                 _mutate_cfg_trigger(owner_kind, owner_id, "judge_revise",
                                     lambda t2: _bump_rounds(t2, per_task))
@@ -799,7 +980,7 @@ def _sweep_super_result(actions_left: int) -> int:
             pass
         fb = (f"SUPER RESULT round {used + 1}/{max_rounds}: grounded critic "
               f"verdict {verdict}.\n" + brief[:2500])
-        if _api("POST", f"/api/tasks/{tid}/retry", {"feedback": fb},
+        if _api("POST", f"/api/tasks/{tid}/retry", {"feedback": fb, "origin": "loop_sr"},
                 user_id=t.get("user_id")):
             _mutate_super_cfg(tid, lambda trig2, pt: (
                 _bump_rounds(trig2, pt),
@@ -966,7 +1147,49 @@ def _sweep_auto_approve_ship():
             _broadcast_task(tid, a.get("user_id"))
 
 
+# A frontier verdict row is definitively dead at this age: worst legitimate
+# case is a full frontier-gate wait (2 critic slots × super.timeout_s 1500s)
+# plus the run's own timeout (judge 900s / escalation 2100s) ≈ 70 min. The
+# reaper heals the STRANDED-'running' class at runtime — the boot reconcile
+# (server startup) only fires at restart, and the manual-start posture means
+# the server runs for days (observed: a stranded judge blocked a task's whole
+# loop until the next restart).
+STALE_FRONTIER_S = 7200
+
+
+def _sweep_stale_frontier():
+    """Reap judge/critic/escalation rows stuck at 'running'/'escalating' far
+    past any legitimate runtime (dead daemon thread between the CAS flip and
+    the verdict UPDATE). Judge → 'interrupted' + judge_ts=NULL (re-judgeable,
+    [21] semantics); critic/escalation → 'error' (the SR sweep escalates it to
+    a human checkpoint, matching the boot reconcile)."""
+    now = time.time()
+    n = db.execute(
+        "UPDATE tasks SET judge_verdict='interrupted', "
+        "judge_output=COALESCE(judge_output,'')||' [reaped: judge run went stale]', "
+        "judge_ts=NULL WHERE judge_verdict='running' AND COALESCE(judge_ts,0) < ?",
+        (now - STALE_FRONTIER_S,)).rowcount
+    if n:
+        db.log_activity("warn", "judge",
+                        f"Reaped {n} judge run(s) stuck at 'running' past "
+                        f"{STALE_FRONTIER_S}s — cleared for a re-run")
+    n = db.execute(
+        "UPDATE tasks SET critic_verdict='error', "
+        "critic_output=COALESCE(critic_output,'')||' [reaped: run went stale]' "
+        "WHERE critic_verdict IN ('running','escalating') AND COALESCE(critic_ts,0) < ?",
+        (now - STALE_FRONTIER_S,)).rowcount
+    if n:
+        db.log_activity("warn", "critic",
+                        f"Reaped {n} critic/escalation run(s) stuck past {STALE_FRONTIER_S}s")
+
+
 def loop_sweep():
+    # The stale-verdict reaper runs even in drain/paused posture: manual judge
+    # runs don't require dispatch.enabled, so their strands must not either.
+    try:
+        _sweep_stale_frontier()
+    except Exception as e:
+        db.log_activity("warn", "loop", f"stale-frontier reaper error: {str(e)[:80]}")
     if db.get_setting("dispatch.enabled", "0") != "1":
         return
     _sweep_auto_approve_ship()
