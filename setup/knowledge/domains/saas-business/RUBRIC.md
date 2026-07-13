@@ -1,5 +1,7 @@
 # SaaS Strategy Work — Quality Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Apply to any SaaS strategy deliverable (positioning, pricing proposal, MVP scope, launch plan, metrics review) BEFORE it leaves the AI or a junior's hands.
 Every check below is answerable yes/no or with a count — no taste required.
 Companion: `PLAYBOOK.md` (how to produce the work this rubric scores).

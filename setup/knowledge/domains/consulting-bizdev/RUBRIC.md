@@ -1,5 +1,7 @@
 # Consulting & BizDev Quality Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Quality gate for outreach, proposals, and client-facing documents. Apply BEFORE sending.
 Order: (1) must-pass gates — one fail = do not send; (2) scored dimensions 0–4.
 

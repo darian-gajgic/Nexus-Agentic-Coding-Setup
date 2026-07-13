@@ -1,5 +1,7 @@
 # Marketing Quality Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 > Gate every marketing deliverable through this file before delivery. Companion to `PLAYBOOK.md`.
 > Order of use: (1) must-pass gates — any FAIL means do not deliver, fix and re-run; (2) kill-list sweep; (3) score the dimensions; (4) apply the decision rule.
 > For each gate, record PASS/FAIL plus one line of evidence (a count, a quote, a screenshot ref). Every check here works without taste.

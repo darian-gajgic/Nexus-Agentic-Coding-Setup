@@ -273,6 +273,18 @@ def init_db():
         ("critic_ts", "REAL"),
         ("critic_round", "INTEGER DEFAULT 0"),
         ("critic_keys", "TEXT"),                 # {"round":N,"keys":[...],"prev":[...]} convergence state
+        # Judge-loop overhaul (2026-07-13): per-version-family judge state.
+        # judge_round counts STORED verdicts (quota-interrupted runs don't
+        # count); the hard cap judge.max_runs reads it — the round caps only
+        # bound retries, and 3-7 full frontier passes per task were observed.
+        # judge_keys mirrors critic_keys for the plain loop's convergence
+        # guard. Both reset ONLY on an operator reject (new version family).
+        ("judge_round", "INTEGER DEFAULT 0"),
+        ("judge_keys", "TEXT"),
+        # Budget honesty (2026-07-13): the budget as first derived at creation.
+        # Retry slices and the rework ceiling (dispatch.rework_ceiling_mult)
+        # compute from THIS, not from the silently-grown budget_tokens.
+        ("budget_original", "INTEGER"),
         # Quality Autopilot Q7a: two orthogonal preset axes. NULL = legacy (P10b:
         # no derivation, existing explicit preference honored as-is).
         ("autopilot", "TEXT"),                   # full_auto|assisted|manual|NULL

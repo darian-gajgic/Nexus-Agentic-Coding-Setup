@@ -1,5 +1,7 @@
 # E-commerce Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Quality gate for listings, PDPs, promos, and lifecycle emails. Score BEFORE delivering.
 Rule: **all must-pass gates green AND total score ≥ {{FILL: publish threshold, default 22}}/28 AND no dimension ≤ 1** — otherwise revise, don't publish.
 Every check below is verifiable without taste: count, measure, or find the pattern.

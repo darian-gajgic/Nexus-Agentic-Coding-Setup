@@ -193,6 +193,12 @@ def _wait_on_active_orphan(task: dict, agent_id: str) -> bool:
 
 def _execute(task: dict, mode: str, agent_id: str, dispatch_on: bool = True):
     tid = task["id"]
+    # Rework marker (2026-07-13): retry_feedback + a kept session = a judge/SR
+    # rework round continuing its own session (dispatch.rework_continue_session).
+    # run_task_dispatch must SKIP the orphan-harvest ladder for these — the
+    # previous run finished and was judged; harvesting would resurrect the
+    # rejected reply as the new deliverable.
+    rework = bool(task.get("retry_feedback")) and bool(task.get("session_id"))
     if mode == "queued":
         d = db.query_one(
             "SELECT * FROM dispatches WHERE task_id=? AND state='queued' "
@@ -201,7 +207,8 @@ def _execute(task: dict, mode: str, agent_id: str, dispatch_on: bool = True):
         # A manual re-dispatch of a previously-failed task already has a
         # session that heard the original prompt — resume it (harvest or
         # continue-turn) instead of replaying the same instructions into it.
-        hd.run_task_dispatch(did, tid, agent_id, resume=bool(task.get("session_id")))
+        hd.run_task_dispatch(did, tid, agent_id, resume=bool(task.get("session_id")),
+                             rework=rework)
     elif mode == "resume":
         if not dispatch_on and time.time() - _drain_skip.get(tid, 0) < DRAIN_RECHECK_S:
             return  # recent dead/gone verdict — don't re-fetch the transcript per tick
@@ -235,7 +242,8 @@ def _execute(task: dict, mode: str, agent_id: str, dispatch_on: bool = True):
         # If a session already exists (blocked MID-stream earlier), resume it —
         # harvest first, else continue-turn. Replaying the original prompt into
         # a session that already heard it would duplicate instructions.
-        hd.run_task_dispatch(did, tid, agent_id, resume=bool(task.get("session_id")))
+        hd.run_task_dispatch(did, tid, agent_id, resume=bool(task.get("session_id")),
+                             rework=rework)
 
 
 def main():

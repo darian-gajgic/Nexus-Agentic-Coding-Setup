@@ -1,5 +1,7 @@
 # Brand Rubric — quality gate
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 > Use: run the gates first — any FAIL means do not deliver; fix and re-run. Then score the dimensions 0–4.
 > Pass bar: all gates pass AND total ≥ 21/28 AND no dimension ≤ 1.
 > Every check is text-observable. For each verdict, quote the line that passes or fails. No taste required.

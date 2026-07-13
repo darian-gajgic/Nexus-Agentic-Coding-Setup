@@ -1062,6 +1062,31 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
         "verified assertions — the grounded critic and judge check unmarked claims to "
         "that standard and treat an unmarked-but-false claim as a critical failure, so "
         "flagging honest uncertainty PROTECTS your score.")
+    # Quality-gate evidence contract (2026-07-13): when this deliverable will
+    # face the frontier judge (or the GLM screen), tell the WORKER up front
+    # what a text-only judge can actually credit — evidence on the page — and
+    # require an explicit self-check table. The dominant REVISE class observed
+    # live was evidence-PRESENTATION (true claims without locatable sources),
+    # which is worker-preventable for ~170 framing tokens. Predicate mirrors
+    # the judge/screen scope: a real domain rubric + (high-stakes / SR /
+    # optimal / smart profile / global all_quality).
+    _dom = (task.get("domain") or "").strip()
+    _rubric_file = (os.path.expanduser(f"~/knowledge/domains/{_dom}/RUBRIC.md")
+                    if _dom and _dom != "general" else "")
+    if _rubric_file and os.path.isfile(_rubric_file) and (
+            task.get("high_stakes") or task.get("super_result")
+            or (task.get("spend_profile") or "") in ("optimal", "smart")
+            or db.get_setting("judge.auto_scope", "high_stakes") == "all_quality"):
+        parts.append(
+            "QUALITY GATE — a text-only frontier judge will grade this deliverable and "
+            "can only credit EVIDENCE ON THE PAGE: for every load-bearing claim cite the "
+            "exact source inline (file:line, the command you ran plus its real quoted "
+            "output, or URL + access date). A true claim without a locatable source gets "
+            "refuted. Before finalizing, self-check every 'Done when:' line of this brief "
+            "and every must-pass gate of the rubric, and END the deliverable with a "
+            "'Gate evidence' table: | criterion/gate | where in this deliverable the "
+            "evidence sits |. A criterion you could not satisfy must be listed there "
+            "honestly with [UNSURE: reason] rather than papered over.")
     if (task.get("deliverable_type") or "") != "code_change":
         # Item 17: dev stages virtually never need exchange rates/holidays —
         # the skill stays discoverable on disk; content/research keep the hint.
@@ -1168,9 +1193,30 @@ def build_framing(task: dict, workspace: Path, repo_ctx: dict | None = None,
             + f"\nExtract pdf/docx/xlsx/pptx content with {DOC_TOOLS_PY} "
               "(pypdf, python-docx, openpyxl, python-pptx).")
     if task.get("retry_feedback"):
+        # Targeted-revision contract (2026-07-13): name the preserved previous
+        # version, forbid a from-scratch rebuild, and demand a per-finding
+        # echo — the reworker used to receive only a feedback blob, so it
+        # could regress fixes or rebuild wholesale (observed: rework rounds
+        # cost MORE than the original attempt), and the judge had no way to
+        # verify fix claims. [F#] ids come from _retry_task's comment drain.
+        prev_hint = ""
+        try:
+            vers = sorted((f for f in os.listdir(workspace)
+                           if re.match(r"deliverable\.v\d+\.md$", f)),
+                          key=lambda f: int(re.search(r"\d+", f).group()))
+            if vers:
+                prev_hint = (f" The previous version is preserved at "
+                             f"{workspace}/{vers[-1]} — read it FIRST and keep everything "
+                             "that was not criticized; do not rebuild from scratch.")
+        except OSError:
+            pass
         parts.append(
-            "This is a RETRY: a previous attempt was rejected. Address every point of this "
-            f"feedback before delivering:\n{task['retry_feedback']}"
+            "This is a RETRY (rework round): a previous attempt was rejected."
+            + prev_hint +
+            " Make a TARGETED REVISION addressing EVERY numbered finding below, then END "
+            "the deliverable with a '## Fixes applied' section mapping each finding id to "
+            "the exact change you made (one line each: [F1] → what changed, where). "
+            f"Feedback:\n{task['retry_feedback']}"
         )
     # Item 3: the executing lane's own memory rides with the brief — standing
     # rules the operator taught it (longterm) + its consolidated track record
@@ -1729,13 +1775,19 @@ def _try_harvest(task: dict) -> dict | None:
 
 
 def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
-                      resume: bool = False, fallback_model: str | None = None) -> dict:
+                      resume: bool = False, fallback_model: str | None = None,
+                      rework: bool = False) -> dict:
     """Execute one claimed task as a real Hermes session. Blocking; call from the
     lane's worker process. resume=True = the previous executor died mid-dispatch:
     harvest the orphaned result if it finished, else send a continue-turn into
     the SAME session (context kept); fresh re-dispatch only if the session died.
     fallback_model is internal — set by the QuotaError failover retry so the
-    second pass runs on the overload-fallback model (and never falls back again)."""
+    second pass runs on the overload-fallback model (and never falls back again).
+    rework=True (2026-07-13) = a judge/critic rework round continuing its OWN
+    session: the previous run FINISHED and was already finalized+judged, so the
+    orphan ladder must be skipped — _try_harvest would re-book the old reply as
+    the new deliverable. Sends a targeted rework continue-turn instead of the
+    full brief; the RETRY feedback rides in the framing as usual."""
     task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     agent = db.query_one("SELECT * FROM agents WHERE id=?", (agent_id,))
     if not task or not agent:
@@ -1769,7 +1821,23 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
     resume_with_context = False  # the session's transcript actually heard the brief
     try:
         # Free recovery first: the orphaned run may already be complete (R3.3).
-        if resume:
+        # A rework round skips the ladder — its previous run finished and was
+        # finalized+judged, so "harvesting" it would resurrect the rejected
+        # reply as the new deliverable. EXCEPT when the rework turn itself
+        # already went out (blocked/cut mid-round): then the newest run IS the
+        # rework and the normal ladder (harvest/wait) is exactly right — the
+        # transcript marker below discriminates the two epochs.
+        if resume and rework and task.get("session_id"):
+            try:
+                _msgs = get_messages(task["session_id"])
+                resume_with_context = bool(_msgs)
+                if any((m.get("role") == "user" and
+                        f"Rework round for task {task_id}:" in (m.get("content") or ""))
+                       for m in _msgs):
+                    rework = False  # rework turn already sent → normal ladder
+            except Exception:
+                resume_with_context = False
+        if resume and not rework:
             state = orphan_run_state(task)
             if state == "finished":
                 harvested = _try_harvest(task)
@@ -1803,13 +1871,16 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                     resume_with_context = bool(get_messages(task["session_id"]))
                 except Exception:
                     resume_with_context = False
-            if task.get("session_id") and get_session(task["session_id"]) is None:
-                # Session unusable → fall back to a fresh re-dispatch (R3.4).
-                db.log_activity("warn", agent_id,
-                                f"Task {task_id}: session {task['session_id']} gone — fresh re-dispatch")
-                _set_task(task_id, session_id=None)
-                task["session_id"] = None
-                resume_with_context = False
+        if resume and task.get("session_id") and get_session(task["session_id"]) is None:
+            # Session unusable → fall back to a fresh re-dispatch (R3.4).
+            # Hoisted out of the orphan ladder (2026-07-13) so a REWORK round
+            # whose session died also falls back fresh instead of continuing
+            # into nothing.
+            db.log_activity("warn", agent_id,
+                            f"Task {task_id}: session {task['session_id']} gone — fresh re-dispatch")
+            _set_task(task_id, session_id=None)
+            task["session_id"] = None
+            resume_with_context = False
 
         # Test-only fault injection for the quota gate (SPEC R7.3) — off by default.
         if db.get_setting("dispatch.force_429") == "1":
@@ -1898,7 +1969,19 @@ def run_task_dispatch(dispatch_id: str, task_id: str, agent_id: str,
                             f"Task {task_id}: could not create worktree in {task.get('repo_path')}")
             return db.query_one("SELECT * FROM dispatches WHERE id=?", (dispatch_id,))
         framing = build_framing(task, workspace, repo_ctx, agent_id=agent_id)
-        if resume and resume_with_context:
+        if resume and resume_with_context and rework:
+            # Rework continue-turn (2026-07-13): the session already holds the
+            # brief, its file reads, and the rejected draft — re-briefing from
+            # scratch re-reads the whole input set (observed: rework rounds cost
+            # MORE than the original attempt). The RETRY feedback block in the
+            # framing carries the numbered findings.
+            input_text = (f"Rework round for task {task_id}: your previous deliverable was "
+                          "reviewed and sent back. Apply the RETRY feedback in the framing — "
+                          "make a TARGETED revision (keep everything that was not criticized; "
+                          "do not rebuild from scratch), update "
+                          f"{workspace}/deliverable.md, and reply with the complete final "
+                          "deliverable text.")
+        elif resume and resume_with_context:
             input_text = (f"You were interrupted mid-task. Continue task {task_id} now and "
                           "finish it. The original instructions still apply: write the final "
                           f"deliverable to {workspace}/deliverable.md and reply with the "

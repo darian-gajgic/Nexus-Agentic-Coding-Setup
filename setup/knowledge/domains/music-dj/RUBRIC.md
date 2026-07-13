@@ -1,5 +1,7 @@
 # Music & DJ Quality Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Scoreable gate for four artifact types: **track/master**, **DJ set plan**, **gig prep**, **release plan**.
 Procedure: (1) check must-pass gates for the artifact type — any FAIL blocks shipping; (2) score the applicable dimensions 0–4; (3) scan the kill list — any hit caps the verdict at "revise".
 **Ship verdict:** all gates PASS + no kill-list hits + score ≥ 70% of applicable maximum + no dimension ≤ 1.

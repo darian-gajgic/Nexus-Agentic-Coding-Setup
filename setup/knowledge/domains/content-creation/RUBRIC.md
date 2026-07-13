@@ -1,5 +1,7 @@
 # Content Quality Rubric
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Scoreable gate for every piece before it publishes. Companion to `PLAYBOOK.md` (craft) and
 `~/knowledge/STYLE-VOICE.md` (voice markers). Every item below is checkable without taste.
 

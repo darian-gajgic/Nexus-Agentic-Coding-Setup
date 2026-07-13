@@ -67,23 +67,37 @@ def set_learned_param(key: str, value):
 
 # ─────────────────────────── L1 — outcome capture ───────────────────────────
 
-def _effective_loop_cfg(task: dict) -> dict:
+def _effective_loop_cfg(task: dict) -> tuple[dict, bool]:
+    """Returns (cfg, own): the task's own loop config, else its project's.
+    `own` matters for round accounting — an inherited config tracks per-task
+    rounds in each trigger's used_tasks map, never in the shared `used`."""
     try:
         if task.get("loop_config"):
-            return json.loads(task["loop_config"]) or {}
+            return json.loads(task["loop_config"]) or {}, True
         if task.get("workflow_id"):
             w = db.query_one("SELECT loop_config FROM workflows WHERE id=?", (task["workflow_id"],))
             if w and w.get("loop_config"):
-                return json.loads(w["loop_config"]) or {}
+                return json.loads(w["loop_config"]) or {}, False
     except Exception:
         pass
-    return {}
+    return {}, True
 
 
-def _rounds_used(cfg: dict, task_id: str) -> int:
+_REWORK_TRIGGERS = {"judge_revise", "super_result"}
+
+
+def _rounds_used(cfg: dict, task_id: str, own: bool) -> int:
+    """Rework rounds attributable to THIS task only. The old all-trigger sum
+    made the live histogram uninterpretable (bimodal 0-or-exactly-2): a
+    workflow's verify_fail rounds polluted every member, and the shared
+    workflow-level `used` was credited to each member again. Judge/SR rework
+    triggers only; `used` counts only for a task's OWN config."""
     total = 0
     for t in cfg.get("triggers") or []:
-        total += int(t.get("used") or 0)
+        if (t.get("id") or "") not in _REWORK_TRIGGERS:
+            continue
+        if own:
+            total += int(t.get("used") or 0)
         total += int((t.get("used_tasks") or {}).get(task_id) or 0)
     return total
 
@@ -94,7 +108,7 @@ def record_outcome(task_id: str):
     t = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
         return
-    cfg = _effective_loop_cfg(t)
+    cfg, own_cfg = _effective_loop_cfg(t)
     # fan-out: this task's project ran >=2 parallel investigators/drafts
     fanout = 0
     if t.get("workflow_id"):
@@ -109,17 +123,27 @@ def record_outcome(task_id: str):
     ovr = db.query_one(
         "SELECT 1 FROM approvals WHERE status='rejected' AND payload LIKE ?",
         (f'%"task_id": "{task_id}"%',))
+    # judge_runs: real frontier invocations for this task (the round caps count
+    # retries, not judge calls — this is the number that shows the gap).
+    try:
+        jr = db.query_one(
+            "SELECT COUNT(*) AS n FROM frontier_ledger WHERE task_id=? "
+            "AND kind IN ('judge','judge_screen')", (task_id,))
+        judge_runs = int((jr or {}).get("n") or 0)
+    except Exception:
+        judge_runs = 0
     triage = {"domain": t.get("domain"), "high_stakes": bool(t.get("high_stakes")),
               "super_result": bool(t.get("super_result")),
-              "deliverable_type": t.get("deliverable_type")}
+              "deliverable_type": t.get("deliverable_type"),
+              "judge_runs": judge_runs}
     verdicts = {"judge": t.get("judge_verdict"), "critic": t.get("critic_verdict")}
     db.execute(
         "INSERT OR REPLACE INTO routing_outcomes (id, task_id, user_id, triage_json, "
         "spend_profile, autopilot, rounds_used, fanout_used, final_verdicts, escalated, "
         "overridden, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (f"ro-{task_id}", task_id, t.get("user_id"), json.dumps(triage),
-         t.get("spend_profile"), t.get("autopilot"), _rounds_used(cfg, task_id), fanout,
-         json.dumps(verdicts), 1 if esc else 0, 1 if ovr else 0, time.time()))
+         t.get("spend_profile"), t.get("autopilot"), _rounds_used(cfg, task_id, own_cfg),
+         fanout, json.dumps(verdicts), 1 if esc else 0, 1 if ovr else 0, time.time()))
 
 
 def _tags(raw):

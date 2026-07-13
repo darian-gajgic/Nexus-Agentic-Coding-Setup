@@ -1,5 +1,7 @@
 # Investigation Rubric (deliverable type: analysis / research)
 
+> Frontier-judge scoping (2026-07-13): for the text-only frontier judge, a gate whose evidence cannot appear on the page and is not contradicted by the task's artifacts is UNVERIFIABLE-HERE (a note), not FAIL — the cjudge verdict contract governs: only binding in-scope gate FAILs and critical/high findings block a SHIP.
+
 Score any investigation — audit, root-cause analysis, assessment, reconciliation,
 verification report — using this file alone. This is a TYPE rubric: it applies on
 top of the domain rubric (both must pass). It exists because the most dangerous
