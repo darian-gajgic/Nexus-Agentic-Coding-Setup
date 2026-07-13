@@ -235,12 +235,15 @@ SECTIONS = [
              "help": "Leave app/workspaces/_critic/<id> in place after a run — debugging only."},
             # Appendix C1c — escalated rework (the escalation_model writes the final version).
             {"key": "super.escalation", "label": "Escalated rework (frontier writes the final)", "type": "bool",
-             "default": "0",
+             "default": "1",
              "help": "C1c: on a REWRITE verdict — or the round cap with criticals still open — the "
                      "rework ITSELF runs on the 'escalation model' purpose (judgment-tier), handed the "
                      "full dossier, writing the deliverable directly instead of re-dispatching to GLM. "
-                     "The floor APPROACHES a direct frontier pass but is an empirical claim (a bad "
-                     "dossier can anchor it lower) — Phase 8 measures it. Off by default."},
+                     "ARMED by default since 2026-07-13 (the ladder was designed and tested but never "
+                     "on — REWRITE verdicts dead-ended at a human): bounded by the per-profile C5 "
+                     "thresholds (Eco off / Balanced REWRITE-only / Smart REWRITE-or-cap), "
+                     "escalation_max, and the per-task frontier cost cap. The floor APPROACHES a "
+                     "direct frontier pass but is an empirical claim — Phase 8 measures it."},
             {"key": "super.escalation_max", "label": "Max escalated reworks per task", "type": "int",
              "default": "1", "min": 1, "max": 3,
              "help": "After this many escalated reworks that still don't SHIP, fall through to a human "
@@ -262,6 +265,21 @@ SECTIONS = [
              "help": "Global cap on simultaneous Claude-CLI runs (grounded critic + frontier "
                      "judge) — one subscription with hard usage ceilings. Excess calls wait; "
                      "rate-limit/quota failures back off and requeue instead of escalating."},
+            {"key": "frontier.task_cost_cap_usd", "label": "Frontier cost cap per task ($)", "type": "float",
+             "default": "3.0", "min": 0, "max": 100,
+             "help": "Per-task ceiling on frontier spend (judge + critic + escalation, "
+                     "API-equivalent $ from the C3 ledger), scaled by the profile's budget "
+                     "multiplier (Eco ×0.5 / Balanced ×1 / Smart ×2). At the cap the loop "
+                     "closes out (decision card / checkpoint) instead of spending another "
+                     "pass — observed without it: $8 of Opus on one task. 0 = uncapped."},
+            {"key": "judge.screen", "label": "GLM screening judge", "type": "str",
+             "default": "interior",
+             "help": "The cheap interior verdict tier ('interior' | 'off'): on the Balanced "
+                     "sinks scope, interior pipeline members get ONE GLM screening pass "
+                     "(same contract, no artifact copy) instead of a frontier run. Its "
+                     "REVISE (with a critical/high blocker) loops one fix round; its SHIP "
+                     "never authorizes anything — final deliverables still face the "
+                     "frontier judge. 'off' = interior members get the pre-gate only."},
         ],
     },
     {

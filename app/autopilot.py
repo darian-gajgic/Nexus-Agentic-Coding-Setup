@@ -86,9 +86,12 @@ def _feature_present(name: str) -> bool:
     try:
         import database as db
         if name == "deep_plan":
-            return db.get_setting("deep_plan.enabled", "") == "1"
+            # 2026-07-13: was the dead key 'deep_plan.enabled' — the registered
+            # setting is plan.deep_enabled (default 1), so plan_recommend never
+            # derived even though Deep Plan shipped in Phase 5.
+            return db.get_setting("plan.deep_enabled", "1") == "1"
         if name == "escalation":
-            return db.get_setting("super.escalation", "") == "1"
+            return db.get_setting("super.escalation", "1") == "1"
         if name == "model_floor":
             # C2 (Phase 7, rotation readiness): the centralized fallback-role map
             # is the model-floor mechanism — once it exists, Eco can floor
@@ -111,10 +114,15 @@ def derive(involvement, spend, *, high_stakes: bool = False,
     preference = "speed" if sp == "eco" else "quality"
 
     # involvement → loop mode + Super Result rework mode.
+    # 2026-07-13: assisted sr_mode open→closed. Open mode checkpointed a human
+    # EVERY round, which (with cost) is why SR ran once ever in practice; the
+    # sweep still checkpoints unconditionally at every TERMINAL event (cap,
+    # convergence, contradiction, error, escalation), so assisted keeps its
+    # human touchpoints where they matter. Manual stays fully open.
     if inv == "manual":
         mode, sr_mode = "open", "open"
     elif inv == "assisted":
-        mode, sr_mode = "closed", "open"      # closed fix-rounds, SR checkpoints wait
+        mode, sr_mode = "closed", "closed"    # fix-rounds close; terminal checkpoints wait
     else:  # full_auto
         mode, sr_mode = "closed", "closed"
 
@@ -133,7 +141,15 @@ def derive(involvement, spend, *, high_stakes: bool = False,
         round_cap = 3 if high_stakes else 2
 
     # spend → auto-judge scope (feeds judge.auto_scope semantics).
-    judge_scope = {"eco": "high_stakes", "optimal": "all_quality", "smart": "all_quality"}[sp]
+    # 2026-07-13: Balanced all_quality→sinks — the frontier judge was bound to
+    # the WIDEST scope (every rubric'd quality task = 75%+ of all frontier
+    # spend) while interior pipeline members gained the least from an Opus
+    # pass. Balanced now frontier-judges only SINKS (client-facing: no
+    # dependents / standalone) + high-stakes; interior members get the free
+    # pre-gate + the GLM screen (judge.screen). Smart keeps all_quality for
+    # its SR-off fallback; high-stakes forces the frontier judge everywhere
+    # (rule-2 floor, enforced in the sweep).
+    judge_scope = {"eco": "high_stakes", "optimal": "sinks", "smart": "all_quality"}[sp]
 
     # rule 4 — budget multiplier is the hard cost backstop; move it with the profile.
     budget_mult = {"eco": 0.5, "optimal": 1.0, "smart": 2.0}[sp]

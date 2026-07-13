@@ -724,8 +724,8 @@ async def create_task(body: TaskCreate):
     db.execute("""INSERT INTO tasks
         (id, title, description, status, priority, assignee_id, program_id, created_at, updated_at, tags, position,
          domain, specialist, high_stakes, budget_tokens, model, workflow_id, depends_on, loop_config, repo_path, client, user_id,
-         super_result, deliverable_type, autopilot, spend_profile, model_reason)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         super_result, deliverable_type, autopilot, spend_profile, model_reason, budget_original)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tid, body.title, body.description, body.status, body.priority,
          body.assignee_id, body.program_id, now, now, json.dumps(body.tags), 0,
          body.domain, body.specialist, 1 if body.high_stakes else 0, budget, task_model,
@@ -733,7 +733,11 @@ async def create_task(body: TaskCreate):
          json.dumps(body.loop_config) if body.loop_config else None,
          (body.repo_path or None), (_derive_client(body.client, body.repo_path)), uid,
          1 if body.super_result else 0, body.deliverable_type or None, ap_inv, ap_spend,
-         model_reason))
+         model_reason,
+         # budget_original (2026-07-13): pin the creation-derived budget — the
+         # retry slice + rework ceiling compute from THIS, never from the grown
+         # budget_tokens.
+         budget))
     db.log_activity("info", "system", f"Task created: '{body.title}'", user_id=uid)
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
     if body.super_result:
@@ -781,6 +785,9 @@ async def update_task(task_id: str, body: TaskUpdate):
         updates["high_stakes"] = 1 if body.high_stakes else 0
     if body.budget_tokens is not None:
         updates["budget_tokens"] = body.budget_tokens
+        # An explicit operator budget is a NEW baseline — the retry slice and
+        # rework ceiling (dispatch.rework_ceiling_mult) compute from it.
+        updates["budget_original"] = body.budget_tokens
     if body.model is not None:
         if body.model and body.model not in db.task_models_for(auth.current_user_id()):
             return JSONResponse(status_code=400, content={
@@ -828,6 +835,24 @@ async def update_task(task_id: str, body: TaskUpdate):
         if body.spend_profile is not None:
             updates["spend_profile"] = _ap.norm_spend(body.spend_profile) if body.spend_profile.strip() else None
         profile_changed = True
+        # Rule-4 was creation-only (2026-07-13 fix): switching the spend
+        # profile now re-derives the budget too — unless the operator set an
+        # explicit budget in this same PATCH (theirs wins). The re-derived
+        # value re-pins budget_original so the retry slice/ceiling follow.
+        new_sp = updates.get("spend_profile")
+        if new_sp and body.budget_tokens is None:
+            cur = db.query_one(
+                "SELECT high_stakes, deliverable_type FROM tasks WHERE id=?", (task_id,))
+            try:
+                _, _, rebudget = _ap.preset_fields(
+                    updates.get("autopilot") or body.autopilot, new_sp,
+                    bool((cur or {}).get("high_stakes")), None,
+                    (cur or {}).get("deliverable_type"))
+                if rebudget:
+                    updates["budget_tokens"] = rebudget
+                    updates["budget_original"] = rebudget
+            except Exception:
+                pass
     updates["updated_at"] = time.time()
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -5044,7 +5069,8 @@ def _judge_thread_inner(task_id: str, file_path: str, domain: str):
         jkeys = json.dumps({"round": new_round, "keys": m.get("_keys") or [],
                             "prev": old_keys.get("keys") or []})
     db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=?, "
-               "judge_round=?, judge_keys=COALESCE(?, judge_keys) WHERE id=?",
+               "judge_round=?, judge_keys=COALESCE(?, judge_keys), "
+               "judge_tier='frontier' WHERE id=?",
                (verdict or "error", out[-30000:], time.time(), new_round, jkeys, task_id))
     # Round memory for the delta re-judge: the 'running' flip NULLs
     # judge_output, so this file is the only place round N's findings survive
@@ -5077,6 +5103,127 @@ def _judge_thread_inner(task_id: str, file_path: str, domain: str):
     db.log_activity("info" if verdict else "error", "judge",
                     f"Frontier judge on {task_id}: {verdict or 'no verdict parsed'}"
                     + (f" — {learning}" if learning else ""))
+
+
+def _screen_thread(task_id: str, file_path: str, domain: str):
+    """GLM screening judge (2026-07-13) — the cheap interior verdict tier of
+    the estimator cascade. One Hermes turn on the owner's 'complicated' model
+    with the cjudge verdict contract (deliverable + stage contract, no
+    artifact copy — the session's own file tools can open workspace paths),
+    emitting the same sentinel JSON. Semantics: a REVISE carrying at least one
+    critical/high finding loops ONE fix round (bounded in the sweep); anything
+    else stores SHIP-with-notes. A screen SHIP is NEVER a frontier SHIP —
+    judge_tier='screen' marks it (exemplar selection excludes it). Tokens are
+    GLM-metered and booked to the ledger as kind='judge_screen'."""
+    task = db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    owner = (task or {}).get("user_id")
+    try:
+        import evals as _ev
+        import hermes_dispatch as hd
+        contract = _judge_task_contract(task) if task else None
+        try:
+            with open(file_path, encoding="utf-8", errors="replace") as fh:
+                deliverable = fh.read()
+        except OSError:
+            deliverable = ""
+        rubric = os.path.join(_kroot(), "domains", domain, "RUBRIC.md")
+        prompt = (
+            "You are the SCREENING judge — a fast first-pass reviewer in front of a "
+            "stronger frontier judge. Grade the deliverable below against the rubric at "
+            f"{rubric} (read it" + (f"; the binding STAGE contract follows" if contract else "")
+            + ").\n\n"
+            + (f"STAGE CONTRACT (binding — later stages' criteria are OUT of scope):\n"
+               f"{contract[:8000]}\n\n" if contract else "")
+            + "Stance: flag ONLY defects that affect correctness or the binding "
+              "contract's stated criteria — an unmarked factually-false claim, a "
+              "contradiction with the contract, or a binding 'Done when:' criterion "
+              "not met. Polish, style and depth beyond the contract are NOTES "
+              "(severity medium/low), never blockers. Verdict rule: REVISE only when "
+              "at least one critical/high blocker exists; otherwise SHIP (open notes "
+              "do not block).\n\n"
+            "END the reply with exactly one JSON object between these sentinel lines, "
+            "nothing after the closing sentinel:\n"
+            "NEXUS_JUDGE_JSON_BEGIN\n"
+            '{"verdict": "SHIP|REVISE",\n'
+            ' "findings": [{"severity": "critical|high|medium|low", "file_path": '
+            '"deliverable.md", "line_no": 12, "line_text": "verbatim quote (<=200)", '
+            '"problem": "what is wrong (<=300)", "fix": "concrete edit (<=300)"}],\n'
+            ' "revision_brief": "<=2500 chars — a NUMBERED fix-list [F1]..[Fn], one '
+            'entry per blocker"}\n'
+            "NEXUS_JUDGE_JSON_END\n\n"
+            f"DELIVERABLE ({os.path.basename(file_path)}):\n{deliverable[:24000]}"
+            + ("\n[...truncated — read the full file at "
+               f"{file_path} with your file tools]" if len(deliverable) > 24000 else ""))
+        run_model = db.default_task_model(owner)
+        sid = hd.create_session(f"nexus:screen:{task_id}", model=run_model)
+        hd.publish_session_scope(sid, user=owner)
+        hd.publish_session_key(sid, owner, run_model)
+        try:
+            res = hd.stream_turn(sid, prompt, max_seconds=900)
+        finally:
+            try:
+                hd.delete_session(sid)
+            except Exception:
+                pass
+        out = (res.get("content") or "").strip()
+        if res.get("error") and not out:
+            raise RuntimeError(f"screen turn failed: {str(res['error'])[:200]}")
+        usage = res.get("usage") or {}
+        tokens = int(usage.get("total_tokens")
+                     or (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0))
+        try:
+            db.record_frontier_run(kind="judge_screen", model=run_model, tokens=tokens,
+                                   cost_usd=db.glm_cost_estimate(tokens, run_model),
+                                   source="stream", task_id=task_id,
+                                   workflow_id=(task or {}).get("workflow_id"),
+                                   user_id=owner)
+        except Exception:
+            pass
+        try:
+            m = _ev.parse_judge_metrics(out)
+        except Exception:
+            m = {}
+        verdict = m.get("verdict")
+        findings = m.get("findings") or []
+        blockers = [f for f in findings if f.get("severity") in ("critical", "high")]
+        if verdict == "REVISE" and not blockers:
+            verdict = "SHIP"  # notes-only REVISE = accept-with-notes
+        if verdict not in ("SHIP", "REVISE"):
+            verdict = "SHIP" if out else "error"  # an unparseable screen never blocks
+        new_round = int((task or {}).get("judge_round") or 0) + 1
+        jkeys = None
+        if m.get("_keys"):
+            try:
+                old_keys = json.loads((task or {}).get("judge_keys") or "null") or {}
+            except Exception:
+                old_keys = {}
+            jkeys = json.dumps({"round": new_round, "keys": m.get("_keys") or [],
+                                "prev": old_keys.get("keys") or []})
+        db.execute("UPDATE tasks SET judge_verdict=?, judge_output=?, judge_ts=?, "
+                   "judge_round=?, judge_keys=COALESCE(?, judge_keys), "
+                   "judge_tier='screen' WHERE id=?",
+                   (verdict, ("[GLM SCREENING JUDGE]\n" + out)[-30000:], time.time(),
+                    new_round, jkeys, task_id))
+        if task and findings:
+            _insert_critic_comments(task, {"findings": findings}, source="judge")
+        db.log_activity("info", "judge",
+                        f"Screening judge on {task_id}: {verdict} "
+                        f"({len(blockers)} blocker(s), {len(findings)} finding(s), "
+                        f"{tokens:,} GLM tokens)", user_id=owner)
+        _broadcast_task_row(task_id, owner)
+    except Exception as e:
+        try:
+            db.execute(
+                "UPDATE tasks SET judge_verdict='error', "
+                "judge_output=COALESCE(judge_output,'')||?, judge_ts=?, "
+                "judge_tier='screen' WHERE id=? AND judge_verdict='running'",
+                (f"\n[screen thread crashed: {str(e)[:300]}]", time.time(), task_id))
+        except Exception:
+            pass
+        db.log_activity("error", "judge",
+                        f"Screening judge thread on {task_id} crashed: {str(e)[:160]}",
+                        user_id=owner)
+        _broadcast_task_row(task_id, owner)
 
 
 def _blind_reject_judge_if_wanted(task_id: str, feedback: str | None) -> bool:
@@ -5142,6 +5289,14 @@ async def run_judge(task_id: str, body: dict | None = None):
         return JSONResponse(status_code=409, content={"error": "judge already running"})
     db.execute("UPDATE tasks SET judge_verdict='running', judge_output=NULL, judge_ts=? WHERE id=?",
                (time.time(), task_id))
+    # Tier routing (2026-07-13): the loop passes tier='screen' for interior
+    # members on the sinks scope — one GLM turn instead of an Opus pass. The
+    # manual button never sends a tier and always gets the frontier judge.
+    if (body or {}).get("tier") == "screen":
+        threading.Thread(target=_screen_thread, args=(task_id, deliv, domain),
+                         daemon=True).start()
+        db.log_activity("info", "judge", f"GLM screening judge started on {task_id}")
+        return {"ok": True, "status": "running", "tier": "screen"}
     threading.Thread(target=_judge_thread, args=(task_id, deliv, domain), daemon=True).start()
     db.log_activity("info", "judge", f"Frontier judge started on {task_id}")
     return {"ok": True, "status": "running"}
@@ -5170,7 +5325,16 @@ def _insert_critic_comments(task: dict, parsed: dict, source: str = "critic") ->
     db.execute("DELETE FROM review_comments WHERE task_id=? AND status='open' AND source=?",
                (task_id, source))
     ws = task.get("workspace_path") or ""
-    ws_real = os.path.realpath(ws) if ws else ""
+    # Anchor roots (2026-07-13): workspace first, then the repo WORKTREE — a
+    # judge finding on a branch file (SPEC.md, src/…) previously had nothing to
+    # resolve against, so its anchor rode through unverified (or with a NULL
+    # line) and could never be checked against the file the review renders.
+    roots = [os.path.realpath(ws)] if ws and os.path.isdir(ws) else []
+    if task.get("repo_path"):
+        slug = (task.get("workflow_id") or task_id or "").replace("wf-", "").replace("task-", "")
+        wt_dir = os.path.join(task["repo_path"], ".worktrees", f"nexus-{slug}")
+        if os.path.isdir(wt_dir):
+            roots.append(os.path.realpath(wt_dir))
     n_open = db.query_one(
         "SELECT COUNT(*) AS n FROM review_comments WHERE task_id=? AND status='open'",
         (task_id,))["n"]
@@ -5182,12 +5346,14 @@ def _insert_critic_comments(task: dict, parsed: dict, source: str = "critic") ->
         fp = (str(f.get("file_path") or "").strip() or "deliverable.md")[:500]
         line_no = f.get("line_no")
         line_text = (f.get("line_text") or "").strip()
-        # Anchor validation: when the path resolves to a real file INSIDE the
-        # workspace, the quoted line must exist there (accept ±2 drift, take
-        # line_text from the REAL file) or the line anchor is dropped. Repo
-        # findings keep their repo-relative anchor as-is (nothing to resolve).
-        cand = os.path.realpath(os.path.join(ws, fp)) if ws else ""
-        if ws and cand.startswith(ws_real + os.sep) and os.path.isfile(cand):
+        # Anchor validation: when the path resolves to a real file inside the
+        # workspace OR the task's repo worktree, the quoted line must exist
+        # there (accept ±2 drift, take line_text from the REAL file) or the
+        # line anchor is dropped. Unresolvable paths keep their anchor as-is.
+        for root in roots:
+            cand = os.path.realpath(os.path.join(root, fp))
+            if not (cand.startswith(root + os.sep) and os.path.isfile(cand)):
+                continue
             if line_no is not None:
                 try:
                     with open(cand, errors="replace") as fh:
@@ -5209,6 +5375,7 @@ def _insert_critic_comments(task: dict, parsed: dict, source: str = "critic") ->
                     line_text = lines[match - 1]
                 else:
                     line_no = None  # keep the file anchor, drop the line
+            break  # first root that holds the file owns the validation
         sev = (f.get("severity") or "medium").upper()
         body = f"[{sev}] {f.get('problem') or ''}"
         if f.get("claim"):
@@ -5527,7 +5694,7 @@ async def run_escalation(task_id: str):
     task = _owned_task(task_id)
     if not task:
         return JSONResponse(status_code=404, content={"error": "task not found"})
-    if db.get_setting("super.escalation", "0") != "1":
+    if db.get_setting("super.escalation", "1") != "1":
         return JSONResponse(status_code=400,
                             content={"error": "escalated rework is off (settings super.escalation)"})
     deliv = os.path.join(task.get("workspace_path") or "", "deliverable.md")
@@ -6087,8 +6254,11 @@ def _retry_task(task_id: str, feedback: str | None, origin: str = "operator"):
             keep_session = n_prev == 0
     except OSError:
         keep_session = False
-    if ws and os.path.isdir(ws) and not task.get("repo_path"):
-        # review engine: each rework round becomes a comparable version
+    if ws and os.path.isdir(ws):
+        # review engine: each rework round becomes a comparable version. Repo
+        # tasks snapshot too since 2026-07-13 — their workspace (the report +
+        # changes.diff + artifacts) is the surface judge comments anchor to,
+        # and it previously had NO version history at all.
         import review as _review
         snap = _review.snapshot_workspace(ws)
         if snap:
@@ -10348,12 +10518,17 @@ import review as review_engine
 
 
 @app.get("/api/tasks/{task_id}/review")
-def task_review(task_id: str):
+def task_review(task_id: str, pair: str | None = None,
+                from_v: str | None = None, to_v: str | None = None):
+    """pair (repo tasks): 'round' (default when ≥2 rounds — what the latest
+    rework changed) | 'base' (whole branch vs fork point). from_v/to_v
+    (workspace tasks): compare any _history version pair (to_v='live' =
+    current). No params = the defaults, unchanged for single-round tasks."""
     task = _owned_task(task_id)
     if not task or not task.get("workspace_path"):
         return JSONResponse(status_code=404, content={"error": "task or workspace not found"})
     try:
-        return review_engine.build_task_review(task)
+        return review_engine.build_task_review(task, pair=pair, from_v=from_v, to_v=to_v)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"review failed: {str(e)[:200]}"})
 

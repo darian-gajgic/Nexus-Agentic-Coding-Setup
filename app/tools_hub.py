@@ -662,6 +662,32 @@ def get_usage(force: bool = False) -> dict:
     total_in = sum(p["input_tokens"] for p in providers)
     total_out = sum(p["output_tokens"] for p in providers)
 
+    # Quality loop (2026-07-13): the frontier judge/critic/escalation spend
+    # from the C3 ledger, as its own line — it bills the Claude subscription
+    # invisibly (it hid inside the Claude-Code transcript aggregate), yet it
+    # was 75%+ of frontier spend. Kinds: judge, judge_screen (GLM, $-cheap),
+    # critic, escalation, judge_eval, premortem.
+    quality_loop = {"kinds": {}, "total_usd": 0.0, "total_tokens": 0, "runs": 0,
+                    "per_day": []}
+    try:
+        import database as db
+        for r in db.query_all(
+                "SELECT kind, COUNT(*) AS n, COALESCE(SUM(tokens),0) AS tok, "
+                "COALESCE(SUM(cost_usd),0) AS usd FROM frontier_ledger GROUP BY kind"):
+            quality_loop["kinds"][r["kind"]] = {
+                "runs": int(r["n"]), "tokens": int(r["tok"]),
+                "usd": round(float(r["usd"] or 0), 4)}
+            quality_loop["total_usd"] += float(r["usd"] or 0)
+            quality_loop["total_tokens"] += int(r["tok"])
+            quality_loop["runs"] += int(r["n"])
+        quality_loop["total_usd"] = round(quality_loop["total_usd"], 4)
+        quality_loop["per_day"] = db.query_all(
+            "SELECT date(created_at,'unixepoch','localtime') AS day, "
+            "COALESCE(SUM(cost_usd),0) AS usd, COUNT(*) AS n "
+            "FROM frontier_ledger GROUP BY day ORDER BY day DESC LIMIT 14")
+    except Exception:
+        pass
+
     result = {
         "providers": providers,
         "totals": {
@@ -675,6 +701,7 @@ def get_usage(force: bool = False) -> dict:
         "per_model": {k: {**v, "cost": round(_cost(v["in"], v["out"], k), 4)}
                       for k, v in all_models.items()},
         "top_projects": [{"project": p, "tokens": t} for p, t in top_projects],
+        "quality_loop": quality_loop,
         "price_table": PRICE_TABLE,
         "generated_at": now,
         "cache_ttl": _USAGE_TTL,

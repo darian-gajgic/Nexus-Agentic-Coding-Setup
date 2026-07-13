@@ -4,6 +4,7 @@ Each agent can optionally work in its own git worktree + branch so parallel agen
 never stomp each other's files (the amux isolation pattern).
 """
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -164,5 +165,30 @@ def capture_diff(wt_path: str, base: str) -> str:
     if code != 0:
         return ""
     code2, stat = _run_git(wt_path, "diff", "--stat", f"{base}...HEAD", "--",
+                           ".", *_JUNK_PATHSPECS)
+    return (stat + "\n\n" + out) if code2 == 0 and stat else out
+
+
+def head_sha(wt_path: str) -> str | None:
+    """Current HEAD of the worktree — recorded per finalize so the review can
+    diff ROUND-over-round (rounds.json), not only branch-vs-base."""
+    code, out = _run_git(wt_path, "rev-parse", "HEAD")
+    return out.strip() if code == 0 and out.strip() else None
+
+
+def capture_diff_between(wt_path: str, sha_a: str, sha_b: str) -> str:
+    """Round-over-round review diff (2026-07-13): two recorded finalize SHAs of
+    the SAME task branch (two-dot — an exact A→B comparison, both commits ours).
+    The branch-vs-base diff shows spec-stage work as 100% additions forever;
+    this is the 'what did the rework actually change' view the operator asked
+    for. Junk paths excluded like capture_diff."""
+    if not re.fullmatch(r"[0-9a-f]{7,40}", sha_a or "") or \
+            not re.fullmatch(r"[0-9a-f]{7,40}", sha_b or ""):
+        return ""  # SHAs come only from rounds.json, but stay strict anyway
+    code, out = _run_git(wt_path, "diff", f"{sha_a}..{sha_b}", "--",
+                         ".", *_JUNK_PATHSPECS)
+    if code != 0:
+        return ""
+    code2, stat = _run_git(wt_path, "diff", "--stat", f"{sha_a}..{sha_b}", "--",
                            ".", *_JUNK_PATHSPECS)
     return (stat + "\n\n" + out) if code2 == 0 and stat else out

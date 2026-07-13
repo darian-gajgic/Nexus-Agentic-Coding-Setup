@@ -935,9 +935,13 @@ def golden_exemplars(task: dict) -> list[dict]:
     cutoff = time.time() - max_age_days * 86400
     # Fetch a bounded candidate pool (top-K = max×3), freshest first. client
     # narrows when the current task names one; otherwise any client of the domain.
+    # judge_tier guard (2026-07-13): a GLM screen SHIP is accept-with-notes,
+    # not a frontier quality signal — only frontier (or legacy pre-tier NULL)
+    # SHIPs qualify as the operator's quality bar.
     sql = ("SELECT id, rubric_score, completed_at, workspace_path, client, title "
            "FROM tasks WHERE judge_verdict='SHIP' AND domain=? AND user_id IS ? "
-           "AND id != ? AND workspace_path IS NOT NULL AND completed_at >= ?")
+           "AND id != ? AND workspace_path IS NOT NULL AND completed_at >= ? "
+           "AND COALESCE(judge_tier,'frontier') != 'screen'")
     params = [domain, uid, task.get("id"), cutoff]
     if client:
         sql += " AND client=?"
@@ -1735,6 +1739,27 @@ def _capture_repo_result(task: dict, workspace: Path, agent_id: str,
         db.log_activity("info", agent_id,
                         f"Task {task_id}: captured branch diff "
                         f"({len(diff.splitlines())} lines) from {repo_ctx['branch']}")
+        # Round memory for the review (2026-07-13): record this finalize's HEAD
+        # so "Review changes" can diff round-over-round (rounds.json) instead of
+        # only the cumulative branch-vs-base view, where a rework is invisible.
+        try:
+            sha = wt.head_sha(repo_ctx["worktree"])
+            if sha:
+                hist = workspace / "_history"
+                hist.mkdir(exist_ok=True)
+                rf = hist / "rounds.json"
+                try:
+                    rounds = json.loads(rf.read_text()) if rf.is_file() else []
+                    if not isinstance(rounds, list):
+                        rounds = []
+                except Exception:
+                    rounds = []
+                if not rounds or rounds[-1].get("head_sha") != sha:
+                    rounds.append({"round": len(rounds) + 1, "head_sha": sha,
+                                   "ts": time.time()})
+                    rf.write_text(json.dumps(rounds))
+        except Exception:
+            pass
         _copy_branch_artifacts(repo_ctx, workspace, agent_id, task_id)
     except Exception as e:
         db.log_activity("error", agent_id,

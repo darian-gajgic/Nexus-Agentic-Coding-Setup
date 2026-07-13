@@ -281,6 +281,10 @@ def init_db():
         # guard. Both reset ONLY on an operator reject (new version family).
         ("judge_round", "INTEGER DEFAULT 0"),
         ("judge_keys", "TEXT"),
+        # Which tier produced judge_verdict: 'frontier' (Opus cjudge) or
+        # 'screen' (GLM screening judge). A screen SHIP never counts as a
+        # frontier SHIP — exemplar selection and the sweep read this.
+        ("judge_tier", "TEXT"),
         # Budget honesty (2026-07-13): the budget as first derived at creation.
         # Retry slices and the rework ceiling (dispatch.rework_ceiling_mult)
         # compute from THIS, not from the silently-grown budget_tokens.
