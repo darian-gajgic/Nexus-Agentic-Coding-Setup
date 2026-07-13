@@ -320,3 +320,17 @@ line and startup restore guard it.
 - `rounds.json` SHAs can dangle if the operator prunes/rebases the task
   branch — `build_task_review` falls back to 'base' when the diff comes back
   empty; a stronger fix would validate SHAs with `git cat-file`.
+- **2026-07-13b additions** (post live bench-02 feedback + HITL research
+  sweep — sources: LangGraph Agent Inbox action types, GitHub review-state
+  model, OpenAI/Microsoft deterministic-escalation guidance): decision cards
+  now carry `task_ctx` (verdict + STALENESS + rounds + spend + blocking
+  findings, `_decision_card_from_approval`); stale verdicts (judge_ts <
+  completed_at — the verdict grades a PREVIOUS version) are marked on cards/
+  chips with a "Re-judge current version" action; ANY operator retry door
+  re-arms a closed family (reopen moved INTO `_retry_task` origin='operator');
+  request-changes is a real modal (`requestChangesModal`), plus a one-click
+  "Auto-fix round" (reject-no-feedback = findings auto-attach). Backlog from
+  the same research, NOT built: per-finding identity threads across rounds
+  (GitHub resolved-conversation model — [F#] keys exist, no thread UI);
+  an "Edit & ship" card action (operator fixes the artifact directly, then
+  approves — today: edit files manually, then Approve).

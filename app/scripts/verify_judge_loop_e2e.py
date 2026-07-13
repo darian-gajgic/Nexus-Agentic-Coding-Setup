@@ -310,6 +310,59 @@ try:
     ok("screen closure = accept-with-notes (closed, NO card)",
        not db.query_one("SELECT 1 FROM approvals WHERE status='pending' AND "
                         "payload LIKE ?", (f'%"task_id": "{t_scr}"%',)))
+    # 2026-07-13b: ANY operator retry door re-arms a closed family — observed
+    # live (bench-02 implement): a manual ↻ after the cap left the family
+    # closed, so the reworked version sat wearing a stale REVISE, unjudged.
+    t_rearm, ws_rearm = mk(judge_verdict="REVISE", judge_ts=time.time(),
+                           judge_round=4, judge_keys='{"round":4}',
+                           loop_config=json.dumps(cfg))
+    (ws_rearm / "deliverable.md").write_text("# R\n")
+    loc = le._locate_judge_cfg(t_rearm)
+    le._mutate_cfg_trigger(loc[0], loc[1], "judge_revise",
+                           lambda t2: le._set_judge_closed(t2, loc[2], True))
+    srv._retry_task(t_rearm, "operator wants a fresh try", origin="operator")
+    trig_r = json.loads(db.query_one("SELECT loop_config FROM tasks WHERE id=?",
+                                     (t_rearm,))["loop_config"])["triggers"][0]
+    row_r = db.query_one("SELECT judge_round, judge_keys FROM tasks WHERE id=?", (t_rearm,))
+    ok("operator ↻ retry re-arms a closed family (marker + round + keys reset)",
+       not le._judge_closed(trig_r, None) and row_r["judge_round"] == 0
+       and row_r["judge_keys"] is None)
+
+    # ── 6b. preview runner: crashed-state surfacing + package launch ──
+    print("=== 6b. preview crash surfacing + package detection ===")
+    import app_runner as ar
+    probe_ws = tmp / "prevws"
+    probe_ws.mkdir()
+    (probe_ws / "_preview.log").write_text("boom line 1\nModuleNotFoundError: x\n")
+    with ar._lock:
+        reg = ar._load()
+        reg["gateprobe:x:y"] = {"task_id": "gateprobe:x:y", "pid": 999999983,
+                                "port": 1, "type": "python", "label": "gate probe",
+                                "url": "http://127.0.0.1:1",
+                                "workspace": str(probe_ws),
+                                "started_at": time.time(), "expires_at": time.time() + 60}
+        ar._save(reg)
+    try:
+        inst = ar.instances("gateprobe:")
+        ok("dead-pid preview surfaces as state='crashed' WITH the log tail "
+           "(was silently skipped → 'not working, no error')",
+           len(inst) == 1 and inst[0]["state"] == "crashed"
+           and "ModuleNotFoundError" in (inst[0].get("log_tail") or ""),
+           str(inst)[:120])
+    finally:
+        ar.stop_app("gateprobe:x:y")
+    pkg_ws = tmp / "pkgws"
+    (pkg_ws / "app").mkdir(parents=True)
+    (pkg_ws / "app" / "__init__.py").write_text("")
+    (pkg_ws / "app" / "main.py").write_text(
+        "from fastapi import FastAPI\napp = FastAPI()\n")
+    (pkg_ws / "requirements.txt").write_text("fastapi\nuvicorn\n")
+    det = ar.detect_app(str(pkg_ws))
+    ok("package-shaped ASGI app detected: module launch from the ROOT + root "
+       "requirements (was `python main.py` in the subdir → relative-import crash)",
+       det and det["type"] == "python" and det.get("module") == "app.main"
+       and det.get("asgi") == "app" and det.get("run_dir") == str(pkg_ws)
+       and (det.get("reqs") or "").endswith("requirements.txt"), str(det))
 
     # ── 7. exemplar guard: screen SHIPs never qualify ──
     print("=== 7. screen tier guards ===")

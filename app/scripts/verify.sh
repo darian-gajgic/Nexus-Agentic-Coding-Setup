@@ -599,6 +599,13 @@ chk "CR#26: dev specialists single source" "grep -q '_DEV_SPECIALISTS' server.py
 # gates exist and are wired
 chk "judge-loop gate present"         "[ -f scripts/verify_judge_loop_e2e.py ] && grep -q 'judge_pregate' scripts/verify_judge_loop_e2e.py"
 chk "judge-loop spec committed"       "[ -f docs/SPEC-JUDGE-LOOP.md ] && grep -q 'INVARIANTS' docs/SPEC-JUDGE-LOOP.md && grep -q 'SPEC-JUDGE-LOOP' CLAUDE.md"
+# 2026-07-13b — decision-card UX + operator re-arm + preview robustness
+chk "operator retry re-arms the family" "grep -q 'reopen_judge_loop(task_id)' server.py && grep -B2 'reopen_judge_loop(task_id)' server.py | grep -q 'operator'"
+chk "decision cards carry task context" "grep -q 'task_ctx' server.py && grep -q 'task_ctx' static/app.js && grep -q 'verdict_stale' static/app.js"
+chk "request-changes modal (no prompt())" "grep -q 'function requestChangesModal' static/app.js && grep -q 'decideAutoRound' static/app.js && ! grep -q \"prompt('Rejecting\" static/app.js"
+chk "stale-verdict marking"           "grep -q 'from a previous version' static/app.js && grep -q 'Re-judge current version' static/app.js"
+chk "preview: crashed state surfaced" "grep -q \"'crashed'\" app_runner.py && grep -q 'log_tail' app_runner.py && grep -q 'crashed_at' app_runner.py"
+chk "preview: package/ASGI launch"    "grep -q 'run_dir' app_runner.py && grep -q -- '-m uvicorn' app_runner.py && grep -q '__init__.py' app_runner.py"
 
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
