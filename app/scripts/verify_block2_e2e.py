@@ -200,8 +200,13 @@ def main():
        owner.get(f"/api/tasks/{tid}/review/comments").json()["open"] == 0)
     ok("consumed comment refuses edits", owner.patch(
         f"/api/tasks/{tid}/review/comments/{cid}", json={"body": "x"}).status_code == 409)
-    ok("workspace snapshot NOT taken for repo tasks (branch diff is the review)",
-       not (ws / "_history").exists())
+    # 2026-07-13 (judge-loop overhaul): repo tasks now DO snapshot on retry —
+    # the workspace report (deliverable.md) is the surface judge findings
+    # anchor to, and the review renders it as a diffed Report entry that needs
+    # a previous-round comparison base.
+    ok("workspace snapshot IS taken for repo tasks (feeds the report diff)",
+       (ws / "_history").exists()
+       and any(d.name.startswith("v") for d in (ws / "_history").iterdir()))
 
     # workspace-mode review (no repo): versions + highlight from real files
     tid2, ws2 = seed_task()

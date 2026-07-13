@@ -564,6 +564,41 @@ chk "C5: escalation trigger threshold setting" "grep -q 'super.escalation_trigge
 # rule 12 — JARVIS framing documents the new OS surface (ledger + escalated rework)
 chk "rule12: JARVIS knows the cost ledger + escalated rework" "grep -q 'COST LEDGER (Appendix C3)' server.py && grep -q 'ESCALATED REWORK (Appendix C1c)' server.py && grep -q '/api/tasks/ID/escalate' server.py"
 
+echo -e "${YELLOW}═══ 22. JUDGE-LOOP OVERHAUL (2026-07-13) ═══${NC}"
+# 1.1 — verdict recalibration lives in BOTH cjudge copies (vendored + installed)
+chk "cjudge: refute scoped + anti-nitpick" "grep -q 'scoped to FACTUAL CLAIMS' ../setup/bin/cjudge && grep -q 'scoped to FACTUAL CLAIMS' \$HOME/.local/bin/cjudge && grep -q 'do not manufacture findings' ../setup/bin/cjudge"
+chk "cjudge: SHIP-with-notes verdict rule" "grep -q 'BLOCKERS are only' ../setup/bin/cjudge && grep -q 'SHIP when zero blockers exist' \$HOME/.local/bin/cjudge && grep -q 'UNVERIFIABLE-HERE' ../setup/bin/cjudge"
+chk "cjudge: numbered fix-list brief + DELTA block" "grep -q 'NUMBERED fix-list' ../setup/bin/cjudge && grep -q 'DELTA RE-JUDGE round' ../setup/bin/cjudge && grep -q 'criteria set is FROZEN' \$HOME/.local/bin/cjudge"
+chk "cjudge copies byte-identical" "diff -q ../setup/bin/cjudge \$HOME/.local/bin/cjudge >/dev/null"
+chk "rubrics carry the judge-scoping note" "grep -q 'Frontier-judge scoping (2026-07-13)' ~/knowledge/rubrics/INVESTIGATION.md && grep -q 'Frontier-judge scoping (2026-07-13)' ../setup/knowledge/rubrics/INVESTIGATION.md"
+# 1.2/1.3 — worker evidence contract + deterministic pre-gate
+chk "worker gate-evidence contract"   "grep -q 'Gate evidence' hermes_dispatch.py && grep -q 'QUALITY GATE' hermes_dispatch.py"
+chk "judge pre-gate wired"            "grep -q 'def judge_pregate' evals.py && grep -q 'judge_pregate' loop_engine.py && grep -q '\"judge.pregate\"' settings_registry.py"
+# 2.x — delta re-judge, hard caps, closure
+chk "delta re-judge plumbing"         "grep -q 'JUDGE_PRIOR' evals.py && grep -q '_build_judge_prior' server.py && grep -q '\"judge.delta_rejudge\"' settings_registry.py"
+chk "judge round state columns"       "grep -q '\"judge_round\"' database.py && grep -q '\"judge_keys\"' database.py && grep -q '\"judge_tier\"' database.py"
+chk "judge hard cap + closure card"   "grep -q '\"judge.max_runs\"' settings_registry.py && grep -q '_close_judge_loop' loop_engine.py && grep -q 'reopen_judge_loop' loop_engine.py"
+chk "judge thread crash-safe + reaper" "grep -q 'judge thread crashed' server.py && grep -q '_sweep_stale_frontier' loop_engine.py"
+chk "rework continue-session"         "grep -q 'rework: bool = False' hermes_dispatch.py && grep -q 'Rework round for task' hermes_dispatch.py && grep -q '\"dispatch.rework_continue_session\"' settings_registry.py"
+chk "retry targeted-revision contract" "grep -q 'Fixes applied' hermes_dispatch.py && grep -q 'TARGETED REVISION' hermes_dispatch.py"
+# 3.x — mode ladder, screen, budgets, visibility
+chk "three-tier judge scope"          "grep -q '\"optimal\": \"sinks\"' autopilot.py && grep -q 'def _judge_tier' loop_engine.py && grep -q 'def _is_sink' loop_engine.py"
+chk "GLM screening judge"             "grep -q 'def _screen_thread' server.py && grep -q '\"judge.screen\"' settings_registry.py && grep -q 'judge_screen' tools_hub.py"
+chk "screen SHIP never authorizes"    "grep -q \"COALESCE(judge_tier,'frontier') != 'screen'\" hermes_dispatch.py"
+chk "frontier cost cap"               "grep -q '\"frontier.task_cost_cap_usd\"' settings_registry.py && grep -q '_frontier_cost_capped' loop_engine.py"
+chk "escalation ladder armed"         "grep -Eq '\"super.escalation\".*$' settings_registry.py && grep -A2 '\"key\": \"super.escalation\",' settings_registry.py | grep -q '\"default\": \"1\"'"
+chk "honest budgets: slice + ceiling + card" "grep -q '\"dispatch.retry_slice_frac\"' settings_registry.py && grep -q '\"dispatch.rework_ceiling_mult\"' settings_registry.py && grep -q \"action_type='budget'\" server.py && grep -q '\"budget_original\"' database.py"
+chk "cost visibility (chip + ledger line + usage panel)" "grep -q 'frontier_cost_usd' static/app.js && grep -q 'td-truecost' static/app.js && grep -q 'quality_loop' tools_hub.py && grep -q 'Quality Loop' static/app.js"
+# 4.x — review round-over-round + findings panel
+chk "review round pairs"              "grep -q 'def capture_diff_between' worktree.py && grep -q 'rounds.json' hermes_dispatch.py && grep -q 'def repo_rounds' review.py"
+chk "review report entry + findings panel" "grep -q 'def _report_entry' review.py && grep -q 'rvFindingsHTML' static/app.js && grep -q 'rvSelectPair' static/app.js"
+chk "repo-aware comment anchors"      "grep -q 'the repo WORKTREE' server.py"
+# regression guards for the two already-fixed code-review findings (#6/#26)
+chk "CR#6: retry clears stale stop flag" "grep -q 'cancel_requested=NULL' server.py"
+chk "CR#26: dev specialists single source" "grep -q '_DEV_SPECIALISTS' server.py && grep -q 'DEV_SPECIALISTS' routing.py"
+# gates exist and are wired
+chk "judge-loop gate present"         "[ -f scripts/verify_judge_loop_e2e.py ] && grep -q 'judge_pregate' scripts/verify_judge_loop_e2e.py"
+
 echo ""
 echo -e "${YELLOW}══════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then

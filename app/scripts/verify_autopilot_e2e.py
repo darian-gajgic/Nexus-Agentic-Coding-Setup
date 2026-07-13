@@ -66,12 +66,22 @@ chk("rule6 Smart round cap == 3", smart["round_cap"] == 3)
 chk("rule4 budget multiplier ×0.5/×1/×2",
     eco["budget"] == 500_000 and opt["budget"] == 1_000_000 and smart["budget"] == 2_000_000)
 chk("involvement flips mode (full_auto/assisted closed, manual open)",
-    smart["mode"] == "closed" and opt["sr_mode"] == "open" and eco["mode"] == "open")
+    smart["mode"] == "closed" and eco["mode"] == "open")
+# 2026-07-13: assisted sr_mode open→closed — SR fix-rounds close, humans are
+# pulled in only at TERMINAL checkpoints (cap/convergence/error/escalation);
+# open-per-round checkpoints were why SR ran once ever. Manual stays open.
+chk("assisted SR closes fix-rounds; manual keeps every round open",
+    opt["sr_mode"] == "closed" and ap.derive("manual", "optimal")["sr_mode"] == "open")
 chk("rule3 Eco model floor DERIVED (C2/Phase 7): Eco→easy tier, Opt/Smart none",
     eco.get("model_floor") == "easy" and opt.get("model_floor") is None
     and smart.get("model_floor") is None and "model_floor" not in eco.get("staged", {}))
-chk("P2 forward-deps staged (plan_recommend); escalation derives when on",
-    "plan_recommend" in eco.get("staged", {}))
+# 2026-07-13: both forward-deps now DERIVE — plan_recommend (dead
+# deep_plan.enabled key fixed → plan.deep_enabled, default on) and the
+# escalation thresholds (super.escalation armed by default).
+chk("P2 forward-deps derive: plan_recommend + escalation thresholds",
+    eco.get("plan_recommend") == "never" and opt.get("plan_recommend") == "triage"
+    and eco.get("escalation") == "off" and opt.get("escalation") == "rewrite"
+    and smart.get("escalation") == "rewrite_or_cap")
 
 print("=== Q7a — design_loop derivation (rule 2 hard floor) ===")
 c_smart = le.design_loop("workflow", {"title": "Aud", "domain": "marketing", "super_result": True,
@@ -460,11 +470,33 @@ db.execute("INSERT INTO approvals (id, agent_id, action_type, description, paylo
            (json.dumps({"task_id": "aa-hs"}), old_ts, uid))
 _cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE id IN ('aa-ok','aa-hs')"))
 _cleanup.append(lambda: db.execute("DELETE FROM approvals WHERE id IN ('aa-appr-ok','aa-appr-hs')"))
+# 2026-07-13 semantics fix: the setting was structurally dead (the ONLY
+# 'deliverable' approvals were high-stakes finalize gates and the sweep
+# excluded exactly those). Now Full-Auto + a FRONTIER judge SHIP auto-approves
+# after the window, high-stakes included; what still never auto-approves:
+# REVISE closure cards (verdict gate), screen-tier SHIPs, and SR tasks.
+db.execute("INSERT OR REPLACE INTO tasks (id, title, status, user_id, autopilot, high_stakes, "
+           "judge_verdict, judge_tier) VALUES ('aa-scr','AA-SCR','review',?, 'full_auto',0,'SHIP','screen')", (uid,))
+db.execute("INSERT OR REPLACE INTO tasks (id, title, status, user_id, autopilot, high_stakes, "
+           "judge_verdict, super_result) VALUES ('aa-sr','AA-SR','review',?, 'full_auto',0,'SHIP',1)", (uid,))
+db.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
+           "risk_level, requested_at, user_id) VALUES ('aa-appr-scr','a','deliverable','d',?,'pending','high',?,?)",
+           (json.dumps({"task_id": "aa-scr"}), old_ts, uid))
+db.execute("INSERT INTO approvals (id, agent_id, action_type, description, payload, status, "
+           "risk_level, requested_at, user_id) VALUES ('aa-appr-sr','a','deliverable','d',?,'pending','high',?,?)",
+           (json.dumps({"task_id": "aa-sr"}), old_ts, uid))
+_cleanup.append(lambda: db.execute("DELETE FROM tasks WHERE id IN ('aa-scr','aa-sr')"))
+_cleanup.append(lambda: db.execute("DELETE FROM approvals WHERE id IN ('aa-appr-scr','aa-appr-sr')"))
 le._sweep_auto_approve_ship()
 ok = db.query_one("SELECT status FROM approvals WHERE id='aa-appr-ok'")["status"]
 hs = db.query_one("SELECT status FROM approvals WHERE id='aa-appr-hs'")["status"]
+scr = db.query_one("SELECT status FROM approvals WHERE id='aa-appr-scr'")["status"]
+sr_st = db.query_one("SELECT status FROM approvals WHERE id='aa-appr-sr'")["status"]
 chk("Q7b Full-Auto SHIP non-high-stakes auto-approved after hours", ok == "approved")
-chk("rule2 high-stakes NEVER auto-approved (still pending)", hs == "pending")
+chk("Full-Auto frontier-SHIP high-stakes auto-approves after the window "
+    "(2026-07-13 semantics fix — the setting was structurally dead)", hs == "approved")
+chk("screen-tier SHIP never auto-approves", scr == "pending")
+chk("Super Result tasks never auto-approve via this sweep", sr_st == "pending")
 try:
     dd = get("/api/decisions")
     body = dd.json()
