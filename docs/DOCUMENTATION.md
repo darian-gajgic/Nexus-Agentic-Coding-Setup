@@ -83,6 +83,11 @@ where it currently falls short.
 
 ## 2. Architecture
 
+> 🛰️ **Graphic version:** `docs/ARCHITECTURE.html` — a detailed visual
+> schematic of everything in this section (layer stack, task lifecycle,
+> dispatch state machine, quality cascade, voice pipeline). Open it in any
+> browser; it is self-contained.
+
 ```
 ┌─────────────────────────────  YOUR MACHINE  ─────────────────────────────┐
 │                                                                          │
@@ -883,6 +888,7 @@ The queue as of 2026-07-15, in dependency order:
 | `app/` | The Nexus control plane — THE live working tree (`~/nexus-agent-os` symlinks here) |
 | `setup/` | The complete Hermes environment: configs, agents, skills, plugins, guardian, systemd, infra, knowledge base, bridge CLIs |
 | `docs/DOCUMENTATION.md` | **This document** |
+| `docs/ARCHITECTURE.html` | The architecture as a detailed graphic schematic (self-contained HTML) |
 | `docs/archive/` | Implementation plans/reports and audits (judge loop, Super Result, Quality Autopilot, Deep Plan, security sweeps…) |
 | `benchmarks/` | bench-01, bench-02-webshop, bench-03-marketing, judge-loop-ab, added-value |
 | `install.sh` / `setup/install.sh` | Nexus-only installer / full Hermes-environment installer |

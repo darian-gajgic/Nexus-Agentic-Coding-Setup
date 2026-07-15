@@ -1,0 +1,559 @@
+<title>Nexus Agent OS + Hermes — Architecture</title>
+<style>
+  :root{
+    --bg:#F2F5F9; --panel:#FFFFFF; --panel2:#E9EEF5; --ink:#182432; --muted:#5B6C80;
+    --line:#CBD6E2; --line2:#DCE4EC;
+    --cyan:#0B7D93; --blue:#2160C4; --amber:#8F6508; --green:#1F7D4D; --violet:#6D4FC9;
+    --red:#C24747; --slate:#5B6C80;
+    --chipbg:#FFFFFF;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0A101C; --panel:#111A2B; --panel2:#0D1524; --ink:#E4ECF7; --muted:#8DA2BB;
+      --line:#243349; --line2:#1B2839;
+      --cyan:#43D6EC; --blue:#7AB0FF; --amber:#EFC368; --green:#67D9A0; --violet:#B69CFF;
+      --red:#F08484; --slate:#8DA2BB;
+      --chipbg:#0D1524;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0A101C; --panel:#111A2B; --panel2:#0D1524; --ink:#E4ECF7; --muted:#8DA2BB;
+    --line:#243349; --line2:#1B2839;
+    --cyan:#43D6EC; --blue:#7AB0FF; --amber:#EFC368; --green:#67D9A0; --violet:#B69CFF;
+    --red:#F08484; --slate:#8DA2BB;
+    --chipbg:#0D1524;
+  }
+  :root[data-theme="light"]{
+    --bg:#F2F5F9; --panel:#FFFFFF; --panel2:#E9EEF5; --ink:#182432; --muted:#5B6C80;
+    --line:#CBD6E2; --line2:#DCE4EC;
+    --cyan:#0B7D93; --blue:#2160C4; --amber:#8F6508; --green:#1F7D4D; --violet:#6D4FC9;
+    --red:#C24747; --slate:#5B6C80;
+    --chipbg:#FFFFFF;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
+    font-size:15px; line-height:1.5;
+  }
+  .mono, code{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-variant-numeric:tabular-nums;
+  }
+  .wrap{max-width:1260px;margin:0 auto;padding:0 24px 64px}
+
+  /* ── Masthead ─────────────────────────────────────────── */
+  .masthead{
+    position:relative; overflow:hidden;
+    border-bottom:1px solid var(--line);
+    padding:44px 0 30px; margin-bottom:26px;
+  }
+  .masthead::before{
+    content:""; position:absolute; inset:0; pointer-events:none; opacity:.5;
+    background:
+      radial-gradient(1.4px 1.4px at 12% 30%, var(--cyan) 45%, transparent 55%),
+      radial-gradient(1px 1px   at 26% 72%, var(--muted) 45%, transparent 55%),
+      radial-gradient(1.2px 1.2px at 41% 22%, var(--violet) 45%, transparent 55%),
+      radial-gradient(1px 1px   at 57% 60%, var(--muted) 45%, transparent 55%),
+      radial-gradient(1.5px 1.5px at 70% 28%, var(--cyan) 45%, transparent 55%),
+      radial-gradient(1px 1px   at 83% 70%, var(--muted) 45%, transparent 55%),
+      radial-gradient(1.2px 1.2px at 93% 36%, var(--violet) 45%, transparent 55%);
+  }
+  .masthead .inner{position:relative}
+  .eyebrow{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--cyan);
+    margin:0 0 10px;
+  }
+  h1{
+    margin:0 0 10px; font-size:clamp(26px,4vw,38px); line-height:1.12;
+    letter-spacing:-.015em; font-weight:750; text-wrap:balance;
+  }
+  .sub{max-width:68ch; color:var(--muted); margin:0 0 18px}
+  .metachips{display:flex; flex-wrap:wrap; gap:8px}
+  .mchip{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:11.5px; padding:4px 10px; border:1px solid var(--line);
+    border-radius:999px; color:var(--muted); background:var(--chipbg); white-space:nowrap;
+  }
+  .mchip b{color:var(--ink); font-weight:600}
+
+  /* ── Legend ───────────────────────────────────────────── */
+  .legend{display:flex; flex-wrap:wrap; gap:14px 22px; margin:0 0 22px; align-items:center}
+  .lg{display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted)}
+  .sw{width:11px; height:11px; border-radius:3px; flex:none}
+
+  /* ── Diagram frame ────────────────────────────────────── */
+  .diagram-scroll{overflow-x:auto; padding-bottom:6px}
+  .diagram{
+    display:grid; grid-template-columns:158px minmax(660px,1fr) 218px;
+    gap:16px; min-width:1080px; align-items:start;
+  }
+  .railtitle{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:10.5px; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--muted); margin:0 0 12px;
+  }
+
+  /* left lifecycle rail */
+  .steps{display:flex; flex-direction:column; gap:0; position:sticky; top:14px}
+  .step{display:grid; grid-template-columns:24px 1fr; gap:9px; padding:0 0 18px; position:relative}
+  .step::before{
+    content:""; position:absolute; left:11px; top:26px; bottom:2px; width:1px;
+    background:var(--line);
+  }
+  .step:last-child::before{display:none}
+  .fbn{
+    width:23px; height:23px; border-radius:50%; flex:none; z-index:1;
+    display:flex; align-items:center; justify-content:center;
+    border:1px solid var(--cyan); color:var(--cyan); background:var(--bg);
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:11.5px;
+  }
+  .step h5{margin:2px 0 2px; font-size:12.5px; font-weight:650; letter-spacing:.01em}
+  .step p{margin:0; font-size:11.5px; color:var(--muted); line-height:1.4}
+
+  /* right ops rail */
+  .oprail{display:flex; flex-direction:column; gap:10px; position:sticky; top:14px}
+  .opcard{
+    border:1px solid var(--line); border-radius:8px; background:var(--panel);
+    padding:10px 12px;
+  }
+  .opcard h5{
+    margin:0 0 5px; font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    color:var(--slate); font-weight:600;
+  }
+  .opcard p{margin:0; font-size:11.5px; color:var(--muted); line-height:1.45}
+  .opcard p b{color:var(--ink); font-weight:600}
+
+  /* center stack */
+  .stack{display:flex; flex-direction:column}
+  .band{
+    border:1px solid var(--line); border-radius:10px; background:var(--panel);
+    padding:13px 14px 14px;
+  }
+  .band-head{display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin:0 0 10px}
+  .band-head .bcat{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:10.5px; letter-spacing:.18em; text-transform:uppercase; font-weight:600;
+  }
+  .band-head .btitle{font-size:14.5px; font-weight:700; letter-spacing:-.01em}
+  .band-head .bnote{
+    font-size:11.5px; color:var(--muted); margin-left:auto;
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+  }
+  .band-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(196px,1fr)); gap:9px}
+  .node{
+    border:1px solid var(--line2); border-radius:7px; background:var(--panel2);
+    padding:9px 11px 10px; min-width:0;
+  }
+  .node h4{
+    margin:0 0 4px; font-size:12.5px; font-weight:650;
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    display:flex; align-items:center; gap:7px; letter-spacing:0;
+  }
+  .node h4 .dot{width:7px; height:7px; border-radius:50%; flex:none}
+  .node p{margin:0; font-size:11.5px; color:var(--muted); line-height:1.45}
+  .node p b{color:var(--ink); font-weight:600}
+  .fb{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:16px; height:16px; border-radius:50%; margin-left:auto; flex:none;
+    border:1px solid var(--cyan); color:var(--cyan); font-size:10px; font-weight:600;
+  }
+  .wide{grid-column:1/-1}
+
+  /* connectors between bands */
+  .conn{display:flex; flex-direction:column; align-items:center; padding:2px 0}
+  .conn .stem{width:1px; height:11px; background:var(--line)}
+  .conn .lbl{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:10.5px; color:var(--muted); border:1px solid var(--line); background:var(--chipbg);
+    border-radius:999px; padding:3px 12px; margin:1px 0; max-width:96%;
+    text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .conn .arr{color:var(--muted); font-size:10px; line-height:1; margin-top:1px}
+
+  /* tier split band */
+  .split{display:grid; grid-template-columns:1fr 1fr; gap:9px}
+  @media (max-width:1100px){ .split{grid-template-columns:1fr} }
+
+  /* ── Insets ───────────────────────────────────────────── */
+  .insets{display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; margin-top:30px}
+  .inset{border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:14px 15px 16px}
+  .inset>h3{margin:0 0 3px; font-size:14px; font-weight:700; letter-spacing:-.01em}
+  .inset>.isub{
+    margin:0 0 12px; font-size:11.5px; color:var(--muted);
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+  }
+  .srow{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:8px}
+  .st{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:11px; padding:3px 9px; border-radius:999px; border:1px solid var(--line);
+    background:var(--panel2); color:var(--ink); white-space:nowrap;
+  }
+  .st.term{border-style:dashed}
+  .sarr{color:var(--muted); font-size:11px}
+  .slbl{font-size:11px; color:var(--muted); width:100%; margin:-2px 0 4px 2px}
+  .cascade{display:flex; flex-direction:column; gap:0}
+  .crow{display:grid; grid-template-columns:26px 1fr auto; gap:9px; align-items:start; padding:0 0 12px; position:relative}
+  .crow::before{content:""; position:absolute; left:12px; top:24px; bottom:0; width:1px; background:var(--line)}
+  .crow:last-child::before{display:none}
+  .cn{
+    width:24px; height:24px; border-radius:6px; display:flex; align-items:center; justify-content:center;
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:10.5px; z-index:1; border:1px solid var(--line); background:var(--panel2);
+  }
+  .crow h6{margin:2px 0 1px; font-size:12px; font-weight:650}
+  .crow p{margin:0; font-size:11px; color:var(--muted); line-height:1.4}
+  .cost{
+    font-family:"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,ui-monospace,monospace;
+    font-size:10px; letter-spacing:.08em; text-transform:uppercase; margin-top:4px; white-space:nowrap;
+  }
+
+  /* footer */
+  .foot{
+    margin-top:34px; padding-top:16px; border-top:1px solid var(--line);
+    font-size:12px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px 24px;
+  }
+  .foot code{font-size:11px}
+
+  /* color helpers */
+  .c-cyan{color:var(--cyan)} .c-blue{color:var(--blue)} .c-amber{color:var(--amber)}
+  .c-green{color:var(--green)} .c-violet{color:var(--violet)} .c-slate{color:var(--slate)}
+  .b-cyan{background:var(--cyan)} .b-blue{background:var(--blue)} .b-amber{background:var(--amber)}
+  .b-green{background:var(--green)} .b-violet{background:var(--violet)} .b-slate{background:var(--slate)}
+
+  a{color:var(--cyan)}
+  a:focus-visible{outline:2px solid var(--cyan); outline-offset:2px; border-radius:3px}
+  @media (prefers-reduced-motion: reduce){ *{transition:none!important; animation:none!important} }
+</style>
+
+<header class="masthead">
+  <div class="wrap inner">
+    <p class="eyebrow">Nexus-Agentic-Coding-Setup · System Schematic</p>
+    <h1>Nexus Agent OS + Hermes — Architecture</h1>
+    <p class="sub">A self-hosted AI-agent operating system: the Nexus control plane plans, queues,
+      budgets, and quality-gates the work; the Hermes engine executes it with specialized agents;
+      a local GPU substrate keeps memory, voice, and vision on the machine. Companion to
+      <span class="mono">docs/DOCUMENTATION.md</span>.</p>
+    <div class="metachips">
+      <span class="mchip">2026-07-16</span>
+      <span class="mchip"><b>248</b> API routes</span>
+      <span class="mchip"><b>32</b> DB tables</span>
+      <span class="mchip"><b>24</b> UI views</span>
+      <span class="mchip"><b>18</b> specialists</span>
+      <span class="mchip"><b>~80</b> skills</span>
+      <span class="mchip"><b>8</b> core-mods</span>
+      <span class="mchip"><b>488</b> verify checks</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="legend" role="list" aria-label="Color legend">
+    <span class="lg" role="listitem"><span class="sw b-cyan"></span>Nexus control plane</span>
+    <span class="lg" role="listitem"><span class="sw b-blue"></span>Hermes execution</span>
+    <span class="lg" role="listitem"><span class="sw b-amber"></span>Frontier judgment tier (metered $)</span>
+    <span class="lg" role="listitem"><span class="sw b-green"></span>Local AI substrate (GPU)</span>
+    <span class="lg" role="listitem"><span class="sw b-violet"></span>Memory &amp; vectors</span>
+    <span class="lg" role="listitem"><span class="sw b-slate"></span>State &amp; integrity</span>
+    <span class="lg" role="listitem"><span class="fbn" style="width:18px;height:18px;font-size:10px">n</span>&nbsp;task-lifecycle step</span>
+  </div>
+
+  <div class="diagram-scroll">
+  <div class="diagram">
+
+    <!-- ── LEFT RAIL: lifecycle ── -->
+    <aside>
+      <p class="railtitle">Task lifecycle</p>
+      <div class="steps">
+        <div class="step"><span class="fbn">1</span><div><h5>Describe</h5><p>Wizard v3 or Deep&nbsp;Plan interview → SPEC + pipeline DAG</p></div></div>
+        <div class="step"><span class="fbn">2</span><div><h5>Route</h5><p>Autopilot preset (involvement × spend) + model auto-routing</p></div></div>
+        <div class="step"><span class="fbn">3</span><div><h5>Claim</h5><p>Agent lane atomic CAS claim, per-model slots</p></div></div>
+        <div class="step"><span class="fbn">4</span><div><h5>Execute</h5><p>One Hermes session per task; budgets, quota backoff, orphan harvest</p></div></div>
+        <div class="step"><span class="fbn">5</span><div><h5>Deliver</h5><p>Workspace deliverable or repo branch diff; versioned rounds</p></div></div>
+        <div class="step"><span class="fbn">6</span><div><h5>Verify</h5><p>Pre-gate → GLM screen / frontier judge → bounded rework rounds</p></div></div>
+        <div class="step"><span class="fbn">7</span><div><h5>Decide</h5><p>Decision card → approve / reject-with-feedback; human merges</p></div></div>
+      </div>
+    </aside>
+
+    <!-- ── CENTER: the stack ── -->
+    <div class="stack">
+
+      <!-- operator layer -->
+      <section class="band" aria-label="Operator layer">
+        <div class="band-head">
+          <span class="bcat c-slate">Operator</span>
+          <span class="btitle">Browser — single-page app, no build step</span>
+          <span class="bnote">HTTPS only · Tailscale-only remote</span>
+        </div>
+        <div class="band-grid">
+          <div class="node"><h4><span class="dot b-cyan"></span>SPA · app.js <span class="fb">1</span></h4>
+            <p><b>24 views</b> (kanban, workflows, deliverables, decisions, memory, settings…) · WebSocket live updates · in-place DOM patching · tours</p></div>
+          <div class="node"><h4><span class="dot b-cyan"></span>3D modules</h4>
+            <p>Memory galaxy (real PCA positions) · agent constellation · holographic avatar — three.js lazy-imported</p></div>
+          <div class="node"><h4><span class="dot b-green"></span>J.A.R.V.I.S voice UI</h4>
+            <p>Mic capture → streamed reply → lip-synced avatar · hands-free CONV mode · ⚡ deck mini-cards</p></div>
+          <div class="node"><h4><span class="dot b-slate"></span>Multi-user</h4>
+            <p>Cookie sessions (scrypt, hashed tokens) · login appears only at ≥2 users · per-user data scope</p></div>
+        </div>
+      </section>
+
+      <div class="conn" aria-hidden="true">
+        <span class="stem"></span>
+        <span class="lbl">HTTPS :8777 (self-signed TLS) · /ws live events · SSE chat stream</span>
+        <span class="arr">▼</span>
+      </div>
+
+      <!-- control plane -->
+      <section class="band" aria-label="Nexus control plane">
+        <div class="band-head">
+          <span class="bcat c-cyan">Control plane</span>
+          <span class="btitle">Nexus — FastAPI server.py</span>
+          <span class="bnote">:8777 · 248 routes + 2 WS · every request user-scoped</span>
+        </div>
+        <div class="band-grid">
+          <div class="node"><h4><span class="dot b-cyan"></span>server.py core</h4>
+            <p>Auth middleware → user contextvar · REST + WebSockets · static SPA host · JARVIS SSE proxy · internal-token loopback for automation</p></div>
+          <div class="node"><h4><span class="dot b-cyan"></span>Background engines</h4>
+            <p><b>loop_engine</b> 20s quality sweep · <b>watchdog</b> 10s self-heal &amp; cost caps · <b>scheduler</b> cron + task templates · metrics</p></div>
+          <div class="node"><h4><span class="dot b-cyan"></span>Planning <span class="fb">1</span></h4>
+            <p><b>plan_engine</b> Deep Plan (interview → SPEC → premortem → revise) · wizard v3 + pipeline repair</p></div>
+          <div class="node"><h4><span class="dot b-cyan"></span>Presets &amp; routing <span class="fb">2</span></h4>
+            <p><b>autopilot</b> involvement × spend → all quality knobs · <b>routing</b> purpose tiers, “Best for” overrides, telemetry</p></div>
+          <div class="node"><h4><span class="dot b-amber"></span>Quality plumbing <span class="fb">6</span></h4>
+            <p><b>evals</b> pre-gate, judge/critic/escalation runners, frontier cost ledger · <b>review</b> PR-style diffs + anchored comments</p></div>
+          <div class="node"><h4><span class="dot b-violet"></span>Learning</h4>
+            <p><b>lessons</b> distillation → knowledge deltas (approval-gated) · <b>feedback_log</b> WINS/LESSONS → framing · <b>agent_memory</b> 4 scopes</p></div>
+          <div class="node"><h4><span class="dot b-green"></span>Media</h4>
+            <p><b>voice</b> TTS/STT client · <b>vision</b> visual memory · <b>dictation</b> + MeetingMode · <b>jarvis_brain</b> domain packs</p></div>
+          <div class="node"><h4><span class="dot b-slate"></span>Ops &amp; config</h4>
+            <p><b>settings_registry</b> 13 sections / ~133 keys · <b>secrets_store</b> Fernet credentials · <b>app_runner</b>/<b>project_preview</b> “Test app”</p></div>
+        </div>
+      </section>
+
+      <div class="conn" aria-hidden="true">
+        <span class="stem"></span>
+        <span class="lbl">SQLite WAL · atomic compare-and-swap claims · workspace files</span>
+        <span class="arr">▼</span>
+      </div>
+
+      <!-- state -->
+      <section class="band" aria-label="State layer">
+        <div class="band-head">
+          <span class="bcat c-slate">State</span>
+          <span class="btitle">Single source of truth</span>
+          <span class="bnote">nexus.db + filesystem</span>
+        </div>
+        <div class="band-grid">
+          <div class="node"><h4><span class="dot b-slate"></span>nexus.db</h4>
+            <p><b>32 tables</b> — tasks (+ dispatch_state, judge/critic rounds), dispatches, workflows, users, approvals, frontier_ledger, plan_sessions, review_comments…</p></div>
+          <div class="node"><h4><span class="dot b-slate"></span>workspaces/&lt;task-id&gt;/ <span class="fb">5</span></h4>
+            <p>deliverable.md + files · <b>_history/vN</b> version snapshots · <b>_judge/round-N.json</b> · changes.diff for repo tasks</p></div>
+          <div class="node"><h4><span class="dot b-violet"></span>~/knowledge</h4>
+            <p>Business brain: 10 domain PLAYBOOK+RUBRIC pairs · WINS/LESSONS ledgers · eval cases · onboarding-rendered, git-tracked</p></div>
+          <div class="node"><h4><span class="dot b-slate"></span>Secrets</h4>
+            <p>secret.key (0600) + Fernet-encrypted credentials table · machine keys in ~/.hermes/.env — never in git</p></div>
+        </div>
+      </section>
+
+      <div class="conn" aria-hidden="true">
+        <span class="stem"></span>
+        <span class="lbl">worker lanes poll every 2s · claim → dispatch → finalize</span>
+        <span class="arr">▼</span>
+      </div>
+
+      <!-- lanes -->
+      <section class="band" aria-label="Execution lanes">
+        <div class="band-head">
+          <span class="bcat c-cyan">Execution lanes</span>
+          <span class="btitle">One OS subprocess per agent</span>
+          <span class="bnote">restart-safe by design</span>
+        </div>
+        <div class="band-grid">
+          <div class="node"><h4><span class="dot b-cyan"></span>worker.py × N <span class="fb">3</span></h4>
+            <p>Priority ladder: resume/harvest own dispatch → queued → unblocked → claim new · per-model slot gate · drain posture before restarts</p></div>
+          <div class="node"><h4><span class="dot b-cyan"></span>hermes_dispatch.py <span class="fb">4</span></h4>
+            <p>Session per task · framing: playbook, exemplars, attachments, dep deliverables, WINS/LESSONS, repo code-map · budgets &amp; quota · orphan-harvest ladder · rework continues its session</p></div>
+          <div class="node"><h4><span class="dot b-blue"></span>worktree.py (repo tasks)</h4>
+            <p>Branch <span class="mono">nexus/&lt;slug&gt;</span> in an isolated worktree · snapshot commits · three-dot diff capture · operator checkout never touched</p></div>
+        </div>
+      </section>
+
+      <div class="conn" aria-hidden="true">
+        <span class="stem"></span>
+        <span class="lbl">HTTP + SSE :8642 · bridges: session-keys.json (model + effort) · model-efforts.json</span>
+        <span class="arr">▼</span>
+      </div>
+
+      <!-- hermes -->
+      <section class="band" aria-label="Hermes engine">
+        <div class="band-head">
+          <span class="bcat c-blue">Execution engine</span>
+          <span class="btitle">Hermes Agent — gateway + sessions</span>
+          <span class="bnote">:8642 · pinned v0.18.0 @ 048270fa</span>
+        </div>
+        <div class="band-grid">
+          <div class="node"><h4><span class="dot b-blue"></span>Gateway &amp; sessions</h4>
+            <p>Sessions persist in state.db and <b>survive client death</b> — finished orphans are harvested, zero token waste</p></div>
+          <div class="node"><h4><span class="dot b-blue"></span>18 specialists</h4>
+            <p>5 dev-pipeline (tech-lead → implementer → reviewer → debugger → acceptance-verifier) + 13 business/creative · each reads its domain playbook, owns private mem0 lessons</p></div>
+          <div class="node"><h4><span class="dot b-blue"></span>~80 skills · 6 plugins</h4>
+            <p>Quality gates, research, creative, MLOps, productivity skills · plugins: zai provider, brave_context, local_reader, mem0-client, specialist_router, wayland_portal</p></div>
+          <div class="node"><h4><span class="dot b-blue"></span>Tools</h4>
+            <p>terminal · files · browser (playwright MCP) · <b>serena</b> LSP symbol navigation · <b>context7</b> live library docs · web search/extract</p></div>
+          <div class="node wide"><h4><span class="dot b-slate"></span>Guardian core-mods ×8</h4>
+            <p>mem0 per-agent scoping (×3) · specialist delegation binding · langfuse reasoning capture · <b>session-model-api-server</b> (keystone of model routing) · Z.AI prompt-fingerprint reword · <b>session-run-stop</b> (the ⏹ button)</p></div>
+        </div>
+      </section>
+
+      <div class="conn" aria-hidden="true">
+        <span class="stem"></span>
+        <span class="lbl">execution turns → Z.AI cloud · judgment subprocesses → claude CLI · memory → local substrate</span>
+        <span class="arr">▼</span>
+      </div>
+
+      <!-- model tiers -->
+      <section class="band" aria-label="Model tiers">
+        <div class="band-head">
+          <span class="bcat c-blue">Model tiers</span>
+          <span class="btitle">Two currencies, one ledger</span>
+          <span class="bnote">API-equivalent $ tracked per task</span>
+        </div>
+        <div class="split">
+          <div class="node"><h4><span class="dot b-blue"></span>Execution — Z.AI GLM (flat-rate)</h4>
+            <p><b>glm-5.2</b> complicated + all dev stages (hard floor) · <b>glm-5.1</b> easy · <b>glm-4.5-air</b> mechanical · <b>glm-5-turbo</b> overload fallback · per-task reasoning effort (medium→xhigh) · 429/1305 storm backoff</p></div>
+          <div class="node"><h4><span class="dot b-amber"></span>Judgment — Anthropic via claude CLI (metered)</h4>
+            <p><b>cjudge</b> rubric judge · <b>cverify</b> grounded critic · <b>cexec</b> escalated rework · <b>cspec</b> premortem · cimprove / cdistill · seeded Opus 4.8 · per-task $ cap (default $3 × profile) → frontier_ledger</p></div>
+        </div>
+      </section>
+
+      <div class="conn" aria-hidden="true">
+        <span class="stem"></span>
+        <span class="lbl">shared 12 GB VRAM — gpu_lock flock arbitration · worker kill-on-idle is the VRAM guarantee</span>
+        <span class="arr">▼</span>
+      </div>
+
+      <!-- local substrate -->
+      <section class="band" aria-label="Local AI substrate">
+        <div class="band-head">
+          <span class="bcat c-green">Local substrate</span>
+          <span class="btitle">On-machine AI services</span>
+          <span class="bnote">loopback-bound · manual-start</span>
+        </div>
+        <div class="band-grid">
+          <div class="node"><h4><span class="dot b-violet"></span>qdrant :6333</h4>
+            <p>Docker, server mode · <b>mem0</b> collection (768-dim dense + BM25 sparse) · <b>jarvis_vision</b> frames</p></div>
+          <div class="node"><h4><span class="dot b-green"></span>ollama ×3 roles</h4>
+            <p>llama3.1:8b + nomic-embed (mem0 extraction/embedding) · qwen3-vl:8b (vision describe) · gemma3:4b on :11435 (dictation cleanup)</p></div>
+          <div class="node"><h4><span class="dot b-green"></span>Speech</h4>
+            <p>ONE faster-whisper <b>large-v3</b> STT worker (killable subprocess, CUDA→CPU self-heal) · Piper TTS on CPU — zero VRAM</p></div>
+          <div class="node"><h4><span class="dot b-green"></span>Sight</h4>
+            <p>Wav2Lip lip-sync (~/ml-env CUDA) · SigLIP so400m + RapidOCR ingest · SDXL-Turbo image generation</p></div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- ── RIGHT RAIL: integrity & ops ── -->
+    <aside class="oprail">
+      <p class="railtitle" style="margin-bottom:2px">Cross-cutting</p>
+      <div class="opcard"><h5 class="c-slate">hermes-guardian</h5>
+        <p>SHA-256 manifest over every customization · <b>8 core-mod patches</b> · drift detected &amp; repaired (15-min timer) · <span class="mono">hermes update</span> survivable</p></div>
+      <div class="opcard"><h5 class="c-slate">systemd (user)</h5>
+        <p>nexus · hermes-gateway · guardian / reflect / prune timers · <b>manual-start posture</b>: nothing at boot, <span class="mono">nexus-up</span> starts the stack</p></div>
+      <div class="opcard"><h5 class="c-slate">Verify gates</h5>
+        <p><b>488</b> static checks, pre-commit enforced · ~20 runtime e2e suites (dispatch, judge loop, multiuser, UI, JARVIS…)</p></div>
+      <div class="opcard"><h5 class="c-slate">Security</h5>
+        <p>Loopback-only + HTTPS · Tailscale-only remote · tirith pre-exec hook fail-closed · no command auto-approval · esc() everywhere</p></div>
+      <div class="opcard"><h5 class="c-slate">Observability</h5>
+        <p>Langfuse (optional, self-hosted) traces · Usage &amp; Cost view · honest API-equivalent cost ledgers</p></div>
+      <div class="opcard"><h5 class="c-amber">Learning loop</h5>
+        <p>reflect timer drafts specialist lessons · WINS/LESSONS ride into future framings · eval corpus + cimprove · routing telemetry tunes tiers — <b>every write human-approved</b></p></div>
+    </aside>
+
+  </div>
+  </div>
+
+  <!-- ── INSETS ── -->
+  <div class="insets">
+
+    <section class="inset" aria-label="Dispatch state machine">
+      <h3>Dispatch state machine</h3>
+      <p class="isub">tasks.dispatch_state — orthogonal to the kanban board</p>
+      <div class="srow">
+        <span class="st">none</span><span class="sarr">→</span>
+        <span class="st">queued</span><span class="sarr">→</span>
+        <span class="st">dispatching</span><span class="sarr">→</span>
+        <span class="st">streaming</span><span class="sarr">→</span>
+        <span class="st">finalizing</span><span class="sarr">→</span>
+        <span class="st term" style="border-color:var(--green);color:var(--green)">completed</span>
+      </div>
+      <div class="srow">
+        <span class="slbl">exits from any active state:</span>
+        <span class="st term" style="border-color:var(--red);color:var(--red)">failed</span>
+        <span class="st term" style="border-color:var(--amber);color:var(--amber)">blocked_quota</span>
+        <span class="st term" style="border-color:var(--amber);color:var(--amber)">blocked_budget</span>
+        <span class="st term">cancelled</span>
+      </div>
+      <p style="font-size:11.5px;color:var(--muted);margin:8px 0 0">
+        Heartbeat stale &gt;90s → the lane resumes via the orphan ladder:
+        <b>active</b> = wait &amp; refresh · <b>finished</b> = harvest from session history ·
+        <b>dead</b> = supersede with a continue-turn. Runaway only at 2× the turn cap;
+        blocked states self-clear and retry. <span class="mono">completed</span> finalizes to
+        kanban <b>review</b> (high-stakes) or <b>done</b>.</p>
+    </section>
+
+    <section class="inset" aria-label="Quality cascade">
+      <h3>Quality cascade — cheap → expensive</h3>
+      <p class="isub">loop_engine sweep, every 20s · SPEC-JUDGE-LOOP.md</p>
+      <div class="cascade">
+        <div class="crow"><span class="cn">0</span><div><h6>Closed-family / hard caps</h6><p>Operator-closed? judge_round ≥ max_runs (4)? frontier $ cap?</p></div><span class="cost c-green">free</span></div>
+        <div class="crow"><span class="cn">1</span><div><h6>Deterministic pre-gate</h6><p>Stub/short deliverable, &lt;2 headings, TBD/TODO, empty repo diff → free retry with fix list</p></div><span class="cost c-green">free</span></div>
+        <div class="crow"><span class="cn">2</span><div><h6>Tier resolution</h6><p>high-stakes/smart → frontier · eco → none · Balanced → frontier for sinks, GLM screen for interior stages</p></div><span class="cost c-green">free</span></div>
+        <div class="crow"><span class="cn" style="border-color:var(--blue);color:var(--blue)">3</span><div><h6>GLM screen</h6><p>One cheap turn, same verdict contract; can never block on its own failure</p></div><span class="cost c-blue">~¢</span></div>
+        <div class="crow"><span class="cn" style="border-color:var(--amber);color:var(--amber)">4</span><div><h6>Frontier judge (cjudge)</h6><p><b>SHIP</b>-with-notes / <b>REVISE</b> / <b>REWRITE</b> vs stage contract + domain rubric; findings → anchored comments</p></div><span class="cost c-amber">$</span></div>
+        <div class="crow"><span class="cn" style="border-color:var(--amber);color:var(--amber)">5</span><div><h6>Bounded rework</h6><p>Round 1 continues the original session (“Fixes applied” echo); round ≥2 fresh + <b>delta re-judge</b> (fix-list + diff, criteria frozen)</p></div><span class="cost c-amber">$$</span></div>
+        <div class="crow"><span class="cn" style="border-color:var(--red);color:var(--red)">6</span><div><h6>Closure</h6><p>Convergence (keys ⊆ prev) | round cap | $ cap → ONE decision card; reject re-arms a new version family. Super Result replaces 2–6 with the sandboxed critic + Opus escalation</p></div><span class="cost c-slate">human</span></div>
+      </div>
+    </section>
+
+    <section class="inset" aria-label="JARVIS voice turn">
+      <h3>J.A.R.V.I.S voice turn</h3>
+      <p class="isub">all local except the LLM reply</p>
+      <div class="srow">
+        <span class="st">🎙 mic</span><span class="sarr">→</span>
+        <span class="st">/api/jarvis/stt</span><span class="sarr">→</span>
+        <span class="st" style="border-color:var(--green);color:var(--green)">faster-whisper</span>
+      </div>
+      <div class="srow">
+        <span class="sarr">→</span><span class="st" style="border-color:var(--blue);color:var(--blue)">Hermes /chat/stream</span>
+        <span class="sarr">+</span><span class="st" style="border-color:var(--violet);color:var(--violet)">brain framing (~/knowledge)</span>
+      </div>
+      <div class="srow">
+        <span class="sarr">→</span><span class="st">sentence split</span><span class="sarr">→</span>
+        <span class="st" style="border-color:var(--green);color:var(--green)">Piper TTS</span><span class="sarr">+</span>
+        <span class="st" style="border-color:var(--green);color:var(--green)">Wav2Lip MP4</span>
+      </div>
+      <div class="srow">
+        <span class="sarr">→</span><span class="st">face &lt;video&gt; + voice &lt;audio&gt;</span>
+        <span class="st term">2-deep prefetch</span>
+      </div>
+      <p style="font-size:11.5px;color:var(--muted);margin:8px 0 0">
+        Barge-in interrupts playback; CONV mode loops via silence-VAD. The avatar’s visemes are
+        text-aligned and gated by live RMS; idle workers are killed to reclaim VRAM.
+        Dictation reuses the same STT worker system-wide (hotkey → transcribe → LLM cleanup → type).</p>
+    </section>
+
+  </div>
+
+  <footer class="foot">
+    <span>Source of truth: <code>docs/DOCUMENTATION.md</code> · per-subsystem specs in <code>app/docs/</code></span>
+    <span>Repo: <code>Nexus-Agentic-Coding-Setup</code> · schematic generated 2026-07-16</span>
+  </footer>
+
+</div>
