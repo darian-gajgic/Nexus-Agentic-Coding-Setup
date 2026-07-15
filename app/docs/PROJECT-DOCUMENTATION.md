@@ -1,5 +1,12 @@
 # Nexus Agent OS + Hermes — Project Documentation
 
+> **SUPERSEDED (2026-07-15):** the canonical, current complete documentation
+> is the repo-root **`docs/DOCUMENTATION.md`** — it covers everything below
+> plus all systems shipped since 2026-07-07 (Super Result, Quality Autopilot,
+> Deep Plan mode, model auto-routing, the 2026-07-13 judge-loop overhaul,
+> agent memory, notes/meetings, benchmarks, and the honest strengths/
+> weaknesses assessment). This file is kept as the 2026-07-07 snapshot.
+
 *Complete reference, 2026-07-07. The in-app **User Manual** tab carries the
 plain-language version; this document is the engineering deep-dive.*
 

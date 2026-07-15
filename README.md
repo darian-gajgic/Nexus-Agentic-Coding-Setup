@@ -1,16 +1,27 @@
 # Nexus-Agentic-Coding-Setup
 
-Repo-native agentic coding for the Nexus + Hermes stack: point any kanban task
-(or a whole wizard pipeline) at an **existing client repository** and the
-pipeline works *inside* it — isolated git worktree, branch per pipeline, the
-repo's own conventions and test gates, and a reviewable **diff as the
-deliverable** — instead of scaffolding a fresh project in an empty workspace.
+The COMPLETE Nexus + Hermes project in one repository: the full **Nexus Agent
+OS** (`app/` — the live working tree of the running service) plus the entire
+**Hermes environment** (`setup/` — configs, 18 specialists, skills, plugins,
+guardian core-mod system, systemd units, qdrant infra, knowledge base), the
+installers, feature patches, benchmarks, and documentation.
 
-Built 2026-07-07 against the researched plan in
-`docs/HERMES-BIGPROJECT-CODING-PLAN.md` (Sourcegraph Big-Code practices,
-Claude Code context discipline, live audit of this install).
+**📖 Start here: [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)** — the
+complete system documentation: every feature and its architecture, how the
+tool works end to end, and an honest assessment of its added value,
+strengths, and weaknesses.
 
-## What it adds
+The repo began (2026-07-07) as the package for **repo-native agentic coding**
+— pointing kanban tasks or whole wizard pipelines at an *existing client
+repository*, so the pipeline works inside it: isolated git worktree, branch
+per pipeline, the repo's own conventions and test gates, and a reviewable
+**diff as the deliverable** instead of scaffolding a fresh workspace project.
+It has since grown into the canonical home of the whole project (see
+`CLAUDE.md`). The sections below document that original feature; it was built
+against the researched plan now archived at
+`docs/archive/HERMES-BIGPROJECT-CODING-PLAN.md`.
+
+## What the repo-native feature adds
 
 **Hermes side** (`patches/hermes-dev-specialists.patch`, already applied +
 committed in `~/.hermes/agents` @ e14fc20):
@@ -85,9 +96,13 @@ runtime data (nexus.db, workspaces, Hermes state.db).
   `nexus-repo-native-tasks.patch` applies on nexus-agent-os @ **01d7138**.
 - `files/` — copies of just the feature-changed files (review-friendly view;
   `app/` supersedes them for installation).
-- `scripts/refresh-app.sh` — re-snapshot this package from the live source
-  machine before pushing updates.
-- `docs/` — the research plan this implements.
+- `scripts/` — repo tooling (`refresh-app.sh` is RETIRED: since the
+  2026-07-09 unification `app/` IS the live working tree — edit + commit here
+  directly).
+- `benchmarks/` — the benchmark program (bench-01/02/03, judge-loop A/B,
+  added-value campaign).
+- `docs/` — `DOCUMENTATION.md` (the complete system documentation) plus
+  archived implementation plans, reports, and audits in `docs/archive/`.
 
 NOT in the package (by design): `nexus.db` and task workspaces (runtime data),
 TLS certs (generated per machine), JARVIS voice models (optional GPU stack —
