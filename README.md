@@ -9,7 +9,9 @@ installers, feature patches, benchmarks, and documentation.
 **📖 Start here: [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)** — the
 complete system documentation: every feature and its architecture, how the
 tool works end to end, and an honest assessment of its added value,
-strengths, and weaknesses.
+strengths, and weaknesses. **🛰️ [`docs/ARCHITECTURE.html`](docs/ARCHITECTURE.html)**
+is the companion graphic — the full architecture as a detailed visual
+schematic (open in any browser).
 
 The repo began (2026-07-07) as the package for **repo-native agentic coding**
 — pointing kanban tasks or whole wizard pipelines at an *existing client
