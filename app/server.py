@@ -2716,7 +2716,10 @@ async def remote_meeting_chunk(request: Request):
         return JSONResponse(status_code=400, content={"error": "empty chunk"})
     if len(blob) > 32 * 1024 * 1024:
         return JSONResponse(status_code=413, content={"error": "chunk too large"})
-    queued = sess.add_chunk(blob)
+    channel = request.headers.get("x-meeting-channel", "me")
+    if channel not in ("me", "client"):
+        return JSONResponse(status_code=400, content={"error": "channel must be me|client"})
+    queued = sess.add_chunk(blob, channel)
     return {"ok": True, "queued": queued, "turns": len(sess.turns)}
 
 

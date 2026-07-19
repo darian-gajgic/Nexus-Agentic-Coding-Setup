@@ -8,9 +8,16 @@ worker thread here decodes (ffmpeg), gates on a windowed energy VAD, and
 transcribes through the machine's ONE shared whisper into the SAME
 speaker-labeled live transcript format the Meetings tab already manages.
 
-Single-channel by nature ("Me" = whatever that device's mic hears) — for a
-call, speakers instead of a headset put both sides on the mic. A watchdog
-auto-finalizes the transcript when the feed dies (tab closed, laptop lid).
+TWO channels, mirroring the local MeetingMode: "me" chunks (the device's
+microphone) and optional "client" chunks (the device's SYSTEM audio, captured
+by the browser via the screen-share picker's "share system audio" — this is
+the only reliable way to get the other call participants: with a headset the
+mic never hears them, and with speakers the browser's echo cancellation
+actively removes them from the mic signal). Mic-only sessions still work —
+everything is "Me". No cross-channel bleed dedup here: mic AEC already
+suppresses the far end when a separate client channel exists, and chunk
+granularity (~15 s) is too coarse for the local overlap check to be sound.
+A watchdog auto-finalizes the transcript when the feed dies (tab closed).
 """
 from __future__ import annotations
 
@@ -97,11 +104,11 @@ class RemoteMeetingSession:
         self.log(f"remote meeting: -> {self.path} ({self.label})")
 
     # -- feed -----------------------------------------------------------------
-    def add_chunk(self, blob: bytes) -> int:
+    def add_chunk(self, blob: bytes, channel: str = "me") -> int:
         self.last_feed = time.time()
         self.chunks_seen += 1
         try:
-            self.q.put(blob, timeout=1.0)
+            self.q.put((channel, blob), timeout=1.0)
         except Full:   # never block the HTTP path; drop with a visible marker
             self._note("[chunk dropped — transcription backlog]")
             self.log("remote meeting: queue full — dropped a chunk")
@@ -114,7 +121,7 @@ class RemoteMeetingSession:
         lang = (sreg.conf("dictation.language") or "").strip() or None
         while not (self.stop_event.is_set() and self.q.empty()):
             try:
-                blob = self.q.get(timeout=0.3)
+                channel, blob = self.q.get(timeout=0.3)
             except Empty:
                 continue
             try:   # one bad chunk never kills the worker (local rule #5)
@@ -126,10 +133,11 @@ class RemoteMeetingSession:
                 t0 = time.time()
                 text = voice.transcribe_pcm(pcm, sample_rate=SR, language=lang,
                                             beam_size=beam, vad_filter=True)
-                self.log(f"remote meeting: {pcm.size / SR:.1f}s -> "
+                speaker = "Client" if channel == "client" else "Me"
+                self.log(f"remote meeting: [{speaker}] {pcm.size / SR:.1f}s -> "
                          f"{time.time() - t0:.2f}s -> {text[:60]!r}")
                 if text:
-                    self._append(text, start, end)
+                    self._append(speaker, text, start, end)
             except Exception as e:  # noqa: BLE001
                 self.log(f"remote meeting: chunk error ({e!r}) — worker continues")
 
@@ -141,14 +149,14 @@ class RemoteMeetingSession:
                 self.stop()
                 return
 
-    # -- transcript (single channel, paragraph on long pauses) ----------------
-    def _append(self, text: str, start: float, end: float):
-        if self.turns and self.turns[-1][0] == "Me" \
+    # -- transcript (speaker-labeled, paragraph on long pauses) ---------------
+    def _append(self, speaker: str, text: str, start: float, end: float):
+        if self.turns and self.turns[-1][0] == speaker \
                 and start - self.turns[-1][3] < PARAGRAPH_GAP_S:
             p = self.turns[-1]
-            self.turns[-1] = ("Me", p[1] + " " + text, p[2], end)
+            self.turns[-1] = (speaker, p[1] + " " + text, p[2], end)
         else:
-            self.turns.append(("Me", text, start, end))
+            self.turns.append((speaker, text, start, end))
         self._flush()
 
     def _note(self, text: str):
