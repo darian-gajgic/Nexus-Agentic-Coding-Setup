@@ -10427,10 +10427,12 @@ function startRemoteMeeting() {
     <div class="view-intro" style="margin-bottom:10px">
       <strong>🎙+🔊 Mic + other participants</strong> — the browser will show its <b>screen-share
       dialog: that is normal and required.</b> Browsers only release a PC's system audio through
-      that consent dialog — pick <b>Entire screen</b> (or the meeting tab) and tick
-      <b>“Also share system audio”</b>. <b>No video is recorded or uploaded</b> — Nexus keeps
-      only the audio. Your mic becomes <b>Me</b>, everything the PC plays (the other people)
-      becomes <b>Client</b>. A headset is fine in this mode.<br><br>
+      that consent dialog. In it, choose the <b>Entire screen</b> option — <b>NOT an app
+      window</b> (window shares have no audio checkbox at all) — and tick
+      <b>“Also share system audio”</b> at the bottom. <b>No video is recorded or uploaded</b> —
+      Nexus keeps only the audio. Your mic becomes <b>Me</b>, everything the PC plays (the other
+      people) becomes <b>Client</b>. A headset is fine in this mode.
+      ${/firefox/i.test(navigator.userAgent) ? '<br><b>⚠ This browser is Firefox — it cannot share system audio.</b> Use Chrome or Edge on this device for the Client channel; otherwise the recording falls back to open-mic speaker capture.' : ''}<br><br>
       <strong>🎙 Mic only</strong> — just this device's microphone (voice memo, in-room meeting).
       In a call it will NOT hear the other side.</div>
     <div class="modal-actions">
@@ -10446,19 +10448,34 @@ async function doStartRemote(withSystem) {
   let display = null, clientTracks = [];
   if (withSystem) {
     try {
-      // video:true is required for the picker; we record ONLY the audio tracks
-      display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      // video:true is required for the picker; we record ONLY the audio tracks.
+      // systemAudio:'include' makes Chrome/Edge offer the system-audio checkbox
+      // on the Entire-screen surface (unknown members are ignored elsewhere).
+      display = await navigator.mediaDevices.getDisplayMedia(
+        { video: true, audio: true, systemAudio: 'include' });
       clientTracks = display.getAudioTracks();
       if (!clientTracks.length) {
-        toast('No system audio was shared (did you tick “Also share system audio”?) — recording mic only', 'err', 7000);
+        toast('The share came back WITHOUT audio — that happens when an app window is picked '
+          + '(no audio checkbox), the checkbox stays unticked, or the browser can\'t share '
+          + 'system audio (Firefox; Linux entire-screen). Falling back to OPEN-MIC capture: '
+          + 'put the call on SPEAKERS and both sides will be heard.', 'err', 12000);
         display.getTracks().forEach(t => t.stop());
         display = null;
       }
-    } catch (e) { toast('Screen/audio share declined — recording mic only', 'err'); display = null; }
+    } catch (e) {
+      toast('Screen/audio share declined — falling back to open-mic capture: put the call on speakers', 'err', 8000);
+      display = null;
+    }
   }
+  // With a Client channel, the mic keeps its echo cancellation (it keeps the
+  // far end OFF the Me channel). Without one, AEC would ERASE the far end —
+  // so the fallback runs the mic wide open and relies on speakers.
+  const micConstraints = display || !withSystem
+    ? { audio: true }
+    : { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
   let mic;
   try {
-    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mic = await navigator.mediaDevices.getUserMedia(micConstraints);
   } catch (e) {
     if (display) display.getTracks().forEach(t => t.stop());
     toast('Microphone unavailable: ' + e.message, 'err');
@@ -10467,7 +10484,7 @@ async function doStartRemote(withSystem) {
   try {
     const label = (navigator.platform || 'browser')
       + (navigator.userAgent.includes('Windows') ? ' (Windows)' : '')
-      + (display ? ' · mic+system audio' : ' · mic only');
+      + (display ? ' · mic+system audio' : (withSystem ? ' · open-mic speaker capture' : ' · mic only'));
     const r = await api('POST', '/api/meetings/remote/start', { label });
     R.active = true; R.token = r.token; R.name = r.name; R.display = display; R.finishing = false;
     R.chans = [{ key: 'me', stream: mic, recorder: null, timer: null, stopped: false, dead: false }];
@@ -10484,7 +10501,8 @@ async function doStartRemote(withSystem) {
     }
     R.chans.forEach(remoteMeetCycle);
     toast(display ? 'Recording mic (Me) + system audio (Client) — live transcript appears in the list'
-      : 'Recording this device\'s mic — live transcript appears in the list', 'ok', 6000);
+      : (withSystem ? 'Recording with an OPEN mic — put the call on speakers; both sides land in the transcript'
+        : 'Recording this device\'s mic — live transcript appears in the list'), 'ok', 6000);
     meetState.fetched = false;
     setTimeout(() => { if (currentView === 'meetings') loadMeetings(); }, 1200);
   } catch (e) {
