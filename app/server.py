@@ -5,6 +5,7 @@ import json
 import uuid
 import base64
 import asyncio
+import secrets
 import threading
 from pathlib import Path
 
@@ -2635,14 +2636,16 @@ def _valid_meeting_name(name: str) -> bool:
 
 
 def _live_meeting_name() -> str | None:
-    if _dictation is None:
-        return None
     # [25]: single read — stop_meeting (a daemon thread) can NULL _meeting
     # between a check and a .path access, 500ing the Meetings endpoints
-    # exactly during the stop transition.
-    m = _dictation.manager._meeting
-    p = m.path if m is not None else None
-    return os.path.basename(p) if p else None
+    # exactly during the stop transition. Same rule for the remote session.
+    if _dictation is not None:
+        m = _dictation.manager._meeting
+        p = m.path if m is not None else None
+        if p:
+            return os.path.basename(p)
+    r = _remote_meeting
+    return r.name if r is not None else None
 
 
 @app.get("/api/dictation/status")
@@ -2663,6 +2666,71 @@ async def dictation_meeting_toggle():
     m = _dictation.manager
     reply = m.handle("toggle") if m.state == _dictation.MEETING else m.handle("meeting")
     return {"reply": reply, "state": m.state, "live": _live_meeting_name()}
+
+
+# ── Remote meetings: MeetingMode fed by the BROWSER's microphone, so a
+# meeting at another device (the Windows PC, a phone) records with THAT
+# device's mic and lands in the same Meetings tab. ──
+_remote_meeting = None                  # active dictation_remote session
+_remote_meeting_lock = threading.Lock()
+
+
+def _remote_meeting_closed(sess) -> None:
+    """on_close callback (stop endpoint OR watchdog auto-close)."""
+    global _remote_meeting
+    with _remote_meeting_lock:
+        if _remote_meeting is sess:
+            _remote_meeting = None
+
+
+@app.post("/api/meetings/remote/start")
+async def remote_meeting_start(body: dict | None = None):
+    global _remote_meeting
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    import dictation_remote
+    with _remote_meeting_lock:
+        if _remote_meeting is not None:
+            return JSONResponse(status_code=409, content={
+                "error": "a remote meeting is already recording",
+                "name": _remote_meeting.name})
+        label = str((body or {}).get("label") or "remote device")
+        sess = dictation_remote.RemoteMeetingSession(
+            label, lambda m: print(f"[dictation] {m}", flush=True),
+            on_close=_remote_meeting_closed)
+        _remote_meeting = sess
+    db.log_activity("info", "system", f"Remote meeting started ({sess.label}) → {sess.name}")
+    return {"name": sess.name, "token": sess.token}
+
+
+@app.post("/api/meetings/remote/chunk")
+async def remote_meeting_chunk(request: Request):
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    sess = _remote_meeting
+    token = request.headers.get("x-meeting-token", "")
+    if sess is None or not secrets.compare_digest(token, sess.token):
+        return JSONResponse(status_code=404, content={"error": "no matching remote meeting"})
+    blob = await request.body()
+    if not blob:
+        return JSONResponse(status_code=400, content={"error": "empty chunk"})
+    if len(blob) > 32 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": "chunk too large"})
+    queued = sess.add_chunk(blob)
+    return {"ok": True, "queued": queued, "turns": len(sess.turns)}
+
+
+@app.post("/api/meetings/remote/stop")
+async def remote_meeting_stop(request: Request):
+    if not auth.is_admin():
+        return JSONResponse(status_code=403, content={"error": "admin only"})
+    sess = _remote_meeting
+    token = request.headers.get("x-meeting-token", "")
+    if sess is None or not secrets.compare_digest(token, sess.token):
+        return JSONResponse(status_code=404, content={"error": "no matching remote meeting"})
+    await asyncio.to_thread(sess.stop)     # drains the transcription queue
+    db.log_activity("info", "system", f"Remote meeting saved → {sess.name}")
+    return {"name": sess.name}
 
 
 @app.get("/api/meetings")
