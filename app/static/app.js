@@ -10071,9 +10071,10 @@ async function previewDeliverable(taskId, name) {
 // ═══════════════════ MEETINGS (dictation MeetingMode transcripts) ═══════════════════
 const meetState = {
   list: null, fetched: false, live: null, dir: '', _poll: null,
-  // remote = "Record this device": browser-mic MeetingMode from ANY device.
+  // remote = "Record this device": browser-fed MeetingMode from ANY device —
+  // chans = per-channel recorders ('me' mic, optional 'client' system audio).
   // Recorder objects live here so view re-renders never touch them.
-  remote: { active: false, token: null, name: null, stream: null, recorder: null, timer: null },
+  remote: { active: false, token: null, name: null, chans: [], display: null, finishing: false },
 };
 
 async function loadMeetings(renderIfChanged = false) {
@@ -10369,11 +10370,11 @@ function viewMeetings() {
       </div>
     </div>`).join('');
   return `
-    <div class="view-intro" style="margin-bottom:12px">Dual-channel meeting transcripts — 🎤 <strong>Me</strong> (your mic) and 🔊 <strong>Client</strong> (whatever is playing, e.g. the call) — from dictation's MeetingMode. <strong>🌐 Record this device</strong> works from any browser (the Windows PC, a phone): it records with <em>that device's</em> microphone and the transcript lands here just the same. Assign a transcript to a project to unlock the smart buttons: 🧠 summary, 📋 requirements, 💾 memory, ✨ plan work from it. Files live in <code>${esc(meetState.dir)}</code>.</div>
+    <div class="view-intro" style="margin-bottom:12px">Dual-channel meeting transcripts — 🎤 <strong>Me</strong> (your mic) and 🔊 <strong>Client</strong> (whatever is playing, e.g. the call) — from dictation's MeetingMode. <strong>🌐 Record this device</strong> works from any browser (the Windows PC, a phone): <em>that device's</em> mic is 🎤 Me and — when you pick “share system audio” — everything that device plays (the other call participants) is 🔊 Client. Assign a transcript to a project to unlock the smart buttons: 🧠 summary, 📋 requirements, 💾 memory, ✨ plan work from it. Files live in <code>${esc(meetState.dir)}</code>.</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
       <button class="${live ? 'btn-ghost' : 'btn-primary'}" id="meetToggleBtn">${live ? '⏹ Stop meeting' : '● Start meeting'}</button>
       <button class="${meetState.remote.active ? 'btn-ghost' : 'btn-primary'}" id="meetRemoteBtn"
-        title="Record a meeting with THIS device's microphone (works from any browser — e.g. your Windows PC). In a call, use speakers rather than a headset so the mic hears both sides.">
+        title="Record a meeting from THIS browser (works on any device — e.g. your Windows PC): your mic = Me, and via 'share system audio' the other call participants = Client.">
         ${meetState.remote.active ? '⏹ Stop device recording' : '🌐 Record this device'}</button>
       ${live ? `<span class="chip c-red">recording → ${esc(live)}</span>` : ''}
       <button class="btn-ghost" onclick="meetState.fetched=false;render()">↻ Refresh</button>
@@ -10414,53 +10415,113 @@ function bindMeetings() {
 // timeslice blobs are undecodable on their own). ──
 const REMOTE_MEET_CYCLE_MS = 15000;
 
-async function startRemoteMeeting() {
+// The mic alone can NEVER capture the other call participants: a headset keeps
+// them off the mic physically, and with speakers the browser's echo
+// cancellation subtracts them from the mic signal. The "client" channel
+// therefore comes from SYSTEM audio via the screen-share picker ("also share
+// system/tab audio") — same Me/Client semantics as the local MeetingMode.
+function startRemoteMeeting() {
+  if (meetState.remote.active) return;
+  showModal(`
+    <h2>🌐 Record this device</h2>
+    <div class="view-intro" style="margin-bottom:10px">
+      <strong>🎙+🔊 Mic + other participants</strong> — the browser asks you to share your screen:
+      pick <b>Entire screen</b> (or the meeting tab) and tick <b>“Also share system audio”</b>.
+      Your mic becomes <b>Me</b>, everything the PC plays (the other people) becomes <b>Client</b>.
+      A headset is fine in this mode.<br><br>
+      <strong>🎙 Mic only</strong> — just this device's microphone (voice memo, in-room meeting).
+      In a call it will NOT hear the other side.</div>
+    <div class="modal-actions">
+      <button class="btn-primary" onclick="closeModal();doStartRemote(true)">🎙+🔊 Mic + other participants</button>
+      <button class="btn-ghost" onclick="closeModal();doStartRemote(false)">🎙 Mic only</button>
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+    </div>`);
+}
+
+async function doStartRemote(withSystem) {
   const R = meetState.remote;
   if (R.active) return;
-  let stream;
+  let display = null, clientTracks = [];
+  if (withSystem) {
+    try {
+      // video:true is required for the picker; we record ONLY the audio tracks
+      display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      clientTracks = display.getAudioTracks();
+      if (!clientTracks.length) {
+        toast('No system audio was shared (did you tick “Also share system audio”?) — recording mic only', 'err', 7000);
+        display.getTracks().forEach(t => t.stop());
+        display = null;
+      }
+    } catch (e) { toast('Screen/audio share declined — recording mic only', 'err'); display = null; }
+  }
+  let mic;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (e) { toast('Microphone unavailable: ' + e.message, 'err'); return; }
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    if (display) display.getTracks().forEach(t => t.stop());
+    toast('Microphone unavailable: ' + e.message, 'err');
+    return;
+  }
   try {
-    const label = (navigator.platform || 'browser') + (navigator.userAgent.includes('Windows') ? ' (Windows)' : '');
+    const label = (navigator.platform || 'browser')
+      + (navigator.userAgent.includes('Windows') ? ' (Windows)' : '')
+      + (display ? ' · mic+system audio' : ' · mic only');
     const r = await api('POST', '/api/meetings/remote/start', { label });
-    R.active = true; R.token = r.token; R.name = r.name; R.stream = stream;
-    toast('Recording this device\'s mic — the live transcript appears in the list', 'ok');
-    remoteMeetCycle();
+    R.active = true; R.token = r.token; R.name = r.name; R.display = display; R.finishing = false;
+    R.chans = [{ key: 'me', stream: mic, recorder: null, timer: null, stopped: false, dead: false }];
+    if (display) {
+      const ch = { key: 'client', stream: new MediaStream(clientTracks), recorder: null, timer: null, stopped: false, dead: false };
+      R.chans.push(ch);
+      // user hits the browser's own "Stop sharing" -> lose Client, keep Me
+      display.getVideoTracks()[0].onended = () => {
+        ch.dead = true;
+        if (ch.recorder && ch.recorder.state === 'recording') ch.recorder.stop();
+        else ch.stopped = true;
+        toast('System-audio share ended — other participants are no longer captured (mic continues)', 'err', 7000);
+      };
+    }
+    R.chans.forEach(remoteMeetCycle);
+    toast(display ? 'Recording mic (Me) + system audio (Client) — live transcript appears in the list'
+      : 'Recording this device\'s mic — live transcript appears in the list', 'ok', 6000);
     meetState.fetched = false;
     setTimeout(() => { if (currentView === 'meetings') loadMeetings(); }, 1200);
   } catch (e) {
-    stream.getTracks().forEach(t => t.stop());
+    mic.getTracks().forEach(t => t.stop());
+    if (display) display.getTracks().forEach(t => t.stop());
     toast('Could not start: ' + e.message, 'err');
   }
 }
 
-function remoteMeetCycle() {
+function remoteMeetCycle(ch) {
   const R = meetState.remote;
-  if (!R.active || !R.stream) return;
+  if (!R.active || ch.dead || !ch.stream) return;
   const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus'
     : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
-  const rec = new MediaRecorder(R.stream, mime ? { mimeType: mime } : {});
+  const rec = new MediaRecorder(ch.stream, mime ? { mimeType: mime } : {});
   const parts = [];
   rec.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
   rec.onstop = async () => {
-    if (parts.length) await uploadRemoteChunk(new Blob(parts, { type: rec.mimeType }));
-    if (R.active) remoteMeetCycle();          // next standalone-container cycle
-    else await finishRemoteMeeting();         // stop was requested: finalize
+    if (parts.length) await uploadRemoteChunk(new Blob(parts, { type: rec.mimeType }), ch.key);
+    if (R.active && !ch.dead) { remoteMeetCycle(ch); return; }  // next standalone container
+    ch.stopped = true;
+    if (!R.active) maybeFinishRemote();
   };
-  rec.onerror = e => { toast('Recorder error: ' + (e.error && e.error.message || 'unknown'), 'err'); stopRemoteMeeting(); };
-  R.recorder = rec;
+  rec.onerror = () => {
+    if (ch.key === 'me') { toast('Mic recorder error — recording stopped', 'err'); stopRemoteMeeting(); }
+    else { ch.dead = true; toast('System-audio recorder error — mic continues', 'err'); }
+  };
+  ch.recorder = rec;
   rec.start();
-  R.timer = setTimeout(() => { if (rec.state === 'recording') rec.stop(); }, REMOTE_MEET_CYCLE_MS);
+  ch.timer = setTimeout(() => { if (rec.state === 'recording') rec.stop(); }, REMOTE_MEET_CYCLE_MS);
 }
 
-async function uploadRemoteChunk(blob) {
+async function uploadRemoteChunk(blob, channel) {
   const R = meetState.remote;
   if (!R.token) return;
   try {
     const res = await fetch(API + '/api/meetings/remote/chunk', {
       method: 'POST', body: blob,
-      headers: { 'Content-Type': 'application/octet-stream', 'X-Meeting-Token': R.token },
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Meeting-Token': R.token, 'X-Meeting-Channel': channel },
     });
     if (res.status === 404) {                 // server restarted / watchdog closed it
       toast('The server closed this remote meeting (feed timeout or restart) — recording stopped', 'err');
@@ -10469,20 +10530,32 @@ async function uploadRemoteChunk(blob) {
   } catch { /* transient network blip — the next cycle retries; the server watchdog covers real loss */ }
 }
 
-async function stopRemoteMeeting() {
+function stopRemoteMeeting() {
   const R = meetState.remote;
   if (!R.active) return;
-  R.active = false;                           // onstop() of the last cycle finalizes
-  clearTimeout(R.timer);
-  if (R.recorder && R.recorder.state === 'recording') R.recorder.stop();
-  else await finishRemoteMeeting();
+  R.active = false;                           // each channel's last onstop reports in
+  R.chans.forEach(ch => {
+    clearTimeout(ch.timer);
+    if (ch.stopped) return;
+    if (ch.recorder && ch.recorder.state === 'recording') ch.recorder.stop();
+    else ch.stopped = true;
+  });
+  maybeFinishRemote();
+}
+
+function maybeFinishRemote() {
+  const R = meetState.remote;
+  if (R.active || R.finishing || !R.chans.every(c => c.stopped)) return;
+  R.finishing = true;
+  finishRemoteMeeting();
 }
 
 async function finishRemoteMeeting() {
   const R = meetState.remote;
-  if (R.stream) R.stream.getTracks().forEach(t => t.stop());
+  R.chans.forEach(ch => { if (ch.stream) ch.stream.getTracks().forEach(t => t.stop()); });
+  if (R.display) R.display.getTracks().forEach(t => t.stop());
   const token = R.token;
-  R.stream = R.recorder = R.timer = R.token = null;
+  R.chans = []; R.display = R.token = null;
   if (token) {
     try {
       const res = await fetch(API + '/api/meetings/remote/stop', {
