@@ -2396,20 +2396,23 @@ function settingItemHTML(it) {
   const id = 'sr-' + it.key.replace(/\./g, '-');
   const eff = it.effective !== undefined && it.effective !== '' ? it.effective : (it.default || '');
   let input;
+  const attrs = `class="form-select sr-item" id="${id}" data-key="${esc(it.key)}" onchange="saveSettingItem(this)"`;
   if (it.type === 'bool') {
     const opts = [['', `(default: ${eff === '1' ? 'on' : 'off'})`], ['1', 'on'], ['0', 'off']]
       .map(([v, t]) => `<option value="${v}" ${it.value === v ? 'selected' : ''}>${t}</option>`).join('');
-    input = `<select class="form-select sr-item" id="${id}" data-key="${esc(it.key)}">${opts}</select>`;
+    input = `<select ${attrs}>${opts}</select>`;
   } else if (it.type === 'int' || it.type === 'float') {
     input = `<input class="form-input sr-item" id="${id}" data-key="${esc(it.key)}" type="number"
+      onchange="saveSettingItem(this)"
       ${it.min !== undefined ? `min="${it.min}"` : ''} ${it.max !== undefined ? `max="${it.max}"` : ''}
       ${it.type === 'float' ? 'step="any"' : ''} value="${esc(it.value || '')}" placeholder="${esc(eff)}">`;
   } else if (it.type === 'enum') {
     const opts = [['', `(default: ${esc(eff)})`]].concat((it.options || []).map(o => [o, o]))
       .map(([v, t]) => `<option value="${esc(v)}" ${it.value === v ? 'selected' : ''}>${esc(t)}</option>`).join('');
-    input = `<select class="form-select sr-item" id="${id}" data-key="${esc(it.key)}">${opts}</select>`;
+    input = `<select ${attrs}>${opts}</select>`;
   } else {
     input = `<input class="form-input sr-item" id="${id}" data-key="${esc(it.key)}"
+      onchange="saveSettingItem(this)"
       value="${esc(it.value || '')}" placeholder="${esc(eff)}" spellcheck="false">`;
   }
   const badges = (it.restart ? ' <span class="muted" title="Applies after a service restart">↻ restart</span>' : '')
@@ -2754,18 +2757,38 @@ async function toggleUserActive(uid, active) {
   } catch { }
 }
 
-async function saveSettingsTab() {
-  const body = {};
-  // Generic registry inputs (Settings v2) — empty value = clear to default.
-  document.querySelectorAll('.sr-item').forEach(el => { body[el.dataset.key] = el.value; });
-  // Per-model concurrency + effort rows (hermes-route registry models).
-  for (const mo of hermesModels()) {
-    const mid = mo.model_id;
-    const cap = ($(`#st-cap-${CSS.escape(mid)}`) || {}).value;
-    body[`dispatch.max_concurrent.${mid}`] = cap ? String(Math.min(10, parseInt(cap) || 8)) : '';
-    body[`model.effort.${mid}`] = ($(`#st-eff-${CSS.escape(mid)}`) || {}).value || '';
-  }
+// One registry field saves ITSELF the moment it changes (blur/Enter/select) —
+// the bottom "Save all settings" button stays as a bulk path, but no typed
+// value ever depends on reaching it (values also died silently to background
+// re-renders while unsaved — this closes that whole class).
+async function saveSettingItem(el) {
+  const key = el.dataset.key, v = el.value;
+  const it = ((settingsState.schema || {}).sections || [])
+    .flatMap(s => s.items).find(i => i.key === key) || {};
   try {
+    await api('PATCH', '/api/settings', { [key]: v });
+    // Patch the cached schema so any re-render shows what was just saved.
+    if (it.key) {
+      it.value = v;
+      it.effective = v !== '' ? v : (it.default || it.effective);
+    }
+    toast(`${it.label || key} saved${v === '' ? ' — back to default' : ''}` +
+      `${it.restart ? ' · applies after a service restart' : ''}`, 'ok');
+  } catch (e) { toast(`${it.label || key}: save failed — ${e.message}`, 'err'); }
+}
+
+async function saveSettingsTab() {
+  try {
+    const body = {};
+    // Generic registry inputs (Settings v2) — empty value = clear to default.
+    document.querySelectorAll('.sr-item').forEach(el => { body[el.dataset.key] = el.value; });
+    // Per-model concurrency + effort rows (hermes-route registry models).
+    for (const mo of hermesModels()) {
+      const mid = mo.model_id;
+      const cap = ($(`#st-cap-${CSS.escape(mid)}`) || {}).value;
+      body[`dispatch.max_concurrent.${mid}`] = cap ? String(Math.min(10, parseInt(cap) || 8)) : '';
+      body[`model.effort.${mid}`] = ($(`#st-eff-${CSS.escape(mid)}`) || {}).value || '';
+    }
     await api('PATCH', '/api/settings', body);
     settingsState.fetched = false;
     toast('Settings saved', 'ok');
