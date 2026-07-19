@@ -10425,10 +10425,12 @@ function startRemoteMeeting() {
   showModal(`
     <h2>🌐 Record this device</h2>
     <div class="view-intro" style="margin-bottom:10px">
-      <strong>🎙+🔊 Mic + other participants</strong> — the browser asks you to share your screen:
-      pick <b>Entire screen</b> (or the meeting tab) and tick <b>“Also share system audio”</b>.
-      Your mic becomes <b>Me</b>, everything the PC plays (the other people) becomes <b>Client</b>.
-      A headset is fine in this mode.<br><br>
+      <strong>🎙+🔊 Mic + other participants</strong> — the browser will show its <b>screen-share
+      dialog: that is normal and required.</b> Browsers only release a PC's system audio through
+      that consent dialog — pick <b>Entire screen</b> (or the meeting tab) and tick
+      <b>“Also share system audio”</b>. <b>No video is recorded or uploaded</b> — Nexus keeps
+      only the audio. Your mic becomes <b>Me</b>, everything the PC plays (the other people)
+      becomes <b>Client</b>. A headset is fine in this mode.<br><br>
       <strong>🎙 Mic only</strong> — just this device's microphone (voice memo, in-room meeting).
       In a call it will NOT hear the other side.</div>
     <div class="modal-actions">
