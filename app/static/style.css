@@ -132,11 +132,13 @@ code, pre, .mono { font-family: var(--font-mono); }
 .sidebar-footer { padding:14px 18px 16px; border-top:1px solid var(--border); }
 .sys-mini { display:flex; flex-direction:column; gap:7px; }
 .mini-row { display:flex; align-items:center; gap:8px; font-size:10px; color:var(--text-faint); font-family:var(--font-mono); }
-.mini-row span:first-child { width:26px; letter-spacing:1px; }
+.mini-row span:first-child { width:48px; letter-spacing:1px; white-space:nowrap; }
 .mini-row b { width:34px; text-align:right; color:var(--text-dim); font-weight:500; }
 .mini-bar { flex:1; height:4px; background:var(--panel-3); border-radius:2px; overflow:hidden; }
 .mini-fill { height:100%; background:var(--grad); border-radius:2px; transition:width .5s; }
 .mini-fill.mem { background:linear-gradient(90deg,#5eead4,#22d3ee); }
+.mini-fill.gpu { background:linear-gradient(90deg,#4ade80,#a3e635); }
+.mini-fill.gpumem { background:linear-gradient(90deg,#fb923c,#f472b6); }
 .version { text-align:center; margin-top:12px; font-size:9px; letter-spacing:2px; color:var(--text-faint); }
 
 /* ═══ TOPBAR ═══ */
@@ -321,7 +323,7 @@ code, pre, .mono { font-family: var(--font-mono); }
 .dash-row.triple { grid-template-columns:1fr 1fr 1fr; }
 
 /* ═══ GAUGES ═══ */
-.gauge-container { display:flex; justify-content:space-around; padding:8px 0; }
+.gauge-container { display:flex; justify-content:space-around; flex-wrap:wrap; padding:8px 0; }
 .gauge { text-align:center; position:relative; }
 .gauge svg { transform:rotate(-90deg); }
 .gauge-bg { stroke:var(--panel-3); }

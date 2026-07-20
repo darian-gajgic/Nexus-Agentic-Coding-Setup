@@ -223,17 +223,79 @@ def collect_metrics():
     db.execute("DELETE FROM activity WHERE ts < ?", (now - 14 * 86400,))
 
 
+# Latest GPU sample, written only by the metrics thread; get_system_stats()
+# (called from async routes) must never spawn nvidia-smi itself.
+_gpu_stats = {"gpu_percent": None, "gpu_mem_percent": None,
+              "gpu_mem_used_mb": None, "gpu_mem_total_mb": None}
+_GPU_PCI_DIR = None
+
+
+def _find_nvidia_pci_dir():
+    """Sysfs dir of the NVIDIA display device (vendor 0x10de, class 0x03*)."""
+    for dev in Path("/sys/bus/pci/devices").glob("*"):
+        try:
+            if (dev / "vendor").read_text().strip() == "0x10de" and \
+               (dev / "class").read_text().strip().startswith("0x03"):
+                return dev
+        except OSError:
+            continue
+    return None
+
+
+def _sample_gpu(force: bool = False):
+    """Refresh _gpu_stats via nvidia-smi. Hybrid-graphics machine: if the dGPU
+    is runtime-suspended, report idle from the cached total WITHOUT invoking
+    nvidia-smi — the query itself would wake the card and keep it powered.
+    force=True bypasses that skip (one startup wake to learn the VRAM total)."""
+    global _gpu_stats
+    if not force and _GPU_PCI_DIR is not None:
+        try:
+            if (_GPU_PCI_DIR / "power" / "runtime_status").read_text().strip() == "suspended":
+                total = _gpu_stats["gpu_mem_total_mb"]
+                _gpu_stats = {"gpu_percent": 0.0, "gpu_mem_percent": 0.0,
+                              "gpu_mem_used_mb": 0.0, "gpu_mem_total_mb": total}
+                return
+        except OSError:
+            pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        util, used, total = (float(x) for x in out.stdout.strip().splitlines()[0].split(","))
+        _gpu_stats = {
+            "gpu_percent": util,
+            "gpu_mem_percent": round(used / total * 100, 1) if total else 0.0,
+            "gpu_mem_used_mb": used,
+            "gpu_mem_total_mb": total,
+        }
+    except Exception:
+        _gpu_stats = {"gpu_percent": None, "gpu_mem_percent": None,
+                      "gpu_mem_used_mb": None, "gpu_mem_total_mb": None}
+
+
 def metrics_loop(stop_event: threading.Event):
     """Background thread: collect metrics every few seconds."""
+    global _GPU_PCI_DIR
     # Prime psutil's per-process CPU counter once so the first non-blocking
     # cpu_percent(interval=None) read (here and in get_system_stats) returns a
     # real delta instead of 0.0.
     psutil.cpu_percent(interval=None)
+    _GPU_PCI_DIR = _find_nvidia_pci_dir()
+    try:
+        _sample_gpu(force=True)
+    except Exception:
+        pass
     while not stop_event.is_set():
         try:
             collect_metrics()
         except Exception as e:
             print(f"[metrics] error: {e}", file=sys.stderr)
+        try:
+            _sample_gpu()
+        except Exception as e:
+            print(f"[metrics] gpu error: {e}", file=sys.stderr)
         stop_event.wait(3)
 
 
@@ -260,6 +322,7 @@ def get_system_stats() -> dict:
         "net_sent_mb": round(net.bytes_sent / (1024**2), 1),
         "net_recv_mb": round(net.bytes_recv / (1024**2), 1),
         "uptime": time.time() - psutil.boot_time(),
+        **_gpu_stats,
     }
 
 

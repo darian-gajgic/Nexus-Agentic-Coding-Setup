@@ -1012,6 +1012,13 @@ function distListHTML(byStatus, colors) {
     </div>`).join('');
 }
 
+function sysLineText(sys) {
+  const vram = sys.gpu_mem_total_mb
+    ? ` · VRAM ${((sys.gpu_mem_used_mb || 0) / 1024).toFixed(1)}/${(sys.gpu_mem_total_mb / 1024).toFixed(1)}GB`
+    : '';
+  return `${sys.cpu_count || 0} cores · ${sys.mem_total_gb || 0}GB RAM${vram} · Load ${(sys.load_avg || [0, 0, 0]).join(' / ')}`;
+}
+
 const AGENT_STATUS_COLORS = { running: 'var(--green)', busy: 'var(--yellow)', idle: 'var(--text-dim)', stopped: 'var(--red)', crashed: 'var(--orange)' };
 const TASK_STATUS_COLORS = { backlog: 'var(--text-dim)', todo: 'var(--blue)', in_progress: 'var(--yellow)', review: 'var(--orange)', done: 'var(--green)' };
 
@@ -1022,6 +1029,8 @@ function viewDashboard() {
   const cpuPct = sys.cpu_percent ? sys.cpu_percent.toFixed(0) : 0;
   const memPct = sys.mem_percent ? sys.mem_percent.toFixed(0) : 0;
   const diskPct = sys.disk_percent ? sys.disk_percent.toFixed(0) : 0;
+  const gpuPct = sys.gpu_percent ? sys.gpu_percent.toFixed(0) : 0;
+  const gpuMemPct = sys.gpu_mem_percent ? sys.gpu_mem_percent.toFixed(0) : 0;
   const liveCount = (state.agents || []).filter(a => a.status === 'running' || a.status === 'busy').length;
 
   return `
@@ -1071,10 +1080,12 @@ function viewDashboard() {
           <div class="gauge-container" id="gaugeWrap">
             ${gauge('CPU', cpuPct, '#7c5cff', 'gCpu')}
             ${gauge('MEM', memPct, '#5eead4', 'gMem')}
+            ${gauge('GPU', gpuPct, '#4ade80', 'gGpu')}
+            ${gauge('GPU MEM', gpuMemPct, '#f472b6', 'gGpuMem')}
             ${gauge('DISK', diskPct, '#fb923c', 'gDisk')}
           </div>
           <div style="font-size:11px;color:var(--text-faint);text-align:center;margin-top:10px;font-family:var(--font-mono)" id="sysLine">
-            ${sys.cpu_count || 0} cores · ${sys.mem_total_gb || 0}GB RAM · Load ${(sys.load_avg || [0, 0, 0]).join(' / ')}
+            ${sysLineText(sys)}
           </div>
         </div>
       </div>
@@ -1125,12 +1136,14 @@ function updateDashboardInPlace() {
   set('kpiTokensSub', `↓${fmtTokens(tokens.total_in || 0)} in · ↑${fmtTokens(tokens.total_out || 0)} out`);
   set('kpiDone', tp.tasks_completed || 0);
   set('kpiDoneSub', `${tp.tasks_failed || 0} failed`);
-  set('sysLine', `${sys.cpu_count || 0} cores · ${sys.mem_total_gb || 0}GB RAM · Load ${(sys.load_avg || [0, 0, 0]).join(' / ')}`);
+  set('sysLine', sysLineText(sys));
   set('rosterCount', `LIVE · ${state.agents.length} AGENTS`);
   const liveCount = (state.agents || []).filter(a => a.status === 'running' || a.status === 'busy').length;
   set('heroLive', `${liveCount} active now`);
   updateGauge('gCpu', sys.cpu_percent || 0);
   updateGauge('gMem', sys.mem_percent || 0);
+  updateGauge('gGpu', sys.gpu_percent || 0);
+  updateGauge('gGpuMem', sys.gpu_mem_percent || 0);
   updateGauge('gDisk', sys.disk_percent || 0);
   const now = document.getElementById('nowStrip'); if (now) now.innerHTML = nowRunningHTML();
   const rb = document.getElementById('rosterBody'); if (rb) rb.innerHTML = rosterHTML();
@@ -5390,6 +5403,10 @@ function updateSidebarMini() {
   const el2 = $('#miniMem'); if (el2) el2.style.width = (sys.mem_percent || 0) + '%';
   const v1 = $('#miniCpuVal'); if (v1) v1.textContent = `${Math.round(sys.cpu_percent || 0)}%`;
   const v2 = $('#miniMemVal'); if (v2) v2.textContent = `${Math.round(sys.mem_percent || 0)}%`;
+  const el3 = $('#miniGpu'); if (el3) el3.style.width = (sys.gpu_percent || 0) + '%';
+  const el4 = $('#miniGpuMem'); if (el4) el4.style.width = (sys.gpu_mem_percent || 0) + '%';
+  const v3 = $('#miniGpuVal'); if (v3) v3.textContent = sys.gpu_percent == null ? '--' : `${Math.round(sys.gpu_percent)}%`;
+  const v4 = $('#miniGpuMemVal'); if (v4) v4.textContent = sys.gpu_mem_percent == null ? '--' : `${Math.round(sys.gpu_mem_percent)}%`;
 }
 
 // ===== ACTIONS =====
