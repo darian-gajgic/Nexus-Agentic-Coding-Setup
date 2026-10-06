@@ -4,7 +4,7 @@ This is YOUR complete step-by-step guide. It is self-contained: every step is on
 a command to paste, a button to click, or a thing to wait for with its expected result. You do not need to
 read anything else to execute it. Background documents (only if you want detail):
 `PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md` (the campaign the Claude sessions execute) and
-`Production-Readyness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` (what every feature is for + research verdicts).
+`Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` (what every feature is for + research verdicts).
 
 Rules that keep you safe throughout:
 - Never run two campaign sessions at the same time.
@@ -48,7 +48,7 @@ service several times and would corrupt the run).
 
 **Step 5.** Commit the campaign documents:
 ```
-git add PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md Production-Readyness-Review-1/ SECURITY-SWEEP-PLAN-2026-07-12.md CODE-REVIEW-FINDINGS-2026-07-12.md && git commit -m "docs: final readiness review campaign 2026-07-13 (plan + tool documentation + operator guide)"
+git add PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md Production-Readiness-Review-1/ SECURITY-SWEEP-PLAN-2026-07-12.md CODE-REVIEW-FINDINGS-2026-07-12.md && git commit -m "docs: final readiness review campaign 2026-07-13 (plan + tool documentation + operator guide)"
 ```
 EXPECTED: the pre-commit check runs for about a minute, prints `ALL CHECKS PASSED: N/N`, and the commit is
 created.
@@ -119,16 +119,16 @@ claude --model claude-fable-5 --permission-mode acceptEdits
 Execute PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md — Session A, ultracode.
 You are the reviewer, not the fixer: findings are PROPOSED (only the labeled batch-0 one-liners get
 committed, at the end, after my Block-2 approval). Zero trust in prior test reports — re-verify everything
-yourself at runtime, and judge design against Production-Readyness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md
+yourself at runtime, and judge design against Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md
 (its verdicts are hypotheses to confirm or refute). Work the phases in order; after every phase update
-Production-Readyness-Review-1/PROGRESS.md and flush findings to FINAL-REVIEW-2026-07-13.md. Ping me ONLY at
+Production-Readiness-Review-1/PROGRESS.md and flush findings to FINAL-REVIEW-2026-07-13.md. Ping me ONLY at
 the two ATTENDED BLOCKS and for cost-risky approvals; play the client yourself via the plan's ANSWER-SHEET
 and log every question. Functional QA only — no security probing, per the plan's §1 guardrail hygiene.
 Start with Phase 0 and report the stub-sweep result before anything else.
 ```
 
 **Step 17.** Wait ~10 minutes and check the session once. EXPECTED: it has confirmed the plan, created
-`Production-Readyness-Review-1/PROGRESS.md` and the FINAL-REVIEW skeleton, and reported a CLEAN stub-sweep.
+`Production-Readiness-Review-1/PROGRESS.md` and the FINAL-REVIEW skeleton, and reported a CLEAN stub-sweep.
 Now you can leave the machine. Total Session A runtime: ~10–13 hours; it needs you only twice (~45 min total).
 
 ## PHASE 3 — DURING Session A: the only 4 things it will ask of you
@@ -172,7 +172,7 @@ cd ~/Nexus-Agentic-Coding-Setup && claude --continue
 ```
 Then paste EXACTLY:
 ```
-Resume the production-readiness campaign. Read Production-Readyness-Review-1/PROGRESS.md and
+Resume the production-readiness campaign. Read Production-Readiness-Review-1/PROGRESS.md and
 PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md, run git status and the stub-hygiene sweep, then re-do the
 FIRST unticked PROGRESS item from scratch and continue the plan. Do not trust any in-context memory of prior
 progress over the files on disk.
@@ -183,15 +183,15 @@ repeat any number of times.
 
 ## PHASE 4 — AFTER Session A: read and approve (~30 min)
 
-**Step 18.** Read `Production-Readyness-Review-1/FINAL-REVIEW-2026-07-13.md` — at minimum section 1
+**Step 18.** Read `Production-Readiness-Review-1/FINAL-REVIEW-2026-07-13.md`, at minimum section 1
 (executive verdict) and the P0/P1 findings.
 
-**Step 19.** Read `Production-Readyness-Review-1/FIX-RUNBOOK-2026-07-13.md`. If you disagree with a batch,
+**Step 19.** Read `Production-Readiness-Review-1/FIX-RUNBOOK-2026-07-13.md`. If you disagree with a batch,
 delete or reorder it directly in the file.
 
 **Step 20.** Run:
 ```
-git add Production-Readyness-Review-1 && git commit -m "review: Session A findings + fix runbook + improvements" && git push
+git add Production-Readiness-Review-1 && git commit -m "review: Session A findings + fix runbook + improvements" && git push
 ```
 EXPECTED: pre-commit passes, push clean.
 
@@ -209,7 +209,7 @@ every REBUILD batch = Fable 5).
 
 **Step 22.** Paste this prompt with the batch ID filled in (e.g. `B1` or `R1`):
 ```
-Execute batch <BATCH-ID> of Production-Readyness-Review-1/FIX-RUNBOOK-2026-07-13.md.
+Execute batch <BATCH-ID> of Production-Readiness-Review-1/FIX-RUNBOOK-2026-07-13.md.
 Read the batch entry and the finding entries it cites in FINAL-REVIEW-2026-07-13.md first. FIX batch: fix
 exactly that scope — nothing else; a deeper problem you uncover becomes a new finding write-up, not a bigger
 fix. REBUILD batch: present the design note and wait for my GO, then build it properly in a git worktree
@@ -257,7 +257,7 @@ EXPECTED after ~2–3 hours: a final line `VERDICT: SHIP`, or `VERDICT: REVISE` 
 
 **Step 27.** Run:
 ```
-git add -A Production-Readyness-Review-1 && git commit -m "review: campaign complete — Session C verdict" && git push
+git add -A Production-Readiness-Review-1 && git commit -m "review: campaign complete, Session C verdict" && git push
 ```
 
 **Step 28.** In any Claude session in this repo, say:
