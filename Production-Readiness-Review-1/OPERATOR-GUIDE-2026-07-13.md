@@ -183,7 +183,7 @@ repeat any number of times.
 
 ## PHASE 4 — AFTER Session A: read and approve (~30 min)
 
-**Step 18.** Read `Production-Readiness-Review-1/FINAL-REVIEW-2026-07-13.md` — at minimum section 1
+**Step 18.** Read `Production-Readiness-Review-1/FINAL-REVIEW-2026-07-13.md`, at minimum section 1
 (executive verdict) and the P0/P1 findings.
 
 **Step 19.** Read `Production-Readiness-Review-1/FIX-RUNBOOK-2026-07-13.md`. If you disagree with a batch,
@@ -257,7 +257,7 @@ EXPECTED after ~2–3 hours: a final line `VERDICT: SHIP`, or `VERDICT: REVISE` 
 
 **Step 27.** Run:
 ```
-git add -A Production-Readiness-Review-1 && git commit -m "review: campaign complete — Session C verdict" && git push
+git add -A Production-Readiness-Review-1 && git commit -m "review: campaign complete, Session C verdict" && git push
 ```
 
 **Step 28.** In any Claude session in this repo, say:

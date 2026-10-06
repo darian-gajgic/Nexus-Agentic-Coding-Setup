@@ -52,7 +52,7 @@ readiness is not final until both campaigns have run.
 
 ## §2 Read first (Session A, ~20 min, no skipping)
 
-1. `Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` — **FIRST.** Per-functionality intended
+1. `Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md`: **FIRST.** Per-functionality intended
    goals, current implementation, web-researched proper way, PROPER/PARTIAL/NOT-PROPER verdicts. This is the
    purpose ground truth; its verdicts are hypotheses this campaign confirms or refutes at runtime.
 2. `CLAUDE.md` (repo root) — ONE-REPO rule, `app/` is the LIVE tree, `~/nexus-agent-os` symlink is
@@ -620,7 +620,7 @@ stubs leak.
     B-batches (steps 24–26), then rerun Session C. Loop until SHIP.
 
 **CLOSE-OUT**
-31. Run: `git add -A Production-Readiness-Review-1 && git commit -m "review: campaign complete — Session C verdict" && git push`
+31. Run: `git add -A Production-Readiness-Review-1 && git commit -m "review: campaign complete, Session C verdict" && git push`
 32. In any Claude session in this repo, say: "Update project memory: readiness campaign complete, verdict
     <SHIP/...>, security sweep still pending."
 33. Schedule/run the security sweep (`SECURITY-SWEEP-PLAN-2026-07-12.md`, own small session, **Opus 4.8**) —
