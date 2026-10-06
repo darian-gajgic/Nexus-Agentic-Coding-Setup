@@ -59,6 +59,6 @@ HOST=$(tailscale status --json 2>/dev/null | python3 -c \
   "import sys, json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" 2>/dev/null || echo "<machine>.<tailnet>.ts.net")
 echo
 echo "Nexus is now reachable INSIDE your tailnet at:  https://${HOST}"
-echo "  • Phone / girlfriend's laptop: install Tailscale, join the same"
+echo "  • Other devices (phone, second laptop): install Tailscale, join the same"
 echo "    tailnet, open that URL. Login screen appears once 2+ users exist."
 echo "  • Public internet exposure: NONE (verify: tailscale funnel status)"

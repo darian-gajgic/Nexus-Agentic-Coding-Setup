@@ -228,4 +228,4 @@ Remote access: **Tailscale only, never public** — see docs/TAILSCALE.md
 - `~/hermes-team-setup` — portable snapshot of the whole environment.
 - `~/Nexus-Agentic-Coding-Setup` — **the finished-project package**: full
   Nexus source (`app/`), complete Hermes environment (`setup/`), installer,
-  patches, docs. Private GitHub: `dariannixda-eng/Nexus-Agentic-Coding-Setup`.
+  patches, docs. GitHub: `darian-gajgic/Nexus-Agentic-Coding-Setup`.
