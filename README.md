@@ -1,5 +1,14 @@
 # Nexus-Agentic-Coding-Setup
 
+> **Discontinued prototype.** Nexus was built in July 2026 and stopped after it
+> missed the success criterion it had set in advance. In a blind-scored webshop
+> benchmark (bench-02, n=1) it reached 28/50 at about 17 times the cost of a
+> direct frontier-model run, which scored 44/50. The
+> [post-mortem](https://github.com/darian-gajgic/Sinet-Agentic-Control-Hub/blob/main/Docs/nexus-post-mortem.md)
+> explains what worked, what failed and why. The successor is
+> [Sinet Agentic Control Hub](https://github.com/darian-gajgic/Sinet-Agentic-Control-Hub).
+> This repository is kept as a record and is no longer maintained.
+
 The COMPLETE Nexus + Hermes project in one repository: the full **Nexus Agent
 OS** (`app/` — the live working tree of the running service) plus the entire
 **Hermes environment** (`setup/` — configs, 18 specialists, skills, plugins,
@@ -36,8 +45,8 @@ committed in `~/.hermes/agents` @ e14fc20):
   migrations always escalate to the human.
 
 **Nexus side** (`patches/nexus-repo-native-tasks.patch`, applied to the live
-working tree, deliberately NOT committed in nexus-agent-os per operator
-instruction — this repo is the canonical record):
+working tree, deliberately NOT committed in nexus-agent-os (a private
+repository, not published) per operator instruction; this repo is the canonical record):
 - `tasks.repo_path` column + API field + validation (`is_repo`).
 - `worktree.py`: `ensure_task_worktree` (idempotent branch `nexus/<slug>`,
   worktree under `<repo>/.worktrees/`; pipeline tasks share one branch so
@@ -72,7 +81,7 @@ instruction — this repo is the canonical record):
 
 ## Install on a new machine — FULL project (Hermes + Nexus)
 ```bash
-git clone git@github.com:dariannixda-eng/Nexus-Agentic-Coding-Setup.git
+git clone https://github.com/darian-gajgic/Nexus-Agentic-Coding-Setup.git
 cd Nexus-Agentic-Coding-Setup
 # then follow setup/CLAUDE.md — or open the repo in Claude Code and say
 # "set this up": the runbook installs Hermes (pinned @ 048270fa069f), local
@@ -95,7 +104,8 @@ runtime data (nexus.db, workspaces, Hermes state.db).
   `~/.hermes/agents` (with backups), and registers the systemd user unit.
 - `system/nexus.service` — the unit template (paths rewritten at install).
 - `patches/` — the feature as reviewable git patches.
-  `nexus-repo-native-tasks.patch` applies on nexus-agent-os @ **01d7138**.
+  `nexus-repo-native-tasks.patch` applies on the private nexus-agent-os
+  repository @ **01d7138**; `app/` already contains the patched tree.
 - `files/` — copies of just the feature-changed files (review-friendly view;
   `app/` supersedes them for installation).
 - `scripts/` — repo tooling (`refresh-app.sh` is RETIRED: since the
@@ -111,6 +121,8 @@ TLS certs (generated per machine), JARVIS voice models (optional GPU stack —
 see `docs/JARVIS-VOICE.md` in `app/docs/`), and Hermes itself (own setup repo).
 
 ## Apply / verify / rollback
+These steps assume a local checkout of the private nexus-agent-os repository
+at `~/nexus-agent-os`. Without it, use `app/` and `install.sh` instead.
 - Nexus: `git -C ~/nexus-agent-os apply patches/nexus-repo-native-tasks.patch`
   (already live on this machine; base commit 01d7138 — if the base has moved,
   copy from `files/nexus/` instead), then `bash scripts/verify.sh` and restart
