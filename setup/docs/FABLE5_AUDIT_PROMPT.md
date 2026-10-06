@@ -14,7 +14,7 @@ The user specifically wants your judgment on:
 - Configuration correctness: verify if this is actually configured correctly. A silently misconfigured file is a failure waiting to happen during client work — surface any you find.
 - Blind spots the user (learning by doing) and the current agent (too close to the setup) can't see — failure modes that haven't surfaced, scalability limits, workflow bottlenecks for a 2-person team.
 - Improvement opportunities: not just "is this correct now" but "how could this be better." Identify specific improvements that would meaningfully increase output quality or automate work for their goal.
-- The 2-person team question: one shared profile, separate Hermes profiles, or something else? What does the girlfriend's marketing/design/brand workflow need that's missing?
+- The 2-person team question: one shared profile, separate Hermes profiles, or something else? What does the second team member's marketing/design/brand workflow need that's missing?
 - What must be fixed or implemented BEFORE real client work vs. what can wait.
 - I made some modification on hemes, we have to make sure they do not get overwritten by a new update from hermes.
 - The laptop sometimes gets shut down and restarted. The system has to handle that, so it's not losing anything and restarting everything on a reboot of the laptop. 
