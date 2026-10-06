@@ -15,12 +15,12 @@ improvement plan → fixes/rebuilds executed → re-verified.
 **Posture (owner, 2026-07-13):** the code was designed and implemented by a junior software
 architect/developer. Nothing in the current implementation is assumed correct — **including its design**.
 Every subsystem is judged against web-researched state-of-the-art and best practices
-(`Production-Readyness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` holds the per-functionality research and
+(`Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` holds the per-functionality research and
 verdicts as hypotheses; this campaign confirms them at runtime). Where something is not well implemented, do
 NOT patch around it — plan a **proper re-implementation** that reaches the intended goal the right way.
 
 **Campaign shape:** Session A (big review, Fable 5, ultracode) → Sessions B1..Bn (fix + rebuild batches) →
-Session C (re-verify judge, Fable 5). Everything lands in `Production-Readyness-Review-1/`:
+Session C (re-verify judge, Fable 5). Everything lands in `Production-Readiness-Review-1/`:
 - `FINAL-REVIEW-2026-07-13.md` — findings ledger + goal/subsystem/domain scorecards + architecture verdict
 - `FIX-RUNBOOK-2026-07-13.md` — self-contained fix/rebuild batches (P0/P1/P2)
 - `IMPROVEMENTS-2026-07-13.md` — max 7 adopted "work smarter" additions + rejects with earn-back triggers
@@ -52,7 +52,7 @@ readiness is not final until both campaigns have run.
 
 ## §2 Read first (Session A, ~20 min, no skipping)
 
-1. `Production-Readyness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` — **FIRST.** Per-functionality intended
+1. `Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md` — **FIRST.** Per-functionality intended
    goals, current implementation, web-researched proper way, PROPER/PARTIAL/NOT-PROPER verdicts. This is the
    purpose ground truth; its verdicts are hypotheses this campaign confirms or refutes at runtime.
 2. `CLAUDE.md` (repo root) — ONE-REPO rule, `app/` is the LIVE tree, `~/nexus-agent-os` symlink is
@@ -517,7 +517,7 @@ Session C <date>"), appends a Session-C section, and ends with exactly one line:
 
 Operator: `cd ~/Nexus-Agentic-Coding-Setup && claude --continue`, then paste:
 ```
-Resume the production-readiness campaign. Read Production-Readyness-Review-1/PROGRESS.md and
+Resume the production-readiness campaign. Read Production-Readiness-Review-1/PROGRESS.md and
 PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md, run git status and the stub-hygiene sweep, then re-do the
 FIRST unticked PROGRESS item from scratch and continue the plan. Do not trust any in-context memory of prior
 progress over the files on disk.
@@ -556,7 +556,7 @@ stubs leak.
 4. Open `https://127.0.0.1:8777` → Tasks board — EXPECTED: no bench-02 run or other big dispatch currently
    streaming (this campaign restarts the service several times). If one is running, wait for it.
 5. Commit the campaign docs:
-   `git add PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md Production-Readyness-Review-1/ SECURITY-SWEEP-PLAN-2026-07-12.md CODE-REVIEW-FINDINGS-2026-07-12.md && git commit -m "docs: final readiness review campaign 2026-07-13 (plan + tool documentation)"`
+   `git add PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md Production-Readiness-Review-1/ SECURITY-SWEEP-PLAN-2026-07-12.md CODE-REVIEW-FINDINGS-2026-07-12.md && git commit -m "docs: final readiness review campaign 2026-07-13 (plan + tool documentation)"`
    — EXPECTED: pre-commit verify.sh runs and passes, commit created.
 6. Run: `git push` — EXPECTED: pushed to origin/main clean.
 7. Start the stack: `nexus-up` — EXPECTED: ollama + qdrant/langfuse containers + timers + nexus.service come
@@ -581,7 +581,7 @@ stubs leak.
     Fable 5.)
 15. Paste the Session-A kickoff prompt from §15 (block 1) and send.
 16. EXPECTED within ~10 min: it confirms the plan + read-first docs, creates
-    `Production-Readyness-Review-1/PROGRESS.md` + the FINAL-REVIEW skeleton, reports the stub-sweep result,
+    `Production-Readiness-Review-1/PROGRESS.md` + the FINAL-REVIEW skeleton, reports the stub-sweep result,
     and starts Phase 1. You can leave.
 17. PINGS TO EXPECT: (a) ~T+4h "ATTENDED BLOCK 1 ready" → do §7 block 1 (9 steps, ~20 min);
     (b) occasional batched [UNSURE] questions → answer short, only what's asked;
@@ -597,9 +597,9 @@ stubs leak.
     unticked item.
 
 **AFTER SESSION A (you, ~30 min)**
-21. Read `Production-Readyness-Review-1/FINAL-REVIEW-2026-07-13.md` §1, then skim the P0/P1 findings.
+21. Read `Production-Readiness-Review-1/FINAL-REVIEW-2026-07-13.md` §1, then skim the P0/P1 findings.
 22. Read `FIX-RUNBOOK-2026-07-13.md`. Edit it directly to strike or reorder batches you disagree with.
-23. Run: `git add Production-Readyness-Review-1 && git commit -m "review: Session A findings + fix runbook + improvements" && git push`
+23. Run: `git add Production-Readiness-Review-1 && git commit -m "review: Session A findings + fix runbook + improvements" && git push`
 
 **SESSIONS B1..Bn — one batch per session, in runbook order**
 24. For the next unticked batch: `claude --permission-mode acceptEdits`, then `/model` → the model named in
@@ -620,7 +620,7 @@ stubs leak.
     B-batches (steps 24–26), then rerun Session C. Loop until SHIP.
 
 **CLOSE-OUT**
-31. Run: `git add -A Production-Readyness-Review-1 && git commit -m "review: campaign complete — Session C verdict" && git push`
+31. Run: `git add -A Production-Readiness-Review-1 && git commit -m "review: campaign complete — Session C verdict" && git push`
 32. In any Claude session in this repo, say: "Update project memory: readiness campaign complete, verdict
     <SHIP/...>, security sweep still pending."
 33. Schedule/run the security sweep (`SECURITY-SWEEP-PLAN-2026-07-12.md`, own small session, **Opus 4.8**) —
@@ -634,9 +634,9 @@ stubs leak.
 Execute PRODUCTION-READINESS-REVIEW-PLAN-2026-07-13.md — Session A, ultracode.
 You are the reviewer, not the fixer: findings are PROPOSED (only the labeled batch-0 one-liners get
 committed, at the end, after my Block-2 approval). Zero trust in prior test reports — re-verify everything
-yourself at runtime, and judge design against Production-Readyness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md
+yourself at runtime, and judge design against Production-Readiness-Review-1/TOOL-DOCUMENTATION-2026-07-13.md
 (its verdicts are hypotheses to confirm or refute). Work the phases in order; after every phase update
-Production-Readyness-Review-1/PROGRESS.md and flush findings to FINAL-REVIEW-2026-07-13.md. Ping me ONLY at
+Production-Readiness-Review-1/PROGRESS.md and flush findings to FINAL-REVIEW-2026-07-13.md. Ping me ONLY at
 the two ATTENDED BLOCKS and for cost-risky approvals; play the client yourself via the plan's ANSWER-SHEET
 and log every question. Functional QA only — no security probing, per the plan's §1 guardrail hygiene.
 Start with Phase 0 and report the stub-sweep result before anything else.
@@ -644,7 +644,7 @@ Start with Phase 0 and report the stub-sweep result before anything else.
 
 **Block 2 — Session B (fill `<BATCH-ID>`):**
 ```
-Execute batch <BATCH-ID> of Production-Readyness-Review-1/FIX-RUNBOOK-2026-07-13.md.
+Execute batch <BATCH-ID> of Production-Readiness-Review-1/FIX-RUNBOOK-2026-07-13.md.
 Read the batch entry and the finding entries it cites in FINAL-REVIEW-2026-07-13.md first. FIX batch: fix
 exactly that scope — nothing else; a deeper problem you uncover becomes a new finding write-up, not a bigger
 fix. REBUILD batch: present the design note and wait for my GO, then build it properly in a git worktree
